@@ -60,7 +60,7 @@ pub async fn search(query: &str, max_results: usize) -> Result<Vec<WebResult>> {
     let client = client()?;
 
     // 1) Bing (reliable from datacenter IPs).
-    let bing = fetch_engine(&client, BING_ENDPOINT, "q", query, parse_bing).await;
+    let bing = bing_search(&client, query).await;
     if let Ok(mut results) = bing {
         if !results.is_empty() {
             results.truncate(max_results.max(1));
@@ -74,6 +74,28 @@ pub async fn search(query: &str, max_results: usize) -> Result<Vec<WebResult>> {
         Ok(results) => Ok(results.into_iter().take(max_results.max(1)).collect()),
         Err(e) => Err(e),
     }
+}
+
+/// Bing search with an explicit English locale so datacenter endpoints do not
+/// serve region-specific (e.g. German) results for arbitrary queries.
+async fn bing_search(client: &reqwest::Client, query: &str) -> Result<Vec<WebResult>> {
+    let resp = client
+        .get(BING_ENDPOINT)
+        .query(&[
+            ("q", query),
+            ("setlang", "en"),
+            ("cc", "us"),
+            ("mkt", "en-US"),
+        ])
+        .send()
+        .await
+        .with_context(|| format!("search request to {BING_ENDPOINT} failed"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        anyhow::bail!("search returned {status}");
+    }
+    let html = resp.text().await.context("failed to read response body")?;
+    Ok(parse_bing(&html))
 }
 
 async fn fetch_engine<F>(
@@ -115,7 +137,7 @@ pub fn parse_bing(html: &str) -> Vec<WebResult> {
         };
         let title = text_of(link);
         let url = resolve_bing_url(link.value().attr("href").unwrap_or(""));
-        if url.is_empty() {
+        if url.is_empty() || !is_external(&url) {
             continue;
         }
         let description = el
@@ -130,6 +152,20 @@ pub fn parse_bing(html: &str) -> Vec<WebResult> {
         });
     }
     results
+}
+
+/// Keep only real external results; drop Bing-internal pages (search, related,
+/// redirect stubs) that can slip into organic HTML.
+fn is_external(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    match parsed.host_str() {
+        Some(host) if host.eq_ignore_ascii_case("bing.com") => false,
+        Some(host) if host.ends_with(".bing.com") => false,
+        Some(_) => true,
+        None => false,
+    }
 }
 
 /// Bing organic results point at `bing.com/ck/a?...&u=<base64url>`; decode the
