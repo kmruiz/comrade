@@ -139,6 +139,13 @@ struct App {
     // geometry/metrics refreshed on every draw
     chat_rect: Rect,
     row_targets: Vec<Option<usize>>,
+    /// Owning chat-message index for each rendered row (None = live preview).
+    row_msg: Vec<Option<usize>>,
+    /// Per chat-message row span (start row, height) over the last layout.
+    msg_ranges: Vec<(usize, usize)>,
+    view_rows: usize,
+    /// Currently selected chat block (Emacs-style navigation).
+    sel: Option<usize>,
     scroll_top: usize,
     follow: bool,
 }
@@ -170,6 +177,39 @@ impl App {
         }
     }
 
+    /// Move to the next (`+1`) or previous (`-1`) chat block.
+    fn move_block(&mut self, dir: isize) {
+        if let Some(next) = step_block(self.sel, self.chat.len(), dir) {
+            self.select_block(next);
+        }
+    }
+
+    /// Move to the next (`+1`) or previous (`-1`) user message.
+    fn move_user(&mut self, dir: isize) {
+        let users: Vec<usize> = self
+            .chat
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.kind == MsgKind::User)
+            .map(|(i, _)| i)
+            .collect();
+        if let Some(i) = step_user(&users, self.sel, dir) {
+            self.select_block(i);
+        }
+    }
+
+    /// Select a chat block and scroll it into view (top-aligned).
+    fn select_block(&mut self, idx: usize) {
+        if idx >= self.chat.len() {
+            return;
+        }
+        self.sel = Some(idx);
+        self.follow = false;
+        if let Some(&(start, _)) = self.msg_ranges.get(idx) {
+            self.scroll_top = start;
+        }
+    }
+
     fn start_run(&mut self, prompt: String) {
         if self.running || prompt.trim().is_empty() {
             return;
@@ -183,6 +223,7 @@ impl App {
         self.stop = Some(stop.clone());
         self.running = true;
         self.follow = true;
+        self.sel = None;
         tokio::spawn(async move {
             let _ = run_agent(&cfg, &client, ctx, &tools, prompt, tx, stop).await;
         });
@@ -337,6 +378,10 @@ pub async fn run(deps: &Deps) -> Result<()> {
         dialogs: Vec::new(),
         chat_rect: Rect::default(),
         row_targets: Vec::new(),
+        row_msg: Vec::new(),
+        msg_ranges: Vec::new(),
+        view_rows: 0,
+        sel: None,
         scroll_top: 0,
         follow: true,
     };
@@ -403,6 +448,31 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
             }
             if !app.dialogs.is_empty() {
                 return handle_dialog_key(app, key.code);
+            }
+            // Emacs-style chat navigation. Ctrl+shift variants (P/N) jump
+            // between user messages; plain Ctrl+p/n move block to block.
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if let KeyCode::Char(ch) = key.code {
+                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                    let ctrl_p = ch.eq_ignore_ascii_case(&'p');
+                    let ctrl_n = ch.eq_ignore_ascii_case(&'n');
+                    if ctrl_p && shift {
+                        app.move_user(-1);
+                        return false;
+                    }
+                    if ctrl_n && shift {
+                        app.move_user(1);
+                        return false;
+                    }
+                    if ctrl_p {
+                        app.move_block(-1);
+                        return false;
+                    }
+                    if ctrl_n {
+                        app.move_block(1);
+                        return false;
+                    }
+                }
             }
             match key.code {
                 KeyCode::Esc => {
@@ -487,11 +557,59 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         }
         MouseEventKind::Down(MouseButton::Left) => {
             let row = y + app.scroll_top;
+            if let Some(Some(idx)) = app.row_msg.get(row) {
+                app.sel = Some(*idx);
+            }
             if let Some(Some(idx)) = app.row_targets.get(row) {
                 app.toggle_tool(*idx);
             }
         }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// navigation math (pure)
+// ---------------------------------------------------------------------------
+
+/// Next/previous chat block index given the current selection.
+fn step_block(sel: Option<usize>, len: usize, dir: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match sel {
+        Some(i) => (i as isize + dir).clamp(0, len as isize - 1) as usize,
+        None => {
+            if dir < 0 {
+                len - 1
+            } else {
+                0
+            }
+        }
+    })
+}
+
+/// Next/previous user-message index given the user positions and selection.
+fn step_user(users: &[usize], sel: Option<usize>, dir: isize) -> Option<usize> {
+    if users.is_empty() {
+        return None;
+    }
+    let Some(anchor) = sel else {
+        return if dir < 0 {
+            users.last().copied()
+        } else {
+            users.first().copied()
+        };
+    };
+    let anchor = anchor as isize;
+    if dir < 0 {
+        users
+            .iter()
+            .rev()
+            .find(|&&i| (i as isize) < anchor)
+            .copied()
+    } else {
+        users.iter().find(|&&i| (i as isize) > anchor).copied()
     }
 }
 
@@ -546,7 +664,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
         ),
         Span::raw("  "),
         Span::styled(
-            "enter:run  esc:cancel  ctrl-c:quit  wheel:scroll  click:open tool",
+            "enter:run  esc:cancel  ctrl-c:quit  ctrl-p/n:nav  ctrl-shift-p/n:users",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -580,10 +698,13 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(block, area);
 
     let width = inner.width.saturating_sub(2) as usize; // prefix column + spacing
-    let rows = layout_messages(app, width);
+    let (rows, row_msg, ranges) = layout_messages(app, width);
 
     app.chat_rect = inner;
     app.row_targets = rows.iter().map(|r| r.tool_header).collect();
+    app.row_msg = row_msg;
+    app.msg_ranges = ranges;
+    app.view_rows = inner.height as usize;
     if app.follow {
         app.scroll_top = rows.len().saturating_sub(inner.height as usize);
     }
@@ -592,15 +713,26 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
         .min(rows.len().saturating_sub(inner.height as usize));
     app.scroll_top = offset;
 
+    let sel_start = app.sel.and_then(|i| app.msg_ranges.get(i)).map(|&(s, _)| s);
     let lines: Vec<Line> = rows
         .iter()
-        .map(|r| {
-            let prefix = match r.rule {
-                Some(color) => Line::from(vec![Span::styled(
-                    "| ",
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )]),
-                None => Line::from("  "),
+        .enumerate()
+        .map(|(row, r)| {
+            let prefix = if Some(row) == sel_start {
+                Line::from(vec![Span::styled(
+                    "> ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )])
+            } else {
+                match r.rule {
+                    Some(color) => Line::from(vec![Span::styled(
+                        "| ",
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )]),
+                    None => Line::from("  "),
+                }
             };
             let mut line = prefix;
             for s in &r.spans {
@@ -613,9 +745,17 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
 }
 
-fn layout_messages(app: &App, width: usize) -> Vec<RenderRow> {
+/// Lay the chat out into rows. Returns (rows, msg-owner per row, per-message
+/// row spans). The live streaming preview is appended without an owner.
+fn layout_messages(
+    app: &App,
+    width: usize,
+) -> (Vec<RenderRow>, Vec<Option<usize>>, Vec<(usize, usize)>) {
     let mut out = Vec::new();
+    let mut owner: Vec<Option<usize>> = Vec::new();
+    let mut ranges = Vec::new();
     for (i, msg) in app.chat.iter().enumerate() {
+        let start = out.len();
         match msg.kind {
             MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), width),
             MsgKind::Meta => {
@@ -647,6 +787,9 @@ fn layout_messages(app: &App, width: usize) -> Vec<RenderRow> {
                 }
             }
         }
+        let end = out.len();
+        owner.extend((start..end).map(|_| Some(i)));
+        ranges.push((start, end - start));
     }
     // Live streaming preview (scaffolding hidden), never committed.
     if !app.stream.is_empty() {
@@ -657,9 +800,10 @@ fn layout_messages(app: &App, width: usize) -> Vec<RenderRow> {
                 spans,
                 tool_header: None,
             });
+            owner.push(None);
         }
     }
-    out
+    (out, owner, ranges)
 }
 
 fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width: usize) {
@@ -1016,15 +1160,6 @@ fn md_to_lines(md: &str, width: usize) -> Vec<Vec<Span<'static>>> {
         .collect()
 }
 
-/// Plain-text version of [`md_to_lines`] (used by tests/measuring).
-#[cfg(test)]
-fn md_text(md: &str, width: usize) -> Vec<String> {
-    md_tok_lines(md, width)
-        .into_iter()
-        .map(|line| line.into_iter().map(|t| t.text).collect())
-        .collect()
-}
-
 fn heading_level(s: &str) -> Option<usize> {
     let level = s.chars().take_while(|&c| c == '#').count();
     if level >= 1 && level <= 6 && s.len() > level && s.as_bytes()[level] == b' ' {
@@ -1142,6 +1277,15 @@ fn wrap_toks(tokens: &[Tok], width: usize) -> Vec<Vec<Tok>> {
     out
 }
 
+/// Plain-text version of [`md_to_lines`] (used by tests/measuring).
+#[cfg(test)]
+fn md_text(md: &str, width: usize) -> Vec<String> {
+    md_tok_lines(md, width)
+        .into_iter()
+        .map(|line| line.into_iter().map(|t| t.text).collect())
+        .collect()
+}
+
 /// Remove ReAct scaffolding (Thought/Tool/Args/Justification/Risk lines and the
 /// multi-line Args JSON) so only human-readable content is rendered.
 fn strip_react_scaffolding(text: &str) -> String {
@@ -1237,5 +1381,29 @@ mod tests {
         for l in &lines {
             assert!(l.chars().count() <= 20, "line too wide: {l:?}");
         }
+    }
+
+    #[test]
+    fn block_navigation_wraps_at_edges() {
+        // blocks: user, tool, assistant
+        assert_eq!(step_block(None, 3, 1), Some(0));
+        assert_eq!(step_block(None, 3, -1), Some(2));
+        assert_eq!(step_block(Some(0), 3, -1), Some(0));
+        assert_eq!(step_block(Some(2), 3, 1), Some(2));
+        assert_eq!(step_block(Some(1), 3, 1), Some(2));
+        assert_eq!(step_block(Some(0), 0, 1), None);
+    }
+
+    #[test]
+    fn user_navigation_steps_between_users() {
+        // chat indices of user messages: 0 and 4 (tool/assistant in between)
+        let users = vec![0usize, 4usize];
+        assert_eq!(step_user(&users, None, 1), Some(0));
+        assert_eq!(step_user(&users, None, -1), Some(4));
+        assert_eq!(step_user(&users, Some(0), 1), Some(4));
+        assert_eq!(step_user(&users, Some(0), -1), None); // already at first user
+        assert_eq!(step_user(&users, Some(4), 1), None); // already at last user
+        assert_eq!(step_user(&users, Some(4), -1), Some(0));
+        assert_eq!(step_user(&[], Some(0), 1), None);
     }
 }
