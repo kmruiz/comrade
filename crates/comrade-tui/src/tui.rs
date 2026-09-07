@@ -60,6 +60,7 @@ enum MsgKind {
     Assistant,
     Tool,
     Meta,
+    Failure,
 }
 
 struct ToolCard {
@@ -72,10 +73,28 @@ struct ToolCard {
     open: bool,
 }
 
+/// One failed test: name + captured failure detail.
+struct TestFail {
+    name: String,
+    detail: String,
+    open: bool,
+}
+
+/// Structured summary of a `run_tests` invocation.
+#[derive(Default)]
+struct TestSummary {
+    passed: usize,
+    failed: usize,
+    duration: String,
+    /// (name, detail) for every failing test.
+    cases: Vec<(String, String)>,
+}
+
 struct Msg {
     kind: MsgKind,
     text: String,
     tool: Option<ToolCard>,
+    fail: Option<TestFail>,
 }
 
 impl Msg {
@@ -84,6 +103,7 @@ impl Msg {
             kind,
             text: text.into(),
             tool: None,
+            fail: None,
         }
     }
     fn tool(card: ToolCard) -> Self {
@@ -91,6 +111,19 @@ impl Msg {
             kind: MsgKind::Tool,
             text: String::new(),
             tool: Some(card),
+            fail: None,
+        }
+    }
+    fn failure(name: String, detail: String) -> Self {
+        Msg {
+            kind: MsgKind::Failure,
+            text: String::new(),
+            tool: None,
+            fail: Some(TestFail {
+                name,
+                detail,
+                open: false,
+            }),
         }
     }
 }
@@ -179,8 +212,14 @@ impl App {
         if let Some(m) = self.chat.get_mut(idx) {
             if let Some(card) = &mut m.tool {
                 card.open = !card.open;
+            } else if let Some(fail) = &mut m.fail {
+                fail.open = !fail.open;
             }
         }
+    }
+
+    fn push_failure(&mut self, name: String, detail: String) {
+        self.push_msg(Msg::failure(name, detail));
     }
 
     /// Move to the next (`+1`) or previous (`-1`) chat block.
@@ -294,7 +333,34 @@ impl App {
             AgentEvent::ToolResult { name, output, ok } => {
                 self.stream.clear();
                 self.activity = None;
-                if let Some(card) = self.last_tool_mut(&name) {
+                if name == "run_tests" {
+                    if output.contains("test result:") {
+                        // Render a rich summary card + one collapsible block per
+                        // failing test instead of a wall of text.
+                        let summary = parse_test_summary(&output);
+                        let fails = summary.failed;
+                        let passed = summary.passed;
+                        let duration = if summary.duration.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {}", summary.duration)
+                        };
+                        if let Some(card) = self.last_tool_mut("run_tests") {
+                            card.ok = fails == 0;
+                            card.result =
+                                Some(format!("{passed} passed, {fails} failed{duration}"));
+                        }
+                        for (test_name, detail) in summary.cases {
+                            self.push_failure(test_name, detail);
+                        }
+                        if fails == 0 && passed > 0 {
+                            self.push_meta(format!("all {passed} tests passed"));
+                        }
+                    } else if let Some(card) = self.last_tool_mut("run_tests") {
+                        card.result = Some(output);
+                        card.ok = ok;
+                    }
+                } else if let Some(card) = self.last_tool_mut(&name) {
                     card.result = Some(output);
                     card.ok = ok;
                 }
@@ -664,6 +730,73 @@ fn step_user(users: &[usize], sel: Option<usize>, dir: isize) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// run_tests output parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a `run_tests` summary: counts + duration + one (name, detail) per
+/// failing test (from `---- <name> stdout ----` sections).
+fn parse_test_summary(text: &str) -> TestSummary {
+    let mut summary = TestSummary::default();
+    let mut current: Option<(String, Vec<String>)> = None;
+
+    let flush = |cases: &mut Vec<(String, String)>, cur: &mut Option<(String, Vec<String>)>| {
+        if let Some((name, detail)) = cur.take() {
+            cases.push((name, detail.join("\n")));
+        }
+    };
+
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("test result:") {
+            summary.passed = number_before(raw, " passed").unwrap_or(summary.passed);
+            summary.failed = number_before(raw, " failed").unwrap_or(summary.failed);
+            if let Some(d) = after(raw, "finished in ") {
+                let d = d.trim_end_matches(' ').to_string();
+                summary.duration = d;
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("---- ") {
+            if let Some(name) = rest.strip_suffix(" stdout ----") {
+                flush(&mut summary.cases, &mut current);
+                current = Some((name.to_string(), Vec::new()));
+                continue;
+            }
+            // a closing "---- name ----" or other separator: just flush
+            flush(&mut summary.cases, &mut current);
+            continue;
+        }
+        if let Some((_, detail)) = current.as_mut() {
+            let t = trimmed;
+            if t.starts_with("note:") || t.is_empty() {
+                continue;
+            }
+            detail.push(raw.to_string());
+        }
+    }
+    flush(&mut summary.cases, &mut current);
+    summary
+}
+
+fn number_before(line: &str, needle: &str) -> Option<usize> {
+    let i = line.find(needle)?;
+    let digits: String = line[..i]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.chars().rev().collect::<String>().parse().ok()
+}
+
+fn after<'a>(line: &'a str, needle: &str) -> Option<&'a str> {
+    let i = line.find(needle)? + needle.len();
+    Some(line[i..].trim())
+}
+
+// ---------------------------------------------------------------------------
 // chat rendering / markdown
 // ---------------------------------------------------------------------------
 
@@ -830,6 +963,7 @@ fn layout_messages(
     for (i, msg) in app.chat.iter().enumerate() {
         let start = out.len();
         match msg.kind {
+            MsgKind::Failure => layout_failure(&mut out, i, msg.fail.as_ref().unwrap(), width),
             MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), width),
             MsgKind::Meta => {
                 for s in plain_wrap(&msg.text, width) {
@@ -877,6 +1011,39 @@ fn layout_messages(
         }
     }
     (out, owner, ranges)
+}
+
+fn layout_failure(out: &mut Vec<RenderRow>, msg_idx: usize, fail: &TestFail, width: usize) {
+    out.push(RenderRow {
+        rule: None,
+        spans: vec![
+            Span::styled(
+                if fail.open { "v " } else { "> " },
+                Style::default().fg(Color::Red),
+            ),
+            Span::styled(
+                "FAILED ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(fail.name.clone(), Style::default().fg(Color::White)),
+        ],
+        tool_header: Some(msg_idx),
+    });
+    if !fail.open {
+        return;
+    }
+    if !fail.detail.is_empty() {
+        for s in plain_wrap(&fail.detail, width.saturating_sub(2)) {
+            out.push(RenderRow {
+                rule: None,
+                spans: vec![Span::styled(
+                    format!("  {s}"),
+                    Style::default().fg(Color::Red),
+                )],
+                tool_header: None,
+            });
+        }
+    }
 }
 
 fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width: usize) {
@@ -1568,5 +1735,46 @@ mod tests {
         assert_eq!(step_user(&users, Some(4), 1), None); // already at last user
         assert_eq!(step_user(&users, Some(4), -1), Some(0));
         assert_eq!(step_user(&[], Some(0), 1), None);
+    }
+}
+
+#[cfg(test)]
+mod test_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parses_counts_duration_and_failures() {
+        let text = "\
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.34s
+
+failures:
+    tests::bar
+
+---- tests::bar stdout ----
+thread 'tests::bar' panicked at src/lib.rs:10:5:
+assertion `left == right` failed
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` for a backtrace
+";
+        let s = parse_test_summary(text);
+        assert_eq!(s.passed, 11);
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.duration, "2.34s");
+        assert_eq!(s.cases.len(), 1);
+        let (name, detail) = &s.cases[0];
+        assert_eq!(name, "tests::bar");
+        assert!(detail.contains("panicked at"), "{detail}");
+        assert!(detail.contains("left: 1"), "{detail}");
+        assert!(!detail.contains("note:"), "{detail}");
+    }
+
+    #[test]
+    fn parses_passing_run() {
+        let text = "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s\n";
+        let s = parse_test_summary(text);
+        assert_eq!(s.passed, 4);
+        assert_eq!(s.failed, 0);
+        assert!(s.cases.is_empty());
     }
 }

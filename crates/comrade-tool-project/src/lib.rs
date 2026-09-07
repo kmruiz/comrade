@@ -214,36 +214,34 @@ impl Tool for RunTests {
     }
 }
 
-/// Reduce raw `cargo test` output to a readable summary for the model.
+/// Reduce raw `cargo test` output to a readable summary for the model: keep
+/// totals, failing-test sections and their detail lines; drop compile/build
+/// noise and the per-test "... ok" lines.
 fn simplify_test_output(raw: &str) -> String {
-    let interesting = [
-        "test result:",
-        "running ",
-        "failures:",
-        "---- ",
-        "panicked at",
-        "error[",
-        "error:",
-        "FAILED",
-        "passed",
-        "warning: unused",
-    ];
     let mut out = String::new();
+    let mut kept = 0usize;
     for line in raw.lines() {
         let t = line.trim_start();
-        if t.starts_with("   Compiling")
-            || t.starts_with("    Finished")
-            || t.starts_with("     Running")
-            || t.starts_with("   Doc-tests")
-            || t.starts_with("running 0 tests")
+        if t.is_empty()
+            || t.starts_with("Compiling")
+            || t.starts_with("Finished")
+            || t.starts_with("Running")
+            || t.starts_with("Doc-tests")
+            || t.starts_with("warning: ")
+            || t.contains("running 0 tests")
         {
             continue;
         }
-        if interesting.iter().any(|k| line.contains(k)) {
-            out.push_str(line);
-            out.push('\n');
+        // skip individual passing tests ("test foo ... ok")
+        if let Some(rest) = t.strip_prefix("test ") {
+            if rest.ends_with(" ... ok") {
+                continue;
+            }
         }
-        if out.matches('\n').count() > 120 {
+        out.push_str(line);
+        out.push('\n');
+        kept += 1;
+        if kept > 200 {
             out.push_str("... (output trimmed)\n");
             break;
         }
