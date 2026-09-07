@@ -20,6 +20,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(FindDefinition),
         Box::new(ReadSymbol),
         Box::new(ReferencesCount),
+        Box::new(FindSymbol),
     ]
 }
 
@@ -498,6 +499,80 @@ impl Tool for ReferencesCount {
     }
 }
 
+// ---------------------------------------------------------------------------
+// find_symbol
+// ---------------------------------------------------------------------------
+
+struct FindSymbol;
+
+static FIND_SYMBOL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "find_symbol".into(),
+    description: "Find declarations whose name contains the query (case-insensitive), across the project or a file. Returns kind, name, one-line signature and file:line so you can locate the right symbol and then read only its body with read_symbol.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string", "description": "Substring of a symbol name, e.g. \"build\", \"Error\"." },
+            "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Max matches to return." }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for FindSymbol {
+    fn spec(&self) -> &ToolSpec {
+        &FIND_SYMBOL_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            query: String,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            git_modified_only: bool,
+            #[serde(default = "default_limit")]
+            limit: usize,
+        }
+        fn default_limit() -> usize {
+            25
+        }
+        let args: Args = serde_json::from_value(args)?;
+        if args.query.trim().is_empty() {
+            anyhow::bail!("query must not be empty");
+        }
+        let scope = changed_scope(ctx, args.git_modified_only)?;
+        guard_path_scope(ctx, &args.path, &scope)?;
+        let mut rows = engine::search_symbols(
+            &ctx.project_root,
+            &args.query,
+            args.path.as_deref(),
+            scope.as_ref(),
+        )?;
+        let total = rows.len();
+        rows.truncate(args.limit);
+        if rows.is_empty() {
+            return Ok(format!("No symbols matching {:?} found.", args.query));
+        }
+        let mut out = format!(
+            "{total} symbol(s) matching {:?}:
+",
+            args.query
+        );
+        out.push_str(&rows.join("\n"));
+        if total > args.limit {
+            out.push_str(&format!("\n... and {} more", total - args.limit));
+        }
+        Ok(clamp(out))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -650,6 +725,39 @@ struct Thing { a: i32 }
                 .any(|s| s.contains("fn add | fn add(a: i32, b: i32) -> i32 @")),
             "{sigs:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod find_symbol_tests {
+    use std::path::PathBuf;
+
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "comrade-findsym-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn searches_declarations_by_name() {
+        let root = scratch();
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub fn build_config() {}\nfn run_build() {}\nstruct Config {}\n",
+        )
+        .unwrap();
+        let hits = crate::engine::search_symbols(&root, "build", None, None).unwrap();
+        assert!(
+            hits.iter().any(|h| h.contains("fn build_config")),
+            "{hits:?}"
+        );
+        assert!(hits.iter().any(|h| h.contains("fn run_build")), "{hits:?}");
+        assert!(!hits.iter().any(|h| h.contains("struct Config")));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

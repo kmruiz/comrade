@@ -390,6 +390,23 @@ pub fn list_symbol_signatures(
         .collect())
 }
 
+/// Find declarations whose name contains `query` (case-insensitive). Returns
+/// rows `kind name | signature @ line` so the caller can pick the right symbol
+/// and then read only its body.
+pub fn search_symbols(
+    root: &Path,
+    query: &str,
+    path: Option<&str>,
+    only: Option<&HashSet<PathBuf>>,
+) -> Result<Vec<String>> {
+    let q = query.to_lowercase();
+    Ok(collect_decl_rows(root, path, only)?
+        .into_iter()
+        .filter(|r| r.text.to_lowercase().contains(&q))
+        .map(|r| format!("{} {} | {} @ {}", r.label, r.text, r.signature, r.line))
+        .collect())
+}
+
 /// Returns (rel_path, contents) for the target files. When `path` is provided
 /// only that file (resolved relative to root) is returned.
 fn collect_files(

@@ -32,7 +32,9 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(ListFiles),
         Box::new(RGrep),
         Box::new(ReadFile),
+        Box::new(ReadRanges),
         Box::new(ApplyEdit),
+        Box::new(ApplyPatch),
         Box::new(WriteFile),
     ]
 }
@@ -681,6 +683,268 @@ fn no_sep(slice: &[u8]) -> bool {
     !slice.contains(&b'/')
 }
 
+// ---------------------------------------------------------------------------
+// read_ranges
+// ---------------------------------------------------------------------------
+
+struct ReadRanges;
+
+static READ_RANGES_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+    ToolSpec {
+    name: "read_ranges".into(),
+    description: "Read several non-contiguous 1-based line ranges of one file in a single call. Each range is [start, end] inclusive. Use instead of repeated read_file calls when you need a few windows of the same file.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string", "description": "File to read, relative to the project root." },
+            "ranges": { "type": "array", "items": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 2, "maxItems": 2 }, "minItems": 1, "description": "Inclusive [start, end] line ranges." }
+        },
+        "required": ["path", "ranges"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for ReadRanges {
+    fn spec(&self) -> &ToolSpec {
+        &READ_RANGES_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            path: String,
+            ranges: Vec<(usize, usize)>,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let file = resolve(ctx, &args.path)?;
+        let rel = display_path(ctx, &file);
+        let bytes = tokio::fs::read(&file)
+            .await
+            .with_context(|| format!("cannot read {rel}"))?;
+        if bytes.contains(&0) {
+            anyhow::bail!("{rel} looks binary");
+        }
+        let text = String::from_utf8(bytes).context("file is not valid UTF-8")?;
+        let lines: Vec<&str> = text.lines().collect();
+        let total = lines.len();
+        let mut out = String::new();
+        for (start, end) in args.ranges {
+            let lo = start.saturating_sub(1);
+            let hi = end.min(total);
+            if lo >= total {
+                out.push_str(&format!("# {start}..{end} (out of range, {total} lines)\n"));
+                continue;
+            }
+            out.push_str(&format!("# {start}..{end} of {total}\n"));
+            for (i, line) in lines[lo..hi].iter().enumerate() {
+                out.push_str(&format!("{:>6} {}\n", lo + i + 1, line));
+            }
+        }
+        Ok(clamp(out))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// apply_patch (unified diff)
+// ---------------------------------------------------------------------------
+
+struct ApplyPatch;
+
+static APPLY_PATCH_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+    ToolSpec {
+    name: "apply_patch".into(),
+    description: "Apply a unified diff to files (project-root relative), much more compact than apply_edit: send only +/- hunks with a little surrounding context. Format:\n  --- a/<path>\n  +++ b/<path>\n  @@ ... @@ (ignored)\n    context line\n  - removed line\n  + added line\nEach hunk's old block must appear exactly once in the file. Approval-gated.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "diff": { "type": "string", "description": "Unified diff text." }
+        },
+        "required": ["diff"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for ApplyPatch {
+    fn spec(&self) -> &ToolSpec {
+        &APPLY_PATCH_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            diff: String,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let patches = parse_unified(&args.diff)?;
+        if patches.is_empty() {
+            anyhow::bail!("no hunks found in the diff");
+        }
+
+        // Compute the intended changes first, then ask for approval, then write.
+        let mut pending: Vec<(String, String, String, usize)> = Vec::new();
+        let mut preview = String::new();
+        for patch in &patches {
+            let abs = resolve(ctx, &patch.path)?;
+            let rel = display_path(ctx, &abs);
+            let before = tokio::fs::read_to_string(&abs)
+                .await
+                .with_context(|| format!("cannot read {rel}"))?;
+            let after = apply_hunks(&before, &patch.hunks)
+                .with_context(|| format!("failed to apply diff to {rel}"))?;
+            if before == after {
+                continue;
+            }
+            preview.push_str(&format!("{rel}: {} hunk(s)\n", patch.hunks.len()));
+            pending.push((rel, before, after, patch.hunks.len()));
+        }
+        if pending.is_empty() {
+            return Ok("Nothing to apply: diff matches current content.".to_string());
+        }
+        ctx.confirm(
+            format!("apply_patch ({pending} file(s))", pending = pending.len()),
+            Some(preview),
+        )
+        .await?;
+
+        let mut applied = 0usize;
+        for (rel, before, after, hunks) in pending {
+            ctx.undo.capture(&rel, before).await?;
+            let abs = resolve(ctx, &rel)?;
+            tokio::fs::write(&abs, after)
+                .await
+                .with_context(|| format!("cannot write {rel}"))?;
+            applied += hunks;
+        }
+        Ok(format!(
+            "Applied {applied} hunk(s) across {} file(s).",
+            patches.len()
+        ))
+    }
+}
+
+/// A parsed file diff: one or more hunks to apply in order.
+struct FilePatch {
+    path: String,
+    hunks: Vec<Hunk>,
+}
+
+struct Hunk {
+    /// Old lines to find (context + removals, in order).
+    old: Vec<String>,
+    /// Replacement lines (context + additions).
+    new: Vec<String>,
+}
+
+/// Parse a simplified unified diff: `--- a/x` / `+++ b/x` headers, `@@`
+/// lines ignored, hunk body = context/`-`/`+` lines.
+fn parse_unified(diff: &str) -> Result<Vec<FilePatch>> {
+    let mut patches = Vec::new();
+    let mut cur_path: Option<String> = None;
+    let mut body: Vec<String> = Vec::new();
+
+    let finish = |cur_path: &Option<String>,
+                  body: &mut Vec<String>,
+                  patches: &mut Vec<FilePatch>|
+     -> Result<()> {
+        if let Some(path) = cur_path {
+            let hunks = hunks_from_body(body)?;
+            if !hunks.is_empty() {
+                patches.push(FilePatch {
+                    path: path.clone(),
+                    hunks,
+                });
+            }
+        }
+        *body = Vec::new();
+        Ok(())
+    };
+
+    for raw in diff.lines() {
+        let line = raw.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            finish(&cur_path, &mut body, &mut patches)?;
+            cur_path = Some(rest.trim_start_matches("b/").trim().to_string());
+            body.clear();
+            continue;
+        }
+        if line.starts_with("--- ") || line.starts_with("@@") || line.starts_with("\\ No newline") {
+            continue;
+        }
+        body.push(line.to_string());
+    }
+    finish(&cur_path, &mut body, &mut patches)?;
+    Ok(patches)
+}
+
+fn hunks_from_body(body: &[String]) -> Result<Vec<Hunk>> {
+    // Group contiguous body lines into hunks (each is one edit block).
+    let mut hunks = Vec::new();
+    let mut old = Vec::new();
+    let mut new = Vec::new();
+    for line in body {
+        match line.chars().next() {
+            Some(' ') => {
+                old.push(line[1..].to_string());
+                new.push(line[1..].to_string());
+            }
+            Some('-') => old.push(line[1..].to_string()),
+            Some('+') => new.push(line[1..].to_string()),
+            _ => {}
+        }
+    }
+    if !old.is_empty() {
+        hunks.push(Hunk { old, new });
+    }
+    Ok(hunks)
+}
+
+/// Apply parsed hunks to `before`, returning the new content. Each hunk's old
+/// block must occur exactly once.
+fn apply_hunks(before: &str, hunks: &[Hunk]) -> Result<String> {
+    let mut content: Vec<String> = before.lines().map(str::to_string).collect();
+    for hunk in hunks {
+        let window = content.len();
+        let old_len = hunk.old.len();
+        if old_len == 0 {
+            continue;
+        }
+        let mut matches = Vec::new();
+        if window >= old_len {
+            for i in 0..=(window - old_len) {
+                if content[i..i + old_len] == hunk.old[..] {
+                    matches.push(i);
+                }
+            }
+        }
+        if matches.is_empty() {
+            anyhow::bail!("hunk block not found");
+        }
+        if matches.len() > 1 {
+            anyhow::bail!(
+                "hunk block is ambiguous ({} occurrences); add more context lines",
+                matches.len()
+            );
+        }
+        let at = matches[0];
+        let mut next = Vec::with_capacity(content.len() - old_len + hunk.new.len());
+        next.extend(content[..at].iter().cloned());
+        next.extend(hunk.new.iter().cloned());
+        next.extend(content[at + old_len..].iter().cloned());
+        content = next;
+    }
+    // Reconstruct with a trailing newline only if the original had one.
+    let joined = content.join("\n");
+    if before.ends_with('\n') {
+        Ok(format!("{joined}\n"))
+    } else {
+        Ok(joined)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,5 +1144,47 @@ mod tests {
         assert!(!out.contains("notes.txt"), "{out}");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_applies_removal_and_addition() {
+        let before = "line one\nline two\nline three\n";
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n line one\n-line two\n+line TWO\n line three\n";
+        let patches = parse_unified(diff).unwrap();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].path, "a.txt");
+        let after = apply_hunks(before, &patches[0].hunks).unwrap();
+        assert_eq!(after, "line one\nline TWO\nline three\n");
+    }
+
+    #[test]
+    fn appends_only_with_context() {
+        let before = "fn main() {}\n";
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,3 @@\n fn main() {}\n+// done\n";
+        let patches = parse_unified(diff).unwrap();
+        let after = apply_hunks(before, &patches[0].hunks).unwrap();
+        assert_eq!(after, "fn main() {}\n// done\n");
+    }
+
+    #[test]
+    fn ambiguous_hunk_is_rejected() {
+        let before = "a\nb\na\n";
+        let diff = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
+        let patches = parse_unified(diff).unwrap();
+        assert!(apply_hunks(before, &patches[0].hunks).is_err());
+    }
+
+    #[test]
+    fn multi_file_patch_parses_paths() {
+        let diff = "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-x\n+y\n--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-x\n+z\n";
+        let patches = parse_unified(diff).unwrap();
+        assert_eq!(patches.len(), 2);
+        assert_eq!(patches[0].path, "one.txt");
+        assert_eq!(patches[1].path, "two.txt");
     }
 }

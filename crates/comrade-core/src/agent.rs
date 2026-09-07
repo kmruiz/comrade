@@ -19,6 +19,10 @@ const APPROVAL_GATED_TOOLS: &[&str] = &[
     "run_task",
     "remember",
     "amend_decision",
+    "apply_patch",
+    "format_code",
+    "run_tests",
+    "shell",
 ];
 
 fn is_approval_gated(name: &str) -> bool {
