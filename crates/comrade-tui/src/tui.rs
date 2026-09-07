@@ -64,15 +64,26 @@ impl UserIo for TuiUserIo {
 
 #[derive(Clone, Copy, PartialEq)]
 enum MsgKind {
+    /// A message from the human user.
     User,
+    /// A message written by the (main) model: replies and final answers.
     Assistant,
+    /// A tool call card (also covers the parent's `delegate` hand-offs).
     Tool,
+    /// Small grey status note ("run finished", "plan finished", ...).
     Meta,
+    /// A collapsed failing-test block.
     Failure,
+    /// A collapsible "thinking" block: model reasoning between actions.
+    Reasoning,
+    /// A reply from a delegated model, shown under that model's name.
+    Delegate,
 }
 
 struct ToolCard {
     name: String,
+    /// Display name of the model that invoked the tool (None for legacy rows).
+    author: Option<String>,
     args: String,
     justification: Option<String>,
     risk: Option<String>,
@@ -103,6 +114,11 @@ struct Msg {
     text: String,
     tool: Option<ToolCard>,
     fail: Option<TestFail>,
+    /// Who produced this entry: "you", the main model's display label, or the
+    /// delegate's name. None for Meta/Failure rows.
+    author: Option<String>,
+    /// Open state of a collapsible Reasoning block.
+    open: bool,
 }
 
 impl Msg {
@@ -112,6 +128,18 @@ impl Msg {
             text: text.into(),
             tool: None,
             fail: None,
+            author: None,
+            open: false,
+        }
+    }
+    fn authored(kind: MsgKind, author: impl Into<String>, text: impl Into<String>) -> Self {
+        Msg {
+            kind,
+            text: text.into(),
+            tool: None,
+            fail: None,
+            author: Some(author.into()),
+            open: false,
         }
     }
     fn tool(card: ToolCard) -> Self {
@@ -120,6 +148,8 @@ impl Msg {
             text: String::new(),
             tool: Some(card),
             fail: None,
+            author: None,
+            open: false,
         }
     }
     fn failure(name: String, detail: String) -> Self {
@@ -132,6 +162,8 @@ impl Msg {
                 detail,
                 open: false,
             }),
+            author: None,
+            open: false,
         }
     }
 }
@@ -233,6 +265,23 @@ struct App {
 }
 
 impl App {
+    /// Display label of the main model: the name shown next to every message,
+    /// action and thought this session's assistant produces.
+    fn actor_label(&self) -> String {
+        self.cfg.llm.display()
+    }
+
+    /// Commit the text currently streaming in the live preview as a Reasoning
+    /// block (the model's visible reasoning right before a tool call), then
+    /// drop the preview.
+    fn commit_stream_reasoning(&mut self) {
+        if let Some(visible) = reasoning_from_stream(&self.stream) {
+            let author = self.actor_label();
+            self.push_msg(Msg::authored(MsgKind::Reasoning, author, visible));
+        }
+        self.stream.clear();
+    }
+
     fn push_msg(&mut self, msg: Msg) {
         if self.chat.len() >= 400 {
             self.chat.remove(0);
@@ -253,10 +302,19 @@ impl App {
 
     fn toggle_tool(&mut self, idx: usize) {
         if let Some(m) = self.chat.get_mut(idx) {
-            if let Some(card) = &mut m.tool {
-                card.open = !card.open;
-            } else if let Some(fail) = &mut m.fail {
-                fail.open = !fail.open;
+            match m.kind {
+                MsgKind::Tool => {
+                    if let Some(card) = &mut m.tool {
+                        card.open = !card.open;
+                    }
+                }
+                MsgKind::Failure => {
+                    if let Some(fail) = &mut m.fail {
+                        fail.open = !fail.open;
+                    }
+                }
+                MsgKind::Reasoning => m.open = !m.open,
+                _ => {}
             }
         }
     }
@@ -365,6 +423,8 @@ impl App {
                 card.open = true;
             } else if let Some(fail) = &mut m.fail {
                 fail.open = true;
+            } else if m.kind == MsgKind::Reasoning {
+                m.open = true;
             }
         }
     }
@@ -426,7 +486,7 @@ impl App {
             }
             AgentEvent::User(u) => {
                 self.stream.clear();
-                self.push_msg(Msg::text(MsgKind::User, u));
+                self.push_msg(Msg::authored(MsgKind::User, "you", u));
             }
             AgentEvent::Delta(d) => {
                 self.stream.push_str(&d);
@@ -444,10 +504,11 @@ impl App {
                 justification,
                 risk,
             } => {
-                // This turn produced a tool call; drop any scaffold-only prose
-                // that was streaming and show a compact card instead. Important
-                // cards (diffs, and run_tests/run_task results) open by default.
-                self.stream.clear();
+                // This turn produced a tool call: keep whatever the model was
+                // saying before the call as a visible reasoning block, then
+                // show a compact card. Important cards (diffs, and
+                // run_tests/run_task results) open by default.
+                self.commit_stream_reasoning();
                 self.activity = Some(name.clone());
                 let open_default = matches!(
                     name.as_str(),
@@ -455,6 +516,7 @@ impl App {
                 );
                 self.push_msg(Msg::tool(ToolCard {
                     name,
+                    author: Some(self.actor_label()),
                     args,
                     justification,
                     risk,
@@ -467,7 +529,9 @@ impl App {
             AgentEvent::ToolResult { name, output, ok } => {
                 self.stream.clear();
                 self.activity = None;
-                if name == "run_tests" {
+                if name == "delegate" {
+                    self.on_delegate_result(&output, ok);
+                } else if name == "run_tests" {
                     if output.contains("test result:") {
                         // Render a rich summary card + one collapsible block per
                         // failing test instead of a wall of text.
@@ -499,14 +563,30 @@ impl App {
                     card.ok = ok;
                 }
             }
-            AgentEvent::AssistantText(_) => {}
-            AgentEvent::Thought(_) => {}
+            AgentEvent::AssistantText(_) => {
+                // The full assistant text is redundant with the `Delta` stream;
+                // it is committed (as reasoning or as the final answer) when
+                // the turn ends in a tool call or a final answer.
+            }
+            AgentEvent::Thought(t) => {
+                // ReAct mode reports the isolated reasoning line: surface it as
+                // a thinking block under the main model's name instead of
+                // dropping it. The streamed turn text is its duplicate, so the
+                // preview is cleared here.
+                self.stream.clear();
+                let t = t.trim();
+                if !t.is_empty() {
+                    let author = self.actor_label();
+                    self.push_msg(Msg::authored(MsgKind::Reasoning, author, t.to_string()));
+                }
+            }
             AgentEvent::FinalAnswer(a) => {
                 self.stream.clear();
                 self.activity = None;
                 let visible = strip_react_scaffolding(&a);
                 if !visible.trim().is_empty() {
-                    self.push_msg(Msg::text(MsgKind::Assistant, visible));
+                    let author = self.actor_label();
+                    self.push_msg(Msg::authored(MsgKind::Assistant, author, visible));
                 }
             }
             AgentEvent::Error(e) => {
@@ -531,6 +611,31 @@ impl App {
             AgentEvent::AccountBalance(balance) => {
                 self.balance = Some(balance);
             }
+        }
+    }
+
+    /// A `delegate` tool call finished: show the delegate's reply as its own
+    /// chat entry under the delegate's model name. The parent's tool card keeps
+    /// a compact summary; the full text lives in the delegate's message.
+    fn on_delegate_result(&mut self, output: &str, ok: bool) {
+        if ok {
+            if let Some((model, reply)) = parse_delegate_reply(output) {
+                if let Some(card) = self.last_tool_mut("delegate") {
+                    card.ok = true;
+                    card.open = false;
+                    card.result = Some(format!("replied ({} chars)", reply.chars().count()));
+                }
+                if !reply.trim().is_empty() {
+                    self.push_msg(Msg::authored(MsgKind::Delegate, model, reply));
+                }
+                return;
+            }
+        }
+        // Unparseable or failed hand-off: keep the plain tool-card behaviour so
+        // the error/raw text is still visible.
+        if let Some(card) = self.last_tool_mut("delegate") {
+            card.result = Some(output.to_string());
+            card.ok = ok;
         }
     }
 
@@ -1516,6 +1621,14 @@ fn layout_messages(
         match msg.kind {
             MsgKind::Failure => layout_failure(&mut out, i, msg.fail.as_ref().unwrap(), width),
             MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), width),
+            MsgKind::Reasoning => layout_reasoning(
+                &mut out,
+                i,
+                msg.text.as_str(),
+                msg.author.as_deref().unwrap_or("model"),
+                msg.open,
+                width,
+            ),
             MsgKind::Meta => {
                 for s in plain_wrap(&msg.text, width) {
                     out.push(RenderRow {
@@ -1526,6 +1639,7 @@ fn layout_messages(
                 }
             }
             MsgKind::User => {
+                author_header(&mut out, "you", Color::Cyan, width);
                 let rule = Some(Color::Cyan);
                 for spans in md_to_lines(&msg.text, width) {
                     out.push(RenderRow {
@@ -1536,9 +1650,31 @@ fn layout_messages(
                 }
             }
             MsgKind::Assistant => {
+                author_header(
+                    &mut out,
+                    msg.author.as_deref().unwrap_or("assistant"),
+                    Color::Green,
+                    width,
+                );
                 for spans in md_to_lines(&msg.text, width) {
                     out.push(RenderRow {
                         rule: None,
+                        spans,
+                        tool_header: None,
+                    });
+                }
+            }
+            MsgKind::Delegate => {
+                author_header(
+                    &mut out,
+                    msg.author.as_deref().unwrap_or("delegate"),
+                    Color::Magenta,
+                    width,
+                );
+                let rule = Some(Color::Magenta);
+                for spans in md_to_lines(&msg.text, width) {
+                    out.push(RenderRow {
+                        rule,
                         spans,
                         tool_header: None,
                     });
@@ -1593,6 +1729,7 @@ fn tool_icon(name: &str) -> (&'static str, Color) {
         "run_task" => ("▸", Color::Yellow),
         "shell" => ("$", Color::Green),
         "git_status" | "git_diff" | "git_log" | "git_commit" => ("↗", Color::Magenta),
+        "delegate" => ("⇄", Color::Magenta),
         "read_file" | "read_ranges" => ("≡", Color::Blue),
         "list_dir" | "list_files" | "rgrep" | "list_symbols" | "find_symbol"
         | "find_definition" | "read_symbol" | "structural_map" | "references_count"
@@ -1644,7 +1781,50 @@ fn tool_headline(name: &str, args: &str) -> Option<String> {
         "web_search" => pick(&["query"]),
         "run_task" | "run_tests" => pick(&["task", "command"]),
         "shell" => pick(&["command", "dir"]),
+        "delegate" => {
+            // Which delegate is engaged (ad-hoc), or which plan step (step).
+            if let Some(m) = map
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(cap(m, 40))
+            } else {
+                map.get("step")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|n| format!("step {n}"))
+            }
+        }
         _ => None,
+    }
+}
+
+/// Parse the `delegate` tool's success output into (delegate name, reply):
+/// `delegate <name> (<display>) replied:\n<reply>`.
+fn parse_delegate_reply(output: &str) -> Option<(String, String)> {
+    let rest = output.strip_prefix("delegate ")?;
+    let open = rest.find(" (")?;
+    let model = rest[..open].trim();
+    if model.is_empty() {
+        return None;
+    }
+    let after = &rest[open + 2..];
+    let marker = ") replied:\n";
+    let end = after.find(marker)?;
+    let reply = after[end + marker.len()..].trim_end();
+    Some((model.to_string(), reply.to_string()))
+}
+
+/// Visible reasoning extracted from a streamed assistant text: scaffold lines
+/// (Thought:/Tool:/Args:/...) removed; `None` when nothing meaningful remains.
+fn reasoning_from_stream(stream: &str) -> Option<String> {
+    let visible = strip_react_scaffolding(stream);
+    let visible = visible.trim();
+    if visible.is_empty() {
+        None
+    } else {
+        Some(visible.to_string())
     }
 }
 
@@ -1710,6 +1890,67 @@ fn arg_lines(args: &str) -> Vec<String> {
     lines
 }
 
+/// A one-row author tag ("you", the main model's label, or a delegate name)
+/// rendered above a content block so the transcript shows *who* produced it.
+fn author_header(out: &mut Vec<RenderRow>, author: &str, color: Color, width: usize) {
+    let label = cap(author, width.saturating_sub(2));
+    out.push(RenderRow {
+        rule: None,
+        spans: vec![Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )],
+        tool_header: None,
+    });
+}
+
+/// A collapsible "reasoning" block: the model's visible thinking between
+/// actions, headed by an author tag and toggled like a tool card.
+fn layout_reasoning(
+    out: &mut Vec<RenderRow>,
+    msg_idx: usize,
+    text: &str,
+    author: &str,
+    open: bool,
+    width: usize,
+) {
+    out.push(RenderRow {
+        rule: None,
+        spans: vec![
+            Span::styled(
+                if open { "v " } else { "> " },
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                "🧠 reasoning",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  · {author}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ],
+        tool_header: Some(msg_idx),
+    });
+    if !open {
+        return;
+    }
+    if !text.trim().is_empty() {
+        for s in plain_wrap(text, width.saturating_sub(2)) {
+            out.push(RenderRow {
+                rule: None,
+                spans: vec![Span::styled(
+                    format!("  {s}"),
+                    Style::default().fg(Color::DarkGray),
+                )],
+                tool_header: None,
+            });
+        }
+    }
+}
+
 fn layout_failure(out: &mut Vec<RenderRow>, msg_idx: usize, fail: &TestFail, width: usize) {
     out.push(RenderRow {
         rule: None,
@@ -1761,6 +2002,12 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
                 .add_modifier(Modifier::BOLD),
         ),
     ];
+    if let Some(a) = card.author.as_deref() {
+        spans.push(Span::styled(
+            format!(" · {a}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     if let Some(h) = tool_headline(&card.name, &card.args) {
         spans.push(Span::styled(
             format!("  {h}"),
@@ -2699,6 +2946,39 @@ mod tests {
         assert_eq!(step_user(&users, Some(4), -1), Some(0));
         assert_eq!(step_user(&[], Some(0), 1), None);
     }
+
+    #[test]
+    fn delegate_reply_is_parsed_into_model_and_text() {
+        let out = "delegate mistral (ollama/mistral:7b) replied:\nHere is the code:\n```rust\nfn x() {}\n```\nVERIFICATION: passes";
+        let (model, reply) = parse_delegate_reply(out).unwrap();
+        assert_eq!(model, "mistral");
+        assert!(reply.contains("fn x() {}"));
+        assert!(reply.contains("VERIFICATION: passes"));
+        // A fix round uses the very same envelope.
+        let fix = format!("delegate mistral (mistral) replied:\n{out}");
+        assert_eq!(parse_delegate_reply(&fix).unwrap().0, "mistral");
+    }
+
+    #[test]
+    fn delegate_failure_output_is_not_a_reply() {
+        assert!(parse_delegate_reply("ERROR: delegate mistral failed").is_none());
+        assert!(parse_delegate_reply("").is_none());
+        assert!(parse_delegate_reply("delegate replied:\nno name").is_none());
+    }
+
+    #[test]
+    fn reasoning_keeps_prose_and_drops_scaffolding() {
+        let raw = "Thought: I will list the files\nTool: list_dir\nArgs: { \"path\": \".\" }\n\nLet me inspect the layout.";
+        let got = reasoning_from_stream(raw).unwrap();
+        assert!(!got.contains("Thought:"));
+        assert!(!got.contains("list_dir"));
+        assert!(!got.contains("Args:"));
+        assert!(got.contains("inspect the layout"));
+        assert!(
+            reasoning_from_stream("Thought: just scaffolding\nTool: run_tests\nArgs: {}").is_none()
+        );
+        assert!(reasoning_from_stream("").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -3073,6 +3353,7 @@ mod search_tests {
     fn search_covers_tool_and_failure_cards() {
         let card = Msg::tool(ToolCard {
             name: "run_task".into(),
+            author: Some("ollama/x".into()),
             args: r#"{"task":"test"}"#.into(),
             justification: Some("verify the suite".into()),
             risk: Some("none".into()),

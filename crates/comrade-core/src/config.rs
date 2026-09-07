@@ -85,6 +85,19 @@ impl Default for LlmCfg {
     }
 }
 
+impl LlmCfg {
+    /// Short display label used in the UI and in tool output to name the model,
+    /// e.g. `ollama/devstral-small-2`; the bare model id when no provider is
+    /// configured. The chat transcript attributes every message/action to the
+    /// model that produced it using this label.
+    pub fn display(&self) -> String {
+        match &self.provider {
+            Some(p) => format!("{p}/{}", self.model),
+            None => self.model.clone(),
+        }
+    }
+}
+
 /// An extra model — usually a cheaper/faster one, possibly on another provider
 /// — that the main "planner" model can delegate self-contained sub-tasks to via
 /// the `delegate` tool. One `[[delegates]]` entry per model.
@@ -326,6 +339,16 @@ mod tests {
         assert_eq!(c.llm.api_key.as_deref(), Some("sk-test"));
         assert_eq!(c.llm.model, "deepseek-chat");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn display_label_prefers_provider_qualified_form() {
+        let mut cfg = LlmCfg::default();
+        cfg.provider = Some("ollama".into());
+        cfg.model = "devstral-small-2".into();
+        assert_eq!(cfg.display(), "ollama/devstral-small-2");
+        cfg.provider = None;
+        assert_eq!(cfg.display(), "devstral-small-2");
     }
 
     #[test]

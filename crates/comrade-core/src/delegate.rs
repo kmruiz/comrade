@@ -329,13 +329,7 @@ impl Tool for DelegateTool {
             ChatMessage::new(Role::User, user_prompt),
         ];
 
-        let display = target
-            .cfg
-            .llm
-            .provider
-            .as_deref()
-            .map(|p| format!("{p}/{}", target.cfg.llm.model))
-            .unwrap_or_else(|| target.cfg.llm.model.clone());
+        let display = target.cfg.llm.display();
         let reply = target
             .client
             .chat(&messages)
@@ -387,9 +381,9 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
 
+    use comrade_tool::PlanStepDraft;
     use comrade_tool::ToolContext;
     use comrade_tool::tool::{UserIo, UserPrompt, UserReply};
-    use comrade_tool::{PlanStepDraft, SessionControl};
 
     use super::*;
     use crate::MemoryUndo;
