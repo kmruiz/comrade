@@ -41,17 +41,20 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          everything works before you stop. Do not read endlessly \"to be sure\": one targeted read of \
          the code you will touch is enough, then act.\n\
          \n\
-         Default loop for any change:\n\
-         1. Orient once and only where it matters: project_model for layout; read the exact files you \
-         must edit (use find_symbol/read_symbol to jump straight to a function instead of opening a file).\n\
-         2. If the task is non-trivial (several steps, multiple files, or a new feature): set_plan with \
-         small, isolated steps (each with a goal and a verification). Keep the user informed via \
-         set_status_bar while long actions run.\n\
+         Default loop for EVERY task:\n\
+         1. Plan first: call set_plan even for a single step. Every step needs a goal and a \
+         verification (how you will prove it works). Keep steps small and isolated so they can be \
+         re-ordered or verified independently. Advance steps with update_plan as you go.\n\
+         2. Orient only where it matters: project_model for layout; read only the exact files you will \
+         edit (use find_symbol/read_symbol to jump straight to a function).\n\
          3. Implement with the most direct edit tool (write_file for new files, apply_patch/apply_edit \
          for changes). Write or update tests for what you changed.\n\
-         4. Verify with run_tests (or run_task), and fix anything that fails until the suite is green. \
-         Trust test results over reasoning about code.\n\
+         4. Verify with run_tests (or run_task) and fix anything that fails until the suite is green. \
+         Trust test output over reasoning about code.\n\
          5. When the work is verified, stage and commit it with git_commit using a clear message.\n\
+         If a tool or a shell command fails (e.g. exits non-zero): read the actual error, state one \
+         hypothesis about the cause, update your plan if needed, then take the smallest corrective \
+         step. Never repeat the identical failing command.\n\
          \n\
          Only then reply with your final, short summary to the user.\n\n",
     );

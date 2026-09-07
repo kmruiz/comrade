@@ -233,6 +233,8 @@ async fn run_agent_loop(
     let max_iterations = cfg.agent.max_iterations;
     let mut iterations = 0usize;
     let mut tracker = LoopTracker::default();
+    // We nudge the model once per run to open with a plan.
+    let mut plan_nudged = false;
 
     loop {
         if stop.is_cancelled() {
@@ -314,6 +316,33 @@ async fn run_agent_loop(
 
         // Native function calls: dispatch them (possibly several per turn).
         if !turn.tool_calls.is_empty() {
+            // Every task opens with a plan (single nudge per run).
+            if !plan_nudged && ctx.session.plan().is_empty() {
+                let first = turn
+                    .tool_calls
+                    .first()
+                    .map(|c| c.name.as_str())
+                    .unwrap_or("");
+                let is_plan_tool = matches!(first, "set_plan" | "rename_session" | "ask_question");
+                if !is_plan_tool {
+                    plan_nudged = true;
+                    let msg = "Every task starts with a plan. Call set_plan first with your steps - \
+                               each step needs a goal and a verification - before taking any other action.";
+                    ctxm.push(ChatMessage::new(Role::Assistant, turn.content.clone()));
+                    let _ = tx
+                        .send(AgentEvent::ToolResult {
+                            name: first.to_string(),
+                            output: msg.to_string(),
+                            ok: false,
+                        })
+                        .await;
+                    ctxm.push(ChatMessage::new(
+                        Role::User,
+                        render_observation(first, &msg),
+                    ));
+                    continue;
+                }
+            }
             run_native_calls(&mut ctxm, &tx, tools, &ctx, &mut tracker, turn).await?;
             continue;
         }
@@ -430,6 +459,32 @@ async fn run_agent_loop(
                 justification: turn_p.justification.clone().unwrap_or_default(),
                 risk: turn_p.risk.clone(),
             });
+        }
+
+        // Every task opens with a plan. Nudge once if the model started acting
+        // without calling set_plan.
+        if !plan_nudged && ctx.session.plan().is_empty() {
+            let is_plan_tool = matches!(
+                tool_call.name.as_str(),
+                "set_plan" | "rename_session" | "ask_question"
+            );
+            if !is_plan_tool {
+                plan_nudged = true;
+                let msg = "Every task starts with a plan. Call set_plan first with your steps - each step \
+                     needs a goal and a verification - before taking any other action.";
+                let _ = tx
+                    .send(AgentEvent::ToolResult {
+                        name: tool_call.name.clone(),
+                        output: msg.to_string(),
+                        ok: false,
+                    })
+                    .await;
+                ctxm.push(ChatMessage::new(
+                    Role::User,
+                    render_observation(&tool_call.name, &msg),
+                ));
+                continue;
+            }
         }
 
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
@@ -823,6 +878,13 @@ mod tests {
 
         let (tx, mut events) = mpsc::channel(64);
         let session = Arc::new(AgentSession::new(tx.clone()));
+        comrade_tool::SessionControl::set_plan(
+            &*session,
+            vec![comrade_tool::PlanStepDraft {
+                goal: "do it".into(),
+                verification: "verifies".into(),
+            }],
+        );
         let root = std::env::temp_dir().join(format!("comrade-agent-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let undo = Arc::new(MemoryUndo::new(root.clone()));
@@ -923,6 +985,13 @@ mod tests {
 
         let (tx, mut events) = mpsc::channel(64);
         let session = Arc::new(AgentSession::new(tx.clone()));
+        comrade_tool::SessionControl::set_plan(
+            &*session,
+            vec![comrade_tool::PlanStepDraft {
+                goal: "do it".into(),
+                verification: "verifies".into(),
+            }],
+        );
         let root = std::env::temp_dir().join(format!("comrade-gated-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let undo = Arc::new(MemoryUndo::new(root.clone()));
@@ -984,6 +1053,13 @@ mod tests {
 
         let (tx, _events) = mpsc::channel(64);
         let session = Arc::new(AgentSession::new(tx.clone()));
+        comrade_tool::SessionControl::set_plan(
+            &*session,
+            vec![comrade_tool::PlanStepDraft {
+                goal: "do it".into(),
+                verification: "verifies".into(),
+            }],
+        );
         let root = std::env::temp_dir().join(format!("comrade-notes-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let undo = Arc::new(MemoryUndo::new(root.clone()));
@@ -1072,6 +1148,13 @@ mod tests {
 
         let (tx, mut events) = mpsc::channel(64);
         let session = Arc::new(AgentSession::new(tx.clone()));
+        comrade_tool::SessionControl::set_plan(
+            &*session,
+            vec![comrade_tool::PlanStepDraft {
+                goal: "do it".into(),
+                verification: "verifies".into(),
+            }],
+        );
         let root = std::env::temp_dir().join(format!("comrade-native-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let undo = Arc::new(MemoryUndo::new(root.clone()));
@@ -1127,6 +1210,13 @@ mod tests {
 
         let (tx, mut events) = mpsc::channel(64);
         let session = Arc::new(AgentSession::new(tx.clone()));
+        comrade_tool::SessionControl::set_plan(
+            &*session,
+            vec![comrade_tool::PlanStepDraft {
+                goal: "do it".into(),
+                verification: "verifies".into(),
+            }],
+        );
         let root =
             std::env::temp_dir().join(format!("comrade-native-gated-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -1259,6 +1349,13 @@ mod loop_tests {
 
         let (tx, mut events) = mpsc::channel(64);
         let session = Arc::new(AgentSession::new(tx.clone()));
+        comrade_tool::SessionControl::set_plan(
+            &*session,
+            vec![comrade_tool::PlanStepDraft {
+                goal: "do it".into(),
+                verification: "verifies".into(),
+            }],
+        );
         let root =
             std::env::temp_dir().join(format!("comrade-parse-fallback-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
