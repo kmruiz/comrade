@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use comrade_core::{Config, LlmClient, MemoryUndo};
+use comrade_core::{Config, DelegateTool, LlmClient, MemoryUndo};
 use comrade_tool::{ToolContext, ToolRegistry};
 
 #[derive(Parser, Debug)]
@@ -82,7 +82,7 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
     }
     let cfg = Arc::new(cfg);
 
-    let tools = Arc::new(build_tools());
+    let tools = Arc::new(build_tools(&cfg)?);
     Ok(Deps {
         cfg,
         client,
@@ -92,7 +92,7 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
     })
 }
 
-fn build_tools() -> ToolRegistry {
+fn build_tools(cfg: &Config) -> Result<ToolRegistry> {
     let mut reg = ToolRegistry::new();
     reg.extend(comrade_tool_session::all());
     reg.extend(comrade_tool_project::all());
@@ -101,7 +101,12 @@ fn build_tools() -> ToolRegistry {
     reg.extend(comrade_tool_syntax::all());
     reg.extend(comrade_tool_memory::all());
     reg.extend(comrade_tool_web::all());
-    reg
+    // Delegate models configured under [[delegates]] become the `delegate`
+    // tool; absent delegates mean no tool is advertised.
+    if let Some(delegate) = DelegateTool::new(&cfg.delegates)? {
+        reg.register(Box::new(delegate));
+    }
+    Ok(reg)
 }
 
 /// Session state + undo log wired to a fresh event channel. The caller chooses

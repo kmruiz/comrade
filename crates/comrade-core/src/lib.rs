@@ -9,14 +9,16 @@
 pub mod agent;
 pub mod config;
 pub mod context;
+pub mod delegate;
 pub mod llm;
 pub mod react;
 pub mod session;
 pub mod undo;
 
 pub use agent::run_agent;
-pub use config::{Autonomy, Config, LoadedConfig};
+pub use config::{Autonomy, Config, DelegateCfg, LoadedConfig};
 pub use context::{ContextManager, estimate_tokens};
+pub use delegate::DelegateTool;
 pub use llm::{ChatMessage, LlmClient, Role};
 pub use session::{AgentEvent, AgentSession};
 pub use undo::MemoryUndo;

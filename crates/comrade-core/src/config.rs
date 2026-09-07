@@ -85,6 +85,33 @@ impl Default for LlmCfg {
     }
 }
 
+/// An extra model — usually a cheaper/faster one, possibly on another provider
+/// — that the main "planner" model can delegate self-contained sub-tasks to via
+/// the `delegate` tool. One `[[delegates]]` entry per model.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DelegateCfg {
+    /// Unique name the planner model uses to select this model, e.g. `groq`.
+    pub name: String,
+    /// Short human-readable blurb of when to use this model (shown to the
+    /// planner so it can pick the right delegate for a task).
+    pub description: String,
+    /// The model settings for this delegate: `provider`, `model`, `api_key`,
+    /// `temperature`, ... written inline at the same level as `name`.
+    #[serde(flatten)]
+    pub llm: LlmCfg,
+}
+
+impl Default for DelegateCfg {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            llm: LlmCfg::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AgentCfg {
@@ -136,6 +163,8 @@ pub struct Config {
     pub agent: AgentCfg,
     pub context: CtxCfg,
     pub security: SecurityCfg,
+    /// Extra models the planner can delegate sub-tasks to (see `delegate` tool).
+    pub delegates: Vec<DelegateCfg>,
 }
 
 /// Config loaded from disk with defaults layered underneath.
@@ -211,25 +240,61 @@ pub fn provider_base_url(name: &str) -> Option<&'static str> {
 }
 
 /// When `llm.provider` is set and the config did not explicitly set
-/// `llm.base_url`, fill the provider's base URL from the preset.
+/// `llm.base_url`, fill the provider's base URL from the preset. Delegate
+/// entries get the same treatment per entry.
 fn apply_provider(raw_toml: &str, config: &mut Config) -> Result<()> {
-    let Some(provider) = config.llm.provider.as_deref() else {
+    let raw = toml::from_str::<toml::Value>(raw_toml).ok();
+    let llm_has_explicit_url = raw
+        .as_ref()
+        .and_then(|v| v.get("llm"))
+        .and_then(|l| l.get("base_url"))
+        .is_some();
+    fill_provider_base_url(
+        config.llm.provider.as_deref(),
+        llm_has_explicit_url,
+        &mut config.llm.base_url,
+        "llm",
+    )?;
+
+    let explicit: Vec<bool> = raw
+        .as_ref()
+        .and_then(|v| v.get("delegates"))
+        .and_then(|d| d.as_array())
+        .map(|arr| arr.iter().map(|e| e.get("base_url").is_some()).collect())
+        .unwrap_or_default();
+    for (i, delegate) in config.delegates.iter_mut().enumerate() {
+        let has_explicit_url = explicit.get(i).copied().unwrap_or(false);
+        fill_provider_base_url(
+            delegate.llm.provider.as_deref(),
+            has_explicit_url,
+            &mut delegate.llm.base_url,
+            &format!("delegates[{}]", delegate.name),
+        )?;
+    }
+    Ok(())
+}
+
+/// Fill `base_url` from a named provider preset unless the config already set
+/// one explicitly. Unknown provider names are an error.
+fn fill_provider_base_url(
+    provider: Option<&str>,
+    has_explicit_url: bool,
+    base_url: &mut String,
+    where_: &str,
+) -> Result<()> {
+    let Some(provider) = provider else {
         return Ok(());
     };
-    let base_url_explicit = match toml::from_str::<toml::Value>(raw_toml) {
-        Ok(v) => v.get("llm").and_then(|l| l.get("base_url")).is_some(),
-        Err(_) => false,
-    };
-    if base_url_explicit {
+    if has_explicit_url {
         return Ok(());
     }
     match provider_base_url(provider) {
         Some(url) => {
-            config.llm.base_url = url.to_string();
+            *base_url = url.to_string();
             Ok(())
         }
         None => anyhow::bail!(
-            "unknown llm.provider {provider:?}. Known providers: ollama, openai, deepseek, mistral, openrouter, groq, together"
+            "unknown provider {provider:?} in {where_}. Known providers: ollama, openai, deepseek, mistral, openrouter, groq, together"
         ),
     }
 }
@@ -276,6 +341,71 @@ mod tests {
     #[test]
     fn unknown_provider_is_rejected() {
         let p = write_tmp("[llm]\nprovider = \"skynet\"\nmodel = \"x\"\n");
+        assert!(Config::load(Some(&p)).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn delegates_parse_with_provider_presets_and_defaults() {
+        let p = write_tmp(
+            r#"
+            [llm]
+            provider = "deepseek"
+            model = "deepseek-chat"
+
+            [[delegates]]
+            name = "groq-fast"
+            description = "Groq Llama 3.3 70B - very fast and cheap"
+            provider = "groq"
+            model = "llama-3.3-70b-versatile"
+            api_key = "gsk-x"
+
+            [[delegates]]
+            name = "local-tiny"
+            provider = "ollama"
+            model = "qwen3:4b"
+            "#,
+        );
+        let c = Config::load(Some(&p)).unwrap().config;
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(c.delegates.len(), 2);
+        let groq = &c.delegates[0];
+        assert_eq!(groq.name, "groq-fast");
+        assert_eq!(groq.description, "Groq Llama 3.3 70B - very fast and cheap");
+        // provider preset fills the base URL...
+        assert_eq!(groq.llm.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(groq.llm.model, "llama-3.3-70b-versatile");
+        assert_eq!(groq.llm.api_key.as_deref(), Some("gsk-x"));
+        // ...and omitted scalar settings fall back to defaults.
+        assert_eq!(groq.llm.temperature, 0.2);
+        assert_eq!(groq.llm.timeout_secs, 600);
+        // second delegate has no description and still resolves its provider.
+        assert_eq!(c.delegates[1].llm.base_url, "http://localhost:11434/v1");
+        assert!(c.delegates[1].description.is_empty());
+    }
+
+    #[test]
+    fn delegate_explicit_base_url_wins() {
+        let p = write_tmp(
+            r#"
+            [[delegates]]
+            name = "proxy"
+            provider = "openai"
+            base_url = "http://proxy.example/v1"
+            model = "gpt-4o-mini"
+            "#,
+        );
+        let c = Config::load(Some(&p)).unwrap().config;
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(c.delegates.len(), 1);
+        assert_eq!(c.delegates[0].llm.base_url, "http://proxy.example/v1");
+    }
+
+    #[test]
+    fn unknown_delegate_provider_is_rejected() {
+        let p = write_tmp(
+            "[llm]\nprovider = \"ollama\"\nmodel = \"x\"\n[[delegates]]\nname = \"d\"\nprovider = \"skynet\"\nmodel = \"y\"\n",
+        );
         assert!(Config::load(Some(&p)).is_err());
         let _ = std::fs::remove_file(&p);
     }
