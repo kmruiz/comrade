@@ -1197,8 +1197,8 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
                 pair.0.as_deref(),
                 pair.1.as_deref(),
                 width,
-                Some(Color::Red),
-                Some(Color::Green),
+                Some(diff_remove_bg()),
+                Some(diff_add_bg()),
             );
             out.push(RenderRow {
                 rule: None,
@@ -2159,6 +2159,38 @@ fn lcs_pairs(a: &[String], b: &[String]) -> Vec<(Option<String>, Option<String>)
         k += 1;
     }
     merged
+}
+
+// ---------------------------------------------------------------------------
+// diff backgrounds: translucent-looking red/green, blended over the chat bg so
+// full-saturation colors don't flashbang the developer.
+// ---------------------------------------------------------------------------
+
+/// The assumed chat background the diff tints sit on (a dark neutral; terminals
+/// cannot report their real theme color to ratatui).
+const DIFF_BASE_BG: (u8, u8, u8) = (0x13, 0x14, 0x18);
+/// Removal tint (red) and addition tint (green), at partial opacity.
+const DIFF_TINT_REMOVED: (u8, u8, u8) = (0xff, 0x47, 0x47);
+const DIFF_TINT_ADDED: (u8, u8, u8) = (0x3c, 0xd0, 0x6c);
+const DIFF_TINT_ALPHA: f32 = 0.22;
+
+fn blend_rgb(base: (u8, u8, u8), tint: (u8, u8, u8), alpha: f32) -> Color {
+    let mix = |b: u8, t: u8| (b as f32 * (1.0 - alpha) + t as f32 * alpha).round() as u8;
+    Color::Rgb(
+        mix(base.0, tint.0),
+        mix(base.1, tint.1),
+        mix(base.2, tint.2),
+    )
+}
+
+/// Soft background for removed (left) diff lines.
+fn diff_remove_bg() -> Color {
+    blend_rgb(DIFF_BASE_BG, DIFF_TINT_REMOVED, DIFF_TINT_ALPHA)
+}
+
+/// Soft background for added (right) diff lines.
+fn diff_add_bg() -> Color {
+    blend_rgb(DIFF_BASE_BG, DIFF_TINT_ADDED, DIFF_TINT_ALPHA)
 }
 
 const CODE_KEYWORDS: &[&str] = &[
