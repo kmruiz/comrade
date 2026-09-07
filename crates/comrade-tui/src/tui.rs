@@ -212,6 +212,9 @@ struct App {
     sel: Option<usize>,
     scroll_top: usize,
     follow: bool,
+    /// True while the previous frame sat at the bottom of the chat, so new
+    /// content keeps the view pinned there (autoscroll).
+    was_at_bottom: bool,
     /// Latest context-usage snapshot for the gauge.
     ctx_tokens: usize,
     ctx_budget: usize,
@@ -306,6 +309,7 @@ impl App {
         }
         self.sel = Some(idx);
         self.follow = false;
+        self.was_at_bottom = false;
         if let Some(&(start, _)) = self.msg_ranges.get(idx) {
             self.scroll_top = start;
         }
@@ -670,6 +674,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         sel: None,
         scroll_top: 0,
         follow: true,
+        was_at_bottom: true,
         ctx_tokens: 0,
         ctx_budget: deps
             .cfg
@@ -982,10 +987,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseEventKind::ScrollUp => {
             app.scroll_top = app.scroll_top.saturating_sub(3);
             app.follow = false;
+            app.was_at_bottom = false;
         }
         MouseEventKind::ScrollDown => {
             app.scroll_top += 3;
             app.follow = false;
+            app.was_at_bottom = false;
         }
         MouseEventKind::Down(MouseButton::Left) => {
             let row = y + app.scroll_top;
@@ -1307,13 +1314,15 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     app.row_msg = row_msg;
     app.msg_ranges = ranges;
     app.view_rows = inner.height as usize;
-    if app.follow {
-        app.scroll_top = rows.len().saturating_sub(inner.height as usize);
+    let max = rows.len().saturating_sub(inner.height as usize);
+    // Autoscroll: stay pinned to the bottom while following a run or while the
+    // user is already at the bottom of the chat.
+    if app.follow || app.was_at_bottom {
+        app.scroll_top = max;
     }
-    let offset = app
-        .scroll_top
-        .min(rows.len().saturating_sub(inner.height as usize));
-    app.scroll_top = offset;
+    app.scroll_top = app.scroll_top.min(max);
+    let offset = app.scroll_top;
+    app.was_at_bottom = app.scroll_top >= max;
 
     let sel_start = app.sel.and_then(|i| app.msg_ranges.get(i)).map(|&(s, _)| s);
     // Row span of the currently selected search match, if any.
