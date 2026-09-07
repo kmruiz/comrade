@@ -70,16 +70,19 @@ pub fn resolve(
     }
     let model = pom::load(root)?;
 
-    let cwd = match subproject {
+    // Working directory used by `!shell` aliases and bare shell commands when a
+    // subproject is selected. `cargo` commands always run from the workspace
+    // root, because `--manifest-path` is resolved relative to it.
+    let sub_cwd = match subproject {
         Some(dir) => {
             let dir = dir.trim_end_matches('/');
             let path = root.join(dir);
             if !path.starts_with(root) || dir.contains("..") {
                 anyhow::bail!("subproject {dir:?} escapes the project root");
             }
-            path
+            Some(path)
         }
-        None => root.to_path_buf(),
+        None => None,
     };
 
     let manifest = manifest_path_arg(subproject);
@@ -126,6 +129,14 @@ pub fn resolve(
     let describe = match &line {
         CommandLine::Cargo { args } => cargo_describe(args),
         CommandLine::Shell { script } => format!("bash -c {script:?}"),
+    };
+
+    // cargo commands run from the workspace root (manifest-path is root
+    // relative); shell commands run inside the subproject when one is given.
+    let cwd = match (&line, &sub_cwd) {
+        (CommandLine::Cargo { .. }, _) => root.to_path_buf(),
+        (CommandLine::Shell { .. }, Some(sub)) => sub.clone(),
+        (CommandLine::Shell { .. }, None) => root.to_path_buf(),
     };
 
     Ok(Resolved {
@@ -326,12 +337,17 @@ mod tests {
             }
             _ => panic!("expected cargo with manifest path"),
         }
+        // cargo runs from the workspace root, so --manifest-path resolves
+        assert_eq!(r.cwd, root, "cargo must run from the workspace root");
 
         let r = resolve(&root, "deploy", &none, &[]).unwrap();
         match &r.line {
             CommandLine::Shell { script } => assert_eq!(script, "echo deploying"),
             _ => panic!("expected shell alias"),
         }
+        // shell aliases run inside the chosen subproject
+        let r = resolve(&root, "deploy", &sub, &[]).unwrap();
+        assert_eq!(r.cwd, root.join("crates/a"));
 
         assert!(resolve(&root, "nope", &none, &[]).is_err());
         let _ = std::fs::remove_dir_all(&root);
