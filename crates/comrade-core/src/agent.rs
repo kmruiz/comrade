@@ -51,6 +51,59 @@ fn is_mutating(name: &str) -> bool {
     MUTATING_TOOLS.contains(&name)
 }
 
+/// Tools that only gather information (never change state).
+const READ_ONLY_TOOLS: &[&str] = &[
+    "list_dir",
+    "list_files",
+    "rgrep",
+    "read_file",
+    "read_ranges",
+    "list_symbols",
+    "find_symbol",
+    "find_definition",
+    "read_symbol",
+    "references_count",
+    "find_references",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "project_model",
+    "find_decisions",
+    "read_decision",
+    "web_search",
+];
+
+fn is_read_only(name: &str) -> bool {
+    READ_ONLY_TOOLS.contains(&name)
+}
+
+/// After this many consecutive reads with no state change, we refuse another.
+const READ_GUARD_THRESHOLD: usize = 5;
+
+/// Process monitor: if the model keeps reading without doing anything, stop it.
+/// Returns `true` when the tool may run (and updates the counter); `false` when
+/// the read should be refused as "enough context".
+fn allow_read_step(name: &str, consecutive_reads: &mut usize) -> bool {
+    if is_read_only(name) {
+        if *consecutive_reads >= READ_GUARD_THRESHOLD {
+            return false;
+        }
+        *consecutive_reads += 1;
+    } else {
+        // any action (edit, plan change, question) resets the counter
+        *consecutive_reads = 0;
+    }
+    true
+}
+
+fn read_guard_message(count: usize) -> String {
+    format!(
+        "You have performed {count} reads in a row with no changes. You have enough context - \
+         implement now (write or edit a file), or call update_plan to revise your steps. Do not \
+         keep reading."
+    )
+}
+
 /// Approval-gated tools advertise `justification` and `risk` as optional native
 /// arguments so the model actually passes them (many models omit fields the
 /// schema forbids via `additionalProperties: false`). The agent strips them
@@ -235,6 +288,8 @@ async fn run_agent_loop(
     let mut tracker = LoopTracker::default();
     // We nudge the model once per run to open with a plan.
     let mut plan_nudged = false;
+    // Consecutive read-only calls since the last state change (read guard).
+    let mut consecutive_reads = 0usize;
 
     loop {
         if stop.is_cancelled() {
@@ -343,7 +398,16 @@ async fn run_agent_loop(
                     continue;
                 }
             }
-            run_native_calls(&mut ctxm, &tx, tools, &ctx, &mut tracker, turn).await?;
+            run_native_calls(
+                &mut ctxm,
+                &tx,
+                tools,
+                &ctx,
+                &mut tracker,
+                &mut consecutive_reads,
+                turn,
+            )
+            .await?;
             continue;
         }
 
@@ -487,6 +551,24 @@ async fn run_agent_loop(
             }
         }
 
+        // Read guard: stop the model from reading forever without doing work.
+        if !allow_read_step(&tool_call.name, &mut consecutive_reads) {
+            let count = consecutive_reads;
+            let msg = read_guard_message(count);
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: tool_call.name.clone(),
+                    output: msg.clone(),
+                    ok: false,
+                })
+                .await;
+            ctxm.push(ChatMessage::new(
+                Role::User,
+                render_observation(&tool_call.name, &msg),
+            ));
+            continue;
+        }
+
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
         let sig = format!("{} {args_pretty}", tool_call.name);
         if let Some(count) = tracker.check(&sig) {
@@ -570,6 +652,7 @@ async fn run_native_calls(
     tools: &ToolRegistry,
     ctx: &ToolContext,
     tracker: &mut LoopTracker,
+    consecutive_reads: &mut usize,
     turn: crate::llm::LlmTurn,
 ) -> Result<()> {
     if !turn.content.trim().is_empty() {
@@ -625,6 +708,20 @@ async fn run_native_calls(
     'calls: for p in prepared {
         let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
         let sig = format!("{} {args_pretty}", p.name);
+        // Read guard: refuse further exploration once nothing has changed.
+        if !allow_read_step(&p.name, consecutive_reads) {
+            let count = *consecutive_reads;
+            let msg = read_guard_message(count);
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: p.name.clone(),
+                    output: msg.clone(),
+                    ok: false,
+                })
+                .await;
+            ctxm.push(ChatMessage::tool_result(p.id, msg));
+            continue;
+        }
         let _ = tx
             .send(AgentEvent::ToolCall {
                 name: p.name.clone(),
@@ -1466,5 +1563,40 @@ mod loop_tracker_tests {
         assert!(t.stuck_reason().is_none());
         t.mark_stuck("run_tests {..}");
         assert!(t.stuck_reason().unwrap().contains("Stopped"));
+    }
+}
+
+#[cfg(test)]
+mod read_guard_tests {
+    use super::*;
+
+    #[test]
+    fn reads_count_up_then_guard_refuses() {
+        let mut reads = 0usize;
+        for _ in 0..READ_GUARD_THRESHOLD {
+            assert!(
+                allow_read_step("read_file", &mut reads),
+                "reads should be allowed until threshold"
+            );
+        }
+        assert_eq!(reads, READ_GUARD_THRESHOLD);
+        // the next read is refused (and does not bump the counter)
+        assert!(!allow_read_step("read_file", &mut reads));
+        assert_eq!(reads, READ_GUARD_THRESHOLD);
+    }
+
+    #[test]
+    fn any_state_change_resets_the_counter() {
+        let mut reads = 0usize;
+        for _ in 0..READ_GUARD_THRESHOLD {
+            assert!(allow_read_step("rgrep", &mut reads));
+        }
+        assert!(!allow_read_step("rgrep", &mut reads));
+
+        // an action (write/edit/plan) resets the read counter
+        assert!(allow_read_step("apply_edit", &mut reads));
+        assert_eq!(reads, 0);
+        assert!(allow_read_step("rgrep", &mut reads));
+        assert_eq!(reads, 1);
     }
 }
