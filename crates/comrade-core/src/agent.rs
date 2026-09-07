@@ -104,6 +104,12 @@ async fn run_agent_loop(
         ctx.clear_approval();
 
         ctxm.enforce_budget();
+        let _ = tx
+            .send(AgentEvent::ContextStats {
+                tokens: ctxm.total_tokens(),
+                budget: cfg.context.budget_tokens,
+            })
+            .await;
 
         // Advertise native tools unless the protocol is strictly ReAct.
         let native = cfg.llm.protocol.native_enabled();

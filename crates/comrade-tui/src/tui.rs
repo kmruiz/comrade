@@ -148,6 +148,11 @@ struct App {
     sel: Option<usize>,
     scroll_top: usize,
     follow: bool,
+    /// Latest context-usage snapshot for the gauge.
+    ctx_tokens: usize,
+    ctx_budget: usize,
+    /// Name of the tool currently running (auto status while no agent text).
+    activity: Option<String>,
 }
 
 impl App {
@@ -238,11 +243,15 @@ impl App {
 
     fn on_agent_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::RunStart => {}
+            AgentEvent::RunStart => {
+                self.ctx_tokens = 0;
+                self.activity = None;
+            }
             AgentEvent::RunEnd => {
                 self.running = false;
                 self.stop = None;
                 self.stream.clear();
+                self.activity = None;
                 self.push_meta("run finished");
             }
             AgentEvent::User(u) => {
@@ -268,6 +277,7 @@ impl App {
                 // This turn produced a tool call; drop any scaffold-only prose
                 // that was streaming and show a compact card instead.
                 self.stream.clear();
+                self.activity = Some(name.clone());
                 self.push_msg(Msg::tool(ToolCard {
                     name,
                     args,
@@ -281,6 +291,7 @@ impl App {
             AgentEvent::ToolStart { .. } => {}
             AgentEvent::ToolResult { name, output, ok } => {
                 self.stream.clear();
+                self.activity = None;
                 if let Some(card) = self.last_tool_mut(&name) {
                     card.result = Some(output);
                     card.ok = ok;
@@ -290,6 +301,7 @@ impl App {
             AgentEvent::Thought(_) => {}
             AgentEvent::FinalAnswer(a) => {
                 self.stream.clear();
+                self.activity = None;
                 let visible = strip_react_scaffolding(&a);
                 if !visible.trim().is_empty() {
                     self.push_msg(Msg::text(MsgKind::Assistant, visible));
@@ -297,6 +309,7 @@ impl App {
             }
             AgentEvent::Error(e) => {
                 self.stream.clear();
+                self.activity = None;
                 self.push_meta(format!("error: {e}"));
             }
             AgentEvent::TitleChanged | AgentEvent::StatusChanged | AgentEvent::PlanChanged => {}
@@ -304,6 +317,10 @@ impl App {
                 Some(s) => self.push_meta(format!("plan finished: {s}")),
                 None => self.push_meta("plan finished"),
             },
+            AgentEvent::ContextStats { tokens, budget } => {
+                self.ctx_tokens = tokens;
+                self.ctx_budget = budget.max(1);
+            }
         }
     }
 
@@ -384,6 +401,9 @@ pub async fn run(deps: &Deps) -> Result<()> {
         sel: None,
         scroll_top: 0,
         follow: true,
+        ctx_tokens: 0,
+        ctx_budget: deps.cfg.context.budget_tokens,
+        activity: None,
     };
 
     let mut terminal = ratatui::init();
@@ -667,8 +687,26 @@ fn draw(app: &mut App, frame: &mut Frame) {
         Span::styled("undo:", Style::default().fg(Color::DarkGray)),
         Span::raw(format!("{undo_count}")),
     ]);
+    let (status_msg, status_color) = {
+        let agent = app.session.status();
+        if !agent.trim().is_empty() {
+            (agent, Color::White)
+        } else if app.running {
+            match &app.activity {
+                Some(name) => (format!("running {name}"), Color::Magenta),
+                None => ("working...".to_string(), Color::Green),
+            }
+        } else {
+            (String::new(), Color::DarkGray)
+        }
+    };
     let footer = Line::from(vec![
-        Span::styled(app.session.status(), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            status_msg,
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::ITALIC),
+        ),
         Span::raw("  "),
         Span::styled(
             run_state,
@@ -691,10 +729,15 @@ fn draw(app: &mut App, frame: &mut Frame) {
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Percentage(34)])
+        .constraints([Constraint::Min(20), Constraint::Percentage(30)])
         .split(rows[1]);
     draw_chat(app, frame, cols[0]);
-    draw_plan(app, frame, cols[1]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(0)])
+        .split(cols[1]);
+    draw_stats(app, frame, right[0]);
+    draw_plan(app, frame, right[1]);
 
     let input_hint = if app.running { " (running...)" } else { "" };
     let input_line = Line::from(vec![
@@ -887,6 +930,61 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             });
         }
     }
+}
+
+fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" context ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let tokens = app.ctx_tokens;
+    let budget = app.ctx_budget.max(1);
+    let ratio = (tokens as f64 / budget as f64).clamp(0.0, 1.0);
+    let pct = (ratio * 100.0).round() as usize;
+    let bar_color = if ratio < 0.7 {
+        Color::Green
+    } else if ratio < 0.9 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
+    let width = inner.width as usize;
+    let filled = (ratio * width as f64).floor() as usize;
+    let mut line1 = Vec::new();
+    line1.push(Span::styled(
+        "#".repeat(filled),
+        Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+    ));
+    line1.push(Span::styled(
+        "-".repeat(width.saturating_sub(filled)),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let mut line2 = vec![Span::styled(
+        format!("{pct}% used  "),
+        Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+    )];
+    line2.push(Span::styled(
+        format!("{tokens} / {budget} tokens"),
+        Style::default().fg(Color::White),
+    ));
+    line2.push(Span::styled(
+        " (est.)",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new(Line::from(line1)), rows[0]);
+    frame.render_widget(Paragraph::new(Line::from(line2)), rows[1]);
+    let _ = rows;
 }
 
 fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {

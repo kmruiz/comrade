@@ -45,6 +45,8 @@ pub enum AgentEvent {
     Error(String),
     /// The run finished (success or not).
     RunEnd,
+    /// Live context-usage snapshot (estimated tokens vs budget) for the gauge.
+    ContextStats { tokens: usize, budget: usize },
 }
 
 /// Observable session state. Doubles as the [`SessionControl`] implementation
