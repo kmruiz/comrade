@@ -68,6 +68,8 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          Risk: <what could go wrong or how invasive it is; write \"Risk: none\" if safe>\n\
          \n\
          Approval-gated tools are refused if you omit either line — repeat the call with both.\n\
+         When using native function calls (instead of the Tool/Args text form), pass the same two \
+         fields as extra arguments `justification` and `risk` on every approval-gated tool.\n\
          After each tool call you will receive:\n\
          \n\
          Observation: <the tool result>\n\

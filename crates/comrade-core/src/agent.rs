@@ -103,8 +103,17 @@ async fn run_agent_loop(
 
         ctxm.enforce_budget();
 
+        // Advertise native tools unless the protocol is strictly ReAct.
+        let native = cfg.llm.protocol.native_enabled();
+        let tool_specs: Option<Vec<comrade_tool::ToolSpec>> = if native {
+            let specs: Vec<_> = tools.iter().map(|t| t.spec().clone()).collect();
+            if specs.is_empty() { None } else { Some(specs) }
+        } else {
+            None
+        };
+
         // Stream the model's reply: each content chunk is forwarded to the UI as
-        // `Delta`, while the accumulated text is returned for parsing/history.
+        // `Delta`; the accumulated turn (text + native tool calls) is returned.
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let events_tx = tx.clone();
         let forwarder = tokio::spawn(async move {
@@ -116,7 +125,7 @@ async fn run_agent_loop(
         });
 
         let stream_result = tokio::select! {
-            r = client.chat_stream(ctxm.messages(), {
+            r = client.chat_turn(ctxm.messages(), tool_specs.as_deref(), {
                 let delta_tx = delta_tx.clone();
                 move |piece: &str| { let _ = delta_tx.send(piece.to_string()); }
             }) => r.context("llm call failed"),
@@ -129,7 +138,16 @@ async fn run_agent_loop(
         // forwarder got to before we moved on.
         let _ = forwarder.await;
 
-        let response = stream_result?;
+        let turn = stream_result?;
+
+        // Native function calls: dispatch them (possibly several per turn).
+        if !turn.tool_calls.is_empty() {
+            run_native_calls(&mut ctxm, &tx, tools, &ctx, turn).await?;
+            continue;
+        }
+
+        // Plain text: final answer or (auto/react fallback) a ReAct tool turn.
+        let response = turn.content;
         if response.trim().is_empty() {
             bail!("model returned an empty response");
         }
@@ -137,13 +155,13 @@ async fn run_agent_loop(
         ctxm.push(ChatMessage::new(Role::Assistant, response.clone()));
         let _ = tx.send(AgentEvent::AssistantText(response.clone())).await;
 
-        let turn = parse_turn(&response).context("failed to parse model response")?;
-        if let Some(t) = turn.thought.as_deref() {
+        let turn_p = parse_turn(&response).context("failed to parse model response")?;
+        if let Some(t) = turn_p.thought.as_deref() {
             let _ = tx.send(AgentEvent::Thought(t.to_string())).await;
         }
 
-        let Some(tool_call) = turn.tool_call else {
-            let answer = turn.final_text.clone();
+        let Some(tool_call) = turn_p.tool_call else {
+            let answer = turn_p.final_text.clone();
             let _ = tx.send(AgentEvent::FinalAnswer(answer.clone())).await;
             return Ok(AgentOutcome {
                 final_answer: answer,
@@ -175,13 +193,13 @@ async fn run_agent_loop(
         // Justification and a Risk line, otherwise the human has nothing to
         // reason with. Ask the model to repeat instead of running them.
         if is_approval_gated(&tool_call.name) && !ctx.auto_approve {
-            let has_justification = !turn
+            let has_justification = !turn_p
                 .justification
                 .as_deref()
                 .unwrap_or("")
                 .trim()
                 .is_empty();
-            let has_risk = !turn.risk.as_deref().unwrap_or("").trim().is_empty();
+            let has_risk = !turn_p.risk.as_deref().unwrap_or("").trim().is_empty();
             if !has_justification || !has_risk {
                 let missing = [(has_justification, "Justification"), (has_risk, "Risk")]
                     .iter()
@@ -213,8 +231,8 @@ async fn run_agent_loop(
             }
             // Both fields present: surface them on the approval prompt.
             ctx.set_approval(comrade_tool::ApprovalNotes {
-                justification: turn.justification.clone().unwrap_or_default(),
-                risk: turn.risk.clone(),
+                justification: turn_p.justification.clone().unwrap_or_default(),
+                risk: turn_p.risk.clone(),
             });
         }
 
@@ -246,8 +264,140 @@ async fn run_agent_loop(
         ));
         // The tool call is spent: strip its (potentially large) args from the
         // stored assistant message so they are not re-sent every later turn.
-        ctxm.note_tool_done(&tool_call.name, turn.thought.as_deref());
+        ctxm.note_tool_done(&tool_call.name, turn_p.thought.as_deref());
     }
+}
+
+/// Dispatch a turn's native function calls. The assistant message with all
+/// `tool_calls` is recorded first; each call then gets a `Role::Tool` result.
+/// Approval-gated calls require `justification`/`risk` in their arguments.
+async fn run_native_calls(
+    ctxm: &mut ContextManager,
+    tx: &mpsc::Sender<AgentEvent>,
+    tools: &ToolRegistry,
+    ctx: &ToolContext,
+    turn: crate::llm::LlmTurn,
+) -> Result<()> {
+    if !turn.content.trim().is_empty() {
+        let _ = tx
+            .send(AgentEvent::AssistantText(turn.content.clone()))
+            .await;
+    }
+
+    struct Prepared {
+        id: String,
+        name: String,
+        args: serde_json::Value,
+        justification: Option<String>,
+        risk: Option<String>,
+    }
+
+    let mut prepared = Vec::new();
+    let mut calls = Vec::new();
+    for mc in turn.tool_calls {
+        let parsed: serde_json::Value = serde_json::from_str(&mc.arguments)
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let text = |k: &str| {
+            parsed
+                .get(k)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let justification = text("justification");
+        let risk = text("risk");
+        let mut clean = parsed.clone();
+        if let Some(obj) = clean.as_object_mut() {
+            obj.remove("justification");
+            obj.remove("risk");
+        }
+        calls.push(crate::llm::ToolCallMsg {
+            id: mc.id.clone(),
+            name: mc.name.clone(),
+            arguments: clean.clone(),
+        });
+        prepared.push(Prepared {
+            id: mc.id,
+            name: mc.name,
+            args: clean,
+            justification,
+            risk,
+        });
+    }
+
+    ctxm.push(ChatMessage::assistant_with_calls(turn.content, calls));
+
+    let total = prepared.len();
+    for p in prepared {
+        if is_approval_gated(&p.name) && !ctx.auto_approve {
+            let has_j = p.justification.is_some();
+            let has_r = p.risk.is_some();
+            if !has_j || !has_r {
+                let missing = [(has_j, "justification"), (has_r, "risk")]
+                    .iter()
+                    .filter(|(ok, _)| !ok)
+                    .map(|(_, l)| *l)
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                let msg = format!(
+                    "tool `{name}` is approval-gated and was called without {missing}. \
+                     Repeat the call passing `justification` and `risk` as arguments.",
+                    name = p.name,
+                );
+                let _ = tx
+                    .send(AgentEvent::ToolResult {
+                        name: p.name.clone(),
+                        output: msg.clone(),
+                        ok: false,
+                    })
+                    .await;
+                ctxm.push(ChatMessage::tool_result(p.id, msg));
+                continue;
+            }
+            ctx.set_approval(comrade_tool::ApprovalNotes {
+                justification: p.justification.unwrap_or_default(),
+                risk: p.risk,
+            });
+        }
+
+        let Some(tool) = tools.get(&p.name) else {
+            let msg = format!("unknown tool {:?}; choose from the listed tools", p.name);
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: p.name.clone(),
+                    output: msg.clone(),
+                    ok: false,
+                })
+                .await;
+            ctxm.push(ChatMessage::tool_result(p.id, msg));
+            continue;
+        };
+
+        let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
+        let _ = tx
+            .send(AgentEvent::ToolStart {
+                name: p.name.clone(),
+                args: args_pretty,
+            })
+            .await;
+        let output = match tool.invoke(ctx, p.args.clone()).await {
+            Ok(out) => out,
+            Err(err) => format!("ERROR: {err:#}"),
+        };
+        let ok = !output.starts_with("ERROR:");
+        let clamped = ctxm.truncate_observation(&output);
+        let _ = tx
+            .send(AgentEvent::ToolResult {
+                name: p.name.clone(),
+                output: clamped.clone(),
+                ok,
+            })
+            .await;
+        ctxm.push(ChatMessage::tool_result(p.id, clamped));
+    }
+    ctxm.note_turn_done(total);
+    Ok(())
 }
 
 /// Convenience wrapper so callers don't need the full signature when running a
@@ -585,6 +735,166 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.final_answer, "All done.");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Serve one native tool-call request (streamed `tool_calls`), then a final
+    /// text answer. When `gated` the tool call targets write_file without
+    /// justification/risk.
+    fn spawn_native_model() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let calls = Arc::new(AtomicUsize::new(0));
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let mut used = 0usize;
+                loop {
+                    match stream.read(&mut buf[used..]) {
+                        Ok(0) => break,
+                        Ok(r) => {
+                            used += r;
+                            if buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let body = if n == 0 {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Writing now.\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\": \\\"x.rs\\\", \\\"content\\\": \\\"a\\\"}\"}}]}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                } else {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"All done.\"}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn native_tool_calls_dispatch_and_then_finish() {
+        let port = spawn_native_model();
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "fake".into();
+
+        let (tx, mut events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        let root = std::env::temp_dir().join(format!("comrade-native-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let undo = Arc::new(MemoryUndo::new(root.clone()));
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: undo.clone(),
+            auto_approve: true,
+            approval: Default::default(),
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools = gated_registry(calls.clone());
+        let client = LlmClient::new(&cfg.llm).unwrap();
+
+        let outcome = run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            "write it".to_string(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.final_answer, "All done.");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // auto-approve path: tool executed without a confirm prompt
+
+        let mut saw_final = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
+        {
+            if let AgentEvent::FinalAnswer(a) = &ev {
+                saw_final = a.contains("All done");
+            }
+            if let AgentEvent::RunEnd = ev {
+                break;
+            }
+        }
+        assert!(saw_final);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn native_gated_tool_refused_without_justification_args() {
+        let port = spawn_native_model();
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "fake".into();
+
+        let (tx, mut events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        let root =
+            std::env::temp_dir().join(format!("comrade-native-gated-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let undo = Arc::new(MemoryUndo::new(root.clone()));
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: undo.clone(),
+            auto_approve: false,
+            approval: Default::default(),
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools = gated_registry(calls.clone());
+        let client = LlmClient::new(&cfg.llm).unwrap();
+
+        let outcome = run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            "write it".to_string(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.final_answer, "All done.");
+        // gated native call without justification/risk never reached the tool
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let mut saw_refusal = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
+        {
+            if let AgentEvent::ToolResult { output, ok, .. } = &ev {
+                if !ok && output.contains("approval-gated") {
+                    saw_refusal = true;
+                }
+            }
+            if let AgentEvent::RunEnd = ev {
+                break;
+            }
+        }
+        assert!(saw_refusal, "expected native approval-gated refusal");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

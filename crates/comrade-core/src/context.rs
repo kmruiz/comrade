@@ -99,6 +99,23 @@ impl ContextManager {
             None => format!("[Tool: {tool} executed]"),
         };
         self.history[idx].content = content;
+        // Native-mode tool calls carry the full arguments payload; they are
+        // spent once executed.
+        self.history[idx].tool_calls = None;
+    }
+
+    /// Condense the last assistant message after a native turn dispatched
+    /// `count` function calls (drops the `tool_calls` arguments payload).
+    pub fn note_turn_done(&mut self, count: usize) {
+        let Some(idx) = self
+            .history
+            .iter()
+            .rposition(|m| m.role == crate::llm::Role::Assistant)
+        else {
+            return;
+        };
+        self.history[idx].content = format!("[{count} tool call(s) executed]");
+        self.history[idx].tool_calls = None;
     }
 
     /// Fit history under the token budget: stub large old observations, then
@@ -199,7 +216,7 @@ fn rollup_snippet(msg: &ChatMessage) -> Option<String> {
         return None;
     }
     match msg.role {
-        crate::llm::Role::System => None,
+        crate::llm::Role::System | crate::llm::Role::Tool => None,
         crate::llm::Role::User => {
             if content.starts_with("Observation (result of")
                 || content.starts_with("Earlier context (compacted)")

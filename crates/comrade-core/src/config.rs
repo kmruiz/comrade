@@ -25,6 +25,24 @@ impl Autonomy {
     }
 }
 
+/// How the agent talks to the model: native OpenAI-style tool calls when
+/// possible, text ReAct, or auto (native with ReAct fallback per turn).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    Auto,
+    Native,
+    React,
+}
+
+impl Protocol {
+    /// Whether to advertise native `tools` on requests.
+    pub fn native_enabled(self) -> bool {
+        !matches!(self, Protocol::React)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LlmCfg {
@@ -37,6 +55,8 @@ pub struct LlmCfg {
     pub temperature: f32,
     /// Seconds to wait for a response.
     pub timeout_secs: u64,
+    /// Tool-calling protocol: auto | native | react.
+    pub protocol: Protocol,
 }
 
 impl Default for LlmCfg {
@@ -47,6 +67,7 @@ impl Default for LlmCfg {
             model: "devstral-small-2".into(),
             temperature: 0.2,
             timeout_secs: 600,
+            protocol: Protocol::Auto,
         }
     }
 }
