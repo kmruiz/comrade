@@ -34,8 +34,9 @@ fn changed_scope(ctx: &ToolContext, enabled: bool) -> Result<Option<HashSet<Path
     }
 }
 
-/// When a scope is set and an explicit path was given, require that the path is
-/// part of the change set.
+/// When a scope is set and an explicit path was given, require that a *file*
+/// path is part of the change set. Directory paths are always allowed: the
+/// per-file scope check happens inside the engine.
 fn guard_path_scope(
     ctx: &ToolContext,
     path: &Option<String>,
@@ -45,6 +46,9 @@ fn guard_path_scope(
         let abs = ctx.project_root.join(p);
         if !abs.starts_with(&ctx.project_root) {
             anyhow::bail!("path {p:?} escapes the project root");
+        }
+        if abs.is_dir() {
+            return Ok(());
         }
         if !set.contains(&abs) {
             anyhow::bail!("{p} is not modified (git_modified_only)");
@@ -838,6 +842,32 @@ fn main() {}
         assert!(joined.contains("fn main"), "{joined}");
         assert!(!joined.contains("struct Client"), "{joined}");
         assert!(!joined.contains("mod api"), "{joined}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maps_a_directory_path() {
+        use std::collections::HashSet;
+        let root = scratch();
+        std::fs::create_dir_all(root.join("crates/foo/src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/bar/src")).unwrap();
+        std::fs::write(
+            root.join("crates/foo/src/lib.rs"),
+            "pub fn foo() {}\nstruct Foo {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/bar/src/lib.rs"),
+            "pub fn bar() {}\nstruct Bar {}\n",
+        )
+        .unwrap();
+        let all: HashSet<String> = HashSet::new();
+        let lines =
+            crate::engine::structural_map(&root, Some("crates/foo"), None, false, &all).unwrap();
+        let joined = lines.join("\n");
+        assert!(joined.contains("== crates/foo/src/lib.rs =="), "{joined}");
+        assert!(joined.contains("fn foo"), "{joined}");
+        assert!(!joined.contains("bar"), "{joined}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

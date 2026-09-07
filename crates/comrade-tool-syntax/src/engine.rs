@@ -558,7 +558,8 @@ pub fn structural_map(
 }
 
 /// Returns (rel_path, contents) for the target files. When `path` is provided
-/// only that file (resolved relative to root) is returned.
+/// it may name a single file *or* a directory (which is walked for supported
+/// sources), resolved relative to root.
 fn collect_files(
     root: &Path,
     path: Option<&str>,
@@ -570,12 +571,34 @@ fn collect_files(
         if !abs.starts_with(root) {
             anyhow::bail!("path {p:?} escapes the project root");
         }
-        if let Some(set) = only {
-            if !set.contains(&abs) {
-                return Ok(Vec::new());
+        let is_dir = abs.is_dir();
+        if is_dir {
+            // A directory scope: map every supported source under it. The
+            // git-modified (`only`) filter is applied per file afterwards.
+            let mut paths = Vec::new();
+            for ext in ["rs"] {
+                walk_files(&abs, ext, &mut paths);
             }
+            for sub in paths {
+                if let Ok(meta) = sub.metadata() {
+                    if meta.len() > MAX_FILE_BYTES {
+                        continue;
+                    }
+                }
+                let rel = sub
+                    .strip_prefix(root)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| sub.to_string_lossy().into_owned());
+                files.push((rel, sub));
+            }
+        } else {
+            if let Some(set) = only {
+                if !set.contains(&abs) {
+                    return Ok(Vec::new());
+                }
+            }
+            files.push((p.trim_start_matches('/').to_string(), abs));
         }
-        files.push((p.trim_start_matches('/').to_string(), abs));
     } else {
         let mut paths = Vec::new();
         for ext in ["rs"] {
