@@ -79,7 +79,7 @@ fn is_read_only(name: &str) -> bool {
 }
 
 /// After this many consecutive reads with no state change, we refuse another.
-const READ_GUARD_THRESHOLD: usize = 5;
+const READ_GUARD_THRESHOLD: usize = 20;
 
 /// Process monitor: if the model keeps reading without doing anything, stop it.
 /// Returns `true` when the tool may run (and updates the counter); `false` when
