@@ -407,6 +407,156 @@ pub fn search_symbols(
         .collect())
 }
 
+/// A structural-map entry: one declaration, indented by its nesting depth in
+/// modules / impls / traits.
+#[derive(Debug)]
+struct MapRow {
+    depth: usize,
+    /// Short kind label (`fn`, `struct`, `mod`, ...).
+    label: String,
+    /// Display text: the name, or (impl/trait) head, or `name {` for inline mods.
+    text: String,
+    signature: String,
+    line: usize,
+}
+
+/// Recurse into the direct children of a container node (`source_file`,
+/// `declaration_list` bodies) and record the declarations.
+fn map_children(container: &tree_sitter::Node, text: &str, depth: usize, out: &mut Vec<MapRow>) {
+    let count = container.child_count();
+    for i in 0..count {
+        if let Some(c) = container.child(i) {
+            map_item(&c, text, depth, out);
+        }
+    }
+}
+
+/// Record one declaration and, when it nests others (inline `mod`, `impl`,
+/// `trait`), descend one level into its body so the map shows the hierarchy.
+fn map_item(node: &tree_sitter::Node, text: &str, depth: usize, out: &mut Vec<MapRow>) {
+    let kind = node.kind();
+    let is_decl = is_decl_kind(kind) || kind == "impl_item";
+    if !is_decl {
+        return;
+    }
+    let (label, text_col, body) = match kind {
+        "impl_item" => {
+            let head = text[node.start_byte()..node.end_byte()]
+                .lines()
+                .next()
+                .unwrap_or("impl")
+                .trim()
+                .to_string();
+            // Drop the leading `impl` keyword so the row reads "impl Foo {".
+            let head = head
+                .strip_prefix("impl")
+                .unwrap_or(&head)
+                .trim()
+                .to_string();
+            (
+                short_kind(kind).to_string(),
+                head,
+                node.child_by_field_name("body"),
+            )
+        }
+        "trait_item" => {
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| n.utf8_text(text.as_bytes()).unwrap_or("?"))
+                .unwrap_or("?")
+                .to_string();
+            (
+                short_kind(kind).to_string(),
+                name,
+                node.child_by_field_name("body"),
+            )
+        }
+        "mod_item" => {
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| n.utf8_text(text.as_bytes()).unwrap_or("?"))
+                .unwrap_or("?")
+                .to_string();
+            let body = node.child_by_field_name("body");
+            let txt = if body.is_some() {
+                format!("{name} {{")
+            } else {
+                format!("{name};")
+            };
+            (short_kind(kind).to_string(), txt, body)
+        }
+        _ => {
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| n.utf8_text(text.as_bytes()).unwrap_or("?"))
+                .unwrap_or("?")
+                .to_string();
+            (short_kind(kind).to_string(), name, None)
+        }
+    };
+    let (line, _, _) = locate(text, node.start_byte());
+    out.push(MapRow {
+        depth,
+        label,
+        text: text_col,
+        signature: signature_of(node, text),
+        line,
+    });
+    if let Some(body) = body {
+        map_children(&body, text, depth + 1, out);
+    }
+}
+
+/// Build a structural map of the project (or `path`): one section per file
+/// listing the declarations nested under their inline `mod` / `impl` / `trait`
+/// containers, so the layout of functions, modules, and types is visible
+/// without grepping. `only` restricts to files that differ from HEAD when set.
+/// `include` (short kinds, e.g. `fn`) restricts which declarations appear;
+/// empty means every declaration kind.
+pub fn structural_map(
+    root: &Path,
+    path: Option<&str>,
+    only: Option<&HashSet<PathBuf>>,
+    with_sigs: bool,
+    include: &HashSet<String>,
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for (rel, text) in collect_files(root, path, only)? {
+        let ext = Path::new(&rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let Some(lang) = language_for(ext) else {
+            continue;
+        };
+        let mut parser = tree_sitter::Parser::new();
+        let _ = parser.set_language(&lang);
+        let Some(tree) = parser.parse(&text, None) else {
+            continue;
+        };
+        let mut rows = Vec::new();
+        let root_node = tree.root_node();
+        map_children(&root_node, &text, 0, &mut rows);
+        if !include.is_empty() {
+            rows.retain(|r| include.contains(&r.label));
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        out.push(format!("== {rel} =="));
+        for r in rows {
+            let pad = "  ".repeat(r.depth);
+            let row = if with_sigs {
+                format!("{pad}{} {} | {} @ {}", r.label, r.text, r.signature, r.line)
+            } else {
+                format!("{pad}{} {} @ {}", r.label, r.text, r.line)
+            };
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
 /// Returns (rel_path, contents) for the target files. When `path` is provided
 /// only that file (resolved relative to root) is returned.
 fn collect_files(

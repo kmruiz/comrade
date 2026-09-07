@@ -17,6 +17,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(FindReferences),
         Box::new(Rename),
         Box::new(ListSymbols),
+        Box::new(StructuralMap),
         Box::new(FindDefinition),
         Box::new(ReadSymbol),
         Box::new(ReferencesCount),
@@ -299,6 +300,78 @@ impl Tool for ListSymbols {
             return Ok("No symbols found.".to_string());
         }
         Ok(clamp(symbols.join("\n")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// structural_map
+// ---------------------------------------------------------------------------
+
+/// Short kind labels accepted by the `kinds` filter, mirroring the engine.
+const KIND_LABELS: &[&str] = &[
+    "fn", "struct", "enum", "trait", "impl", "mod", "type", "static", "const",
+];
+
+struct StructuralMap;
+
+static STRUCTURAL_MAP_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "structural_map".into(),
+    description: "Build a tree-sitter structural map of the project (or one file): each file section lists its declarations nested under inline mod/impl/trait containers, with line numbers — so you can see where functions, modules, types, and methods live at a glance. Filter by file, git-modified files, or declaration kinds. Prefer this over grepping the codebase to orient yourself; then read_symbol / read_ranges the exact item you will touch.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string", "description": "Optional file or subdir to map (project-root relative). Defaults to the whole project." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only map files that differ from HEAD (staged, unstaged, untracked)." },
+            "with_signatures": { "type": "boolean", "default": false, "description": "Include each declaration's one-line signature." },
+            "kinds": { "type": "array", "items": { "type": "string", "enum": KIND_LABELS }, "description": "Restrict to these declaration kinds (short labels). Default: all kinds." }
+        },
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for StructuralMap {
+    fn spec(&self) -> &ToolSpec {
+        &STRUCTURAL_MAP_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            git_modified_only: bool,
+            #[serde(default)]
+            with_signatures: bool,
+            #[serde(default)]
+            kinds: Vec<String>,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let include: HashSet<String> = args.kinds.iter().map(|k| k.to_lowercase()).collect();
+        for k in &include {
+            if !KIND_LABELS.contains(&k.as_str()) {
+                anyhow::bail!(
+                    "unknown kind {k:?}; expected one of {}",
+                    KIND_LABELS.join(", ")
+                );
+            }
+        }
+        let scope = changed_scope(ctx, args.git_modified_only)?;
+        guard_path_scope(ctx, &args.path, &scope)?;
+        let lines = engine::structural_map(
+            &ctx.project_root,
+            args.path.as_deref(),
+            scope.as_ref(),
+            args.with_signatures,
+            &include,
+        )?;
+        if lines.is_empty() {
+            return Ok("No declarations matched the given filters.".to_string());
+        }
+        Ok(clamp(lines.join("\n")))
     }
 }
 
@@ -725,6 +798,46 @@ struct Thing { a: i32 }
                 .any(|s| s.contains("fn add | fn add(a: i32, b: i32) -> i32 @")),
             "{sigs:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn builds_nested_structural_map() {
+        use std::collections::HashSet;
+        let root = scratch();
+        std::fs::write(
+            root.join("lib.rs"),
+            r#"
+pub mod api {
+    pub struct Client { url: String }
+    impl Client {
+        pub fn new(url: &str) -> Self { todo!() }
+        pub fn get(&self) -> u32 { 0 }
+    }
+}
+fn main() {}
+"#,
+        )
+        .unwrap();
+        let all: HashSet<String> = HashSet::new();
+        let lines = crate::engine::structural_map(&root, None, None, true, &all).unwrap();
+        let joined = lines.join("\n");
+        assert!(joined.contains("== lib.rs =="), "{joined}");
+        assert!(joined.contains("mod api {"), "{joined}");
+        assert!(joined.contains("  struct Client |"), "{joined}");
+        assert!(joined.contains("impl Client {"), "{joined}");
+        assert!(joined.contains("    fn new |"), "{joined}");
+        assert!(joined.contains("    fn get |"), "{joined}");
+        assert!(joined.contains("fn main"), "{joined}");
+
+        // kinds filter: only functions (and methods nested under impls).
+        let only_fns: HashSet<String> = ["fn".to_string()].into();
+        let lines = crate::engine::structural_map(&root, None, None, false, &only_fns).unwrap();
+        let joined = lines.join("\n");
+        assert!(joined.contains("fn new"), "{joined}");
+        assert!(joined.contains("fn main"), "{joined}");
+        assert!(!joined.contains("struct Client"), "{joined}");
+        assert!(!joined.contains("mod api"), "{joined}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

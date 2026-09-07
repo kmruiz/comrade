@@ -59,6 +59,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
     "read_ranges",
     "list_symbols",
+    "structural_map",
     "find_symbol",
     "find_definition",
     "read_symbol",

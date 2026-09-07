@@ -45,8 +45,9 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          1. Plan first: call set_plan even for a single step. Every step needs a goal and a \
          verification (how you will prove it works). Keep steps small and isolated so they can be \
          re-ordered or verified independently. Advance steps with update_plan as you go.\n\
-         2. Orient only where it matters: project_model for layout; read only the exact files you will \
-         edit (use find_symbol/read_symbol to jump straight to a function).\n\
+         2. Orient only where it matters: project_model for layout; call structural_map to see where \
+         functions, modules, types, and methods live before searching. Then read only the exact code \
+         you will edit (use find_symbol/read_symbol to jump straight to a function).\n\
          3. Implement with the most direct edit tool (write_file for new files, apply_patch/apply_edit \
          for changes). Write or update tests for what you changed.\n\
          4. Verify with run_tests (or run_task) and fix anything that fails until the suite is green. \
