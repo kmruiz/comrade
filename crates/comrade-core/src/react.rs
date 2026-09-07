@@ -76,7 +76,19 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
              function, file, regex, data transform, translation, rewrite or focused explanation - \
              even when you could do it yourself, and reserve your own context for what genuinely \
              needs your tools, repository access, approvals or judgement: orienting, integrating, \
-             verifying and committing.\n\n",
+             verifying and committing.\n\n\
+             While a delegate works on a step the plan shows it: delegating a step marks it \
+             in_progress with a `working: <model>` note (fix rounds read `(fix N/5)`). \
+             Verification is a joint effort — the delegate is told to self-check its own \
+             deliverable and close with a VERIFICATION: line, but it has no tools, so that line \
+             is never proof. After EVERY delegate reply, run the step's verification yourself \
+             with your tools (run_tests/run_task, or whatever the step's `verification` \
+             describes); only a green verification lets you mark the step done. If your \
+             verification fails, re-delegate the SAME step passing the failure output as \
+             `feedback` so the delegate fixes it, and repeat — up to 5 fix rounds per step. The \
+             delegate tool counts the rounds and refuses further fix requests after 5; at that \
+             point stop delegating, do the step yourself with your tools, and only then mark it \
+             done (or blocked).\n\n",
         );
     }
     prompt.push_str(
@@ -801,6 +813,17 @@ mod dev_prompt_tests {
         assert!(prompt.contains("root (planner) model"), "{prompt}");
         assert!(prompt.contains("the delegate tool"), "{prompt}");
         assert!(prompt.contains("small steps"), "{prompt}");
+        // Delegation must be shown in the plan, both models verify, and the
+        // parent retries the delegate with feedback up to 5 fix rounds.
+        assert!(prompt.contains("working: <model>"), "{prompt}");
+        assert!(prompt.contains("VERIFICATION: line"), "{prompt}");
+        assert!(
+            prompt.contains("run the step's verification yourself"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("`feedback`"), "{prompt}");
+        assert!(prompt.contains("5 fix rounds"), "{prompt}");
+        assert!(prompt.contains("do the step yourself"), "{prompt}");
     }
 
     #[test]

@@ -9,7 +9,7 @@
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
-use comrade_tool::{Tool, ToolContext, ToolSpec};
+use comrade_tool::{PlanStatus, PlanTarget, Tool, ToolContext, ToolSpec};
 use serde_json::{Value, json};
 
 use crate::config::DelegateCfg;
@@ -18,16 +18,32 @@ use crate::llm::{ChatMessage, LlmClient, Role};
 /// Name of the tool advertised to the orchestrating model.
 pub const TOOL_NAME: &str = "delegate";
 
+/// A delegated plan step gets one attempt from the delegate; if the parent's
+/// verification then fails, the parent may re-delegate the same step with
+/// `feedback` so the delegate can fix its work — up to this many fix rounds.
+/// Rounds are recorded on the step's note (`working: <model> (fix N/5)`), and
+/// further fix requests are refused once the limit is reached so the parent
+/// takes the step over and does it itself.
+const MAX_FIX_ROUNDS: u64 = 5;
+
 /// System prompt for the delegated model. It must be self-sufficient and
-/// return only the deliverable, because its reply goes straight back to the
-/// orchestrator as a tool observation.
+/// return the deliverable, because its reply goes straight back to the
+/// orchestrator as a tool observation. The delegate is also the first line of
+/// verification: it must re-check its own deliverable and report the result,
+/// even though it has no tools to run real checks (the parent does that).
 const SUBAGENT_SYSTEM: &str = "\
 You are a focused sub-agent of Comrade, a software engineering agent. The \
 orchestrating agent delegated ONE self-contained task to you. You have no \
 tools and no repository access: work only from the context and task below. \
 Complete the task to the best of your ability and reply with ONLY the final \
 deliverable (the code, patch, text, or answer) — no preamble, no meta-commentary, \
-no questions.";
+no questions.
+
+Before replying, verify your own deliverable as far as you can: re-read it \
+against the task's verification (when one is given), trace the logic and hunt \
+for mistakes — the parent agent will run its own verification and cannot take \
+your word for it. Close your reply with a single line starting with \
+`VERIFICATION:` that states what you checked and whether the deliverable passes.";
 
 /// One configured delegate model plus the HTTP client that talks to it.
 struct Target {
@@ -98,6 +114,15 @@ snippet, a focused explanation. Put every path, identifier and code snippet the 
 delegate needs inside `task`; use `context` for background material it should \
 consider. The delegate's reply is returned to you verbatim to verify and apply.
 
+The plan shows who is working: delegating a step marks it in_progress with a \
+`working: <model>` note, and fix rounds show up as `(fix N/5)`. Both you and \
+the delegate verify. The delegate is asked to self-check and close with a \
+`VERIFICATION:` line, but it has no tools, so that line is never proof. After \
+the delegate replies, run the step's verification yourself with your tools \
+(e.g. run_tests); if it fails, re-delegate the SAME step with `feedback` set \
+to the failure output so the delegate fixes it — up to 5 fix rounds per step. \
+After 5 the tool refuses further fix requests and you must do the step yourself.
+
 Configured delegates:
 {name_list}"
         );
@@ -122,6 +147,10 @@ Configured delegates:
                 "context": {
                     "type": "string",
                     "description": "Optional background material the delegate should consider (existing code, error logs, constraints). Mutually exclusive with `step`."
+                },
+                "feedback": {
+                    "type": "string",
+                    "description": "Verification failure output from the parent for a delegate that previously attempted `step`: the delegate must fix its deliverable until it passes. Counts as one fix round (max 5 per step, tracked on the step's note). Only valid with `step`."
                 }
             },
             "oneOf": [
@@ -156,6 +185,22 @@ impl Tool for DelegateTool {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let feedback = args
+            .get("feedback")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !feedback.is_empty() && step_id.is_none() {
+            bail!(
+                "`feedback` is only valid with `step`: it reports a failed verification to a \
+                 delegate that previously attempted that plan step"
+            );
+        }
+
+        // When a plan step is delegated, remember its previous status so the
+        // plan can be restored if the delegate call itself fails.
+        let mut delegated_step: Option<(u64, PlanStatus)> = None;
 
         // Resolve what to run: either an explicit ad-hoc task, or one plan step
         // (whose goal/verification/context/model all come from the plan).
@@ -197,6 +242,37 @@ impl Tool for DelegateTool {
                 } else {
                     format!("{goal}\n\nVerify your work: {verify}")
                 };
+
+                // Reflect the delegation in the plan so the UI shows which
+                // delegate is working, and count the fix rounds. A step gets one
+                // attempt from the delegate, then up to MAX_FIX_ROUNDS repairs
+                // requested via `feedback`; past that the parent must take over.
+                let fixes = fix_rounds_in_note(found.note.as_deref(), &found.model);
+                if fixes >= MAX_FIX_ROUNDS {
+                    bail!(
+                        "plan step {id} already had {MAX_FIX_ROUNDS} failed fix round(s) with \
+                         delegate {:?}; stop delegating and do the step yourself",
+                        found.model
+                    );
+                }
+                let note = if feedback.is_empty() {
+                    if fixes == 0 {
+                        format!("working: {}", found.model)
+                    } else {
+                        // a bare re-run keeps the fix count intact
+                        format!("working: {} (fix {fixes}/{MAX_FIX_ROUNDS})", found.model)
+                    }
+                } else {
+                    format!(
+                        "working: {} (fix {}/{MAX_FIX_ROUNDS})",
+                        found.model,
+                        fixes + 1
+                    )
+                };
+                delegated_step = Some((id, found.status));
+                ctx.session
+                    .update_plan(PlanTarget::Id(id), PlanStatus::InProgress, Some(note));
+
                 (task, found.context, found.model)
             }
             None => {
@@ -227,10 +303,26 @@ impl Tool for DelegateTool {
             bail!("unknown delegate model {model:?}. Configured: {known}");
         };
 
-        let user_prompt = if context.trim().is_empty() {
-            format!("Task:\n{task}")
+        let user_prompt = if feedback.is_empty() {
+            if context.trim().is_empty() {
+                format!("Task:\n{task}")
+            } else {
+                format!("Context:\n{context}\n\nTask:\n{task}")
+            }
         } else {
-            format!("Context:\n{context}\n\nTask:\n{task}")
+            // A fix round: the parent ran the verification, it failed, and the
+            // delegate must repair its earlier deliverable.
+            let header = if context.trim().is_empty() {
+                format!("Task:\n{task}")
+            } else {
+                format!("Context:\n{context}\n\nTask:\n{task}")
+            };
+            format!(
+                "{header}\n\nYour previous attempt did not pass the parent's verification of \
+                 this step. The parent ran the verification and observed:\n{feedback}\n\n\
+                 Fix the deliverable so it passes, and reply with the complete corrected version \
+                 followed by the VERIFICATION: line."
+            )
         };
         let messages = vec![
             ChatMessage::new(Role::System, SUBAGENT_SYSTEM),
@@ -248,10 +340,45 @@ impl Tool for DelegateTool {
             .client
             .chat(&messages)
             .await
-            .with_context(|| format!("delegate {model} ({display}) failed"))?;
+            .with_context(|| format!("delegate {model} ({display}) failed"));
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(err) => {
+                // The delegate never ran: pull the step back from "working" so
+                // the plan does not claim a delegate is on the job.
+                if let Some((id, previous)) = delegated_step {
+                    ctx.session.update_plan(
+                        PlanTarget::Id(id),
+                        previous,
+                        Some(format!("delegate {model} failed to run")),
+                    );
+                }
+                return Err(err);
+            }
+        };
 
         Ok(format!("delegate {model} ({display}) replied:\n{reply}"))
     }
+}
+
+/// How many failed fix rounds a plan step has already been through, read from
+/// the note this tool writes while a delegate is working (`working: <model>`
+/// for the first attempt, `working: <model> (fix N/5)` for each repair).
+fn fix_rounds_in_note(note: Option<&str>, model: &str) -> u64 {
+    let Some(note) = note else {
+        return 0;
+    };
+    let Some(rest) = note.strip_prefix(&format!("working: {model}")) else {
+        return 0;
+    };
+    let Some(start) = rest.find("(fix ") else {
+        return 0;
+    };
+    rest[start + "(fix ".len()..]
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -577,5 +704,141 @@ mod tests {
         // Unknown step id.
         let err = tool.invoke(&ctx, json!({"step": 99})).await.unwrap_err();
         assert!(err.to_string().contains("no plan step with id 99"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn plan_step_delegation_marks_step_in_progress_with_working_note() {
+        let (base, _spy) = request_spy();
+        let cfg = Config {
+            delegates: vec![delegate("cheap", &base)],
+            ..Config::default()
+        };
+        let tool = DelegateTool::new(&cfg.delegates).unwrap().unwrap();
+        let ctx = test_ctx();
+        ctx.session.set_plan(vec![PlanStepDraft {
+            goal: "Write double()".into(),
+            verification: "cargo test double passes".into(),
+            model: "cheap".into(),
+            context: "".into(),
+        }]);
+
+        tool.invoke(&ctx, json!({"step": 1})).await.unwrap();
+        let step = &ctx.session.plan()[0];
+        assert_eq!(step.status, PlanStatus::InProgress);
+        let note = step.note.as_deref().unwrap_or_default();
+        assert!(note.contains("working: cheap"), "{note}");
+        assert!(!note.contains("fix"), "{note}");
+    }
+
+    fn cheap_tool(base_url: &str) -> DelegateTool {
+        let cfg = Config {
+            delegates: vec![delegate("cheap", base_url)],
+            ..Config::default()
+        };
+        DelegateTool::new(&cfg.delegates).unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn fix_feedback_is_forwarded_and_rounds_are_counted_on_the_step() {
+        let ctx = test_ctx();
+        ctx.session.set_plan(vec![PlanStepDraft {
+            goal: "Write double()".into(),
+            verification: "cargo test double passes".into(),
+            model: "cheap".into(),
+            context: "".into(),
+        }]);
+        let note = || ctx.session.plan()[0].note.clone();
+
+        // first attempt: no feedback, note carries no round yet
+        let (base1, spy1) = request_spy();
+        let tool = cheap_tool(&base1);
+        tool.invoke(&ctx, json!({"step": 1})).await.unwrap();
+        let body1 = spy1
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            !body1.contains("did not pass the parent's verification"),
+            "{body1}"
+        );
+        assert_eq!(note().as_deref(), Some("working: cheap"));
+
+        // fix round 1: feedback reaches the delegate and the note counts it
+        let (base2, spy2) = request_spy();
+        let tool = cheap_tool(&base2);
+        tool.invoke(
+            &ctx,
+            json!({"step": 1, "feedback": "cargo test fails: double(0) returned 1"}),
+        )
+        .await
+        .unwrap();
+        let body2 = spy2
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            body2.contains("did not pass the parent's verification"),
+            "{body2}"
+        );
+        assert!(body2.contains("double(0) returned 1"), "{body2}");
+        assert_eq!(note().as_deref(), Some("working: cheap (fix 1/5)"));
+
+        // fix round 2 keeps counting
+        let (base3, _spy3) = request_spy();
+        let tool = cheap_tool(&base3);
+        tool.invoke(&ctx, json!({"step": 1, "feedback": "still failing"}))
+            .await
+            .unwrap();
+        assert_eq!(note().as_deref(), Some("working: cheap (fix 2/5)"));
+    }
+
+    #[tokio::test]
+    async fn delegate_is_refused_after_five_fix_rounds() {
+        let ctx = test_ctx();
+        ctx.session.set_plan(vec![PlanStepDraft {
+            goal: "Write double()".into(),
+            verification: "".into(),
+            model: "cheap".into(),
+            context: "".into(),
+        }]);
+        // simulate five failed fix rounds already recorded on the step
+        ctx.session.update_plan(
+            PlanTarget::Id(1),
+            PlanStatus::InProgress,
+            Some("working: cheap (fix 5/5)".into()),
+        );
+
+        let (base, _spy) = request_spy();
+        let tool = cheap_tool(&base);
+        let err = tool
+            .invoke(&ctx, json!({"step": 1, "feedback": "still red"}))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("5 failed fix round(s)"), "{msg}");
+        assert!(msg.contains("do the step yourself"), "{msg}");
+
+        // a bare re-run is refused too once the limit is reached
+        let (base2, _spy2) = request_spy();
+        let tool = cheap_tool(&base2);
+        let err = tool.invoke(&ctx, json!({"step": 1})).await.unwrap_err();
+        assert!(err.to_string().contains("do the step yourself"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn feedback_without_a_step_is_rejected() {
+        let (base, _spy) = request_spy();
+        let tool = cheap_tool(&base);
+        let ctx = test_ctx();
+        let err = tool
+            .invoke(
+                &ctx,
+                json!({"model": "cheap", "task": "write double()", "feedback": "nope"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`feedback` is only valid with `step`"),
+            "{err}"
+        );
     }
 }
