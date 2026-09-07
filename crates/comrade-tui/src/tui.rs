@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use comrade_core::{AgentEvent, AgentSession, ChatMessage, MemoryUndo, Role, run_agent};
 use comrade_tool::{PlanStatus, SessionControl, ToolContext, UserIo, UserPrompt, UserReply};
 use crossterm::event::{
-    self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use ratatui::Frame;
@@ -137,6 +137,26 @@ struct RenderRow {
     tool_header: Option<usize>,
 }
 
+/// Active incremental search over the chat history (Ctrl-F).
+struct Search {
+    /// Raw query as typed by the user (matched case-insensitively).
+    query: String,
+    /// Chat-message indices that contain the query, ascending.
+    matches: Vec<usize>,
+    /// Position of the current match inside `matches`.
+    cur: usize,
+}
+
+impl Search {
+    fn new() -> Self {
+        Search {
+            query: String::new(),
+            matches: Vec::new(),
+            cur: 0,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UI state
 // ---------------------------------------------------------------------------
@@ -167,6 +187,8 @@ struct App {
     /// Raw current model output (not yet committed to a message).
     stream: String,
     input: String,
+    /// Active Ctrl-F search over chat history (None when closed).
+    search: Option<Search>,
     dialogs: Vec<Dialog>,
     /// True while the open dialog buffers a follow-up question to the model.
     dialog_ask: bool,
@@ -261,6 +283,58 @@ impl App {
         if let Some(&(start, _)) = self.msg_ranges.get(idx) {
             self.scroll_top = start;
         }
+    }
+
+    // --- Ctrl-F search over chat history ----------------------------------
+
+    /// Recompute match indices from the current query, then jump to the first.
+    fn refresh_search(&mut self) {
+        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
+            return;
+        };
+        let ql = query.to_lowercase();
+        let matches: Vec<usize> = self
+            .chat
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| msg_matches(m, &ql))
+            .map(|(i, _)| i)
+            .collect();
+        if let Some(s) = &mut self.search {
+            s.matches = matches;
+            s.cur = 0;
+        }
+        self.goto_search_match();
+    }
+
+    /// Scroll the current search match into view; expand collapsed cards so the
+    /// matched content is actually visible.
+    fn goto_search_match(&mut self) {
+        let Some(idx) = self
+            .search
+            .as_ref()
+            .and_then(|s| s.matches.get(s.cur).copied())
+        else {
+            return;
+        };
+        self.select_block(idx);
+        if let Some(m) = self.chat.get_mut(idx) {
+            if let Some(card) = &mut m.tool {
+                card.open = true;
+            } else if let Some(fail) = &mut m.fail {
+                fail.open = true;
+            }
+        }
+    }
+
+    /// Move the search cursor by `dir` (+1 = next, -1 = previous) and jump.
+    fn step_search(&mut self, dir: isize) {
+        let Some(cur) = search_step(self.search.as_ref().map(|s| (s.cur, s.matches.len())), dir)
+        else {
+            return;
+        };
+        self.search.as_mut().unwrap().cur = cur;
+        self.goto_search_match();
     }
 
     fn start_run(&mut self, prompt: String) {
@@ -531,6 +605,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         chat: Vec::new(),
         stream: String::new(),
         input: String::new(),
+        search: None,
         dialogs: Vec::new(),
         dialog_ask: false,
         dialog_ask_tx: None,
@@ -622,8 +697,16 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 return true;
             }
+            if app.search.is_some() {
+                return handle_search_key(app, key);
+            }
             if !app.dialogs.is_empty() {
                 return handle_dialog_key(app, key.code);
+            }
+            // Ctrl-F opens the chat-history search.
+            if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.search = Some(Search::new());
+                return false;
             }
             // Emacs-style chat navigation. Plain Ctrl+p/n move block to block;
             // Ctrl+Shift and Alt variants (P/N) jump between user messages.
@@ -692,6 +775,37 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
         }
         _ => false,
     }
+}
+
+/// Keys while the Ctrl-F search bar is active. Returns true when the app should quit.
+fn handle_search_key(app: &mut App, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        // Close the search bar (Esc or Ctrl-F).
+        KeyCode::Esc => app.search = None,
+        KeyCode::Char('f') if ctrl => app.search = None,
+        // Cycle through matches: enter/↓ next, shift-enter/↑ previous.
+        KeyCode::Enter | KeyCode::Down | KeyCode::PageDown if !shift => app.step_search(1),
+        KeyCode::Enter | KeyCode::Up | KeyCode::PageUp if shift => app.step_search(-1),
+        KeyCode::Up | KeyCode::PageUp => app.step_search(-1),
+        // Edit the query: incremental, jumps to the first match live.
+        KeyCode::Char(c) if !ctrl && !alt => {
+            if let Some(s) = &mut app.search {
+                s.query.push(c);
+            }
+            app.refresh_search();
+        }
+        KeyCode::Backspace if !ctrl => {
+            if let Some(s) = &mut app.search {
+                s.query.pop();
+            }
+            app.refresh_search();
+        }
+        _ => {}
+    }
+    false
 }
 
 fn handle_dialog_key(app: &mut App, code: KeyCode) -> bool {
@@ -831,6 +945,43 @@ fn step_user(users: &[usize], sel: Option<usize>, dir: isize) -> Option<usize> {
     }
 }
 
+/// Step the search cursor by `dir` wrapping inside `(cur, len)`. Returns None
+/// when there are no matches.
+fn search_step(state: Option<(usize, usize)>, dir: isize) -> Option<usize> {
+    let (cur, len) = state?;
+    if len == 0 {
+        return None;
+    }
+    Some((cur as isize + dir).rem_euclid(len as isize) as usize)
+}
+
+/// Lowercased, searchable text of a message (chat body + tool/failure cards).
+fn msg_searchable(msg: &Msg) -> String {
+    let mut s = msg.text.clone();
+    if let Some(t) = &msg.tool {
+        s.push_str(&format!(
+            "\n{}\n{}\n{}\n{}\n{}",
+            t.name,
+            t.args,
+            t.justification.as_deref().unwrap_or(""),
+            t.risk.as_deref().unwrap_or(""),
+            t.result.as_deref().unwrap_or(""),
+        ));
+    }
+    if let Some(f) = &msg.fail {
+        s.push_str(&format!("\n{}\n{}", f.name, f.detail));
+    }
+    s
+}
+
+/// Whether a message matches the (case-insensitive) query.
+fn msg_matches(msg: &Msg, query: &str) -> bool {
+    !query.is_empty()
+        && msg_searchable(msg)
+            .to_lowercase()
+            .contains(&query.to_lowercase())
+}
+
 // ---------------------------------------------------------------------------
 // run_tests output parsing
 // ---------------------------------------------------------------------------
@@ -966,7 +1117,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
         ),
         Span::raw("  "),
         Span::styled(
-            "enter:run  esc:cancel  ctrl-c:quit  ctrl-p/n:block  alt-p/n:user  tab:toggle",
+            "enter:run  esc:cancel  ctrl-c:quit  ctrl-f:search  ctrl-p/n:block  alt-p/n:user  tab:toggle",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -985,14 +1136,50 @@ fn draw(app: &mut App, frame: &mut Frame) {
     draw_stats(app, frame, right[0]);
     draw_plan(app, frame, right[1]);
 
-    let input_hint = if app.running { " (running...)" } else { "" };
-    let input_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Green)),
-        Span::raw(app.input.clone()),
-        Span::styled("_", Style::default().fg(Color::Green)),
-        Span::styled(input_hint, Style::default().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(input_line), rows[2]);
+    if let Some(s) = &app.search {
+        // Search bar replaces the prompt line while Ctrl-F is active.
+        let total = s.matches.len();
+        let counter = if s.query.is_empty() {
+            "type to search".to_string()
+        } else if total == 0 {
+            "no match".to_string()
+        } else {
+            format!("{}/{}", s.cur + 1, total)
+        };
+        let search_line = Line::from(vec![
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(s.query.clone()),
+            Span::styled("_", Style::default().fg(Color::Yellow)),
+            Span::raw("  "),
+            Span::styled(
+                counter,
+                Style::default().fg(if total == 0 {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                }),
+            ),
+            Span::styled(
+                "  enter/↓:next  shift-enter/↑:prev  esc:close",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(search_line), rows[2]);
+    } else {
+        let input_hint = if app.running { " (running...)" } else { "" };
+        let input_line = Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Green)),
+            Span::raw(app.input.clone()),
+            Span::styled("_", Style::default().fg(Color::Green)),
+            Span::styled(input_hint, Style::default().fg(Color::DarkGray)),
+        ]);
+        frame.render_widget(Paragraph::new(input_line), rows[2]);
+    }
 
     if let Some(d) = app.dialogs.first() {
         draw_dialog(app, d, frame);
@@ -1021,10 +1208,17 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     app.scroll_top = offset;
 
     let sel_start = app.sel.and_then(|i| app.msg_ranges.get(i)).map(|&(s, _)| s);
+    // Row span of the currently selected search match, if any.
+    let search_hl = app
+        .search
+        .as_ref()
+        .and_then(|s| s.matches.get(s.cur))
+        .and_then(|&idx| app.msg_ranges.get(idx).copied());
     let lines: Vec<Line> = rows
         .iter()
         .enumerate()
         .map(|(row, r)| {
+            let in_match = search_hl.is_some_and(|(start, len)| row >= start && row < start + len);
             let prefix = if Some(row) == sel_start {
                 Line::from(vec![Span::styled(
                     "> ",
@@ -1043,7 +1237,12 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
             };
             let mut line = prefix;
             for s in &r.spans {
-                line.push_span(s.clone());
+                let span = if in_match {
+                    s.clone().patch_style(Style::default().bg(Color::Yellow))
+                } else {
+                    s.clone()
+                };
+                line.push_span(span);
             }
             line
         })
@@ -2366,5 +2565,48 @@ mod diff_tests {
         let spans = cell_spans(Some("ok"), Some(Color::Green), 10);
         let total: usize = spans.iter().map(|s| s.width()).sum();
         assert_eq!(total, 10);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn search_step_wraps_around() {
+        assert_eq!(search_step(Some((0, 3)), 1), Some(1));
+        assert_eq!(search_step(Some((2, 3)), 1), Some(0));
+        assert_eq!(search_step(Some((0, 3)), -1), Some(2));
+        assert_eq!(search_step(Some((1, 3)), -1), Some(0));
+        assert_eq!(search_step(Some((0, 0)), 1), None);
+        assert_eq!(search_step(None, 1), None);
+    }
+
+    #[test]
+    fn search_matches_plain_text_case_insensitively() {
+        let msg = Msg::text(MsgKind::Assistant, "Hello World");
+        assert!(msg_matches(&msg, "hello"));
+        assert!(msg_matches(&msg, "WORLD"));
+        assert!(!msg_matches(&msg, "nope"));
+    }
+
+    #[test]
+    fn search_covers_tool_and_failure_cards() {
+        let card = Msg::tool(ToolCard {
+            name: "run_task".into(),
+            args: r#"{"task":"test"}"#.into(),
+            justification: Some("verify the suite".into()),
+            risk: Some("none".into()),
+            result: Some("3 passed".into()),
+            ok: true,
+            open: true,
+        });
+        assert!(msg_matches(&card, "run_task"));
+        assert!(msg_matches(&card, "verify"));
+        assert!(msg_matches(&card, "passed"));
+
+        let fail = Msg::failure("flaky_test".into(), "assert left == right".into());
+        assert!(msg_matches(&fail, "flaky"));
+        assert!(msg_matches(&fail, "left == right"));
     }
 }
