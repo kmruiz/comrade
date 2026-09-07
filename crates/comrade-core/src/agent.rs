@@ -51,24 +51,34 @@ pub async fn run_agent(
     );
     ctxm.push(ChatMessage::new(Role::User, user_input));
 
+    let result = run_agent_loop(cfg, client, tools, ctx, ctxm, tx.clone(), &stop).await;
+
+    // Guarantee the UI always sees an error (if any) and a terminal event, on
+    // every exit path.
+    if let Err(e) = &result {
+        let _ = tx.send(AgentEvent::Error(format!("{e:#}"))).await;
+    }
+    let _ = tx.send(AgentEvent::RunEnd).await;
+    result
+}
+
+async fn run_agent_loop(
+    cfg: &Config,
+    client: &LlmClient,
+    tools: &ToolRegistry,
+    ctx: ToolContext,
+    mut ctxm: ContextManager,
+    tx: mpsc::Sender<AgentEvent>,
+    stop: &CancellationToken,
+) -> Result<AgentOutcome> {
     let max_iterations = cfg.agent.max_iterations;
     let mut iterations = 0usize;
 
     loop {
         if stop.is_cancelled() {
-            let _ = tx
-                .send(AgentEvent::Error("interrupted by user".into()))
-                .await;
-            let _ = tx.send(AgentEvent::RunEnd).await;
             bail!("agent interrupted by user");
         }
         if iterations >= max_iterations {
-            let _ = tx
-                .send(AgentEvent::Error(format!(
-                    "reached max_iterations ({max_iterations}) without a final answer"
-                )))
-                .await;
-            let _ = tx.send(AgentEvent::RunEnd).await;
             bail!("reached max_iterations ({max_iterations}) without a final answer");
         }
         iterations += 1;
@@ -93,10 +103,7 @@ pub async fn run_agent(
                 move |piece: &str| { let _ = delta_tx.send(piece.to_string()); }
             }) => r.context("llm call failed"),
             _ = stop.cancelled() => {
-                drop(delta_tx);
-                let _ = tx.send(AgentEvent::Error("interrupted by user".into())).await;
-                let _ = tx.send(AgentEvent::RunEnd).await;
-                bail!("agent interrupted by user");
+                Err(anyhow::anyhow!("agent interrupted by user"))
             }
         };
         drop(delta_tx);
@@ -105,12 +112,7 @@ pub async fn run_agent(
         let _ = forwarder.await;
 
         let response = stream_result?;
-
         if response.trim().is_empty() {
-            let _ = tx
-                .send(AgentEvent::Error("model returned an empty response".into()))
-                .await;
-            let _ = tx.send(AgentEvent::RunEnd).await;
             bail!("model returned an empty response");
         }
 
@@ -125,7 +127,6 @@ pub async fn run_agent(
         let Some(tool_call) = turn.tool_call else {
             let answer = turn.final_text.clone();
             let _ = tx.send(AgentEvent::FinalAnswer(answer.clone())).await;
-            let _ = tx.send(AgentEvent::RunEnd).await;
             return Ok(AgentOutcome {
                 final_answer: answer,
                 iterations,

@@ -282,6 +282,9 @@ pub async fn run(deps: &Deps) -> Result<()> {
         }
     });
 
+    // First frame immediately, so the UI is visible before any input.
+    let _ = terminal.draw(|f| draw(&app, f));
+
     let res = loop {
         tokio::select! {
             ev = kev_rx.recv() => {
@@ -413,6 +416,7 @@ fn draw(app: &App, frame: &mut Frame) {
             Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -455,7 +459,7 @@ fn draw(app: &App, frame: &mut Frame) {
         ),
     ]);
     frame.render_widget(Paragraph::new(header), rows[0]);
-    frame.render_widget(Paragraph::new(footer).alignment(Alignment::Right), rows[2]);
+    frame.render_widget(Paragraph::new(footer).alignment(Alignment::Right), rows[3]);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -463,6 +467,16 @@ fn draw(app: &App, frame: &mut Frame) {
         .split(rows[1]);
     draw_log(app, frame, cols[0]);
     draw_plan(app, frame, cols[1]);
+
+    // Prompt/input bar.
+    let input_hint = if app.running { " (running…)" } else { "" };
+    let input_line = Line::from(vec![
+        Span::styled("❯ ", Style::default().fg(Color::Green)),
+        Span::raw(app.input.clone()),
+        Span::styled("▎", Style::default().fg(Color::Green)),
+        Span::styled(input_hint, Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(input_line), rows[2]);
 
     if let Some(d) = app.dialogs.first() {
         draw_dialog(app, d, frame);
