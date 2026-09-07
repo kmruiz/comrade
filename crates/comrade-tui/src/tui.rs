@@ -49,11 +49,9 @@ impl UserIo for TuiUserIo {
 #[derive(Clone, Copy, PartialEq)]
 enum Tag {
     User,
-    Thought,
-    Tool,
+    Stream,
     Ok,
     Err,
-    Answer,
     Meta,
 }
 
@@ -85,12 +83,20 @@ struct App {
     stop: Option<CancellationToken>,
     running: bool,
     lines: Vec<LogLine>,
+    /// Partial model output that has not yet hit a newline.
+    stream_buf: String,
     input: String,
     dialogs: Vec<Dialog>,
 }
 
 impl App {
+    /// Push a non-stream log line, sealing any in-progress streamed tail first.
     fn push(&mut self, tag: Tag, text: impl Into<String>) {
+        self.seal_stream();
+        self.push_raw(tag, text);
+    }
+
+    fn push_raw(&mut self, tag: Tag, text: impl Into<String>) {
         let text = text.into();
         for l in text.lines() {
             self.lines.push(LogLine {
@@ -101,6 +107,34 @@ impl App {
         if self.lines.len() > 2000 {
             self.lines.drain(..self.lines.len() - 2000);
         }
+    }
+
+    /// Append streamed model output, splitting complete lines as they arrive.
+    fn push_stream(&mut self, delta: &str) {
+        self.stream_buf.push_str(delta);
+        loop {
+            let Some(nl) = self.stream_buf.find('\n') else {
+                break;
+            };
+            let line = self.stream_buf.drain(..=nl).collect::<String>();
+            let line = line.trim_end_matches('\n');
+            if !line.is_empty() {
+                self.push_raw(Tag::Stream, line);
+            }
+        }
+        // Guard against a pathological single token with no newline.
+        if self.stream_buf.chars().count() > 4000 {
+            let excess = self.stream_buf.chars().count() - 4000;
+            self.stream_buf = self.stream_buf.chars().skip(excess).collect();
+        }
+    }
+
+    fn seal_stream(&mut self) {
+        if self.stream_buf.is_empty() {
+            return;
+        }
+        let tail = std::mem::take(&mut self.stream_buf);
+        self.push_raw(Tag::Stream, tail);
     }
 
     fn start_run(&mut self, prompt: String) {
@@ -115,7 +149,6 @@ impl App {
         let stop = CancellationToken::new();
         self.stop = Some(stop.clone());
         self.running = true;
-        self.push(Tag::User, format!("🧑 {prompt}"));
         tokio::spawn(async move {
             let _ = run_agent(&cfg, &client, ctx, &tools, prompt, tx, stop).await;
         });
@@ -130,27 +163,27 @@ impl App {
 
     fn on_agent_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::RunStart => self.push(Tag::Meta, "— run started —"),
+            AgentEvent::RunStart => {}
             AgentEvent::RunEnd => {
                 self.running = false;
                 self.stop = None;
-                self.push(Tag::Meta, "— run finished —");
+                self.seal_stream();
+                self.push_raw(Tag::Meta, "— run finished —");
             }
             AgentEvent::User(u) => self.push(Tag::User, format!("🧑 {u}")),
-            AgentEvent::Thought(t) => self.push(Tag::Thought, format!("🧠 {t}")),
-            AgentEvent::AssistantText(t) => {
-                if !t.contains("Tool:") && !t.contains("Thought:") {
-                    self.push(Tag::Thought, t);
-                }
-            }
-            AgentEvent::ToolStart { name, args } => {
-                self.push(Tag::Tool, format!("🔧 {name} {args}"));
-            }
+            AgentEvent::Delta(d) => self.push_stream(&d),
+            // The streamed output already shows the model's ReAct prose, tool
+            // invocations, and final answer verbatim, so those echoes are
+            // skipped to avoid duplication. Tool *results* are still shown
+            // because they come from the harness, not the model.
+            AgentEvent::Thought(_)
+            | AgentEvent::AssistantText(_)
+            | AgentEvent::ToolStart { .. } => {}
             AgentEvent::ToolResult { name, output, ok } => {
                 let tag = if ok { Tag::Ok } else { Tag::Err };
                 self.push(tag, format!("   └ {name}: {output}"));
             }
-            AgentEvent::FinalAnswer(a) => self.push(Tag::Answer, format!("✅ {a}")),
+            AgentEvent::FinalAnswer(_) => {}
             AgentEvent::Error(e) => self.push(Tag::Err, format!("❌ {e}")),
             AgentEvent::TitleChanged | AgentEvent::StatusChanged | AgentEvent::PlanChanged => {}
             AgentEvent::PlanFinished(s) => match s {
@@ -227,6 +260,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         stop: None,
         running: false,
         lines: Vec::new(),
+        stream_buf: String::new(),
         input: String::new(),
         dialogs: Vec::new(),
     };
@@ -354,13 +388,9 @@ fn status_style(tag: Tag) -> Style {
         Tag::User => Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
-        Tag::Thought => Style::default().fg(Color::White),
-        Tag::Tool => Style::default().fg(Color::Magenta),
+        Tag::Stream => Style::default().fg(Color::White),
         Tag::Ok => Style::default().fg(Color::Green),
         Tag::Err => Style::default().fg(Color::Red),
-        Tag::Answer => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
         Tag::Meta => Style::default().fg(Color::DarkGray),
     }
 }

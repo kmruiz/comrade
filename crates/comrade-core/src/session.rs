@@ -20,6 +20,8 @@ pub enum AgentEvent {
     User(String),
     /// A raw assistant message arrived (may contain Thought/Tool text).
     AssistantText(String),
+    /// A chunk of the assistant message as it is being streamed.
+    Delta(String),
     /// An isolated "Thought:" line from an assistant message.
     Thought(String),
     /// A tool call began.
