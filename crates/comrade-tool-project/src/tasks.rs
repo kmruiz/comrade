@@ -84,7 +84,6 @@ pub fn resolve(
 
     let manifest = manifest_path_arg(subproject);
 
-    let describe;
     let line = if let Some(alias) = find_alias(&model.aliases, task) {
         let expansion = alias.expansion.trim();
         if let Some(shell) = expansion.strip_prefix('!') {
@@ -93,27 +92,24 @@ pub fn resolve(
                 script.push(' ');
                 script.push_str(&extra.join(" "));
             }
-            describe = format!("bash -c {script:?}");
             CommandLine::Shell { script }
         } else {
-            let mut argv = vec!["cargo".to_string()];
-            argv.extend(expansion.split_whitespace().map(str::to_string));
+            let mut args = expansion
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
             if let Some(m) = &manifest {
-                argv.push(m.clone());
+                args.push(m.clone());
             }
-            argv.extend(extra.iter().cloned());
-            describe = argv.join(" ");
-            CommandLine::Cargo { args: argv }
+            args.extend(extra.iter().cloned());
+            CommandLine::Cargo { args }
         }
-    } else if let Some(mut argv) = verb_args(task) {
+    } else if let Some(mut args) = verb_args(task) {
         if let Some(m) = &manifest {
-            argv.push(m.clone());
+            args.push(m.clone());
         }
-        argv.extend(extra.iter().cloned());
-        let mut full = vec!["cargo".to_string()];
-        full.extend(argv.iter().cloned());
-        describe = full.join(" ");
-        CommandLine::Cargo { args: full }
+        args.extend(extra.iter().cloned());
+        CommandLine::Cargo { args }
     } else {
         let available = model
             .aliases
@@ -127,6 +123,11 @@ pub fn resolve(
         );
     };
 
+    let describe = match &line {
+        CommandLine::Cargo { args } => cargo_describe(args),
+        CommandLine::Shell { script } => format!("bash -c {script:?}"),
+    };
+
     Ok(Resolved {
         cwd,
         line,
@@ -134,30 +135,69 @@ pub fn resolve(
     })
 }
 
+/// `cargo <args>` for display; `args` must NOT include the leading `cargo`.
+fn cargo_describe(args: &[String]) -> String {
+    let mut parts = vec!["cargo".to_string()];
+    parts.extend(args.iter().cloned());
+    parts.join(" ")
+}
+
 /// Run a resolved task to completion, returning the status + (capped) output.
 /// Tasks that exceed `timeout_secs` are killed.
 pub async fn run(resolved: &Resolved, timeout_secs: u64) -> Result<String> {
     use std::process::Stdio;
 
-    let mut command = match &resolved.line {
-        CommandLine::Cargo { args } => {
-            let mut c = tokio::process::Command::new("cargo");
-            c.args(args);
-            c
-        }
-        CommandLine::Shell { script } => {
-            let mut c = tokio::process::Command::new("bash");
-            c.arg("-c").arg(script);
-            c
-        }
+    let configure = |program: &str, resolved: &Resolved| {
+        let mut command = match &resolved.line {
+            CommandLine::Cargo { args } => {
+                let mut c = tokio::process::Command::new(program);
+                c.args(args);
+                c
+            }
+            CommandLine::Shell { script } => {
+                let mut c = tokio::process::Command::new(program);
+                c.arg("-c").arg(script);
+                c
+            }
+        };
+        command
+            .current_dir(&resolved.cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command
     };
-    command
-        .current_dir(&resolved.cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
 
-    let child = command.spawn().context("failed to spawn task")?;
+    let mut command = match &resolved.line {
+        CommandLine::Cargo { .. } => configure("cargo", resolved),
+        CommandLine::Shell { .. } => configure("bash", resolved),
+    };
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // `cargo` may not be on the PATH inherited by this process even
+            // though it is on the login shell's PATH. Locate it and retry.
+            if let CommandLine::Cargo { .. } = resolved.line {
+                if let Some(path) = find_cargo().await {
+                    let mut retry = configure(path.to_string_lossy().as_ref(), resolved);
+                    match retry.spawn() {
+                        Ok(child) => child,
+                        Err(e) => return Err(anyhow::anyhow!("failed to spawn {path:?}: {e}")),
+                    }
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "cargo was not found on PATH ({e}). PATH={}",
+                        std::env::var("PATH").unwrap_or_default()
+                    ));
+                }
+            } else {
+                return Err(anyhow::anyhow!("failed to spawn bash: {e}"));
+            }
+        }
+        Err(e) => return Err(anyhow::anyhow!("failed to spawn task: {e}")),
+    };
+
     let started = std::time::Instant::now();
     let output = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
         .await
@@ -194,6 +234,33 @@ pub async fn run(resolved: &Resolved, timeout_secs: u64) -> Result<String> {
         result.push('\n');
     }
     Ok(result)
+}
+
+/// Try to locate `cargo` when it is missing from this process's PATH: first via
+/// a login shell (`bash -lc 'command -v cargo'`), then the rustup default.
+async fn find_cargo() -> Option<PathBuf> {
+    if let Ok(out) = tokio::process::Command::new("bash")
+        .args(["-lc", "command -v cargo"])
+        .output()
+        .await
+    {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() {
+                let p = PathBuf::from(path);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let p = PathBuf::from(home).join(".cargo/bin/cargo");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -238,7 +305,7 @@ mod tests {
         let none = None;
         let r = resolve(&root, "test", &none, &[]).unwrap();
         match &r.line {
-            CommandLine::Cargo { args } => assert_eq!(args, &["cargo", "test"]),
+            CommandLine::Cargo { args } => assert_eq!(args, &["test"]),
             _ => panic!("expected cargo"),
         }
 
@@ -246,7 +313,7 @@ mod tests {
         let r = resolve(&root, "t", &none, &extra).unwrap();
         match &r.line {
             CommandLine::Cargo { args } => {
-                assert_eq!(args, &["cargo", "test", "--", "--nocapture"])
+                assert_eq!(args, &["test", "--", "--nocapture"])
             }
             _ => panic!("expected cargo alias"),
         }
@@ -254,10 +321,9 @@ mod tests {
         let sub = Some("crates/a".to_string());
         let r = resolve(&root, "check", &sub, &[]).unwrap();
         match &r.line {
-            CommandLine::Cargo { args } => assert_eq!(
-                args,
-                &["cargo", "check", "--manifest-path=crates/a/Cargo.toml"]
-            ),
+            CommandLine::Cargo { args } => {
+                assert_eq!(args, &["check", "--manifest-path=crates/a/Cargo.toml"])
+            }
             _ => panic!("expected cargo with manifest path"),
         }
 
@@ -281,6 +347,35 @@ mod tests {
         .unwrap();
         let m = pom::load(&root).unwrap();
         assert!(pom::render(&m).contains("Project: x"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cargo_check_executes_without_duplicate_arg() {
+        let root = scratch();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let none = None;
+        let resolved = resolve(&root, "check", &none, &[]).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt
+            .block_on(run(&resolved, 120))
+            .expect("cargo check should run");
+        // If the leading "cargo" was duplicated, cargo would say this:
+        assert!(
+            !out.contains("'cargo' is not a cargo command"),
+            "duplicate cargo program arg: {out}"
+        );
+        assert!(out.contains("exit 0"), "cargo check failed: {out}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
