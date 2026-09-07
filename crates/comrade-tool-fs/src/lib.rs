@@ -18,6 +18,7 @@ const MAX_OUTPUT_CHARS: usize = 6000;
 pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(ListDir),
+        Box::new(ListFiles),
         Box::new(ReadFile),
         Box::new(ApplyEdit),
         Box::new(WriteFile),
@@ -337,5 +338,167 @@ impl Tool for WriteFile {
         } else {
             Ok(format!("{rel} is unchanged; nothing written."))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// list_files
+// ---------------------------------------------------------------------------
+
+struct ListFiles;
+
+static LIST_FILES_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+    ToolSpec {
+    name: "list_files".into(),
+    description: "List project files matching a glob pattern (project-root relative), one per line. Prefer this over walking with list_dir. `*` matches within a path segment, `**` matches across directories. Examples: \"**/*.rs\", \"src/**/*.rs\", \"Cargo.toml\", \"*.md\".".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "pattern": { "type": "string", "description": "Glob pattern matched against paths relative to the project root." }
+        },
+        "required": ["pattern"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for ListFiles {
+    fn spec(&self) -> &ToolSpec {
+        &LIST_FILES_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            pattern: String,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let pattern = args.pattern.trim().trim_start_matches("./");
+        if pattern.is_empty() || pattern.contains('\\') || pattern.contains("..") {
+            anyhow::bail!("invalid glob pattern {:?}", args.pattern);
+        }
+
+        let mut files = Vec::new();
+        walk(&ctx.project_root, &mut files);
+        files.sort();
+
+        let mut matches = Vec::new();
+        for file in files {
+            let rel = file
+                .strip_prefix(&ctx.project_root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            if glob_matches(pattern, &rel) {
+                matches.push(rel);
+            }
+        }
+
+        let total = matches.len();
+        const MAX_LINES: usize = 400;
+        let mut out = format!("{total} file(s) matching {pattern:?}:\n");
+        for rel in matches.iter().take(MAX_LINES) {
+            out.push_str(&format!("{rel}\n"));
+        }
+        if total > MAX_LINES {
+            out.push_str(&format!("... and {} more\n", total - MAX_LINES));
+        }
+        Ok(clamp(out))
+    }
+}
+
+/// Directories never walked by file listings.
+const IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    "vendor",
+    ".idea",
+    ".vscode",
+    "dist",
+];
+
+fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if IGNORED_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            walk(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// Minimal glob: `*` matches any chars within a segment, `?` one char, `**`
+/// matches across directory separators (and a leading `**/` also matches zero
+/// directories). Nothing else is special-cased.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    glob_at(pattern.as_bytes(), 0, text.as_bytes(), 0)
+}
+
+fn glob_at(p: &[u8], pi: usize, t: &[u8], ti: usize) -> bool {
+    if pi == p.len() {
+        return ti == t.len();
+    }
+    match p[pi] {
+        b'*' => {
+            // Collapse consecutive '*'s; more than one means `**`.
+            let mut j = pi;
+            while j < p.len() && p[j] == b'*' {
+                j += 1;
+            }
+            let is_double = j - pi >= 2;
+            // A `**/` run may match zero directories (skip the slash too).
+            if is_double && j < p.len() && p[j] == b'/' && glob_at(p, j + 1, t, ti) {
+                return true;
+            }
+            // `*` must not cross a '/'; `**` may. Try each suffix position.
+            for k in ti..=t.len() {
+                if is_double || no_sep(&t[ti..k]) {
+                    if glob_at(p, j, t, k) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        b'?' => ti < t.len() && t[ti] != b'/' && glob_at(p, pi + 1, t, ti + 1),
+        c => ti < t.len() && t[ti] == c && glob_at(p, pi + 1, t, ti + 1),
+    }
+}
+
+fn no_sep(slice: &[u8]) -> bool {
+    !slice.contains(&b'/')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_rules() {
+        // exact
+        assert!(glob_matches("Cargo.toml", "Cargo.toml"));
+        assert!(!glob_matches("Cargo.toml", "cargo.toml"));
+        // * within segment only
+        assert!(glob_matches("*.rs", "main.rs"));
+        assert!(!glob_matches("*.rs", "src/main.rs"));
+        // ** across segments
+        assert!(glob_matches("**/*.rs", "src/main.rs"));
+        assert!(glob_matches("**/*.rs", "main.rs"));
+        assert!(glob_matches("**/*.rs", "a/b/c/lib.rs"));
+        assert!(!glob_matches("**/*.rs", "a/b/lib.txt"));
+        // ** zero-dir prefix handled
+        assert!(glob_matches("src/**/*.rs", "src/main.rs"));
+        assert!(glob_matches("src/**/*.rs", "src/a/b.rs"));
+        assert!(!glob_matches("src/**/*.rs", "lib.rs"));
     }
 }
