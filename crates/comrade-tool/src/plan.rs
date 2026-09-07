@@ -51,6 +51,14 @@ pub struct PlanStepDraft {
     /// outcome). Optional but strongly encouraged for isolatable steps.
     #[serde(default)]
     pub verification: String,
+    /// Which model will execute this step. Empty means the main (planner)
+    /// model itself; otherwise a configured delegate name. Shown in the UI.
+    #[serde(default)]
+    pub model: String,
+    /// Summarised context the executing model needs for this step. Fed to the
+    /// delegate verbatim; intentionally never rendered in the UI.
+    #[serde(default)]
+    pub context: String,
 }
 
 /// One row of the session plan the agent presents in the UI.
@@ -62,6 +70,10 @@ pub struct PlanStep {
     pub goal: String,
     /// How to verify the step succeeded (may be empty).
     pub verification: String,
+    /// Which model will execute this step (empty = the main model).
+    pub model: String,
+    /// Summarised context for the executing model (never shown in the UI).
+    pub context: String,
     pub status: PlanStatus,
     pub note: Option<String>,
 }
@@ -71,6 +83,8 @@ impl PlanStep {
         PlanStepDraft {
             goal: goal.to_string(),
             verification: verification.to_string(),
+            model: String::new(),
+            context: String::new(),
         }
     }
 }

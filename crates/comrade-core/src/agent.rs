@@ -1106,6 +1106,8 @@ mod tests {
             vec![comrade_tool::PlanStepDraft {
                 goal: "do it".into(),
                 verification: "verifies".into(),
+                model: "".into(),
+                context: "".into(),
             }],
         );
         let root = std::env::temp_dir().join(format!("comrade-agent-test-{}", std::process::id()));
@@ -1213,6 +1215,8 @@ mod tests {
             vec![comrade_tool::PlanStepDraft {
                 goal: "do it".into(),
                 verification: "verifies".into(),
+                model: "".into(),
+                context: "".into(),
             }],
         );
         let root = std::env::temp_dir().join(format!("comrade-gated-test-{}", std::process::id()));
@@ -1281,6 +1285,8 @@ mod tests {
             vec![comrade_tool::PlanStepDraft {
                 goal: "do it".into(),
                 verification: "verifies".into(),
+                model: "".into(),
+                context: "".into(),
             }],
         );
         let root = std::env::temp_dir().join(format!("comrade-notes-test-{}", std::process::id()));
@@ -1376,6 +1382,8 @@ mod tests {
             vec![comrade_tool::PlanStepDraft {
                 goal: "do it".into(),
                 verification: "verifies".into(),
+                model: "".into(),
+                context: "".into(),
             }],
         );
         let root = std::env::temp_dir().join(format!("comrade-native-test-{}", std::process::id()));
@@ -1438,6 +1446,8 @@ mod tests {
             vec![comrade_tool::PlanStepDraft {
                 goal: "do it".into(),
                 verification: "verifies".into(),
+                model: "".into(),
+                context: "".into(),
             }],
         );
         let root =
@@ -1577,6 +1587,8 @@ mod loop_tests {
             vec![comrade_tool::PlanStepDraft {
                 goal: "do it".into(),
                 verification: "verifies".into(),
+                model: "".into(),
+                context: "".into(),
             }],
         );
         let root =

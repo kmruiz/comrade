@@ -88,6 +88,10 @@ or better done by a specialist model — never use it for work that needs furthe
 tool calls or repository state, because the delegated model has NO tools and NO \
 repository access: it answers purely from the prompt you send.
 
+To execute one of your plan steps, pass `step` (the plan step id): the task and \
+context then come from that step and `model` must match the step's model. \
+Otherwise delegate ad-hoc work with `model` + `task` (+ optional `context`).
+
 Delegate ONLY well-bounded jobs: writing one self-contained function or file \
 with tests, a regex, a data transform, a translation, a rewrite of a code \
 snippet, a focused explanation. Put every path, identifier and code snippet the \
@@ -101,21 +105,29 @@ Configured delegates:
         let schema = json!({
             "type": "object",
             "properties": {
+                "step": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Plan step id to execute. The task comes from the step's goal (+verification) and the context from the step's summarised context; the step's own model is used."
+                },
                 "model": {
                     "type": "string",
                     "enum": names,
-                    "description": "Which configured delegate model should do the work"
+                    "description": "Which configured delegate model should do the work (must match the step's model when `step` is given)"
                 },
                 "task": {
                     "type": "string",
-                    "description": "The exact, self-contained job for the delegate, with all needed details (paths, code, identifiers, expected output)"
+                    "description": "The exact, self-contained job for the delegate, with all needed details (paths, code, identifiers, expected output). Mutually exclusive with `step`."
                 },
                 "context": {
                     "type": "string",
-                    "description": "Optional background material the delegate should consider (existing code, error logs, constraints)"
+                    "description": "Optional background material the delegate should consider (existing code, error logs, constraints). Mutually exclusive with `step`."
                 }
             },
-            "required": ["model", "task"],
+            "oneOf": [
+                { "required": ["step"] },
+                { "required": ["model", "task"] }
+            ],
             "additionalProperties": false
         });
 
@@ -136,11 +148,75 @@ impl Tool for DelegateTool {
         &self.spec
     }
 
-    async fn invoke(&self, _ctx: &ToolContext, args: Value) -> Result<String> {
-        let model = args
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        let step_id = args.get("step").and_then(Value::as_u64);
+        let model_arg = args
             .get("model")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        // Resolve what to run: either an explicit ad-hoc task, or one plan step
+        // (whose goal/verification/context/model all come from the plan).
+        let (task, context, model) = match step_id {
+            Some(id) => {
+                for (key, label) in [("task", "task"), ("context", "context")] {
+                    let present = args
+                        .get(key)
+                        .map(|v| v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(true))
+                        .unwrap_or(false);
+                    if present {
+                        bail!(
+                            "cannot pass `{label}` together with `step`: the {label} comes from the plan step"
+                        );
+                    }
+                }
+                let found = ctx
+                    .session
+                    .plan()
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("no plan step with id {id}"))?;
+                if !model_arg.is_empty() && model_arg != found.model {
+                    bail!(
+                        "`model` {model_arg:?} does not match the model assigned to plan step {id} \
+                         ({:?})",
+                        found.model
+                    );
+                }
+                if found.model.trim().is_empty() {
+                    bail!(
+                        "plan step {id} has no delegate model assigned; it runs on the main model"
+                    );
+                }
+                let goal = found.goal.trim();
+                let verify = found.verification.trim();
+                let task = if verify.is_empty() {
+                    goal.to_string()
+                } else {
+                    format!("{goal}\n\nVerify your work: {verify}")
+                };
+                (task, found.context, found.model)
+            }
+            None => {
+                let task = args
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if task.trim().is_empty() {
+                    bail!("`task` must not be empty (or pass `step` to delegate a plan step)");
+                }
+                let context = args
+                    .get("context")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                (task, context, model_arg)
+            }
+        };
+
         let Some(target) = self.targets.iter().find(|t| t.cfg.name == model) else {
             let known = self
                 .targets
@@ -151,18 +227,10 @@ impl Tool for DelegateTool {
             bail!("unknown delegate model {model:?}. Configured: {known}");
         };
 
-        let task = args.get("task").and_then(Value::as_str).unwrap_or_default();
-        if task.trim().is_empty() {
-            bail!("`task` must not be empty");
-        }
-
-        let user_prompt = match args
-            .get("context")
-            .and_then(Value::as_str)
-            .filter(|c| !c.trim().is_empty())
-        {
-            Some(context) => format!("Context:\n{context}\n\nTask:\n{task}"),
-            None => format!("Task:\n{task}"),
+        let user_prompt = if context.trim().is_empty() {
+            format!("Task:\n{task}")
+        } else {
+            format!("Context:\n{context}\n\nTask:\n{task}")
         };
         let messages = vec![
             ChatMessage::new(Role::System, SUBAGENT_SYSTEM),
@@ -194,6 +262,7 @@ mod tests {
 
     use comrade_tool::ToolContext;
     use comrade_tool::tool::{UserIo, UserPrompt, UserReply};
+    use comrade_tool::{PlanStepDraft, SessionControl};
 
     use super::*;
     use crate::MemoryUndo;
@@ -256,6 +325,57 @@ mod tests {
         format!("http://127.0.0.1:{port}/v1")
     }
 
+    /// Like [`fake_chat_server`], but also ships the raw request body to a
+    /// channel so tests can assert what the delegate was actually asked.
+    fn request_spy() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut data = Vec::new();
+            let mut tmp = [0u8; 2048];
+            let mut body_len: Option<usize> = None;
+            let mut header_end: Option<usize> = None;
+            // Read until the whole body (per Content-Length) is buffered.
+            while body_len.map_or(true, |len| header_end.unwrap_or(0) + 4 + len > data.len()) {
+                let n = stream.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&tmp[..n]);
+                if header_end.is_none() {
+                    if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(p);
+                        let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
+                        body_len = head.lines().find_map(|l| {
+                            l.trim()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        });
+                    }
+                }
+            }
+            let body = match (header_end, body_len) {
+                (Some(he), Some(len)) => {
+                    let start = he + 4;
+                    let end = (start + len).min(data.len());
+                    String::from_utf8_lossy(&data[start..end]).into_owned()
+                }
+                _ => String::new(),
+            };
+            let _ = tx.send(body);
+            let resp_body = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+        });
+        (format!("http://127.0.0.1:{port}/v1"), rx)
+    }
+
     fn delegate(name: &str, base_url: &str) -> DelegateCfg {
         DelegateCfg {
             name: name.into(),
@@ -315,13 +435,18 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(models, vec!["groq-fast", "mistral"]);
         assert!(schema["properties"]["task"].is_object());
-        let required = schema["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(required, vec!["model", "task"]);
+        assert!(schema["properties"]["step"].is_object());
+        // `step` alone, or `model` + `task` (oneOf), are the two call shapes.
+        let one_of = schema["oneOf"].as_array().unwrap();
+        let requires = |needle: &str| {
+            one_of.iter().any(|o| {
+                o["required"]
+                    .as_array()
+                    .map_or(false, |r| r.iter().any(|v| v.as_str() == Some(needle)))
+            })
+        };
+        assert!(requires("step"));
+        assert!(requires("model") && requires("task"));
     }
 
     #[tokio::test]
@@ -371,5 +496,86 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("task"));
+    }
+
+    #[tokio::test]
+    async fn plan_step_delegation_sends_goal_verification_and_context() {
+        let (base, spy) = request_spy();
+        let cfg = Config {
+            delegates: vec![delegate("cheap", &base)],
+            ..Config::default()
+        };
+        let tool = DelegateTool::new(&cfg.delegates).unwrap().unwrap();
+        let ctx = test_ctx();
+        ctx.session.set_plan(vec![PlanStepDraft {
+            goal: "Write a double() function.".into(),
+            verification: "cargo test double passes".into(),
+            model: "cheap".into(),
+            context: "Pure Rust, no dependencies.".into(),
+        }]);
+
+        let out = tool.invoke(&ctx, json!({"step": 1})).await.unwrap();
+        assert!(out.contains("delegate cheap"), "{out}");
+
+        let body = spy.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(body.contains("Write a double() function."), "{body}");
+        assert!(
+            body.contains("Verify your work: cargo test double passes"),
+            "{body}"
+        );
+        assert!(body.contains("Pure Rust, no dependencies."), "{body}");
+    }
+
+    #[tokio::test]
+    async fn plan_step_delegation_validates_args() {
+        let (base, _spy) = request_spy();
+        let cfg = Config {
+            delegates: vec![
+                delegate("cheap", &base),
+                delegate("other", "http://127.0.0.1:1/v1"),
+            ],
+            ..Config::default()
+        };
+        let tool = DelegateTool::new(&cfg.delegates).unwrap().unwrap();
+        let ctx = test_ctx();
+        ctx.session.set_plan(vec![
+            PlanStepDraft {
+                goal: "run on cheap".into(),
+                verification: "".into(),
+                model: "cheap".into(),
+                context: "".into(),
+            },
+            PlanStepDraft {
+                goal: "run on main".into(),
+                verification: "".into(),
+                model: "".into(),
+                context: "".into(),
+            },
+        ]);
+
+        // `model` must match the step's assigned model.
+        let err = tool
+            .invoke(&ctx, json!({"step": 1, "model": "other"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+
+        // A step without an assigned delegate cannot be delegated.
+        let err = tool.invoke(&ctx, json!({"step": 2})).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no delegate model assigned"),
+            "{err}"
+        );
+
+        // `step` is exclusive with an explicit `task`.
+        let err = tool
+            .invoke(&ctx, json!({"step": 1, "task": "nope"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot pass `task`"), "{err}");
+
+        // Unknown step id.
+        let err = tool.invoke(&ctx, json!({"step": 99})).await.unwrap_err();
+        assert!(err.to_string().contains("no plan step with id 99"), "{err}");
     }
 }

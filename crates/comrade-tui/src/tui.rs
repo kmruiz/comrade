@@ -1969,6 +1969,9 @@ fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Word-wrap every step to the panel width so long goals never overflow the
+    // right edge of the plan panel.
+    let width = usize::from(inner.width).max(16);
     let steps = app.session.plan();
     let mut lines: Vec<Line> = Vec::new();
     if steps.is_empty() {
@@ -1989,37 +1992,65 @@ fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
         } else {
             Color::White
         };
-        let mut spans = vec![
-            Span::styled(
+        let mut toks = vec![
+            tok(
                 format!("{} ", plan_prefix(&step.status)),
                 Style::default().fg(color),
             ),
-            Span::styled(
+            tok(
                 format!("{}. ", step.id),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(step.goal.clone(), Style::default().fg(text_color)),
+            tok(flat(&step.goal), Style::default().fg(text_color)),
         ];
-        if let Some(note) = &step.note {
-            spans.push(Span::styled(
-                format!("  - {note}"),
-                Style::default().fg(color),
+        // Which model runs this step, when one is assigned (context is never
+        // rendered in the UI).
+        if !step.model.is_empty() {
+            toks.push(tok(
+                format!("  [{}]", step.model),
+                Style::default().fg(Color::Cyan),
             ));
         }
-        lines.push(Line::from(spans));
+        for line in wrap_toks(&toks, width) {
+            push_tok_line(&mut lines, &line);
+        }
+        if let Some(note) = &step.note {
+            let note_toks = vec![
+                tok("  - ", Style::default().fg(color)),
+                tok(flat(note), Style::default().fg(color)),
+            ];
+            for line in wrap_toks(&note_toks, width) {
+                push_tok_line(&mut lines, &line);
+            }
+        }
         // verification: how this step is proven (keeps steps isolated)
         let verify = step.verification.trim();
         if !verify.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("      ", Style::default()),
-                Span::styled(
-                    format!("verify: {verify}"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
+            let verify_toks = vec![tok(
+                format!("verify: {}", flat(&verify)),
+                Style::default().fg(Color::DarkGray),
+            )];
+            for line in wrap_toks(&verify_toks, width) {
+                push_tok_line(&mut lines, &line);
+            }
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Collapse runs of whitespace (incl. newlines) into single spaces so a plan
+/// line wraps cleanly inside the panel.
+fn flat(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Convert one wrapped token line into a ratatui `Line`.
+fn push_tok_line(lines: &mut Vec<Line>, line: &[Tok]) {
+    let spans: Vec<Span> = line
+        .iter()
+        .map(|t| Span::styled(t.text.clone(), t.style))
+        .collect();
+    lines.push(Line::from(spans));
 }
 
 fn plan_prefix(s: &PlanStatus) -> &'static str {

@@ -73,7 +73,7 @@ struct SetPlan;
 static SET_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "set_plan".into(),
-    description: "Lay out the plan before doing work. Each step is an isolated unit with a goal and a verification (how to prove it succeeded), so steps can later be run independently. Replaces any existing plan; advance steps with update_plan.".into(),
+    description: "Lay out the plan before doing work. Each step is an isolated unit with a goal, a verification (how to prove it succeeded) and optionally the model that will run it plus the summarised context that model needs, so steps can later be run independently or delegated. Replaces any existing plan; advance steps with update_plan.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -83,7 +83,9 @@ static SET_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
                     "type": "object",
                     "properties": {
                         "goal": { "type": "string", "description": "What this step aims to accomplish." },
-                        "verification": { "type": "string", "description": "How to verify the step succeeded, e.g. \"cargo test passes\" or \"rgrep finds the new call sites\"." }
+                        "verification": { "type": "string", "description": "How to verify the step succeeded, e.g. \"cargo test passes\" or \"rgrep finds the new call sites\"." },
+                        "model": { "type": "string", "description": "Which delegate model runs this step (optional; empty means you run it yourself). Shown in the UI." },
+                        "context": { "type": "string", "description": "Summarised context the executing model needs for this step (optional; never shown in the UI)." }
                     },
                     "required": ["goal"],
                     "additionalProperties": false
@@ -110,6 +112,10 @@ impl Tool for SetPlan {
             goal: String,
             #[serde(default)]
             verification: String,
+            #[serde(default)]
+            model: String,
+            #[serde(default)]
+            context: String,
         }
         #[derive(Deserialize)]
         struct Args {
@@ -130,6 +136,8 @@ impl Tool for SetPlan {
             .map(|s| comrade_tool::PlanStepDraft {
                 goal: s.goal,
                 verification: s.verification,
+                model: s.model.trim().to_string(),
+                context: s.context,
             })
             .collect();
         ctx.session.set_plan(drafts.clone());

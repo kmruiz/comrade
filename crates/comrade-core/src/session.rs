@@ -118,6 +118,8 @@ impl SessionControl for AgentSession {
                     id: *next,
                     goal: draft.goal,
                     verification: draft.verification,
+                    model: draft.model,
+                    context: draft.context,
                     status: PlanStatus::Pending,
                     note: None,
                 });
@@ -187,6 +189,8 @@ mod tests {
         PlanStepDraft {
             goal: goal.to_string(),
             verification: verification.to_string(),
+            model: String::new(),
+            context: String::new(),
         }
     }
 
@@ -209,6 +213,16 @@ mod tests {
 
         assert!(s.update_plan(PlanTarget::Id(2), PlanStatus::InProgress, None));
         assert_eq!(s.plan()[1].status, PlanStatus::InProgress);
+
+        // model + context round-trip from draft into the live plan
+        s.set_plan(vec![PlanStepDraft {
+            goal: "delegate me".into(),
+            verification: "".into(),
+            model: "groq".into(),
+            context: "summarised parent context".into(),
+        }]);
+        assert_eq!(s.plan()[0].model, "groq");
+        assert_eq!(s.plan()[0].context, "summarised parent context");
 
         // resetting the plan restarts ids at 1
         s.set_plan(vec![draft("only", "")]);
