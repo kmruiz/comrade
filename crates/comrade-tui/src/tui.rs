@@ -27,7 +27,14 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::editor::{Editor, LayoutRow, cursor_col, cursor_row, wrap_rows};
 use crate::{Deps, new_session};
+
+/// Width of the `"> "` gutter on the prompt line (also used as the indent
+/// for continuation rows).
+const PROMPT_GUTTER: u16 = 2;
+/// Max rows the prompt editor may occupy before it scrolls internally.
+const PROMPT_MAX_ROWS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // UserIo bridging into the UI event loop
@@ -189,7 +196,7 @@ struct App {
     chat: Vec<Msg>,
     /// Raw current model output (not yet committed to a message).
     stream: String,
-    input: String,
+    input: Editor,
     /// Active Ctrl-F search over chat history (None when closed).
     search: Option<Search>,
     dialogs: Vec<Dialog>,
@@ -262,6 +269,11 @@ impl App {
             return;
         };
         let text = msg_searchable(msg).trim().to_string();
+        self.copy_text(&text);
+    }
+
+    /// Put `text` on the system clipboard, reporting failures in the chat.
+    fn copy_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
@@ -272,7 +284,7 @@ impl App {
                 return;
             }
         };
-        if let Err(e) = clip.set_text(text) {
+        if let Err(e) = clip.set_text(text.to_string()) {
             self.push_meta(format!("copy failed: {e}"));
         }
     }
@@ -549,7 +561,7 @@ impl App {
                 let action = one_line(title, 80);
                 self.push_msg(Msg::text(
                     MsgKind::Meta,
-                    format!("auto-accept on \u{2192} approved: {action}"),
+                    format!("auto-accept on → approved: {action}"),
                 ));
             }
         }
@@ -660,7 +672,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         auto_accept: false,
         chat: Vec::new(),
         stream: String::new(),
-        input: String::new(),
+        input: Editor::new(),
         search: None,
         dialogs: Vec::new(),
         dialog_ask: false,
@@ -739,7 +751,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
                                 if action.is_empty() {
                                     "auto-accept: approved".to_string()
                                 } else {
-                                    format!("auto-accept \u{2192} approved: {action}")
+                                    format!("auto-accept → approved: {action}")
                                 },
                             ));
                         } else {
@@ -793,9 +805,15 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 if ctrl && ch.eq_ignore_ascii_case(&'c') {
                     if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        // Ctrl+Shift+C copies the message under the cursor
-                        // to the system clipboard.
-                        app.copy_selected();
+                        // Ctrl+Shift+C copies the prompt's text selection when
+                        // one exists, otherwise the chat message under the
+                        // cursor, to the system clipboard.
+                        if let Some(sel) = app.input.selected_text() {
+                            let sel = sel.to_string();
+                            app.copy_text(&sel);
+                        } else {
+                            app.copy_selected();
+                        }
                         return false;
                     }
                     // Plain Ctrl+C quits.
@@ -850,6 +868,9 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                     }
                 }
             }
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             match key.code {
                 KeyCode::Esc => {
                     if app.running {
@@ -857,8 +878,13 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                     }
                 }
                 KeyCode::Enter => {
-                    let prompt = std::mem::take(&mut app.input);
-                    app.start_run(prompt);
+                    if shift {
+                        // Shift+Enter inserts a newline instead of submitting.
+                        app.input.insert('\n');
+                    } else if !app.running {
+                        let prompt = app.input.take_text();
+                        app.start_run(prompt);
+                    }
                 }
                 KeyCode::Tab => {
                     // Toggle the selected block (the one under the "> " marker).
@@ -866,10 +892,27 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                         app.toggle_tool(idx);
                     }
                 }
-                KeyCode::Char(c) => app.input.push(c),
+                KeyCode::Char(c) if !ctrl && !alt => app.input.insert(c),
                 KeyCode::Backspace => {
-                    app.input.pop();
+                    if alt {
+                        app.input.backspace_word();
+                    } else {
+                        app.input.backspace();
+                    }
                 }
+                KeyCode::Delete => {
+                    if alt {
+                        app.input.delete_word();
+                    } else {
+                        app.input.delete();
+                    }
+                }
+                KeyCode::Left if alt => app.input.move_word_left(shift),
+                KeyCode::Left => app.input.move_left(shift),
+                KeyCode::Right if alt => app.input.move_word_right(shift),
+                KeyCode::Right => app.input.move_right(shift),
+                KeyCode::Home => app.input.move_home(shift),
+                KeyCode::End => app.input.move_end(shift),
                 _ => {}
             }
             false
@@ -1162,12 +1205,21 @@ fn after<'a>(line: &'a str, needle: &str) -> Option<&'a str> {
 fn draw(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
+    // Pre-wrap the prompt text so the row reserved for it can grow with the
+    // content (search mode replaces the prompt with a fixed single row).
+    let (prompt_rows, prompt_win, prompt_cur) = prompt_view(app, area.width);
+    let prompt_h = if app.search.is_some() {
+        1
+    } else {
+        prompt_rows.len().clamp(1, PROMPT_MAX_ROWS)
+    };
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(prompt_h as u16),
             Constraint::Length(1),
         ])
         .split(area);
@@ -1175,30 +1227,22 @@ fn draw(app: &mut App, frame: &mut Frame) {
     let run_state = if app.running { "RUNNING" } else { "IDLE" };
     let undo_count = app.undo.entry_count();
 
-    let mut header_spans: Vec<Span<'static>> = vec![Span::styled(
-        format!(" comrade | {} ", app.session.title()),
-        Style::default()
-            .bg(Color::Blue)
-            .add_modifier(Modifier::BOLD),
-    )];
-    if app.auto_accept {
-        header_spans.push(Span::styled(
-            " AUTO-ACCEPT ",
+    let header = Line::from(vec![
+        Span::styled(
+            format!(" comrade | {} ", app.session.title()),
             Style::default()
-                .bg(Color::Yellow)
-                .fg(Color::Black)
+                .bg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
-        ));
-    }
-    header_spans.push(Span::raw(" "));
-    header_spans.push(Span::styled(
-        app.root.to_string_lossy().into_owned(),
-        Style::default().fg(Color::DarkGray),
-    ));
-    header_spans.push(Span::raw("  "));
-    header_spans.push(Span::styled("undo:", Style::default().fg(Color::DarkGray)));
-    header_spans.push(Span::raw(format!("{undo_count}")));
-    let header = Line::from(header_spans);
+        ),
+        Span::raw(" "),
+        Span::styled(
+            app.root.to_string_lossy().into_owned(),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw("  "),
+        Span::styled("undo:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{undo_count}")),
+    ]);
     let (status_msg, status_color) = {
         let agent = app.session.status();
         if !agent.trim().is_empty() {
@@ -1232,7 +1276,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
         ),
         Span::raw("  "),
         Span::styled(
-            "enter:run  esc:cancel  ctrl-c:quit  ctrl-f:search  ctrl-space:auto-accept  ctrl-p/n:block  alt-p/n:user  tab:toggle",
+            "enter:run shift-enter:newline alt-backspace:word esc:cancel ctrl-c:quit ctrl-f:search ctrl-p/n:block alt-p/n:user tab:toggle",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -1286,19 +1330,109 @@ fn draw(app: &mut App, frame: &mut Frame) {
         ]);
         frame.render_widget(Paragraph::new(search_line), rows[2]);
     } else {
-        let input_hint = if app.running { " (running...)" } else { "" };
-        let input_line = Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Green)),
-            Span::raw(app.input.clone()),
-            Span::styled("_", Style::default().fg(Color::Green)),
-            Span::styled(input_hint, Style::default().fg(Color::DarkGray)),
-        ]);
-        frame.render_widget(Paragraph::new(input_line), rows[2]);
+        draw_prompt(app, frame, rows[2], &prompt_rows, prompt_win, prompt_cur);
     }
 
     if let Some(d) = app.dialogs.first() {
         draw_dialog(app, d, frame);
     }
+}
+
+// ---------------------------------------------------------------------------
+// prompt editor rendering
+// ---------------------------------------------------------------------------
+
+/// Wrap the prompt text into visual rows and choose which window of rows to
+/// show. Returns `(rows, top visible row, row of the cursor)`. The window is
+/// sized `PROMPT_MAX_ROWS` and kept so the cursor row is always visible.
+fn prompt_view(app: &App, width: u16) -> (Vec<LayoutRow>, usize, usize) {
+    let text_w = (width.saturating_sub(PROMPT_GUTTER)).max(1) as usize;
+    let rows = wrap_rows(app.input.text(), text_w);
+    let cur_row = cursor_row(&rows, app.input.cursor());
+    let win = if rows.len() > PROMPT_MAX_ROWS {
+        let max_win = rows.len() - PROMPT_MAX_ROWS;
+        cur_row
+            .saturating_add(1)
+            .saturating_sub(PROMPT_MAX_ROWS)
+            .min(max_win)
+    } else {
+        0
+    };
+    (rows, win, cur_row)
+}
+
+/// Draw the multi-line prompt bar (rows already pre-wrapped by `prompt_view`)
+/// and place the terminal cursor over the text.
+fn draw_prompt(
+    app: &mut App,
+    frame: &mut Frame,
+    area: Rect,
+    rows: &[LayoutRow],
+    win: usize,
+    cur_row: usize,
+) {
+    let sel = app.input.selection();
+    let text = app.input.text().to_string();
+    let mut lines = Vec::with_capacity(rows.len().min(PROMPT_MAX_ROWS));
+    for (i, r) in rows.iter().enumerate().skip(win).take(PROMPT_MAX_ROWS) {
+        let prefix = if i == 0 {
+            Span::styled("> ", Style::default().fg(Color::Green))
+        } else {
+            Span::styled("  ", Style::default().fg(Color::DarkGray))
+        };
+        let mut spans = vec![prefix];
+        spans.extend(selection_spans(&text, *r, sel));
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+
+    // A real (block) cursor replaces the old trailing "_" glyph. Keep it
+    // hidden while a search bar or dialog owns the keyboard.
+    if app.search.is_none() && app.dialogs.is_empty() {
+        let row = rows[cur_row];
+        let col = cursor_col(&text, row, app.input.cursor()) as u16;
+        let x = area
+            .x
+            .saturating_add(PROMPT_GUTTER)
+            .saturating_add(col)
+            .min(area.x.saturating_add(area.width.saturating_sub(1)));
+        let y = area.y.saturating_add((cur_row - win) as u16);
+        frame.set_cursor_position((x, y));
+    }
+}
+
+/// Split one visual row into spans, shading bytes covered by the selection.
+fn selection_spans(text: &str, row: LayoutRow, sel: Option<(usize, usize)>) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut seg_start = row.start;
+    let mut seg_sel = sel.is_some_and(|(a, b)| row.start >= a && row.start < b);
+    let mut i = row.start;
+    while i < row.end {
+        let ch = text[i..].chars().next().unwrap();
+        let next = i + ch.len_utf8();
+        let here = sel.is_some_and(|(a, b)| i >= a && i < b);
+        if here != seg_sel {
+            push_seg(&mut spans, text, seg_start, i, seg_sel);
+            seg_start = i;
+            seg_sel = here;
+        }
+        i = next;
+    }
+    push_seg(&mut spans, text, seg_start, row.end, seg_sel);
+    spans
+}
+
+fn push_seg(spans: &mut Vec<Span<'static>>, text: &str, a: usize, b: usize, selected: bool) {
+    if a == b {
+        return;
+    }
+    let s = String::from(&text[a..b]);
+    let span = if selected {
+        Span::styled(s, Style::default().fg(Color::Black).bg(Color::Gray))
+    } else {
+        Span::raw(s)
+    };
+    spans.push(span);
 }
 
 fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
