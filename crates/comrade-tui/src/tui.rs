@@ -1083,20 +1083,38 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             });
         }
     }
-    if let Some(diff) = colored_diff(&card.name, &card.args) {
+    if let Some((old, new)) = extract_diff_sides(&card.name, &card.args) {
         out.push(RenderRow {
             rule: None,
             spans: vec![Span::styled("diff:", Style::default().fg(Color::DarkGray))],
             tool_header: None,
         });
-        for (color, text) in diff {
-            for cut in hard_cut(&text, width.saturating_sub(2)) {
-                out.push(RenderRow {
-                    rule: None,
-                    spans: vec![Span::styled(format!("  {cut}"), Style::default().fg(color))],
-                    tool_header: None,
-                });
-            }
+        const MAX_DIFF_ROWS: usize = 200;
+        let pairs = lcs_pairs(&old, &new);
+        let shown = pairs.len().min(MAX_DIFF_ROWS);
+        for pair in pairs.iter().take(shown) {
+            let spans = build_diff_row(
+                pair.0.as_deref(),
+                pair.1.as_deref(),
+                width,
+                Some(Color::Red),
+                Some(Color::Green),
+            );
+            out.push(RenderRow {
+                rule: None,
+                spans,
+                tool_header: None,
+            });
+        }
+        if pairs.len() > MAX_DIFF_ROWS {
+            out.push(RenderRow {
+                rule: None,
+                spans: vec![Span::styled(
+                    format!("... {} more diff rows", pairs.len() - MAX_DIFF_ROWS),
+                    Style::default().fg(Color::DarkGray),
+                )],
+                tool_header: None,
+            });
         }
     } else {
         out.push(RenderRow {
@@ -1797,41 +1815,232 @@ note: run with `RUST_BACKTRACE=1` for a backtrace
     }
 }
 
-/// Build a colored line diff for edit tools from their JSON args:
-/// - apply_patch: args.diff (a unified diff) - color +/=green, -/=red.
-/// - apply_edit: args.old/args.new - old lines red, new lines green.
-fn colored_diff(name: &str, args_json: &str) -> Option<Vec<(Color, String)>> {
+// ---------------------------------------------------------------------------
+// side-by-side diff rendering for edit tools
+// ---------------------------------------------------------------------------
+
+/// Pull the changed line sequences out of an edit tool's JSON args:
+/// `(removed, added)`.
+fn extract_diff_sides(name: &str, args_json: &str) -> Option<(Vec<String>, Vec<String>)> {
     let value: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
     match name {
         "apply_patch" => {
             let diff = value.get("diff")?.as_str()?;
-            let mut rows = Vec::new();
             for line in diff.lines() {
-                let color = if line.starts_with('+') {
-                    Color::Green
+                if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+                    continue;
+                } else if line.starts_with('+') {
+                    added.push(line[1..].to_string());
                 } else if line.starts_with('-') {
-                    Color::Red
-                } else {
-                    Color::DarkGray
-                };
-                rows.push((color, line.to_string()));
+                    removed.push(line[1..].to_string());
+                }
             }
-            Some(rows)
         }
         "apply_edit" => {
             let old = value.get("old")?.as_str()?;
             let new = value.get("new")?.as_str()?;
-            let mut rows = Vec::new();
-            for line in old.lines() {
-                rows.push((Color::Red, format!("-{line}")));
-            }
-            for line in new.lines() {
-                rows.push((Color::Green, format!("+{line}")));
-            }
-            Some(rows)
+            removed.extend(old.lines().map(str::to_string));
+            added.extend(new.lines().map(str::to_string));
         }
-        _ => None,
+        _ => return None,
     }
+    Some((removed, added))
+}
+
+/// Longest-common-subsequence alignment of two line lists. Returns pairs where
+/// `Some` = a removed / added line, `None` = a gap on that side. Lines that are
+/// unchanged are dropped (compact diff).
+fn lcs_pairs(a: &[String], b: &[String]) -> Vec<(Option<String>, Option<String>)> {
+    let n = a.len();
+    let m = b.len();
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut pairs: Vec<(Option<String>, Option<String>)> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            pairs.push((Some(a[i].clone()), None));
+            i += 1;
+        } else {
+            pairs.push((None, Some(b[j].clone())));
+            j += 1;
+        }
+    }
+    while i < n {
+        pairs.push((Some(a[i].clone()), None));
+        i += 1;
+    }
+    while j < m {
+        pairs.push((None, Some(b[j].clone())));
+        j += 1;
+    }
+    // Merge an adjacent removed-then-added (or added-then-removed) pair into a
+    // single side-by-side row: one line replaced by another.
+    let mut merged: Vec<(Option<String>, Option<String>)> = Vec::with_capacity(pairs.len());
+    let mut k = 0usize;
+    while k < pairs.len() {
+        if k + 1 < pairs.len() {
+            let (a, b) = (&pairs[k], &pairs[k + 1]);
+            let removed_then_added =
+                a.0.is_some() && a.1.is_none() && b.0.is_none() && b.1.is_some();
+            let added_then_removed =
+                a.0.is_none() && a.1.is_some() && b.0.is_some() && b.1.is_none();
+            if removed_then_added || added_then_removed {
+                let left = a.0.clone().or_else(|| b.0.clone());
+                let right = a.1.clone().or_else(|| b.1.clone());
+                merged.push((left, right));
+                k += 2;
+                continue;
+            }
+        }
+        merged.push(pairs[k].clone());
+        k += 1;
+    }
+    merged
+}
+
+const CODE_KEYWORDS: &[&str] = &[
+    "fn", "let", "mut", "pub", "struct", "enum", "trait", "impl", "for", "while", "if", "else",
+    "match", "use", "mod", "crate", "self", "Self", "return", "async", "await", "const", "static",
+    "type", "where", "move", "ref", "loop", "break", "continue", "true", "false", "None", "Some",
+    "Ok", "Err", "unsafe", "dyn", "in", "as", "super", "fn",
+];
+
+/// Light lexical colorizer (strings, comments, numbers, keywords).
+fn lex_code(line: &str) -> Vec<(String, Color)> {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    let mut out: Vec<(String, Color)> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let c = chars[i];
+        if c.is_whitespace() {
+            let mut s = String::new();
+            while i < n && chars[i].is_whitespace() {
+                s.push(chars[i]);
+                i += 1;
+            }
+            out.push((s, Color::White));
+        } else if c == '/' && i + 1 < n && chars[i + 1] == '/' {
+            let mut s = String::new();
+            while i < n {
+                s.push(chars[i]);
+                i += 1;
+            }
+            out.push((s, Color::DarkGray));
+        } else if c == '"' || c == '\'' {
+            let quote = c;
+            let mut s = String::new();
+            s.push(chars[i]);
+            i += 1;
+            while i < n {
+                s.push(chars[i]);
+                if chars[i] == '\\' && i + 1 < n {
+                    s.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push((s, Color::Yellow));
+        } else if c.is_ascii_digit() {
+            let mut s = String::new();
+            while i < n && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.') {
+                s.push(chars[i]);
+                i += 1;
+            }
+            out.push((s, Color::Cyan));
+        } else if c.is_alphabetic() || c == '_' {
+            let mut s = String::new();
+            while i < n && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                s.push(chars[i]);
+                i += 1;
+            }
+            let color = if CODE_KEYWORDS.contains(&s.as_str()) {
+                Color::Magenta
+            } else {
+                Color::White
+            };
+            out.push((s, color));
+        } else {
+            let mut s = String::new();
+            while i < n && !chars[i].is_whitespace() && !chars[i].is_ascii_alphanumeric() {
+                s.push(chars[i]);
+                i += 1;
+            }
+            if s.is_empty() {
+                s.push(chars[i]);
+                i += 1;
+            }
+            out.push((s, Color::White));
+        }
+    }
+    out
+}
+
+/// Render one diff cell to `width` chars, optionally with a background.
+fn cell_spans(text: Option<&str>, bg: Option<Color>, width: usize) -> Vec<Span<'static>> {
+    let text = text.unwrap_or("");
+    let tokens = lex_code(text);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for (tok, color) in tokens {
+        let remaining = width.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        let shown: String = tok.chars().take(remaining).collect();
+        let count = shown.chars().count();
+        let style = match bg {
+            Some(bg) => Style::default().fg(color).bg(bg),
+            None => Style::default().fg(color),
+        };
+        spans.push(Span::styled(shown, style));
+        used += count;
+    }
+    let pad = width.saturating_sub(used);
+    if pad > 0 {
+        let style = match bg {
+            Some(bg) => Style::default().bg(bg),
+            None => Style::default(),
+        };
+        spans.push(Span::styled(" ".repeat(pad), style));
+    }
+    spans
+}
+
+/// One aligned side-by-side row: removed (left, red bg) / added (right, green).
+fn build_diff_row(
+    left: Option<&str>,
+    right: Option<&str>,
+    width: usize,
+    left_bg: Option<Color>,
+    right_bg: Option<Color>,
+) -> Vec<Span<'static>> {
+    let w = width.max(8);
+    let left_w = (w / 2).saturating_sub(1);
+    let right_w = w.saturating_sub(left_w + 1);
+    let mut spans = cell_spans(left, left_bg, left_w);
+    spans.push(Span::styled(" ", Style::default()));
+    spans.extend(cell_spans(right, right_bg, right_w));
+    spans
 }
 
 #[cfg(test)]
@@ -1839,35 +2048,42 @@ mod diff_tests {
     use super::*;
 
     #[test]
-    fn apply_patch_colors_unified_diff() {
-        let args =
-            r#"{"diff":"--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}\n"}"#;
-        let rows = colored_diff("apply_patch", args).unwrap();
-        assert!(
-            rows.iter()
-                .any(|(c, t)| *c == Color::Red && t.starts_with("-fn old"))
-        );
-        assert!(
-            rows.iter()
-                .any(|(c, t)| *c == Color::Green && t.starts_with("+fn new"))
-        );
+    fn apply_patch_extracts_sides() {
+        let diff = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}\n";
+        let args = serde_json::json!({ "diff": diff }).to_string();
+        let (old, new) = extract_diff_sides("apply_patch", &args).unwrap();
+        assert_eq!(old, vec!["fn old() {}"]);
+        assert_eq!(new, vec!["fn new() {}"]);
     }
 
     #[test]
-    fn apply_edit_builds_red_green_lines() {
-        let old = "fn one() {}\n";
-        let new = "fn one() {}\nfn two() {}\n";
+    fn apply_edit_uses_old_new() {
+        let old = "a\nb\n";
+        let new = "a\nc\n";
         let args = format!(
-            r#"{{"path":"a.rs","old":{},"new":{}}}"#,
+            r#"{{"old":{},"new":{}}}"#,
             serde_json::to_string(old).unwrap(),
             serde_json::to_string(new).unwrap()
         );
-        let rows = colored_diff("apply_edit", &args).unwrap();
-        assert_eq!(rows[0].0, Color::Red);
-        assert_eq!(rows[0].1, "-fn one() {}");
-        assert!(
-            rows.iter()
-                .any(|(c, t)| *c == Color::Green && t.contains("fn two"))
-        );
+        let (removed, added) = extract_diff_sides("apply_edit", &args).unwrap();
+        assert_eq!(removed, vec!["a", "b"]);
+        assert_eq!(added, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn lcs_aligns_changed_lines() {
+        let old: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let new: Vec<String> = vec!["a".into(), "x".into(), "c".into()];
+        let pairs = lcs_pairs(&old, &new);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0.as_deref(), Some("b"));
+        assert_eq!(pairs[0].1.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn cell_background_pads_to_width() {
+        let spans = cell_spans(Some("ok"), Some(Color::Green), 10);
+        let total: usize = spans.iter().map(|s| s.width()).sum();
+        assert_eq!(total, 10);
     }
 }

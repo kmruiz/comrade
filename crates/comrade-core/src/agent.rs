@@ -98,8 +98,11 @@ struct LoopTracker {
     /// How many mutating calls have executed; identical calls on either side of
     /// a mutation are not considered a loop.
     mutation_seq: u64,
-    /// Consecutive refusals per signature.
+    /// Refusals per signature. Reset whenever the model makes any progress.
     refusals: std::collections::HashMap<String, usize>,
+    /// When the model refuses to stop repeating, the run ends gracefully
+    /// (instead of erroring out) with this message.
+    stuck: Option<String>,
 }
 
 impl LoopTracker {
@@ -118,15 +121,44 @@ impl LoopTracker {
         Some(*count)
     }
 
-    /// Note a tool call that actually ran (mutation or read).
+    /// The model made progress (a real tool execution): clear the refusal
+    /// counter so a fresh mistake does not accumulate onto an old one.
     fn record(&mut self, name: &str, sig: String) {
         if is_mutating(name) {
             self.mutation_seq += 1;
+            // A state change means repeats were legitimate; start counting again.
+            self.refusals.clear();
+        } else if !self.refusals.is_empty() {
+            // Running a different tool is an attempt at progress: give the model
+            // the benefit of the doubt instead of carrying old refusals over.
+            if self.refusals.contains_key(&sig) {
+                self.refusals.remove(&sig);
+            } else {
+                self.refusals.clear();
+            }
         }
         self.recent.push_back((sig, self.mutation_seq));
         if self.recent.len() > LOOP_WINDOW {
-            self.recent.pop_front();
+            let dropped = self.recent.pop_front().map(|(s, _)| s);
+            if let Some(dropped) = dropped {
+                if !self.recent.iter().any(|(s, _)| *s == dropped) {
+                    self.refusals.remove(&dropped);
+                }
+            }
         }
+    }
+
+    /// Stop the run gracefully (not an error) because the model kept repeating.
+    fn mark_stuck(&mut self, sig: &str) {
+        if self.stuck.is_none() {
+            self.stuck = Some(format!(
+                "Stopped: repeated identical action `{sig}` without making progress"
+            ));
+        }
+    }
+
+    fn stuck_reason(&self) -> Option<String> {
+        self.stuck.clone()
     }
 }
 
@@ -210,6 +242,15 @@ async fn run_agent_loop(
             bail!("reached max_iterations ({max_iterations}) without a final answer");
         }
         iterations += 1;
+
+        // End gracefully (not as an error) when the model kept repeating.
+        if let Some(reason) = tracker.stuck_reason() {
+            let _ = tx.send(AgentEvent::FinalAnswer(reason.clone())).await;
+            return Ok(AgentOutcome {
+                final_answer: reason,
+                iterations,
+            });
+        }
 
         // Stale approval notes from a previous turn must not leak into a later
         // confirmation; the current turn sets them again below.
@@ -395,6 +436,7 @@ async fn run_agent_loop(
         let sig = format!("{} {args_pretty}", tool_call.name);
         if let Some(count) = tracker.check(&sig) {
             if count >= MAX_LOOP_REFUSALS {
+                tracker.mark_stuck(&sig);
                 let msg = format!(
                     "ERROR: detected a loop: `{sig}` repeated {}x without any state change",
                     count
@@ -406,10 +448,8 @@ async fn run_agent_loop(
                         ok: false,
                     })
                     .await;
-                bail!(
-                    "detected a loop: agent repeated `{}` {count}x without making progress",
-                    tool_call.name
-                );
+                // Let the top of the loop end the run gracefully.
+                continue;
             }
             let msg = loop_refusal(&tool_call.name);
             let _ = tx
@@ -528,7 +568,7 @@ async fn run_native_calls(
     ctxm.push(ChatMessage::assistant_with_calls(turn.content, calls));
 
     let total = prepared.len();
-    for p in prepared {
+    'calls: for p in prepared {
         let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
         let sig = format!("{} {args_pretty}", p.name);
         let _ = tx
@@ -572,6 +612,7 @@ async fn run_native_calls(
 
         if let Some(count) = tracker.check(&sig) {
             if count >= MAX_LOOP_REFUSALS {
+                tracker.mark_stuck(&sig);
                 let msg = format!(
                     "ERROR: detected a loop: `{sig}` repeated {count}x without any state change"
                 );
@@ -582,10 +623,8 @@ async fn run_native_calls(
                         ok: false,
                     })
                     .await;
-                bail!(
-                    "detected a loop: agent repeated `{}` {count}x without making progress",
-                    p.name
-                );
+                // Stop dispatching this batch; the top of the loop ends the run.
+                break 'calls;
             }
             let msg = loop_refusal(&p.name);
             let _ = tx
@@ -1296,5 +1335,40 @@ mod loop_tests {
         let mut t = LoopTracker::default();
         t.record("read_file", "read_file a".to_string());
         assert_eq!(t.check(&"read_file b".to_string()), None);
+    }
+}
+
+#[cfg(test)]
+mod loop_tracker_tests {
+    use super::*;
+
+    #[test]
+    fn refusals_reset_after_different_action() {
+        let mut t = LoopTracker::default();
+        let sig = "read_file a".to_string();
+        t.record("read_file", sig.clone());
+        assert_eq!(t.check(&sig), Some(1));
+        // model tries something else (still no mutation) -> counter resets
+        t.record("rgrep", "rgrep query".to_string());
+        assert_eq!(t.check(&sig), Some(1));
+        assert_eq!(t.check(&sig), Some(2));
+    }
+
+    #[test]
+    fn refusals_reset_after_mutation() {
+        let mut t = LoopTracker::default();
+        let sig = "run_task {\"task\":\"test\"}".to_string();
+        t.record("run_task", sig.clone());
+        assert_eq!(t.check(&sig), Some(1));
+        t.record("apply_edit", "apply_edit {..}".to_string());
+        assert_eq!(t.check(&sig), None); // legit re-run after an edit
+    }
+
+    #[test]
+    fn stuck_ends_gracefully() {
+        let mut t = LoopTracker::default();
+        assert!(t.stuck_reason().is_none());
+        t.mark_stuck("run_tests {..}");
+        assert!(t.stuck_reason().unwrap().contains("Stopped"));
     }
 }

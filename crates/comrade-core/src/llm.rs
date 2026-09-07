@@ -272,22 +272,39 @@ pub struct LlmClient {
     endpoint: String,
 }
 
+/// `Authorization: Bearer <api_key>` headers when a key is configured, so every
+/// outbound request (chat and provider probes alike) authenticates the same way.
+fn auth_headers(cfg: &LlmCfg) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(key) = &cfg.api_key {
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+    }
+    headers
+}
+
+/// Short-timeout HTTP client for lightweight provider probes (model version,
+/// context window). Carries the API key so authenticated `/models` endpoints
+/// (e.g. DeepSeek) answer instead of replying 401.
+fn probe_client(cfg: &LlmCfg) -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(5))
+        .default_headers(auth_headers(cfg))
+        .build()
+        .ok()
+}
+
 impl LlmClient {
     pub fn new(cfg: &LlmCfg) -> Result<Self> {
         let endpoint = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-        let mut builder = reqwest::Client::builder()
+        let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
-            .connect_timeout(Duration::from_secs(15));
-        if let Some(key) = &cfg.api_key {
-            builder = builder.default_headers({
-                let mut h = reqwest::header::HeaderMap::new();
-                if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
-                    h.insert(reqwest::header::AUTHORIZATION, v);
-                }
-                h
-            });
-        }
-        let http = builder.build().context("failed to build http client")?;
+            .connect_timeout(Duration::from_secs(15))
+            .default_headers(auth_headers(cfg))
+            .build()
+            .context("failed to build http client")?;
         Ok(Self {
             http,
             cfg: cfg.clone(),
@@ -307,11 +324,7 @@ impl LlmClient {
             return None;
         }
         let origin = origin_of(&self.cfg.base_url)?;
-        let Ok(short) = reqwest::Client::builder()
-            .timeout(Duration::from_secs(8))
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-        else {
+        let Some(short) = probe_client(&self.cfg) else {
             return None;
         };
         let body = serde_json::json!({ "name": self.cfg.model });
@@ -329,17 +342,15 @@ impl LlmClient {
     }
 
     /// Try to detect the model's context window (tokens). Best effort:
-    /// 1. OpenAI-compatible `GET /models` (`context_length`/`context_window`);
+    /// 1. OpenAI-compatible `GET /models` (`context_length`/`context_window`),
+    ///    sent with the configured API key so authenticated providers (e.g.
+    ///    DeepSeek) don't reject the probe with 401;
     /// 2. Ollama's native `GET /api/show` (`model_info...context_length`) -
     ///    only probed when the endpoint actually looks like Ollama;
     /// 3. a model-name heuristic (e.g. DeepSeek 64K/128K suffixes).
     /// Returns `None` only if nothing is known.
     pub async fn fetch_context_window(&self) -> Option<usize> {
-        let Ok(short) = reqwest::Client::builder()
-            .timeout(Duration::from_secs(8))
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-        else {
+        let Some(short) = probe_client(&self.cfg) else {
             return heuristic_context(&self.cfg.model);
         };
         // 1) OpenAI-compatible models list.
@@ -982,5 +993,64 @@ mod heuristic_tests {
     #[test]
     fn unknown_models_return_none() {
         assert_eq!(heuristic_context("totally-unknown-model"), None);
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// Serve one HTTP request on a loopback listener: reply 200 with an
+    /// OpenAI-compatible model list when the request carries the API key,
+    /// otherwise 401. Returns whether the request was authenticated.
+    fn serve_once_reply() -> (std::net::SocketAddr, std::thread::JoinHandle<bool>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&head).to_lowercase();
+            let authed = head.contains("authorization: bearer sk-test");
+            let (status, reason, body) = if authed {
+                (
+                    "200",
+                    "OK",
+                    r#"{"object":"list","data":[{"id":"deepseek-chat","context_length":131072}]}"#,
+                )
+            } else {
+                ("401", "Unauthorized", r#"{"error":"missing key"}"#)
+            };
+            let resp = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            authed
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn context_window_probe_authenticates_deepseek_models_request() {
+        // DeepSeek's `/models` endpoint requires `Authorization: Bearer`; the
+        // probe must send the configured key or it is 401ed and the advertised
+        // context window can never be read from the provider API.
+        let (addr, server) = serve_once_reply();
+        let mut cfg = LlmCfg::default();
+        cfg.base_url = format!("http://{addr}/v1");
+        cfg.api_key = Some("sk-test".into());
+        cfg.model = "deepseek-chat".into();
+        let client = LlmClient::new(&cfg).unwrap();
+        assert_eq!(client.fetch_context_window().await, Some(131_072));
+        assert!(server.join().unwrap(), "probe request was unauthenticated");
     }
 }
