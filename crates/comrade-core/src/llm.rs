@@ -119,6 +119,13 @@ struct ChatRequest<'a> {
     tools: Option<Vec<ToolDef<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 impl<'a> ChatRequest<'a> {
@@ -143,6 +150,13 @@ impl<'a> ChatRequest<'a> {
                 .collect()
         });
         let tool_choice = if tools.is_some() { Some("auto") } else { None };
+        let stream_options = if stream {
+            Some(StreamOptions {
+                include_usage: true,
+            })
+        } else {
+            None
+        };
         Self {
             model: model.to_string(),
             messages,
@@ -150,6 +164,7 @@ impl<'a> ChatRequest<'a> {
             stream,
             tools,
             tool_choice,
+            stream_options,
         }
     }
 }
@@ -179,17 +194,32 @@ pub struct ModelToolCall {
     pub arguments: String,
 }
 
+/// Real token usage reported by the model API for one request.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: usize,
+    #[serde(default)]
+    pub completion_tokens: usize,
+    #[serde(default)]
+    pub total_tokens: usize,
+}
+
 /// The result of one chat request: streamed text plus any native tool calls.
 #[derive(Debug, Clone)]
 pub struct LlmTurn {
     pub content: String,
     pub tool_calls: Vec<ModelToolCall>,
+    /// Real usage reported by the endpoint, when available.
+    pub usage: Option<Usage>,
 }
 
 /// A single streaming chunk.
 #[derive(Debug, Deserialize)]
 struct StreamChunk {
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -337,6 +367,7 @@ impl LlmClient {
         let mut decoder = SseDecoder::new();
         let mut full = String::new();
         let mut tool_acc: BTreeMap<usize, ToolAccum> = BTreeMap::new();
+        let mut usage: Option<Usage> = None;
 
         let mut byte_stream = resp.bytes_stream();
         while let Some(chunk) = byte_stream.next().await {
@@ -344,12 +375,16 @@ impl LlmClient {
             for event in decoder.push(&chunk) {
                 match event {
                     SseEvent::Done => {
-                        return Ok(finish_turn(full, tool_acc));
+                        return Ok(finish_turn(full, tool_acc, usage));
                     }
                     SseEvent::Data(json) => {
                         let Ok(parsed) = serde_json::from_str::<StreamChunk>(&json) else {
                             continue;
                         };
+                        // usage may arrive on a final chunk with empty choices
+                        if let Some(u) = parsed.usage {
+                            usage = Some(u);
+                        }
                         let Some(delta) = parsed.choices.into_iter().next().map(|c| c.delta) else {
                             continue;
                         };
@@ -381,11 +416,15 @@ impl LlmClient {
                 }
             }
         }
-        Ok(finish_turn(full, tool_acc))
+        Ok(finish_turn(full, tool_acc, usage))
     }
 }
 
-fn finish_turn(full: String, tool_acc: BTreeMap<usize, ToolAccum>) -> LlmTurn {
+fn finish_turn(
+    full: String,
+    tool_acc: BTreeMap<usize, ToolAccum>,
+    usage: Option<Usage>,
+) -> LlmTurn {
     let tool_calls = tool_acc
         .into_iter()
         .filter_map(|(_, acc)| {
@@ -401,6 +440,7 @@ fn finish_turn(full: String, tool_acc: BTreeMap<usize, ToolAccum>) -> LlmTurn {
     LlmTurn {
         content: full.trim().to_string(),
         tool_calls,
+        usage,
     }
 }
 
@@ -614,6 +654,7 @@ mod live_tests {
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"\"}}]}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\": \\\"a.r\"}}]}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"s\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7,\"total_tokens\":49}}\n\n",
                 "data: [DONE]\n\n"
             );
             let resp = format!(
@@ -637,5 +678,11 @@ mod live_tests {
         assert_eq!(call.name, "write_file");
         let args: Value = serde_json::from_str(&call.arguments).unwrap();
         assert_eq!(args["path"], "a.rs");
+
+        // the final chunk reported real usage
+        let usage = turn.usage.expect("usage should be reported");
+        assert_eq!(usage.prompt_tokens, 42);
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.total_tokens, 49);
     }
 }

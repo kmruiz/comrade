@@ -151,6 +151,7 @@ struct App {
     /// Latest context-usage snapshot for the gauge.
     ctx_tokens: usize,
     ctx_budget: usize,
+    ctx_estimated: bool,
     /// Name of the tool currently running (auto status while no agent text).
     activity: Option<String>,
 }
@@ -245,6 +246,7 @@ impl App {
         match event {
             AgentEvent::RunStart => {
                 self.ctx_tokens = 0;
+                self.ctx_estimated = true;
                 self.activity = None;
             }
             AgentEvent::RunEnd => {
@@ -317,9 +319,14 @@ impl App {
                 Some(s) => self.push_meta(format!("plan finished: {s}")),
                 None => self.push_meta("plan finished"),
             },
-            AgentEvent::ContextStats { tokens, budget } => {
+            AgentEvent::ContextStats {
+                tokens,
+                budget,
+                estimated,
+            } => {
                 self.ctx_tokens = tokens;
                 self.ctx_budget = budget.max(1);
+                self.ctx_estimated = estimated;
             }
         }
     }
@@ -403,6 +410,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         follow: true,
         ctx_tokens: 0,
         ctx_budget: deps.cfg.context.budget_tokens,
+        ctx_estimated: true,
         activity: None,
     };
 
@@ -969,10 +977,14 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
         format!("{tokens} / {budget} tokens"),
         Style::default().fg(Color::White),
     ));
-    line2.push(Span::styled(
-        " (est.)",
-        Style::default().fg(Color::DarkGray),
-    ));
+    if app.ctx_estimated {
+        line2.push(Span::styled(
+            " (est.)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        line2.push(Span::styled(" (api)", Style::default().fg(Color::DarkGray)));
+    }
 
     let rows = Layout::default()
         .direction(Direction::Vertical)

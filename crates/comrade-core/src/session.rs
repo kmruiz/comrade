@@ -45,8 +45,14 @@ pub enum AgentEvent {
     Error(String),
     /// The run finished (success or not).
     RunEnd,
-    /// Live context-usage snapshot (estimated tokens vs budget) for the gauge.
-    ContextStats { tokens: usize, budget: usize },
+    /// Live context-usage snapshot. `tokens` is the real `prompt_tokens`
+    /// reported by the model API when available; otherwise it is our estimate
+    /// and `estimated` is true.
+    ContextStats {
+        tokens: usize,
+        budget: usize,
+        estimated: bool,
+    },
 }
 
 /// Observable session state. Doubles as the [`SessionControl`] implementation

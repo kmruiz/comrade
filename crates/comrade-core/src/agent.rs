@@ -104,12 +104,6 @@ async fn run_agent_loop(
         ctx.clear_approval();
 
         ctxm.enforce_budget();
-        let _ = tx
-            .send(AgentEvent::ContextStats {
-                tokens: ctxm.total_tokens(),
-                budget: cfg.context.budget_tokens,
-            })
-            .await;
 
         // Advertise native tools unless the protocol is strictly ReAct.
         let native = cfg.llm.protocol.native_enabled();
@@ -147,6 +141,20 @@ async fn run_agent_loop(
         let _ = forwarder.await;
 
         let turn = stream_result?;
+
+        // Real usage from the API when reported (prompt_tokens = context the
+        // model actually saw); fall back to our estimate otherwise.
+        let (tokens, estimated) = match turn.usage.as_ref() {
+            Some(u) if u.prompt_tokens > 0 => (u.prompt_tokens, false),
+            _ => (ctxm.total_tokens(), true),
+        };
+        let _ = tx
+            .send(AgentEvent::ContextStats {
+                tokens,
+                budget: cfg.context.budget_tokens,
+                estimated,
+            })
+            .await;
 
         // Native function calls: dispatch them (possibly several per turn).
         if !turn.tool_calls.is_empty() {
