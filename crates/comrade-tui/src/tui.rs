@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use arboard::Clipboard;
 use async_trait::async_trait;
 use comrade_core::{AgentEvent, AgentSession, ChatMessage, MemoryUndo, Role, run_agent};
 use comrade_tool::{PlanStatus, SessionControl, ToolContext, UserIo, UserPrompt, UserReply};
@@ -245,6 +246,29 @@ impl App {
             } else if let Some(fail) = &mut m.fail {
                 fail.open = !fail.open;
             }
+        }
+    }
+
+    /// Copy the plain text of the message currently under the cursor
+    /// (the selected block) to the system clipboard. Bound to Ctrl+Shift+C.
+    fn copy_selected(&mut self) {
+        let Some(idx) = self.sel else { return };
+        let Some(msg) = self.chat.get(idx) else {
+            return;
+        };
+        let text = msg_searchable(msg).trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let mut clip = match Clipboard::new() {
+            Ok(clip) => clip,
+            Err(e) => {
+                self.push_meta(format!("copy failed: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = clip.set_text(text) {
+            self.push_meta(format!("copy failed: {e}"));
         }
     }
 
@@ -697,8 +721,18 @@ pub async fn run(deps: &Deps) -> Result<()> {
 fn handle_event(app: &mut App, ev: Event) -> bool {
     match ev {
         Event::Key(key) => {
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                return true;
+            if let KeyCode::Char(ch) = key.code {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                if ctrl && ch.eq_ignore_ascii_case(&'c') {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        // Ctrl+Shift+C copies the message under the cursor
+                        // to the system clipboard.
+                        app.copy_selected();
+                        return false;
+                    }
+                    // Plain Ctrl+C quits.
+                    return true;
+                }
             }
             if app.search.is_some() {
                 return handle_search_key(app, key);
