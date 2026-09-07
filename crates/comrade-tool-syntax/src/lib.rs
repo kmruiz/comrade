@@ -17,6 +17,9 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(FindReferences),
         Box::new(Rename),
         Box::new(ListSymbols),
+        Box::new(FindDefinition),
+        Box::new(ReadSymbol),
+        Box::new(ReferencesCount),
     ]
 }
 
@@ -259,7 +262,8 @@ static LIST_SYMBOLS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
         "type": "object",
         "properties": {
             "path": { "type": "string", "description": "Optional file to inspect (project-root relative). Defaults to the whole project." },
-            "git_modified_only": { "type": "boolean", "default": false, "description": "Only inspect files that differ from HEAD (staged, unstaged, untracked)." }
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only inspect files that differ from HEAD (staged, unstaged, untracked)." },
+            "with_signatures": { "type": "boolean", "default": false, "description": "Include each declaration's one-line signature." }
         },
         "additionalProperties": false
     }),
@@ -279,16 +283,218 @@ impl Tool for ListSymbols {
             path: Option<String>,
             #[serde(default)]
             git_modified_only: bool,
+            #[serde(default)]
+            with_signatures: bool,
         }
         let args: Args = serde_json::from_value(args)?;
         let scope = changed_scope(ctx, args.git_modified_only)?;
         guard_path_scope(ctx, &args.path, &scope)?;
-        let symbols =
-            engine::list_symbols(&ctx.project_root, args.path.as_deref(), scope.as_ref())?;
+        let symbols = if args.with_signatures {
+            engine::list_symbol_signatures(&ctx.project_root, args.path.as_deref(), scope.as_ref())?
+        } else {
+            engine::list_symbols(&ctx.project_root, args.path.as_deref(), scope.as_ref())?
+        };
         if symbols.is_empty() {
             return Ok("No symbols found.".to_string());
         }
         Ok(clamp(symbols.join("\n")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// find_definition
+// ---------------------------------------------------------------------------
+
+struct FindDefinition;
+
+static FIND_DEFINITION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "find_definition".into(),
+    description: "Locate where a symbol is defined and return its kind, one-line signature, and file:line — never the whole body. Cheaper than reading the file when you only need to know a declaration.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "symbol": { "type": "string", "description": "Identifier to locate." },
+            "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD." }
+        },
+        "required": ["symbol"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for FindDefinition {
+    fn spec(&self) -> &ToolSpec {
+        &FIND_DEFINITION_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            symbol: String,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            git_modified_only: bool,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let scope = changed_scope(ctx, args.git_modified_only)?;
+        guard_path_scope(ctx, &args.path, &scope)?;
+        match engine::find_definition(
+            &ctx.project_root,
+            &args.symbol,
+            args.path.as_deref(),
+            scope.as_ref(),
+        )? {
+            Some(def) => Ok(format!(
+                "`{symbol}` defined at {file}:{line}\nkind: {kind}\nsignature: {signature}",
+                symbol = args.symbol,
+                file = def.file,
+                line = def.line,
+                kind = def.kind,
+                signature = def.signature
+            )),
+            None => Ok(format!("No definition found for {:?}.", args.symbol)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// read_symbol
+// ---------------------------------------------------------------------------
+
+struct ReadSymbol;
+
+static READ_SYMBOL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "read_symbol".into(),
+    description: "Read just one symbol's declaration body (function, struct, enum, trait, const, ...) with its file:line and signature. Use before editing a specific item instead of reading the whole file.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "symbol": { "type": "string", "description": "Identifier whose declaration body to read." },
+            "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD." }
+        },
+        "required": ["symbol"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for ReadSymbol {
+    fn spec(&self) -> &ToolSpec {
+        &READ_SYMBOL_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            symbol: String,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            git_modified_only: bool,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let scope = changed_scope(ctx, args.git_modified_only)?;
+        guard_path_scope(ctx, &args.path, &scope)?;
+        match engine::read_symbol(
+            &ctx.project_root,
+            &args.symbol,
+            args.path.as_deref(),
+            scope.as_ref(),
+        )? {
+            Some(def) => {
+                let body = def.body.unwrap_or_default();
+                let lines = body.lines().count();
+                let mut out = format!(
+                    "`{symbol}` ({kind}) at {file}:{line}\n{signature}\n---- ({lines} lines)\n",
+                    symbol = args.symbol,
+                    kind = def.kind,
+                    file = def.file,
+                    line = def.line,
+                    signature = def.signature
+                );
+                out.push_str(&body);
+                Ok(clamp(out))
+            }
+            None => Ok(format!("No definition found for {:?}.", args.symbol)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// references_count
+// ---------------------------------------------------------------------------
+
+struct ReferencesCount;
+
+static REFERENCES_COUNT_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "references_count".into(),
+    description: "Count references to a symbol across the project (lexical tree-sitter identifiers). Returns a total and per-file breakdown, not context lines — use it to gauge blast radius (e.g. before a rename) cheaply.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "symbol": { "type": "string", "description": "Identifier to count." },
+            "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD." }
+        },
+        "required": ["symbol"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for ReferencesCount {
+    fn spec(&self) -> &ToolSpec {
+        &REFERENCES_COUNT_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            symbol: String,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            git_modified_only: bool,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let scope = changed_scope(ctx, args.git_modified_only)?;
+        guard_path_scope(ctx, &args.path, &scope)?;
+        let occ = engine::find_occurrences(
+            &ctx.project_root,
+            &args.symbol,
+            args.path.as_deref(),
+            scope.as_ref(),
+        )?;
+        if occ.is_empty() {
+            return Ok(format!("`{}` has no references.", args.symbol));
+        }
+        let mut per_file: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for o in &occ {
+            *per_file.entry(o.file.as_str()).or_insert(0) += 1;
+        }
+        let total = occ.len();
+        let files = per_file.len();
+        let mut out = format!(
+            "`{}`: {total} reference(s) across {files} file(s)\n",
+            args.symbol
+        );
+        for (file, count) in per_file.iter().take(8) {
+            out.push_str(&format!("  {count:>4}  {file}\n"));
+        }
+        if per_file.len() > 8 {
+            out.push_str(&format!("  … and {} more file(s)\n", per_file.len() - 8));
+        }
+        Ok(out)
     }
 }
 
@@ -364,6 +570,86 @@ fn area(p: Point) -> i32 { p.x }
         assert!(syms.iter().any(|s| s.contains("struct Point")));
         assert!(syms.iter().any(|s| s.contains("trait Draw")));
         assert!(syms.iter().any(|s| s.contains("impl")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finds_definition_signature_and_body() {
+        let root = scratch();
+        std::fs::write(
+            root.join("lib.rs"),
+            r#"
+pub fn compute(x: i32) -> i32 {
+    let y = x * 2;
+    y + 1
+}
+struct Thing { a: i32 }
+"#,
+        )
+        .unwrap();
+
+        let def = crate::engine::find_definition(&root, "compute", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(def.file, "lib.rs");
+        assert_eq!(def.kind, "fn");
+        assert!(
+            def.signature.contains("fn compute(x: i32) -> i32"),
+            "{}",
+            def.signature
+        );
+        assert!(def.body.is_none());
+
+        let full = crate::engine::read_symbol(&root, "compute", None, None)
+            .unwrap()
+            .unwrap();
+        let body = full.body.unwrap();
+        assert!(body.contains("let y = x * 2;"), "{body}");
+        assert!(body.contains("y + 1"));
+
+        // struct found too
+        let s = crate::engine::find_definition(&root, "Thing", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.kind, "struct");
+
+        assert!(
+            crate::engine::find_definition(&root, "nope", None, None)
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn counts_references_across_files() {
+        let root = scratch();
+        std::fs::write(
+            root.join("a.rs"),
+            "fn helper() {}\nfn main() { helper(); helper(); }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("b.rs"), "fn other() { helper(); }\n").unwrap();
+        let occ = crate::engine::find_occurrences(&root, "helper", None, None).unwrap();
+        // definition in a + 2 calls in a + 1 call in b
+        assert_eq!(occ.len(), 4);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lists_symbols_with_signatures() {
+        let root = scratch();
+        std::fs::write(
+            root.join("lib.rs"),
+            "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        )
+        .unwrap();
+        let sigs = crate::engine::list_symbol_signatures(&root, None, None).unwrap();
+        assert!(
+            sigs.iter()
+                .any(|s| s.contains("fn add | fn add(a: i32, b: i32) -> i32 @")),
+            "{sigs:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

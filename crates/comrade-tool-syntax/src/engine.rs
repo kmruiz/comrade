@@ -159,14 +159,48 @@ pub fn rename_edits(
     Ok(grouped.into_values().collect())
 }
 
-/// List top-level declarations (functions, structs, enums, traits, impls,
-/// modules) in a file.
-pub fn list_symbols(
+/// A resolved symbol declaration.
+#[derive(Debug, Clone)]
+pub struct SymbolDef {
+    /// Project-root relative file.
+    pub file: String,
+    /// 1-based line.
+    pub line: usize,
+    /// Short kind label, e.g. `fn`, `struct`.
+    pub kind: String,
+    /// One-line signature / head, e.g. `fn area(p: Point) -> i32`.
+    pub signature: String,
+    /// Whole body text when requested (e.g. by `read_symbol`).
+    pub body: Option<String>,
+}
+
+/// Find the declaration of `symbol` across the project (or `path`).
+pub fn find_definition(
     root: &Path,
+    symbol: &str,
     path: Option<&str>,
     only: Option<&HashSet<PathBuf>>,
-) -> Result<Vec<String>> {
-    let mut out = Vec::new();
+) -> Result<Option<SymbolDef>> {
+    find_decl(root, symbol, path, only, false)
+}
+
+/// Find the declaration of `symbol` and return its whole body.
+pub fn read_symbol(
+    root: &Path,
+    symbol: &str,
+    path: Option<&str>,
+    only: Option<&HashSet<PathBuf>>,
+) -> Result<Option<SymbolDef>> {
+    find_decl(root, symbol, path, only, true)
+}
+
+fn find_decl(
+    root: &Path,
+    symbol: &str,
+    path: Option<&str>,
+    only: Option<&HashSet<PathBuf>>,
+    want_body: bool,
+) -> Result<Option<SymbolDef>> {
     for (rel, text) in collect_files(root, path, only)? {
         let ext = Path::new(&rel)
             .extension()
@@ -182,35 +216,133 @@ pub fn list_symbols(
         };
         let mut cursor = tree.walk();
         let mut descend = true;
-        let decls = [
-            "function_item",
-            "struct_item",
-            "enum_item",
-            "trait_item",
-            "impl_item",
-            "mod_item",
-            "type_item",
-            "static_item",
-            "const_item",
-        ];
         loop {
             let node = cursor.node();
-            if decls.contains(&node.kind()) {
-                if node.kind() == "impl_item" {
+            if is_decl_kind(node.kind())
+                && let Some(name) = node.child_by_field_name("name")
+                && name.utf8_text(text.as_bytes()).unwrap_or("") == symbol
+            {
+                let (line, _, _) = locate(&text, node.start_byte());
+                let signature = signature_of(&node, &text);
+                let body = if want_body {
+                    Some(text[node.start_byte()..node.end_byte()].to_string())
+                } else {
+                    None
+                };
+                return Ok(Some(SymbolDef {
+                    file: rel,
+                    line,
+                    kind: short_kind(node.kind()).to_string(),
+                    signature,
+                    body,
+                }));
+            }
+            if descend && cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    descend = true;
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    return Ok(None);
+                }
+                descend = false;
+                break;
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn is_decl_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "mod_item"
+            | "type_item"
+            | "static_item"
+            | "const_item"
+    )
+}
+
+/// One-line "head" of a declaration node: text up to the opening `{`, whitespace
+/// collapsed, capped.
+fn signature_of(node: &tree_sitter::Node, text: &str) -> String {
+    let seg = &text[node.start_byte()..node.end_byte()];
+    let head = match seg.find('{') {
+        Some(i) => &seg[..i],
+        None => seg,
+    };
+    let collapsed = head.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(300).collect()
+}
+
+/// A single declaration row used for listing.
+struct DeclRow {
+    /// Display label, e.g. `fn` / `impl`.
+    label: String,
+    /// Display text: the name, or the impl head line.
+    text: String,
+    line: usize,
+    signature: String,
+}
+
+/// Collect declaration rows across the target files.
+fn collect_decl_rows(
+    root: &Path,
+    path: Option<&str>,
+    only: Option<&HashSet<PathBuf>>,
+) -> Result<Vec<DeclRow>> {
+    let mut rows = Vec::new();
+    for (rel, text) in collect_files(root, path, only)? {
+        let ext = Path::new(&rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let Some(lang) = language_for(ext) else {
+            continue;
+        };
+        let mut parser = tree_sitter::Parser::new();
+        let _ = parser.set_language(&lang);
+        let Some(tree) = parser.parse(&text, None) else {
+            continue;
+        };
+        let mut cursor = tree.walk();
+        let mut descend = true;
+        loop {
+            let node = cursor.node();
+            if is_decl_kind(node.kind()) || node.kind() == "impl_item" {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let (line, _, _) = locate(&text, node.start_byte());
+                    let label = short_kind(node.kind()).to_string();
+                    let name = name.utf8_text(text.as_bytes()).unwrap_or("?").to_string();
+                    let signature = signature_of(&node, &text);
+                    rows.push(DeclRow {
+                        label: label.clone(),
+                        text: name,
+                        line,
+                        signature,
+                    });
+                } else if node.kind() == "impl_item" {
                     let head = text[node.start_byte()..node.end_byte()]
                         .lines()
                         .next()
                         .unwrap_or("impl")
-                        .trim();
+                        .trim()
+                        .to_string();
                     let (line, _, _) = locate(&text, node.start_byte());
-                    out.push(format!("impl {head} @ {line}"));
-                } else if let Some(name) = node.child_by_field_name("name") {
-                    let (line, _, _) = locate(&text, node.start_byte());
-                    let label = short_kind(node.kind());
-                    out.push(format!(
-                        "{label} {} @ {line}",
-                        name.utf8_text(text.as_bytes()).unwrap_or("?")
-                    ));
+                    let signature = signature_of(&node, &text);
+                    rows.push(DeclRow {
+                        label: "impl".into(),
+                        text: head,
+                        line,
+                        signature,
+                    });
                 }
             }
             if descend && cursor.goto_first_child() {
@@ -222,14 +354,40 @@ pub fn list_symbols(
                     break;
                 }
                 if !cursor.goto_parent() {
-                    return Ok(out);
+                    return Ok(rows);
                 }
                 descend = false;
                 break;
             }
         }
     }
-    Ok(out)
+    Ok(rows)
+}
+
+/// List top-level declarations (functions, structs, enums, traits, impls,
+/// modules) in a file, as `kind name @ line`.
+pub fn list_symbols(
+    root: &Path,
+    path: Option<&str>,
+    only: Option<&HashSet<PathBuf>>,
+) -> Result<Vec<String>> {
+    Ok(collect_decl_rows(root, path, only)?
+        .into_iter()
+        .map(|r| format!("{} {} @ {}", r.label, r.text, r.line))
+        .collect())
+}
+
+/// Like [`list_symbols`] but each row carries its one-line signature:
+/// `kind name | signature @ line`.
+pub fn list_symbol_signatures(
+    root: &Path,
+    path: Option<&str>,
+    only: Option<&HashSet<PathBuf>>,
+) -> Result<Vec<String>> {
+    Ok(collect_decl_rows(root, path, only)?
+        .into_iter()
+        .map(|r| format!("{} {} | {} @ {}", r.label, r.text, r.signature, r.line))
+        .collect())
 }
 
 /// Returns (rel_path, contents) for the target files. When `path` is provided
