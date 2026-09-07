@@ -6,6 +6,7 @@ members = [
     "crates/comrade-tool-fs",
     "crates/comrade-tool-git",
     "crates/comrade-tool-syntax",
+    "crates/comrade-tool-project",
     "crates/comrade-core",
     "crates/comrade-tui",
 ]

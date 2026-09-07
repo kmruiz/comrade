@@ -1,0 +1,15 @@
+[package]
+name = "comrade-tool-project"
+description = "Project object model (POM) and task runner for Cargo projects."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+comrade-tool = { path = "../comrade-tool" }
+anyhow.workspace = true
+toml.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["process", "time", "io-util"] }
