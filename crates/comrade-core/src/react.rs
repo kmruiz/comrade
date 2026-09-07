@@ -34,6 +34,14 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
 
     prompt.push_str("## Tools\n");
     prompt.push_str("You can use the following tools, one per turn:\n");
+    prompt.push_str(
+        "\nChoose the most specific tool for the job:\n\
+         - For anything about the project itself — dependencies, crates/subprojects, workspace \
+         layout, runnable tasks — call project_model FIRST. Do NOT read Cargo.toml files just to \
+         answer such questions; project_model already summarizes them.\n\
+         - Use list_files and rgrep to discover files and search text; use read_file to open a \
+         specific file.\n\n",
+    );
     for tool in tools.iter() {
         prompt.push_str(&render_tool(tool.spec()));
         prompt.push('\n');

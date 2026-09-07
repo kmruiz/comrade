@@ -71,10 +71,10 @@ fn build_deps(cli: &Cli) -> Result<Deps> {
 fn build_tools() -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     reg.extend(comrade_tool_session::all());
+    reg.extend(comrade_tool_project::all());
     reg.extend(comrade_tool_fs::all());
     reg.extend(comrade_tool_git::all());
     reg.extend(comrade_tool_syntax::all());
-    reg.extend(comrade_tool_project::all());
     reg
 }
 

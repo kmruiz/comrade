@@ -32,7 +32,7 @@ struct ProjectModelTool;
 static PROJECT_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "project_model".into(),
-    description: "Describe the Cargo project object model (POM): the project/workspace, its subprojects (workspace members, Maven-module style), their dependencies, and the tasks you can run with run_task. Call this first to orient yourself in an unfamiliar repo. Read-only.".into(),
+    description: "Report this Cargo project's dependencies, subprojects, and tasks (the project object model, POM). Use this INSTEAD of reading Cargo.toml files whenever the user asks about dependencies, crates/modules, the workspace layout, or what tasks can be run. Read-only.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {},
