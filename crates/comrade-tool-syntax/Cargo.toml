@@ -1,0 +1,17 @@
+[package]
+name = "comrade-tool-syntax"
+description = "Tree-sitter powered code tools: find references, rename, list symbols."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+comrade-tool = { path = "../comrade-tool" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["fs", "process"] }
+tree-sitter.workspace = true
+tree-sitter-language.workspace = true
+tree-sitter-rust.workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "comrade-tui"
+description = "Comrade cockpit: ratatui TUI + headless runner."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "comrade"
+path = "src/main.rs"
+
+[dependencies]
+comrade-core = { path = "../comrade-core" }
+comrade-tool = { path = "../comrade-tool" }
+comrade-tool-session = { path = "../comrade-tool-session" }
+comrade-tool-fs = { path = "../comrade-tool-fs" }
+comrade-tool-git = { path = "../comrade-tool-git" }
+comrade-tool-syntax = { path = "../comrade-tool-syntax" }
+anyhow.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "io-std"] }
+tokio-util.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+clap = { version = "4", features = ["derive"] }

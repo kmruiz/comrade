@@ -1,0 +1,14 @@
+[package]
+name = "comrade-tool-git"
+description = "Git tools: status, diff, log, commit, staged as tool for the agent."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+comrade-tool = { path = "../comrade-tool" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["process"] }

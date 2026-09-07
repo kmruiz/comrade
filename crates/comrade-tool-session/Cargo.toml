@@ -1,0 +1,13 @@
+[package]
+name = "comrade-tool-session"
+description = "Session/UI control tools: plan, status bar, session rename, ask-question."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+comrade-tool = { path = "../comrade-tool" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true

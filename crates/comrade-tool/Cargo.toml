@@ -1,0 +1,14 @@
+[package]
+name = "comrade-tool"
+description = "Shared contracts for Comrade tools: Tool trait, context, session state, user IO."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync"] }
