@@ -80,16 +80,28 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
     prompt
 }
 
+/// Render one tool as a single compact line so the per-iteration system prompt
+/// stays small. Format: `### name — <short description> · Args: { f: type*, ... }`.
 fn render_tool(spec: &comrade_tool::ToolSpec) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("### {}\n", spec.name));
-    out.push_str(&format!("{}\n", spec.description));
-    if let Some(props) = spec
+    let mut desc: String = spec
+        .description
+        .split('\n')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(170)
+        .collect();
+    if spec.description.chars().count() > 170 {
+        desc.push('…');
+    }
+
+    let fields: Vec<String> = match spec
         .json_schema
         .get("properties")
         .and_then(Value::as_object)
     {
-        let fields: Vec<String> = props
+        Some(props) => props
             .iter()
             .map(|(k, v)| {
                 let ty = v.get("type").and_then(Value::as_str).unwrap_or("any");
@@ -99,17 +111,20 @@ fn render_tool(spec: &comrade_tool::ToolSpec) -> String {
                     .and_then(Value::as_array)
                     .is_some_and(|r| r.iter().any(|x| x.as_str() == Some(k)));
                 if req {
-                    format!("{k}: {ty} (required)")
+                    format!("{k}: {ty}*")
                 } else {
-                    format!("{k}: {ty} (optional)")
+                    format!("{k}: {ty}")
                 }
             })
-            .collect();
-        out.push_str(&format!("Args: {{ {} }}\n", fields.join(", ")));
+            .collect(),
+        None => Vec::new(),
+    };
+    let args = if fields.is_empty() {
+        "{}".to_string()
     } else {
-        out.push_str("Args: {}\n");
-    }
-    out
+        format!("{{ {} }}", fields.join(", "))
+    };
+    format!("### {name} — {desc}  Args: {args}", name = spec.name)
 }
 
 /// Parse an assistant message into a thought + (optional) tool call.
@@ -465,5 +480,37 @@ mod tests {
             Some("add the requested test file")
         );
         assert!(turn.risk.is_none());
+    }
+
+    #[test]
+    fn tool_render_is_a_single_compact_line() {
+        let spec = comrade_tool::ToolSpec {
+            name: "write_file".into(),
+            description: "Overwrite (or create) a whole file (project-root relative). Parent directories are created as needed.".into(),
+            json_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                    "git_modified_only": { "type": "boolean" }
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        };
+        let line = render_tool(&spec);
+        assert!(
+            !line.contains('\n'),
+            "expected a single line, got: {line:?}"
+        );
+        assert!(line.starts_with("### write_file"));
+        assert!(line.contains("path: string*"), "{line}");
+        assert!(line.contains("content: string*"), "{line}");
+        assert!(line.contains("git_modified_only: boolean"), "{line}");
+        assert!(
+            line.chars().count() < 300,
+            "line too long: {}",
+            line.chars().count()
+        );
     }
 }

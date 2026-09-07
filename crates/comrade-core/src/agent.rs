@@ -138,8 +138,8 @@ async fn run_agent_loop(
         let _ = tx.send(AgentEvent::AssistantText(response.clone())).await;
 
         let turn = parse_turn(&response).context("failed to parse model response")?;
-        if let Some(t) = turn.thought {
-            let _ = tx.send(AgentEvent::Thought(t)).await;
+        if let Some(t) = turn.thought.as_deref() {
+            let _ = tx.send(AgentEvent::Thought(t.to_string())).await;
         }
 
         let Some(tool_call) = turn.tool_call else {
@@ -244,6 +244,9 @@ async fn run_agent_loop(
             Role::User,
             render_observation(&tool_call.name, &clamped),
         ));
+        // The tool call is spent: strip its (potentially large) args from the
+        // stored assistant message so they are not re-sent every later turn.
+        ctxm.note_tool_done(&tool_call.name, turn.thought.as_deref());
     }
 }
 
