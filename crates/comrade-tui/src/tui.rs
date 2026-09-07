@@ -449,8 +449,8 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
             if !app.dialogs.is_empty() {
                 return handle_dialog_key(app, key.code);
             }
-            // Emacs-style chat navigation. Ctrl+shift variants (P/N) jump
-            // between user messages; plain Ctrl+p/n move block to block.
+            // Emacs-style chat navigation. Plain Ctrl+p/n move block to block;
+            // Ctrl+Shift and Alt variants (P/N) jump between user messages.
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 if let KeyCode::Char(ch) = key.code {
                     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -474,6 +474,18 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                     }
                 }
             }
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                if let KeyCode::Char(ch) = key.code {
+                    if ch.eq_ignore_ascii_case(&'p') {
+                        app.move_user(-1);
+                        return false;
+                    }
+                    if ch.eq_ignore_ascii_case(&'n') {
+                        app.move_user(1);
+                        return false;
+                    }
+                }
+            }
             match key.code {
                 KeyCode::Esc => {
                     if app.running {
@@ -483,6 +495,12 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                 KeyCode::Enter => {
                     let prompt = std::mem::take(&mut app.input);
                     app.start_run(prompt);
+                }
+                KeyCode::Tab => {
+                    // Toggle the selected block (the one under the "> " marker).
+                    if let Some(idx) = app.sel {
+                        app.toggle_tool(idx);
+                    }
                 }
                 KeyCode::Char(c) => app.input.push(c),
                 KeyCode::Backspace => {
@@ -664,7 +682,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
         ),
         Span::raw("  "),
         Span::styled(
-            "enter:run  esc:cancel  ctrl-c:quit  ctrl-p/n:nav  ctrl-shift-p/n:users",
+            "enter:run  esc:cancel  ctrl-c:quit  ctrl-p/n:block  alt-p/n:user  tab:toggle",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
