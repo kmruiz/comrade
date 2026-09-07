@@ -42,6 +42,8 @@ struct Deps {
     client: Arc<LlmClient>,
     tools: Arc<ToolRegistry>,
     root: PathBuf,
+    /// DeepSeek account balance (total), when available.
+    balance: Option<String>,
 }
 
 async fn build_deps(cli: &Cli) -> Result<Deps> {
@@ -73,6 +75,10 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
     if cfg.llm.model_version.is_none() {
         cfg.llm.model_version = client.fetch_model_version().await;
     }
+    let balance = client.fetch_account_balance().await;
+    if let Some(b) = &balance {
+        eprintln!("[comrade] account balance: {b}");
+    }
     let cfg = Arc::new(cfg);
 
     let tools = Arc::new(build_tools());
@@ -81,6 +87,7 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
         client,
         tools,
         root,
+        balance,
     })
 }
 

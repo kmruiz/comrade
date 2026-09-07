@@ -349,6 +349,32 @@ impl LlmClient {
     ///    only probed when the endpoint actually looks like Ollama;
     /// 3. a model-name heuristic (e.g. deepseek-chat -> 128K).
     /// Returns `None` only if nothing is known.
+    /// True when the configured endpoint is DeepSeek (provider preset or host).
+    pub fn is_deepseek(&self) -> bool {
+        if let Some(p) = self.cfg.provider.as_deref() {
+            return p.eq_ignore_ascii_case("deepseek");
+        }
+        origin_of(&self.cfg.base_url)
+            .unwrap_or_default()
+            .contains("deepseek.com")
+    }
+
+    /// Fetch the account balance from DeepSeek's `/user/balance` endpoint,
+    /// returned as a short display string (e.g. "110.50 CNY").
+    pub async fn fetch_account_balance(&self) -> Option<String> {
+        if !self.is_deepseek() {
+            return None;
+        }
+        let origin = origin_of(&self.cfg.base_url)?;
+        let url = format!("{origin}/user/balance");
+        let resp = self.http.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let text = resp.text().await.ok()?;
+        parse_balance(&text)
+    }
+
     pub async fn fetch_context_window(&self) -> Option<usize> {
         let Some(short) = probe_client(&self.cfg) else {
             return heuristic_context(&self.cfg.model);
@@ -591,6 +617,23 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
     Some(SseEvent::Data(payload.to_string()))
 }
 
+/// Parse DeepSeek `/user/balance` into a short display string.
+fn parse_balance(json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    let infos = value.get("balance_infos")?.as_array()?;
+    let mut parts = Vec::new();
+    for info in infos {
+        let currency = info.get("currency").and_then(Value::as_str)?;
+        let total = info.get("total_balance").and_then(Value::as_str)?;
+        parts.push(format!("{total} {currency}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" + "))
+    }
+}
+
 /// Name-based context-window fallback for cloud providers whose `/models`
 /// endpoint does not advertise context (e.g. DeepSeek).
 fn heuristic_context(model: &str) -> Option<usize> {
@@ -611,14 +654,10 @@ fn heuristic_context(model: &str) -> Option<usize> {
             return Some(size);
         }
     }
-    match m.as_str() {
-        // DeepSeek's two API models expose a 128K context window, but its
-        // `/models` endpoint does not advertise it.
-        "deepseek-chat" | "deepseek-reasoner" => return Some(131_072),
-        _ => {}
-    }
+    // DeepSeek models expose a ~1M token context window, but its `/models`
+    // endpoint does not advertise it - fall back to the full window.
     if m.contains("deepseek") {
-        return Some(65_536);
+        return Some(1_000_000);
     }
     if m.contains("gpt-4o") {
         return Some(128_000);
@@ -985,12 +1024,14 @@ mod heuristic_tests {
     use super::*;
 
     #[test]
-    fn deepseek_gets_a_sane_fallback_window() {
-        assert_eq!(heuristic_context("deepseek-chat"), Some(131_072));
-        assert_eq!(heuristic_context("deepseek-reasoner"), Some(131_072));
-        // Other names that merely contain "deepseek" keep the conservative
-        // window until we know their real context.
-        assert_eq!(heuristic_context("deepseek-coder-v3"), Some(65_536));
+    fn deepseek_models_get_the_full_1m_window() {
+        assert_eq!(heuristic_context("deepseek-v4-flash"), Some(1_000_000));
+        assert_eq!(heuristic_context("deepseek-v4-pro"), Some(1_000_000));
+        assert_eq!(
+            heuristic_context("deepseek-v4-flash-vision-exp"),
+            Some(1_000_000)
+        );
+        assert_eq!(heuristic_context("deepseek-chat"), Some(1_000_000));
     }
 
     #[test]
@@ -1061,5 +1102,22 @@ mod probe_tests {
         let client = LlmClient::new(&cfg).unwrap();
         assert_eq!(client.fetch_context_window().await, Some(131_072));
         assert!(server.join().unwrap(), "probe request was unauthenticated");
+    }
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+
+    #[test]
+    fn parses_deepseek_balance() {
+        let json = r#"{
+          "is_available": true,
+          "balance_infos": [
+            { "currency": "CNY", "total_balance": "110.50", "granted_balance": "10.00", "topped_up_balance": "100.50" }
+          ]
+        }"#;
+        assert_eq!(parse_balance(json).as_deref(), Some("110.50 CNY"));
+        assert_eq!(parse_balance("{}"), None);
     }
 }

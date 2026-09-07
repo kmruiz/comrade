@@ -185,6 +185,8 @@ struct App {
     ctx_tokens: usize,
     ctx_budget: usize,
     ctx_estimated: bool,
+    /// Account balance display (DeepSeek), when available.
+    balance: Option<String>,
     /// Name of the tool currently running (auto status while no agent text).
     activity: Option<String>,
 }
@@ -483,6 +485,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
             .context_window
             .unwrap_or(deps.cfg.context.budget_tokens),
         ctx_estimated: true,
+        balance: deps.balance.clone(),
         activity: None,
     };
 
@@ -1171,6 +1174,12 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
         if !v.is_empty() {
             model_label.push_str("  ");
             model_label.push_str(v);
+        }
+    }
+    if let Some(b) = &app.balance {
+        if !b.is_empty() {
+            model_label.push_str("  |  ");
+            model_label.push_str(b);
         }
     }
     if model_label.chars().count() > width {
