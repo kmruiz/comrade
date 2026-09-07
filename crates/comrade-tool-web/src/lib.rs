@@ -1,7 +1,9 @@
-//! Web search via DuckDuckGo's HTML endpoint.
+//! Web search with reduced results.
 //!
-//! Results are reduced to what an agent needs: the URL, the page title and a
-//! short description. No HTML is ever returned.
+//! Primary backend is Bing's HTML search (returns results from datacenter IPs
+//! that DuckDuckGo's HTML endpoint flags with a 202 anomaly page); DuckDuckGo
+//! HTML is used as a fallback. Results are reduced to what an agent needs: the
+//! URL, the page title and a short description. No HTML is ever returned.
 
 use anyhow::{Context as _, Result};
 use scraper::{Html, Selector};
@@ -14,36 +16,157 @@ pub struct WebResult {
     pub description: String,
 }
 
-const ENDPOINT: &str = "https://html.duckduckgo.com/html/";
-const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+const DDG_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+const BING_ENDPOINT: &str = "https://www.bing.com/search";
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-/// Perform a DuckDuckGo HTML search and return the first `max_results` results
-/// reduced to (url, title, description).
+fn client() -> Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (k, v) in [
+        (
+            "accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        ),
+        ("accept-language", "en-US,en;q=0.9"),
+        ("upgrade-insecure-requests", "1"),
+        (
+            "sec-ch-ua",
+            "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+        ),
+        ("sec-ch-ua-mobile", "?0"),
+        ("sec-ch-ua-platform", "\"Linux\""),
+    ] {
+        if let (Ok(k), Ok(v)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(v),
+        ) {
+            headers.insert(k, v);
+        }
+    }
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .default_headers(headers)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("failed to build http client")
+}
+
+/// Perform a web search and return the first `max_results` results reduced to
+/// (url, title, description). Tries Bing first, then DuckDuckGo HTML.
 pub async fn search(query: &str, max_results: usize) -> Result<Vec<WebResult>> {
     if query.trim().is_empty() {
         anyhow::bail!("query must not be empty");
     }
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .context("failed to build http client")?;
+    let client = client()?;
 
+    // 1) Bing (reliable from datacenter IPs).
+    let bing = fetch_engine(&client, BING_ENDPOINT, "q", query, parse_bing).await;
+    if let Ok(mut results) = bing {
+        if !results.is_empty() {
+            results.truncate(max_results.max(1));
+            return Ok(results);
+        }
+    }
+
+    // 2) DuckDuckGo HTML fallback.
+    let ddg = fetch_engine(&client, DDG_ENDPOINT, "q", query, parse_results).await;
+    match ddg {
+        Ok(results) => Ok(results.into_iter().take(max_results.max(1)).collect()),
+        Err(e) => Err(e),
+    }
+}
+
+async fn fetch_engine<F>(
+    client: &reqwest::Client,
+    url: &str,
+    param: &str,
+    query: &str,
+    parse: F,
+) -> Result<Vec<WebResult>>
+where
+    F: Fn(&str) -> Vec<WebResult>,
+{
     let resp = client
-        .get(ENDPOINT)
-        .query(&[("q", query)])
+        .get(url)
+        .query(&[(param, query)])
         .send()
         .await
-        .context("duckduckgo request failed")?;
+        .with_context(|| format!("search request to {url} failed"))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        anyhow::bail!("duckduckgo returned {status}");
+        anyhow::bail!("search returned {status}");
     }
     let html = resp.text().await.context("failed to read response body")?;
-    Ok(parse_results(&html)
-        .into_iter()
-        .take(max_results.max(1))
-        .collect())
+    Ok(parse(&html))
+}
+
+/// Parse Bing results: each `li.b_algo` contributes a title link (h2 a) and a
+/// snippet from `.b_caption p`.
+pub fn parse_bing(html: &str) -> Vec<WebResult> {
+    let doc = Html::parse_document(html);
+    let algo = Selector::parse("li.b_algo").expect("static selector");
+    let link_sel = Selector::parse("h2 a").expect("static selector");
+    let snippet_sel = Selector::parse(".b_caption p").expect("static selector");
+
+    let mut results = Vec::new();
+    for el in doc.select(&algo) {
+        let Some(link) = el.select(&link_sel).next() else {
+            continue;
+        };
+        let title = text_of(link);
+        let url = resolve_bing_url(link.value().attr("href").unwrap_or(""));
+        if url.is_empty() {
+            continue;
+        }
+        let description = el
+            .select(&snippet_sel)
+            .next()
+            .map(text_of)
+            .unwrap_or_default();
+        results.push(WebResult {
+            url,
+            title,
+            description,
+        });
+    }
+    results
+}
+
+/// Bing organic results point at `bing.com/ck/a?...&u=<base64url>`; decode the
+/// `u` param to the real destination.
+fn resolve_bing_url(href: &str) -> String {
+    if href.contains("bing.com/ck/a") || href.starts_with("https://www.bing.com/ck/a") {
+        if let Ok(parsed) = url::Url::parse(href.trim()) {
+            for (key, value) in parsed.query_pairs() {
+                if key == "u" {
+                    if let Some(decoded) = decode_base64_url(&value) {
+                        return decoded;
+                    }
+                }
+            }
+        }
+    }
+    href.trim().to_string()
+}
+
+fn decode_base64_url(encoded: &str) -> Option<String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+    // Bing prefixes the payload (e.g. "a1"); try slicing it off progressively.
+    for cut in 0..=4 {
+        let slice = &encoded[cut..];
+        let decoded = URL_SAFE_NO_PAD
+            .decode(slice)
+            .or_else(|_| URL_SAFE.decode(slice));
+        if let Ok(decoded) = decoded {
+            if let Ok(s) = String::from_utf8(decoded) {
+                if s.starts_with("http") {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Parse DDG HTML results: `.result__a` (link + title) and `.result__snippet`
@@ -187,7 +310,7 @@ struct WebSearch;
 static WEB_SEARCH_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "web_search".into(),
-    description: "Search the web via DuckDuckGo. Returns only each result's URL, title and a short description - no HTML, no page content. Use to find docs, APIs, or answers about topics outside the repository.".into(),
+    description: "Search the web (Bing-backed, DuckDuckGo fallback). Returns only each result's URL, title and a short description - no HTML, no page content. Use to find docs, APIs, or answers about topics outside the repository.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -220,5 +343,20 @@ impl Tool for WebSearch {
         let args: Args = serde_json::from_value(args)?;
         let results = search(&args.query, args.max_results).await?;
         Ok(render(&results))
+    }
+}
+
+#[cfg(test)]
+mod bing_tests {
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    #[test]
+    fn decodes_bing_redirect_url() {
+        let target = "https://rust-lang.org/";
+        let enc = format!("a1{}", URL_SAFE_NO_PAD.encode(target));
+        let href = format!("https://www.bing.com/ck/a?x=1&u={enc}&ntb=1");
+        assert_eq!(resolve_bing_url(&href), target);
     }
 }
