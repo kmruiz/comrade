@@ -184,6 +184,8 @@ struct App {
 
     stop: Option<CancellationToken>,
     running: bool,
+    /// Auto-accept mode: approvals are answered "yes" without prompting.
+    auto_accept: bool,
     chat: Vec<Msg>,
     /// Raw current model output (not yet committed to a message).
     stream: String,
@@ -528,6 +530,28 @@ impl App {
         }
     }
 
+    /// Auto-accept the confirmation currently on top of the dialog stack
+    /// (used when the mode is turned on while an approval is waiting).
+    fn accept_top_confirm(&mut self) {
+        let is_confirm = self
+            .dialogs
+            .first()
+            .is_some_and(|d| matches!(d.prompt, UserPrompt::Confirm { .. }));
+        if !is_confirm || self.dialog_ask {
+            return;
+        }
+        if let Some(d) = self.dialogs.first() {
+            if let UserPrompt::Confirm { title, .. } = &d.prompt {
+                let action = one_line(title, 80);
+                self.push_msg(Msg::text(
+                    MsgKind::Meta,
+                    format!("auto-accept on \u{2192} approved: {action}"),
+                ));
+            }
+        }
+        self.answer_top(UserReply::Answer("yes".into()));
+    }
+
     /// Send the buffered text to the model as a follow-up question about the
     /// action pending in the top dialog, then wait for its answer (rendered
     /// inside the dialog) before the human confirms or denies.
@@ -629,6 +653,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         asks_rx,
         stop: None,
         running: false,
+        auto_accept: false,
         chat: Vec::new(),
         stream: String::new(),
         input: String::new(),
@@ -695,10 +720,29 @@ pub async fn run(deps: &Deps) -> Result<()> {
             ask = app.asks_rx.recv() => {
                 match ask {
                     Some(ask) => {
-                        app.dialogs.push(Dialog { prompt: ask.prompt, buf: String::new(), reply: ask.reply });
-                        app.dialog_ask = false;
-                        app.dialog_conv.clear();
-                        app.push_meta("waiting for your input");
+                        // Auto-accept mode answers approvals immediately.
+                        let is_confirm =
+                            matches!(ask.prompt, UserPrompt::Confirm { .. });
+                        if app.auto_accept && is_confirm {
+                            let action = match &ask.prompt {
+                                UserPrompt::Confirm { title, .. } => one_line(title, 80),
+                                _ => String::new(),
+                            };
+                            let _ = ask.reply.send(UserReply::Answer("yes".into()));
+                            app.push_msg(Msg::text(
+                                MsgKind::Meta,
+                                if action.is_empty() {
+                                    "auto-accept: approved".to_string()
+                                } else {
+                                    format!("auto-accept \u{2192} approved: {action}")
+                                },
+                            ));
+                        } else {
+                            app.dialogs.push(Dialog { prompt: ask.prompt, buf: String::new(), reply: ask.reply });
+                            app.dialog_ask = false;
+                            app.dialog_conv.clear();
+                            app.push_meta("waiting for your input");
+                        }
                     }
                     None => break Err(anyhow::anyhow!("ask channel closed")),
                 }
@@ -721,6 +765,25 @@ pub async fn run(deps: &Deps) -> Result<()> {
 fn handle_event(app: &mut App, ev: Event) -> bool {
     match ev {
         Event::Key(key) => {
+            let ctrl_space = key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('\0'));
+            if ctrl_space {
+                app.auto_accept = !app.auto_accept;
+                app.push_msg(Msg::text(
+                    MsgKind::Meta,
+                    if app.auto_accept {
+                        "auto-accept ON: approvals will be accepted automatically (ctrl-space to disable)"
+                            .to_string()
+                    } else {
+                        "auto-accept off".to_string()
+                    },
+                ));
+                if app.auto_accept {
+                    // Accept any approval already waiting, then run with it.
+                    app.accept_top_confirm();
+                }
+                return false;
+            }
             if let KeyCode::Char(ch) = key.code {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 if ctrl && ch.eq_ignore_ascii_case(&'c') {
@@ -1105,22 +1168,30 @@ fn draw(app: &mut App, frame: &mut Frame) {
     let run_state = if app.running { "RUNNING" } else { "IDLE" };
     let undo_count = app.undo.entry_count();
 
-    let header = Line::from(vec![
-        Span::styled(
-            format!(" comrade | {} ", app.session.title()),
+    let mut header_spans: Vec<Span<'static>> = vec![Span::styled(
+        format!(" comrade | {} ", app.session.title()),
+        Style::default()
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if app.auto_accept {
+        header_spans.push(Span::styled(
+            " AUTO-ACCEPT ",
             Style::default()
-                .bg(Color::Blue)
+                .bg(Color::Yellow)
+                .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            app.root.to_string_lossy().into_owned(),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("  "),
-        Span::styled("undo:", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!("{undo_count}")),
-    ]);
+        ));
+    }
+    header_spans.push(Span::raw(" "));
+    header_spans.push(Span::styled(
+        app.root.to_string_lossy().into_owned(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    header_spans.push(Span::raw("  "));
+    header_spans.push(Span::styled("undo:", Style::default().fg(Color::DarkGray)));
+    header_spans.push(Span::raw(format!("{undo_count}")));
+    let header = Line::from(header_spans);
     let (status_msg, status_color) = {
         let agent = app.session.status();
         if !agent.trim().is_empty() {
@@ -1154,7 +1225,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
         ),
         Span::raw("  "),
         Span::styled(
-            "enter:run  esc:cancel  ctrl-c:quit  ctrl-f:search  ctrl-p/n:block  alt-p/n:user  tab:toggle",
+            "enter:run  esc:cancel  ctrl-c:quit  ctrl-f:search  ctrl-space:auto-accept  ctrl-p/n:block  alt-p/n:user  tab:toggle",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
