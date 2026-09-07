@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
-use comrade_core::{AgentEvent, AgentSession, MemoryUndo, run_agent};
+use comrade_core::{AgentEvent, AgentSession, ChatMessage, MemoryUndo, Role, run_agent};
 use comrade_tool::{PlanStatus, SessionControl, ToolContext, UserIo, UserPrompt, UserReply};
 use crossterm::event::{
     self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -168,6 +168,12 @@ struct App {
     stream: String,
     input: String,
     dialogs: Vec<Dialog>,
+    /// True while the open dialog buffers a follow-up question to the model.
+    dialog_ask: bool,
+    /// Sends a follow-up question's answer back from the ask-the-model task.
+    dialog_ask_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Follow-up Q/A shown inside the confirm dialog.
+    dialog_conv: Vec<String>,
 
     // geometry/metrics refreshed on every draw
     chat_rect: Rect,
@@ -421,6 +427,53 @@ impl App {
         }
     }
 
+    /// Send the buffered text to the model as a follow-up question about the
+    /// action pending in the top dialog, then wait for its answer (rendered
+    /// inside the dialog) before the human confirms or denies.
+    fn ask_followup(&mut self) {
+        let question = match self.dialogs.first_mut() {
+            Some(d) => std::mem::take(&mut d.buf).trim().to_string(),
+            None => String::new(),
+        };
+        if question.is_empty() {
+            self.dialog_ask = false;
+            return;
+        }
+        let (summary, body) = match self.dialogs.first() {
+            Some(d) => match &d.prompt {
+                UserPrompt::Confirm { title, diff } => {
+                    (title.clone(), diff.clone().unwrap_or_default())
+                }
+                _ => (String::new(), String::new()),
+            },
+            None => (String::new(), String::new()),
+        };
+        self.dialog_ask = false;
+        self.dialog_conv.push(format!("Q: {question}"));
+        let Some(tx) = self.dialog_ask_tx.clone() else {
+            return;
+        };
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let system = "You are helping a human review a proposed action inside \
+                a command-line agent before they approve it. Answer the human's \
+                follow-up question about the pending action briefly and factually, \
+                quoting the exact command or files involved. Never run anything.";
+            let user = format!(
+                "PENDING ACTION:\n{summary}\n\nDETAILS:\n{body}\n\nHUMAN QUESTION:\n{question}"
+            );
+            let messages = [
+                ChatMessage::new(Role::System, system.to_string()),
+                ChatMessage::new(Role::User, user),
+            ];
+            let answer = match client.chat(&messages).await {
+                Ok(text) => text.trim().to_string(),
+                Err(e) => format!("error asking model: {e:#}"),
+            };
+            let _ = tx.send(answer);
+        });
+    }
+
     fn answer_from_buf(&mut self) {
         let can_submit = self.dialogs.first().is_some_and(|d| match &d.prompt {
             UserPrompt::Question { .. } => !d.buf.trim().is_empty(),
@@ -458,6 +511,7 @@ impl App {
 
 pub async fn run(deps: &Deps) -> Result<()> {
     let (asks_tx, asks_rx) = mpsc::channel::<PendingAsk>(16);
+    let (dialog_ans_tx, mut dialog_ans_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let user = Arc::new(TuiUserIo { tx: asks_tx });
     let (bundle, events_tx, events_rx) = new_session(deps, user);
 
@@ -478,6 +532,9 @@ pub async fn run(deps: &Deps) -> Result<()> {
         stream: String::new(),
         input: String::new(),
         dialogs: Vec::new(),
+        dialog_ask: false,
+        dialog_ask_tx: None,
+        dialog_conv: Vec::new(),
         chat_rect: Rect::default(),
         row_targets: Vec::new(),
         row_msg: Vec::new(),
@@ -496,6 +553,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         balance: deps.balance.clone(),
         activity: None,
     };
+    app.dialog_ask_tx = Some(dialog_ans_tx);
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
@@ -536,9 +594,16 @@ pub async fn run(deps: &Deps) -> Result<()> {
                 match ask {
                     Some(ask) => {
                         app.dialogs.push(Dialog { prompt: ask.prompt, buf: String::new(), reply: ask.reply });
+                        app.dialog_ask = false;
+                        app.dialog_conv.clear();
                         app.push_meta("waiting for your input");
                     }
                     None => break Err(anyhow::anyhow!("ask channel closed")),
+                }
+            }
+            ans = dialog_ans_rx.recv() => {
+                if let Some(answer) = ans {
+                    app.dialog_conv.push(format!("A: {answer}"));
                 }
             }
         }
@@ -635,11 +700,35 @@ fn handle_dialog_key(app: &mut App, code: KeyCode) -> bool {
         UserPrompt::Confirm { .. }
     );
     match code {
-        KeyCode::Esc => app.answer_top(UserReply::Denied),
-        KeyCode::Char('y') if is_confirm => app.answer_top(UserReply::Answer("yes".into())),
-        KeyCode::Char('n') if is_confirm => app.answer_top(UserReply::Answer("no".into())),
-        KeyCode::Enter => app.answer_from_buf(),
-        KeyCode::Char(c) if ('1'..='9').contains(&c) => {
+        KeyCode::Esc => {
+            if app.dialog_ask {
+                // Leave question mode; the confirmation is still open.
+                app.dialog_ask = false;
+            } else {
+                app.answer_top(UserReply::Denied);
+            }
+        }
+        KeyCode::Char('?') if is_confirm && !app.dialog_ask => {
+            // Ask the model a follow-up question before deciding.
+            app.dialog_ask = true;
+            if let Some(d) = app.dialogs.first_mut() {
+                d.buf.clear();
+            }
+        }
+        KeyCode::Char('y') if is_confirm && !app.dialog_ask => {
+            app.answer_top(UserReply::Answer("yes".into()))
+        }
+        KeyCode::Char('n') if is_confirm && !app.dialog_ask => {
+            app.answer_top(UserReply::Answer("no".into()))
+        }
+        KeyCode::Enter => {
+            if app.dialog_ask {
+                app.ask_followup();
+            } else {
+                app.answer_from_buf();
+            }
+        }
+        KeyCode::Char(c) if ('1'..='9').contains(&c) && !app.dialog_ask => {
             let n = c.to_digit(10).unwrap_or(0) as usize;
             let handled = app.dialogs.first().is_some_and(|d| {
                 matches!(&d.prompt, UserPrompt::Question { options, .. } if n >= 1 && n <= options.len())
@@ -1339,8 +1428,22 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
             (" question ", true, options.clone(), lines)
         }
         UserPrompt::Confirm { title, diff } => {
-            let body = preview_lines(diff.as_deref().unwrap_or(title), 96);
-            (" confirm  [y/n] ", false, Vec::new(), body)
+            let mut lines = Vec::new();
+            // The actual action (e.g. the shell command) goes on top so the
+            // human always sees exactly what they are approving.
+            lines.extend(preview_lines(title, 96));
+            if let Some(d) = diff {
+                if !d.trim().is_empty() {
+                    lines.push(Line::from(""));
+                    lines.extend(preview_lines(d, 96));
+                }
+            }
+            if !app.dialog_conv.is_empty() {
+                lines.push(Line::from(""));
+                let conv = app.dialog_conv.join("\n");
+                lines.extend(preview_lines(&conv, 96));
+            }
+            (" confirm  [y/n] ", false, Vec::new(), lines)
         }
     };
     if body.is_empty() {
@@ -1357,11 +1460,16 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     let popup = Rect::new(x, y, w, h);
     frame.render_widget(Clear, popup);
 
-    let border_color = if is_question {
+    let mut kind_label = kind_label;
+    let mut border_color = if is_question {
         Color::Cyan
     } else {
         Color::Yellow
     };
+    if app.dialog_ask && !is_question {
+        kind_label = " confirm  [ask the model] ";
+        border_color = Color::Magenta;
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .title(kind_label)
@@ -1385,8 +1493,9 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(body).scroll((scroll, 0)), row_layout[0]);
 
     // Input row.
+    let input_prompt = if app.dialog_ask { "? " } else { "> " };
     let input = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Green)),
+        Span::styled(input_prompt, Style::default().fg(Color::Green)),
         Span::raw(dialog.buf.clone()),
         Span::styled("_", Style::default().fg(Color::Green)),
     ]);
@@ -1397,8 +1506,10 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
         "number: pick    type + enter: submit    esc: cancel"
     } else if is_question {
         "type + enter: submit    esc: cancel"
+    } else if app.dialog_ask {
+        "type a question + enter: ask the model    esc: back to y/n"
     } else {
-        "y / n    esc: cancel    (you can type a custom answer)"
+        "y / n    ?: ask the model about this action    esc: cancel    (or type a custom answer)"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1435,6 +1546,20 @@ fn preview_lines(text: &str, width: usize) -> Vec<Line<'static>> {
         if t.starts_with("Justification:") {
             mode = 0;
             push_span_line(&mut out, t, Color::Cyan, width, false);
+            continue;
+        }
+        if t.starts_with("Q:") || t.starts_with("A:") {
+            push_span_line(
+                &mut out,
+                t,
+                if t.starts_with("Q:") {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                },
+                width,
+                false,
+            );
             continue;
         }
         if t.starts_with("Risk:") {
