@@ -76,6 +76,7 @@ fn build_tools() -> ToolRegistry {
     reg.extend(comrade_tool_git::all());
     reg.extend(comrade_tool_syntax::all());
     reg.extend(comrade_tool_memory::all());
+    reg.extend(comrade_tool_web::all());
     reg
 }
 

@@ -8,6 +8,7 @@ members = [
     "crates/comrade-tool-syntax",
     "crates/comrade-tool-project",
     "crates/comrade-tool-memory",
+    "crates/comrade-tool-web",
     "crates/comrade-core",
     "crates/comrade-tui",
 ]

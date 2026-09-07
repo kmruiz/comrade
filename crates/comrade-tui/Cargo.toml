@@ -18,6 +18,7 @@ comrade-tool-git = { path = "../comrade-tool-git" }
 comrade-tool-syntax = { path = "../comrade-tool-syntax" }
 comrade-tool-project = { path = "../comrade-tool-project" }
 comrade-tool-memory = { path = "../comrade-tool-memory" }
+comrade-tool-web = { path = "../comrade-tool-web" }
 anyhow.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
