@@ -1,6 +1,11 @@
-//! Minimal cockpit TUI: transcript + plan checklist + prompt bar + modal
-//! dialogs for questions/approvals. Deliberately small; the UX will be
-//! redesigned later.
+//! Cockpit TUI: markdown chat + plan checklist + prompt bar + modal dialogs.
+//!
+//! Chat layout:
+//! - no emojis
+//! - user messages carry a cyan rule on the left of every wrapped line
+//! - agent tool calls render as a compact card (tool + justification); clicking
+//!   (or the mouse wheel) opens the details
+//! - assistant/user text is rendered as markdown
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +14,10 @@ use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use comrade_core::{AgentEvent, AgentSession, MemoryUndo, run_agent};
 use comrade_tool::{PlanStatus, SessionControl, ToolContext, UserIo, UserPrompt, UserReply};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -43,22 +51,62 @@ impl UserIo for TuiUserIo {
 }
 
 // ---------------------------------------------------------------------------
-// UI state
+// chat model
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
-enum Tag {
+enum MsgKind {
     User,
-    Stream,
-    Ok,
-    Err,
+    Assistant,
+    Tool,
     Meta,
 }
 
-struct LogLine {
-    tag: Tag,
-    text: String,
+struct ToolCard {
+    name: String,
+    args: String,
+    justification: Option<String>,
+    risk: Option<String>,
+    result: Option<String>,
+    ok: bool,
+    open: bool,
 }
+
+struct Msg {
+    kind: MsgKind,
+    text: String,
+    tool: Option<ToolCard>,
+}
+
+impl Msg {
+    fn text(kind: MsgKind, text: impl Into<String>) -> Self {
+        Msg {
+            kind,
+            text: text.into(),
+            tool: None,
+        }
+    }
+    fn tool(card: ToolCard) -> Self {
+        Msg {
+            kind: MsgKind::Tool,
+            text: String::new(),
+            tool: Some(card),
+        }
+    }
+}
+
+/// A fully laid-out chat row.
+struct RenderRow {
+    /// None (no rule) or Some(color) for the left vertical rule.
+    rule: Option<Color>,
+    spans: Vec<Span<'static>>,
+    /// Some(msg index) when this row is the clickable header of a tool card.
+    tool_header: Option<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// UI state
+// ---------------------------------------------------------------------------
 
 struct Dialog {
     prompt: UserPrompt,
@@ -82,59 +130,44 @@ struct App {
 
     stop: Option<CancellationToken>,
     running: bool,
-    lines: Vec<LogLine>,
-    /// Partial model output that has not yet hit a newline.
-    stream_buf: String,
+    chat: Vec<Msg>,
+    /// Raw current model output (not yet committed to a message).
+    stream: String,
     input: String,
     dialogs: Vec<Dialog>,
+
+    // geometry/metrics refreshed on every draw
+    chat_rect: Rect,
+    row_targets: Vec<Option<usize>>,
+    scroll_top: usize,
+    follow: bool,
 }
 
 impl App {
-    /// Push a non-stream log line, sealing any in-progress streamed tail first.
-    fn push(&mut self, tag: Tag, text: impl Into<String>) {
-        self.seal_stream();
-        self.push_raw(tag, text);
+    fn push_msg(&mut self, msg: Msg) {
+        if self.chat.len() >= 400 {
+            self.chat.remove(0);
+        }
+        self.chat.push(msg);
     }
 
-    fn push_raw(&mut self, tag: Tag, text: impl Into<String>) {
-        let text = text.into();
-        for l in text.lines() {
-            self.lines.push(LogLine {
-                tag,
-                text: l.to_string(),
-            });
-        }
-        if self.lines.len() > 2000 {
-            self.lines.drain(..self.lines.len() - 2000);
-        }
+    fn push_meta(&mut self, text: impl Into<String>) {
+        self.push_msg(Msg::text(MsgKind::Meta, text));
     }
 
-    /// Append streamed model output, splitting complete lines as they arrive.
-    fn push_stream(&mut self, delta: &str) {
-        self.stream_buf.push_str(delta);
-        loop {
-            let Some(nl) = self.stream_buf.find('\n') else {
-                break;
-            };
-            let line = self.stream_buf.drain(..=nl).collect::<String>();
-            let line = line.trim_end_matches('\n');
-            if !line.is_empty() {
-                self.push_raw(Tag::Stream, line);
+    fn last_tool_mut(&mut self, name: &str) -> Option<&mut ToolCard> {
+        self.chat.iter_mut().rev().find_map(|m| match &mut m.tool {
+            Some(c) if c.name == name || name.is_empty() => Some(c),
+            _ => None,
+        })
+    }
+
+    fn toggle_tool(&mut self, idx: usize) {
+        if let Some(m) = self.chat.get_mut(idx) {
+            if let Some(card) = &mut m.tool {
+                card.open = !card.open;
             }
         }
-        // Guard against a pathological single token with no newline.
-        if self.stream_buf.chars().count() > 4000 {
-            let excess = self.stream_buf.chars().count() - 4000;
-            self.stream_buf = self.stream_buf.chars().skip(excess).collect();
-        }
-    }
-
-    fn seal_stream(&mut self) {
-        if self.stream_buf.is_empty() {
-            return;
-        }
-        let tail = std::mem::take(&mut self.stream_buf);
-        self.push_raw(Tag::Stream, tail);
     }
 
     fn start_run(&mut self, prompt: String) {
@@ -149,6 +182,7 @@ impl App {
         let stop = CancellationToken::new();
         self.stop = Some(stop.clone());
         self.running = true;
+        self.follow = true;
         tokio::spawn(async move {
             let _ = run_agent(&cfg, &client, ctx, &tools, prompt, tx, stop).await;
         });
@@ -158,7 +192,7 @@ impl App {
         if let Some(stop) = &self.stop {
             stop.cancel();
         }
-        self.push(Tag::Meta, "(cancelling…)");
+        self.push_meta("cancelling...");
     }
 
     fn on_agent_event(&mut self, event: AgentEvent) {
@@ -167,40 +201,78 @@ impl App {
             AgentEvent::RunEnd => {
                 self.running = false;
                 self.stop = None;
-                self.seal_stream();
-                self.push_raw(Tag::Meta, "— run finished —");
+                self.stream.clear();
+                self.push_meta("run finished");
             }
-            AgentEvent::User(u) => self.push(Tag::User, format!("🧑 {u}")),
-            AgentEvent::Delta(d) => self.push_stream(&d),
-            // The streamed output already shows the model's ReAct prose, tool
-            // invocations, and final answer verbatim, so those echoes are
-            // skipped to avoid duplication. Tool *results* are still shown
-            // because they come from the harness, not the model.
-            AgentEvent::Thought(_)
-            | AgentEvent::AssistantText(_)
-            | AgentEvent::ToolStart { .. } => {}
+            AgentEvent::User(u) => {
+                self.stream.clear();
+                self.push_msg(Msg::text(MsgKind::User, u));
+            }
+            AgentEvent::Delta(d) => {
+                self.stream.push_str(&d);
+                if self.stream.chars().count() > 40_000 {
+                    self.stream = self
+                        .stream
+                        .chars()
+                        .skip(self.stream.chars().count() - 40_000)
+                        .collect();
+                }
+            }
+            AgentEvent::ToolCall {
+                name,
+                args,
+                justification,
+                risk,
+            } => {
+                // This turn produced a tool call; drop any scaffold-only prose
+                // that was streaming and show a compact card instead.
+                self.stream.clear();
+                self.push_msg(Msg::tool(ToolCard {
+                    name,
+                    args,
+                    justification,
+                    risk,
+                    result: None,
+                    ok: true,
+                    open: false,
+                }));
+            }
+            AgentEvent::ToolStart { .. } => {}
             AgentEvent::ToolResult { name, output, ok } => {
-                let tag = if ok { Tag::Ok } else { Tag::Err };
-                self.push(tag, format!("   └ {name}: {output}"));
+                self.stream.clear();
+                if let Some(card) = self.last_tool_mut(&name) {
+                    card.result = Some(output);
+                    card.ok = ok;
+                }
             }
-            AgentEvent::FinalAnswer(_) => {}
-            AgentEvent::Error(e) => self.push(Tag::Err, format!("❌ {e}")),
+            AgentEvent::AssistantText(_) => {}
+            AgentEvent::Thought(_) => {}
+            AgentEvent::FinalAnswer(a) => {
+                self.stream.clear();
+                let visible = strip_react_scaffolding(&a);
+                if !visible.trim().is_empty() {
+                    self.push_msg(Msg::text(MsgKind::Assistant, visible));
+                }
+            }
+            AgentEvent::Error(e) => {
+                self.stream.clear();
+                self.push_meta(format!("error: {e}"));
+            }
             AgentEvent::TitleChanged | AgentEvent::StatusChanged | AgentEvent::PlanChanged => {}
             AgentEvent::PlanFinished(s) => match s {
-                Some(s) => self.push(Tag::Meta, format!("— plan finished: {s} —")),
-                None => self.push(Tag::Meta, "— plan finished —"),
+                Some(s) => self.push_meta(format!("plan finished: {s}")),
+                None => self.push_meta("plan finished"),
             },
         }
     }
 
-    /// Resolve the top dialog with an answer and pop it.
     fn answer_top(&mut self, reply: UserReply) {
         if !self.dialogs.is_empty() {
             let text = match &reply {
-                UserReply::Answer(a) => format!("↳ answer: {a}"),
-                UserReply::Denied => "↳ dismissed".to_string(),
+                UserReply::Answer(a) => format!("answer: {a}"),
+                UserReply::Denied => "dismissed".to_string(),
             };
-            self.push(Tag::User, text);
+            self.push_msg(Msg::text(MsgKind::Meta, text));
             let d = self.dialogs.remove(0);
             let _ = d.reply.send(reply);
         }
@@ -259,15 +331,20 @@ pub async fn run(deps: &Deps) -> Result<()> {
         asks_rx,
         stop: None,
         running: false,
-        lines: Vec::new(),
-        stream_buf: String::new(),
+        chat: Vec::new(),
+        stream: String::new(),
         input: String::new(),
         dialogs: Vec::new(),
+        chat_rect: Rect::default(),
+        row_targets: Vec::new(),
+        scroll_top: 0,
+        follow: true,
     };
 
     let mut terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
 
-    // Key events arrive on a background thread.
+    // Terminal events arrive on a background thread.
     let (kev_tx, mut kev_rx) = mpsc::channel::<Event>(128);
     std::thread::spawn(move || {
         loop {
@@ -283,13 +360,13 @@ pub async fn run(deps: &Deps) -> Result<()> {
     });
 
     // First frame immediately, so the UI is visible before any input.
-    let _ = terminal.draw(|f| draw(&app, f));
+    let _ = terminal.draw(|f| draw(&mut app, f));
 
     let res = loop {
         tokio::select! {
             ev = kev_rx.recv() => {
                 match ev {
-                    Some(ev) => if handle_key(&mut app, ev) { break Ok(()); },
+                    Some(ev) => if handle_event(&mut app, ev) { break Ok(()); },
                     None => break Err(anyhow::anyhow!("terminal closed")),
                 }
             }
@@ -303,111 +380,126 @@ pub async fn run(deps: &Deps) -> Result<()> {
                 match ask {
                     Some(ask) => {
                         app.dialogs.push(Dialog { prompt: ask.prompt, buf: String::new(), reply: ask.reply });
-                        app.push(Tag::Meta, "— waiting for your input —");
+                        app.push_meta("waiting for your input");
                     }
                     None => break Err(anyhow::anyhow!("ask channel closed")),
                 }
             }
         }
-        let _ = terminal.draw(|f| draw(&app, f));
+        let _ = terminal.draw(|f| draw(&mut app, f));
     };
 
+    let _ = execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     res
 }
 
 /// Returns true when the app should quit.
-fn handle_key(app: &mut App, ev: Event) -> bool {
-    let Event::Key(key) = ev else { return false };
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return true;
+fn handle_event(app: &mut App, ev: Event) -> bool {
+    match ev {
+        Event::Key(key) => {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return true;
+            }
+            if !app.dialogs.is_empty() {
+                return handle_dialog_key(app, key.code);
+            }
+            match key.code {
+                KeyCode::Esc => {
+                    if app.running {
+                        app.cancel_run();
+                    }
+                }
+                KeyCode::Enter => {
+                    let prompt = std::mem::take(&mut app.input);
+                    app.start_run(prompt);
+                }
+                KeyCode::Char(c) => app.input.push(c),
+                KeyCode::Backspace => {
+                    app.input.pop();
+                }
+                _ => {}
+            }
+            false
+        }
+        Event::Mouse(mouse) => {
+            handle_mouse(app, mouse);
+            false
+        }
+        _ => false,
     }
+}
 
-    // Dialog mode takes over all input.
-    if !app.dialogs.is_empty() {
-        let is_confirm = matches!(
-            app.dialogs.first().unwrap().prompt,
-            UserPrompt::Confirm { .. }
-        );
-        match key.code {
-            KeyCode::Esc => {
-                app.answer_top(UserReply::Denied);
-            }
-            KeyCode::Char('y') if is_confirm => app.answer_top(UserReply::Answer("yes".into())),
-            KeyCode::Char('n') if is_confirm => app.answer_top(UserReply::Answer("no".into())),
-            KeyCode::Enter => app.answer_from_buf(),
-            KeyCode::Char(c) if ('1'..='9').contains(&c) => {
-                let n = c.to_digit(10).unwrap_or(0) as usize;
-                let handled = app
-                    .dialogs
-                    .first()
-                    .is_some_and(|d| matches!(&d.prompt, UserPrompt::Question { options, .. } if n >= 1 && n <= options.len()));
-                if handled {
-                    app.pick_option(n);
-                } else if !is_confirm {
-                    app.dialogs.first_mut().unwrap().buf.push(c);
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(d) = app.dialogs.first_mut() {
-                    d.buf.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(d) = app.dialogs.first_mut() {
-                    d.buf.pop();
-                }
-            }
-            _ => {}
-        }
-        return false;
-    }
-
-    match key.code {
-        KeyCode::Esc => {
-            if app.running {
-                app.cancel_run();
+fn handle_dialog_key(app: &mut App, code: KeyCode) -> bool {
+    let is_confirm = matches!(
+        app.dialogs.first().unwrap().prompt,
+        UserPrompt::Confirm { .. }
+    );
+    match code {
+        KeyCode::Esc => app.answer_top(UserReply::Denied),
+        KeyCode::Char('y') if is_confirm => app.answer_top(UserReply::Answer("yes".into())),
+        KeyCode::Char('n') if is_confirm => app.answer_top(UserReply::Answer("no".into())),
+        KeyCode::Enter => app.answer_from_buf(),
+        KeyCode::Char(c) if ('1'..='9').contains(&c) => {
+            let n = c.to_digit(10).unwrap_or(0) as usize;
+            let handled = app.dialogs.first().is_some_and(|d| {
+                matches!(&d.prompt, UserPrompt::Question { options, .. } if n >= 1 && n <= options.len())
+            });
+            if handled {
+                app.pick_option(n);
+            } else if !is_confirm {
+                app.dialogs.first_mut().unwrap().buf.push(c);
             }
         }
-        KeyCode::Enter => {
-            let prompt = std::mem::take(&mut app.input);
-            app.start_run(prompt);
+        KeyCode::Char(c) => {
+            if let Some(d) = app.dialogs.first_mut() {
+                d.buf.push(c);
+            }
         }
-        KeyCode::Char(c) => app.input.push(c),
         KeyCode::Backspace => {
-            app.input.pop();
+            if let Some(d) = app.dialogs.first_mut() {
+                d.buf.pop();
+            }
         }
         _ => {}
     }
     false
 }
 
-// ---------------------------------------------------------------------------
-// drawing
-// ---------------------------------------------------------------------------
-
-fn status_style(tag: Tag) -> Style {
-    match tag {
-        Tag::User => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        Tag::Stream => Style::default().fg(Color::White),
-        Tag::Ok => Style::default().fg(Color::Green),
-        Tag::Err => Style::default().fg(Color::Red),
-        Tag::Meta => Style::default().fg(Color::DarkGray),
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    let inside = mouse.kind != MouseEventKind::Moved
+        && mouse.column >= app.chat_rect.left()
+        && mouse.column < app.chat_rect.right()
+        && mouse.row >= app.chat_rect.top()
+        && mouse.row < app.chat_rect.bottom();
+    if !inside {
+        return;
+    }
+    let y = (mouse.row - app.chat_rect.top()) as usize;
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll_top = app.scroll_top.saturating_sub(3);
+            app.follow = false;
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_top += 3;
+            app.follow = false;
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let row = y + app.scroll_top;
+            if let Some(Some(idx)) = app.row_targets.get(row) {
+                app.toggle_tool(*idx);
+            }
+        }
+        _ => {}
     }
 }
 
-fn plan_prefix(s: &PlanStatus) -> &'static str {
-    match s {
-        PlanStatus::Pending => "○",
-        PlanStatus::InProgress => "◐",
-        PlanStatus::Done => "●",
-        PlanStatus::Blocked => "⊗",
-    }
-}
+// ---------------------------------------------------------------------------
+// chat rendering / markdown
+// ---------------------------------------------------------------------------
 
-fn draw(app: &App, frame: &mut Frame) {
+fn draw(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
     let rows = Layout::default()
@@ -425,7 +517,7 @@ fn draw(app: &App, frame: &mut Frame) {
 
     let header = Line::from(vec![
         Span::styled(
-            format!(" comrade · {} ", app.session.title()),
+            format!(" comrade | {} ", app.session.title()),
             Style::default()
                 .bg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
@@ -454,7 +546,7 @@ fn draw(app: &App, frame: &mut Frame) {
         ),
         Span::raw("  "),
         Span::styled(
-            "enter:run esc:cancel ctrl-c:quit",
+            "enter:run  esc:cancel  ctrl-c:quit  wheel:scroll  click:open tool",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -465,15 +557,14 @@ fn draw(app: &App, frame: &mut Frame) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Percentage(34)])
         .split(rows[1]);
-    draw_log(app, frame, cols[0]);
+    draw_chat(app, frame, cols[0]);
     draw_plan(app, frame, cols[1]);
 
-    // Prompt/input bar.
-    let input_hint = if app.running { " (running…)" } else { "" };
+    let input_hint = if app.running { " (running...)" } else { "" };
     let input_line = Line::from(vec![
-        Span::styled("❯ ", Style::default().fg(Color::Green)),
+        Span::styled("> ", Style::default().fg(Color::Green)),
         Span::raw(app.input.clone()),
-        Span::styled("▎", Style::default().fg(Color::Green)),
+        Span::styled("_", Style::default().fg(Color::Green)),
         Span::styled(input_hint, Style::default().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(input_line), rows[2]);
@@ -483,26 +574,165 @@ fn draw(app: &App, frame: &mut Frame) {
     }
 }
 
-fn draw_log(app: &App, frame: &mut Frame, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" run ");
+fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" chat ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let lines: Vec<Line> = app
-        .lines
+
+    let width = inner.width.saturating_sub(2) as usize; // prefix column + spacing
+    let rows = layout_messages(app, width);
+
+    app.chat_rect = inner;
+    app.row_targets = rows.iter().map(|r| r.tool_header).collect();
+    if app.follow {
+        app.scroll_top = rows.len().saturating_sub(inner.height as usize);
+    }
+    let offset = app
+        .scroll_top
+        .min(rows.len().saturating_sub(inner.height as usize));
+    app.scroll_top = offset;
+
+    let lines: Vec<Line> = rows
         .iter()
-        .map(|l| Line::from(Span::styled(l.text.clone(), status_style(l.tag))))
+        .map(|r| {
+            let prefix = match r.rule {
+                Some(color) => Line::from(vec![Span::styled(
+                    "| ",
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )]),
+                None => Line::from("  "),
+            };
+            let mut line = prefix;
+            for s in &r.spans {
+                line.push_span(s.clone());
+            }
+            line
+        })
         .collect();
-    let scroll = lines.len().saturating_sub(inner.height as usize) as u16;
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+
+    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
+}
+
+fn layout_messages(app: &App, width: usize) -> Vec<RenderRow> {
+    let mut out = Vec::new();
+    for (i, msg) in app.chat.iter().enumerate() {
+        match msg.kind {
+            MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), width),
+            MsgKind::Meta => {
+                for s in plain_wrap(&msg.text, width) {
+                    out.push(RenderRow {
+                        rule: None,
+                        spans: vec![Span::styled(s, Style::default().fg(Color::DarkGray))],
+                        tool_header: None,
+                    });
+                }
+            }
+            MsgKind::User => {
+                let rule = Some(Color::Cyan);
+                for spans in md_to_lines(&msg.text, width) {
+                    out.push(RenderRow {
+                        rule,
+                        spans,
+                        tool_header: None,
+                    });
+                }
+            }
+            MsgKind::Assistant => {
+                for spans in md_to_lines(&msg.text, width) {
+                    out.push(RenderRow {
+                        rule: None,
+                        spans,
+                        tool_header: None,
+                    });
+                }
+            }
+        }
+    }
+    // Live streaming preview (scaffolding hidden), never committed.
+    if !app.stream.is_empty() {
+        let visible = strip_react_scaffolding(&app.stream);
+        for spans in md_to_lines(&visible, width) {
+            out.push(RenderRow {
+                rule: None,
+                spans,
+                tool_header: None,
+            });
+        }
+    }
+    out
+}
+
+fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width: usize) {
+    out.push(RenderRow {
+        rule: None,
+        spans: vec![
+            Span::styled(
+                if card.open { "v " } else { "> " },
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::styled(
+                card.name.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                card.justification
+                    .as_deref()
+                    .map(|j| format!("  - {j}"))
+                    .unwrap_or_default(),
+                Style::default().fg(Color::White),
+            ),
+        ],
+        tool_header: Some(msg_idx),
+    });
+    if !card.open {
+        return;
+    }
+    if let Some(risk) = &card.risk {
+        for s in plain_wrap(&format!("risk: {risk}"), width) {
+            out.push(RenderRow {
+                rule: None,
+                spans: vec![Span::styled(s, Style::default().fg(Color::Yellow))],
+                tool_header: None,
+            });
+        }
+    }
+    out.push(RenderRow {
+        rule: None,
+        spans: vec![Span::styled("args:", Style::default().fg(Color::DarkGray))],
+        tool_header: None,
+    });
+    for s in plain_wrap(&card.args, width) {
+        out.push(RenderRow {
+            rule: None,
+            spans: vec![Span::styled(s, Style::default().fg(Color::Magenta))],
+            tool_header: None,
+        });
+    }
+    if let Some(result) = &card.result {
+        let color = if card.ok { Color::Green } else { Color::Red };
+        out.push(RenderRow {
+            rule: None,
+            spans: vec![Span::styled("result:", Style::default().fg(color))],
+            tool_header: None,
+        });
+        for s in plain_wrap(result, width) {
+            out.push(RenderRow {
+                rule: None,
+                spans: vec![Span::styled(s, Style::default().fg(color))],
+                tool_header: None,
+            });
+        }
+    }
 }
 
 fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
     let finished = app.session.finished_summary().is_some();
-    let block = Block::default().borders(Borders::ALL).title(if finished {
-        " plan ✓ "
-    } else {
-        " plan "
-    });
+    let block =
+        Block::default()
+            .borders(Borders::ALL)
+            .title(if finished { " plan ok " } else { " plan " });
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -539,13 +769,22 @@ fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
         ];
         if let Some(note) = &step.note {
             spans.push(Span::styled(
-                format!("  — {note}"),
+                format!("  - {note}"),
                 Style::default().fg(color),
             ));
         }
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn plan_prefix(s: &PlanStatus) -> &'static str {
+    match s {
+        PlanStatus::Pending => "-",
+        PlanStatus::InProgress => "o",
+        PlanStatus::Done => "+",
+        PlanStatus::Blocked => "x",
+    }
 }
 
 fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
@@ -593,7 +832,7 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     text.push(Line::from(vec![
         Span::styled("> ", Style::default().fg(Color::Green)),
         Span::raw(dialog.buf.clone()),
-        Span::styled("▎", Style::default().fg(Color::Green)),
+        Span::styled("_", Style::default().fg(Color::Green)),
     ]));
 
     let hint = if matches!(dialog.prompt, UserPrompt::Question { .. }) && options.is_empty() {
@@ -617,4 +856,386 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
         rows[1],
     );
     let _ = app;
+}
+
+// ---------------------------------------------------------------------------
+// markdown
+// ---------------------------------------------------------------------------
+
+/// A styled text token (no ratatui dependency in the pure core).
+#[derive(Clone)]
+struct Tok {
+    text: String,
+    style: Style,
+}
+
+fn tok(text: impl Into<String>, style: Style) -> Tok {
+    Tok {
+        text: text.into(),
+        style,
+    }
+}
+
+fn base_style() -> Style {
+    Style::default().fg(Color::White)
+}
+
+/// Wrap a plain string into lines of at most `width` chars.
+fn plain_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn hard_cut(line: &str, width: usize) -> Vec<String> {
+    if line.chars().count() <= width {
+        return vec![line.to_string()];
+    }
+    line.chars()
+        .collect::<Vec<char>>()
+        .chunks(width)
+        .map(|c| c.iter().collect())
+        .collect()
+}
+
+/// Parse markdown into wrapped, styled token lines.
+fn md_tok_lines(md: &str, width: usize) -> Vec<Vec<Tok>> {
+    let width = width.max(8);
+    let lines: Vec<&str> = md.lines().collect();
+    let mut out: Vec<Vec<Tok>> = Vec::new();
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            i += 1;
+            let mut code = Vec::new();
+            while i < lines.len() && !lines[i].trim().starts_with("```") {
+                code.push(lines[i]);
+                i += 1;
+            }
+            if i < lines.len() {
+                i += 1; // closing fence
+            }
+            for line in code {
+                for cut in hard_cut(line, width) {
+                    out.push(vec![tok(cut, Style::default().fg(Color::Cyan))]);
+                }
+            }
+            continue;
+        }
+        if let Some(level) = heading_level(trimmed) {
+            let text = trimmed[level..].trim();
+            let style = Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD);
+            for cut in plain_wrap(text, width) {
+                out.push(vec![tok(cut, style)]);
+            }
+            i += 1;
+            continue;
+        }
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            let bar: String = "-".repeat(width.min(40));
+            out.push(vec![tok(bar, Style::default().fg(Color::DarkGray))]);
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = bullet(trimmed) {
+            let indent = raw.len() - raw.trim_start().len();
+            let prefix = if indent == 0 { "- " } else { "  " };
+            for toks in wrap_toks(&inline_toks(rest, base_style()), width.saturating_sub(2)) {
+                let mut line = vec![tok(prefix, Style::default().fg(Color::Yellow))];
+                line.extend(toks);
+                out.push(line);
+            }
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with('>') {
+            let body = trimmed.trim_start_matches('>').trim();
+            let toks = vec![tok("| ", Style::default().fg(Color::DarkGray))];
+            for t in wrap_toks(&inline_toks(body, base_style()), width.saturating_sub(2)) {
+                let mut line = toks.clone();
+                line.extend(t);
+                out.push(line);
+            }
+            i += 1;
+            continue;
+        }
+        // plain paragraph: gather consecutive plain lines
+        let mut para = String::new();
+        while i < lines.len() {
+            let t = lines[i].trim();
+            if t.is_empty()
+                || t.starts_with('#')
+                || t.starts_with("```")
+                || t == "---"
+                || t.starts_with('>')
+                || bullet(t).is_some()
+            {
+                break;
+            }
+            if !para.is_empty() {
+                para.push(' ');
+            }
+            para.push_str(t);
+            i += 1;
+        }
+        for toks in wrap_toks(&inline_toks(&para, base_style()), width) {
+            out.push(toks);
+        }
+    }
+    out
+}
+
+/// Render a markdown string into wrapped, styled lines.
+fn md_to_lines(md: &str, width: usize) -> Vec<Vec<Span<'static>>> {
+    md_tok_lines(md, width)
+        .into_iter()
+        .map(tok_line_to_spans)
+        .collect()
+}
+
+/// Plain-text version of [`md_to_lines`] (used by tests/measuring).
+#[cfg(test)]
+fn md_text(md: &str, width: usize) -> Vec<String> {
+    md_tok_lines(md, width)
+        .into_iter()
+        .map(|line| line.into_iter().map(|t| t.text).collect())
+        .collect()
+}
+
+fn heading_level(s: &str) -> Option<usize> {
+    let level = s.chars().take_while(|&c| c == '#').count();
+    if level >= 1 && level <= 6 && s.len() > level && s.as_bytes()[level] == b' ' {
+        Some(level)
+    } else {
+        None
+    }
+}
+
+fn bullet(s: &str) -> Option<&str> {
+    s.strip_prefix("- ")
+        .or_else(|| s.strip_prefix("* "))
+        .or_else(|| s.strip_prefix("+ "))
+}
+
+fn tok_line_to_spans(line: Vec<Tok>) -> Vec<Span<'static>> {
+    line.into_iter()
+        .map(|t| Span::styled(t.text, t.style))
+        .collect()
+}
+
+/// Split inline markdown into styled tokens.
+fn inline_toks(text: &str, base: Style) -> Vec<Tok> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let bold = rest.find("**");
+        let code = rest.find('`');
+        let em = rest.find('*');
+        let pos = [bold, code, em].iter().flatten().copied().min();
+        let Some(pos) = pos else {
+            out.push(tok(rest.to_string(), base));
+            break;
+        };
+        if pos > 0 {
+            out.push(tok(rest[..pos].to_string(), base));
+        }
+        let tail = &rest[pos..];
+        if let Some(inner) = tail.strip_prefix("**") {
+            if let Some(end) = inner.find("**") {
+                out.push(tok(
+                    inner[..end].to_string(),
+                    base.add_modifier(Modifier::BOLD),
+                ));
+                rest = &inner[end + 2..];
+            } else {
+                out.push(tok(tail.to_string(), base));
+                break;
+            }
+        } else if let Some(inner) = tail.strip_prefix('`') {
+            if let Some(end) = inner.find('`') {
+                out.push(tok(
+                    inner[..end].to_string(),
+                    Style::default().fg(Color::Cyan),
+                ));
+                rest = &inner[end + 1..];
+            } else {
+                out.push(tok(tail.to_string(), base));
+                break;
+            }
+        } else if let Some(inner) = tail.strip_prefix('*') {
+            if let Some(end) = inner.find('*') {
+                out.push(tok(
+                    inner[..end].to_string(),
+                    base.add_modifier(Modifier::ITALIC),
+                ));
+                rest = &inner[end + 1..];
+            } else {
+                out.push(tok(tail.to_string(), base));
+                break;
+            }
+        } else {
+            out.push(tok(tail.to_string(), base));
+            break;
+        }
+    }
+    out
+}
+
+/// Wrap styled tokens into lines of at most `width` chars, word-aware.
+fn wrap_toks(tokens: &[Tok], width: usize) -> Vec<Vec<Tok>> {
+    let mut out = Vec::new();
+    let mut cur: Vec<Tok> = Vec::new();
+    let mut cur_len = 0usize;
+    let mut first = true;
+
+    for t in tokens {
+        for word in t.text.split(' ') {
+            if word.is_empty() {
+                continue;
+            }
+            let need = if first { 0 } else { 1 };
+            if cur_len + need + word.chars().count() > width && !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                cur_len = 0;
+                cur.push(tok(word.to_string(), t.style));
+                cur_len += word.chars().count();
+            } else {
+                if !first {
+                    cur.push(tok(" ".to_string(), Style::default()));
+                    cur_len += 1;
+                }
+                cur.push(tok(word.to_string(), t.style));
+                cur_len += word.chars().count();
+            }
+            first = false;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(vec![]);
+    }
+    out
+}
+
+/// Remove ReAct scaffolding (Thought/Tool/Args/Justification/Risk lines and the
+/// multi-line Args JSON) so only human-readable content is rendered.
+fn strip_react_scaffolding(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_fence = false;
+    let mut depth: i32 = 0; // brace/bracket depth while inside Args JSON
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_fence {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if depth > 0 {
+            let opens = (trimmed.matches('{').count() + trimmed.matches('[').count()) as i32;
+            let closes = (trimmed.matches('}').count() + trimmed.matches(']').count()) as i32;
+            depth += opens - closes;
+            continue;
+        }
+        if [
+            "Thought:",
+            "Tool:",
+            "Justification:",
+            "Risk:",
+            "Observation:",
+            "Final:",
+        ]
+        .iter()
+        .any(|m| trimmed.starts_with(m))
+        {
+            continue;
+        }
+        if trimmed.starts_with("Args:") {
+            let opens = (trimmed.matches('{').count() + trimmed.matches('[').count()) as i32;
+            let closes = (trimmed.matches('}').count() + trimmed.matches(']').count()) as i32;
+            depth = opens - closes;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_react_scaffolding() {
+        let md = "Thought: I will list\nTool: list_dir\nArgs: { \"path\": \".\" }\nJustification: find files\nRisk: none\n\nHere is the **answer**.";
+        let out = strip_react_scaffolding(md);
+        assert!(!out.contains("Thought:"));
+        assert!(!out.contains("Tool:"));
+        assert!(!out.contains("Args:"));
+        assert!(!out.contains("Justification:"));
+        assert!(out.contains("Here is the"));
+        assert!(out.contains("**answer**"));
+    }
+
+    #[test]
+    fn strips_multiline_args_json() {
+        let md =
+            "Tool: apply_edit\nArgs: {\n  \"old\": \"a\",\n  \"new\": \"b\"\n}\nThen the rest.";
+        let out = strip_react_scaffolding(md);
+        assert!(!out.contains("old"));
+        assert!(!out.contains("new"));
+        assert!(!out.contains("Args:"));
+        assert!(!out.contains("apply_edit"));
+        assert!(out.contains("rest"));
+    }
+
+    #[test]
+    fn markdown_headings_and_code() {
+        let lines = md_text("# Title\n\n```rs\nfn main() {}\n```\nplain", 40);
+        let flat = lines.join("\n");
+        assert!(flat.contains("Title"), "{flat}");
+        assert!(flat.contains("fn main() {}"), "{flat}");
+        assert!(flat.contains("plain"), "{flat}");
+    }
+
+    #[test]
+    fn wraps_long_paragraph() {
+        let text = "word ".repeat(50);
+        let lines = md_text(&text, 20);
+        assert!(lines.len() >= 2);
+        for l in &lines {
+            assert!(l.chars().count() <= 20, "line too wide: {l:?}");
+        }
+    }
 }

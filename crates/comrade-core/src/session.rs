@@ -24,7 +24,14 @@ pub enum AgentEvent {
     Delta(String),
     /// An isolated "Thought:" line from an assistant message.
     Thought(String),
-    /// A tool call began.
+    /// A tool call began, with the model's supplied reasoning when present.
+    ToolCall {
+        name: String,
+        args: String,
+        justification: Option<String>,
+        risk: Option<String>,
+    },
+    /// A tool call began (legacy marker; details are in `ToolCall`).
     ToolStart { name: String, args: String },
     /// A tool call finished.
     ToolResult {

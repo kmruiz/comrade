@@ -238,6 +238,14 @@ async fn run_agent_loop(
 
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
         let _ = tx
+            .send(AgentEvent::ToolCall {
+                name: tool_call.name.clone(),
+                args: args_pretty.clone(),
+                justification: turn_p.justification.clone(),
+                risk: turn_p.risk.clone(),
+            })
+            .await;
+        let _ = tx
             .send(AgentEvent::ToolStart {
                 name: tool_call.name.clone(),
                 args: args_pretty,
@@ -330,6 +338,15 @@ async fn run_native_calls(
 
     let total = prepared.len();
     for p in prepared {
+        let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
+        let _ = tx
+            .send(AgentEvent::ToolCall {
+                name: p.name.clone(),
+                args: args_pretty.clone(),
+                justification: p.justification.clone(),
+                risk: p.risk.clone(),
+            })
+            .await;
         if is_approval_gated(&p.name) && !ctx.auto_approve {
             let has_j = p.justification.is_some();
             let has_r = p.risk.is_some();
