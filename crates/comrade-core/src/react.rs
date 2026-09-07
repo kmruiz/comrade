@@ -47,6 +47,8 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          Tool: <tool_name>\n\
          Args: <JSON object with the tool's arguments>\n\
          \n\
+         Args MUST be valid strict JSON: quote every key and every string value, e.g. {\"path\": \"src/main.rs\"}.\n\
+         \n\
          After each tool call you will receive:\n\
          \n\
          Observation: <the tool result>\n\
@@ -125,8 +127,9 @@ pub fn parse_turn(text: &str) -> Result<ParsedTurn> {
             match seg.find('{') {
                 Some(open) => {
                     let balanced = balanced_object(seg, open)?;
-                    serde_json::from_str(balanced)
-                        .map_err(|e| anyhow::anyhow!("Args is not valid JSON: {e}"))?
+                    parse_args_json(balanced).map_err(|e| {
+                        anyhow::anyhow!("Args is not valid JSON (tried auto-repair): {e}")
+                    })?
                 }
                 None => Value::Object(Default::default()),
             }
@@ -175,6 +178,111 @@ fn balanced_object<'a>(s: &'a str, open: usize) -> Result<&'a str> {
         }
     }
     anyhow::bail!("unbalanced braces in Args JSON")
+}
+
+/// Parse tool arguments, tolerating the JSON-ish output small models produce
+/// (unquoted keys and bare string values such as `{ path: crates }`). Strict
+/// JSON is tried first; on failure the text is repaired and parsing retried.
+fn parse_args_json(text: &str) -> Result<Value> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            let repaired = quote_object_keys_and_bare_strings(text);
+            serde_json::from_str(&repaired).map_err(|e| anyhow::anyhow!("{e}; input: {repaired}"))
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// Expecting an object key (right after `{` or `,`).
+    Key,
+    /// Expecting a value (right after `:`).
+    Value,
+}
+
+/// Repair JSON-ish text into valid JSON: quote unquoted object keys and bare
+/// string values. Walks the input once, skipping string literals; `true`,
+/// `false`, `null`, numbers, and already-quoted text are left alone.
+fn quote_object_keys_and_bare_strings(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len() + 32);
+    let mut i = 0usize;
+    let mut mode = Mode::Key;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                    } else if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+                out.push_str(&input[start..i]);
+                // A string may be a key (next char `:`) or a value.
+                mode = Mode::Value;
+            }
+            b'{' => {
+                out.push('{');
+                i += 1;
+                mode = Mode::Key;
+            }
+            b',' => {
+                out.push(',');
+                i += 1;
+                mode = Mode::Key;
+            }
+            b':' => {
+                out.push(':');
+                i += 1;
+                mode = Mode::Value;
+            }
+            _ if is_ident_start(bytes[i]) => {
+                let start = i;
+                while i < bytes.len() && is_ident_char(bytes[i]) {
+                    i += 1;
+                }
+                let token = &input[start..i];
+                match mode {
+                    Mode::Key => {
+                        out.push('"');
+                        out.push_str(token);
+                        out.push('"');
+                    }
+                    Mode::Value => {
+                        if matches!(token, "true" | "false" | "null") {
+                            out.push_str(token);
+                        } else {
+                            out.push('"');
+                            out.push_str(token);
+                            out.push('"');
+                        }
+                    }
+                }
+            }
+            _ => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
 /// Wrap a tool result as the "Observation" the model sees next.
@@ -235,5 +343,39 @@ mod tests {
         let turn = parse_turn("Tool: list_dir\nArgs: {\"path\": \".\"}").unwrap();
         assert!(turn.thought.is_none());
         assert!(turn.tool_call.is_some());
+    }
+
+    #[test]
+    fn tolerates_unquoted_keys() {
+        let turn =
+            parse_turn("Thought: list it\nTool: list_dir\nArgs: { path: \"crates\" }").unwrap();
+        let call = turn.tool_call.unwrap();
+        assert_eq!(call.name, "list_dir");
+        assert_eq!(call.args["path"], "crates");
+    }
+
+    #[test]
+    fn tolerates_nested_unquoted_keys() {
+        let turn = parse_turn(
+            "Tool: rename\nArgs: { symbol: helper, opts: { path: \"src\", dry_run: true }, n: 3 }",
+        )
+        .unwrap();
+        let call = turn.tool_call.unwrap();
+        assert_eq!(call.args["symbol"], "helper");
+        assert_eq!(call.args["opts"]["path"], "src");
+        assert_eq!(call.args["opts"]["dry_run"], Value::Bool(true));
+        assert_eq!(call.args["n"], Value::from(3));
+    }
+
+    #[test]
+    fn quotes_only_keys_not_string_innards() {
+        let turn = parse_turn(
+            "Tool: apply_edit\nArgs: { path: \"Cargo.toml\", old: \"edition = 2021 note: legacy\", new: \"x\" }",
+        )
+        .unwrap();
+        let call = turn.tool_call.unwrap();
+        // the "note:" inside the string value must NOT be quoted/repaired away
+        assert_eq!(call.args["old"], "edition = 2021 note: legacy");
+        assert_eq!(call.args["path"], "Cargo.toml");
     }
 }
