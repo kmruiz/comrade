@@ -266,6 +266,7 @@ impl App {
         let tools = self.tools.clone();
         let ctx = self.ctx_base.clone();
         let tx = self.events_tx.clone();
+        let balance_tx = self.events_tx.clone();
         let stop = CancellationToken::new();
         self.stop = Some(stop.clone());
         self.running = true;
@@ -273,6 +274,10 @@ impl App {
         self.sel = None;
         tokio::spawn(async move {
             let _ = run_agent(&cfg, &client, ctx, &tools, prompt, tx, stop).await;
+            // Refresh the provider account balance after the run finishes.
+            if let Some(balance) = client.fetch_account_balance().await {
+                let _ = balance_tx.send(AgentEvent::AccountBalance(balance)).await;
+            }
         });
     }
 
@@ -397,6 +402,9 @@ impl App {
                 self.ctx_tokens = tokens;
                 self.ctx_budget = budget.max(1);
                 self.ctx_estimated = estimated;
+            }
+            AgentEvent::AccountBalance(balance) => {
+                self.balance = Some(balance);
             }
         }
     }

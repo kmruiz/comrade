@@ -45,6 +45,8 @@ pub enum AgentEvent {
     Error(String),
     /// The run finished (success or not).
     RunEnd,
+    /// Provider account balance refreshed after a run finished.
+    AccountBalance(String),
     /// Live context-usage snapshot. `tokens` is the real `prompt_tokens`
     /// reported by the model API when available; otherwise it is our estimate
     /// and `estimated` is true.
