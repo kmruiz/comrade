@@ -19,6 +19,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(ListDir),
         Box::new(ListFiles),
+        Box::new(RGrep),
         Box::new(ReadFile),
         Box::new(ApplyEdit),
         Box::new(WriteFile),
@@ -407,6 +408,138 @@ impl Tool for ListFiles {
     }
 }
 
+// ---------------------------------------------------------------------------
+// rgrep
+// ---------------------------------------------------------------------------
+
+struct RGrep;
+
+static RGREP_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+    ToolSpec {
+    name: "rgrep".into(),
+    description: "Search for literal text in project files, like a filtered grep. Returns matching lines as file:line: text. Use when you need to find every place a string, identifier, or phrase appears. `glob` restricts which files are searched (default \"**/*\"). Matching is substring-based; use ignore_case for case-insensitive search.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "pattern": { "type": "string", "description": "Literal text to search for (not a regex)." },
+            "glob": { "type": "string", "default": "**/*", "description": "Glob restricting files to search." },
+            "ignore_case": { "type": "boolean", "default": false, "description": "Case-insensitive match." }
+        },
+        "required": ["pattern"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for RGrep {
+    fn spec(&self) -> &ToolSpec {
+        &RGREP_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            pattern: String,
+            #[serde(default = "default_glob")]
+            glob: String,
+            #[serde(default)]
+            ignore_case: bool,
+        }
+        fn default_glob() -> String {
+            "**/*".to_string()
+        }
+        let args: Args = serde_json::from_value(args)?;
+        if args.pattern.is_empty() {
+            anyhow::bail!("`pattern` must not be empty");
+        }
+
+        let matches = search_files(
+            &ctx.project_root,
+            &args.glob,
+            &args.pattern,
+            args.ignore_case,
+        )?;
+
+        let total = matches.len();
+        const MAX_LINES: usize = 300;
+        let mut out = format!("{total} match(es) for {:?}:\n", args.pattern);
+        for (file, line, text) in matches.iter().take(MAX_LINES) {
+            out.push_str(&format!("{file}:{line}: {text}\n"));
+        }
+        if total > MAX_LINES {
+            out.push_str(&format!("... and {} more\n", total - MAX_LINES));
+        }
+        Ok(clamp(out))
+    }
+}
+
+/// Search matching lines across files under `root` (relative `glob`), returning
+/// (file, 1-based line, trimmed line text) tuples.
+fn search_files(
+    root: &Path,
+    glob: &str,
+    needle: &str,
+    ignore_case: bool,
+) -> Result<Vec<(String, usize, String)>> {
+    let glob = glob.trim().trim_start_matches("./");
+    if glob.is_empty() || glob.contains('\\') || glob.contains("..") {
+        anyhow::bail!("invalid glob {:?}", glob);
+    }
+    let needle_owned;
+    let needle: &str = if ignore_case {
+        needle_owned = needle.to_lowercase();
+        &needle_owned
+    } else {
+        needle
+    };
+
+    let mut files = Vec::new();
+    walk(root, &mut files);
+    files.sort();
+
+    let mut out = Vec::new();
+    for file in files {
+        let rel = file
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if !glob_matches(glob, &rel) {
+            continue;
+        }
+        if file
+            .metadata()
+            .map(|m| m.len() > 4 * 1024 * 1024)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&file) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue; // binary
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let hay = if ignore_case {
+            text.to_lowercase()
+        } else {
+            text.clone()
+        };
+        let src_lines: Vec<&str> = text.split('\n').collect();
+        for (idx, line) in hay.split('\n').enumerate() {
+            if line.contains(needle) {
+                let src = src_lines[idx].trim();
+                let trimmed: String = src.chars().take(160).collect();
+                out.push((rel.clone(), idx + 1, trimmed));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Directories never walked by file listings.
 const IGNORED_DIRS: &[&str] = &[
     ".git",
@@ -500,5 +633,38 @@ mod tests {
         assert!(glob_matches("src/**/*.rs", "src/main.rs"));
         assert!(glob_matches("src/**/*.rs", "src/a/b.rs"));
         assert!(!glob_matches("src/**/*.rs", "lib.rs"));
+    }
+
+    #[test]
+    fn rgrep_filters_by_glob_and_case() {
+        let root = std::env::temp_dir().join(format!(
+            "comrade-rgrep-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/a.rs"),
+            "fn main() { hello(); }\nfn hello() {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/b.txt"), "just hello text\n").unwrap();
+        std::fs::write(root.join("README.md"), "Hello world\n").unwrap();
+
+        let m = super::search_files(&root, "**/*.rs", "hello", false).unwrap();
+        assert_eq!(m.len(), 2);
+        assert!(m.iter().all(|(f, _, _)| f.ends_with(".rs")));
+        // glob restricts to md
+        let m2 = super::search_files(&root, "*.md", "hello", true).unwrap();
+        assert_eq!(m2.len(), 1);
+        assert_eq!(m2[0].0, "README.md");
+        assert_eq!(m2[0].2, "Hello world");
+        // case-sensitive finds nothing in md
+        assert!(
+            super::search_files(&root, "*.md", "hello", false)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
