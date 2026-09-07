@@ -115,7 +115,9 @@ impl ContextManager {
             return;
         };
         self.history[idx].content = format!("[{count} tool call(s) executed]");
-        self.history[idx].tool_calls = None;
+        // NOTE: `tool_calls` must stay intact: the OpenAI wire format requires a
+        // `role: "tool"` message to follow an assistant message that declares the
+        // matching `tool_calls`. Stripping them here broke DeepSeek.
     }
 
     /// Fit history under the token budget: stub large old observations, then
@@ -133,16 +135,31 @@ impl ContextManager {
             };
             self.stub_observation(idx);
         }
-        // 2. Evict from the front, rolling up what we can keep.
+        // 2. Evict from the front, rolling up what we can keep. Tool results are
+        // removed together with the assistant message that declared their
+        // `tool_calls`, so a `role: "tool"` message is never orphaned.
         let mut rolled_up = false;
         while self.over_budget() && self.history.len() > 1 {
             let i = 1;
+            let is_assistant_calls = self.history[i].role == crate::llm::Role::Assistant
+                && self.history[i].tool_calls.is_some();
             if let Some(snippet) = rollup_snippet(&self.history[i]) {
                 self.append_rollup(&snippet);
                 rolled_up = true;
             }
             self.history.remove(i);
             self.evicted += 1;
+            // Drop the tool results that referenced those calls too.
+            if is_assistant_calls {
+                while self.history.len() > 1 && self.history[1].role == crate::llm::Role::Tool {
+                    self.history.remove(1);
+                    self.evicted += 1;
+                }
+            } else if self.history.len() > 1 && self.history[1].role == crate::llm::Role::Tool {
+                // Orphan tool message (shouldn't happen); remove it alone.
+                self.history.remove(1);
+                self.evicted += 1;
+            }
         }
         if rolled_up {
             self.upsert_rollup_message();
@@ -354,5 +371,88 @@ mod tests {
             "oversized observation should be gone/stubbed"
         );
         assert!(cm.total_tokens() <= 40);
+    }
+}
+
+#[cfg(test)]
+mod tool_role_invariant_tests {
+    use super::*;
+    use crate::llm::{ChatMessage, Role, ToolCallMsg};
+
+    fn pair(id: &str, calls: Vec<ToolCallMsg>) -> Vec<ChatMessage> {
+        let mut out = vec![ChatMessage::assistant_with_calls(
+            format!("assistant turn {id} with a fair amount of text"),
+            calls,
+        )];
+        out.push(ChatMessage::tool_result(
+            id,
+            format!("result of {id}, some detail"),
+        ));
+        out.push(ChatMessage::tool_result(
+            id,
+            "second tool result for the same turn",
+        ));
+        out
+    }
+
+    fn no_orphaned_tool_messages(history: &[ChatMessage]) -> bool {
+        let mut pending_calls = false;
+        for m in history {
+            match m.role {
+                Role::Assistant if m.tool_calls.is_some() => pending_calls = true,
+                Role::Tool if !pending_calls => return false,
+                Role::User => pending_calls = false,
+                _ => {}
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn note_turn_done_keeps_tool_calls() {
+        let mut cm = ContextManager::new(1_000_000, 100_000);
+        cm.push(ChatMessage::new(Role::System, "sys"));
+        for m in pair(
+            "c1",
+            vec![ToolCallMsg {
+                id: "c1".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path":"a.rs","content":"x".repeat(40)}),
+            }],
+        ) {
+            cm.push(m);
+        }
+        cm.note_turn_done(1);
+        let assistant = cm
+            .messages()
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .unwrap();
+        assert!(
+            assistant.tool_calls.is_some(),
+            "tool_calls must be preserved"
+        );
+        assert!(assistant.content.contains("tool call(s) executed"));
+    }
+
+    #[test]
+    fn eviction_never_orphans_tool_messages() {
+        let mut cm = ContextManager::new(600, 100_000);
+        cm.push(ChatMessage::new(Role::System, "sys"));
+        for i in 0..30u32 {
+            let id = format!("c{i}");
+            let calls = vec![ToolCallMsg {
+                id: id.clone(),
+                name: "run_task".into(),
+                arguments: serde_json::json!({"task":"test"}),
+            }];
+            for m in pair(&id, calls) {
+                cm.push(m);
+            }
+        }
+        cm.enforce_budget();
+        let history = cm.messages().to_vec();
+        assert!(no_orphaned_tool_messages(&history), "{history:?}");
+        assert!(cm.evicted > 0);
     }
 }

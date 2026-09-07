@@ -303,6 +303,9 @@ impl LlmClient {
     /// `/api/show` details like "7B (Q4_K_M)"). Returns `None` when the endpoint
     /// is not Ollama or does not provide details.
     pub async fn fetch_model_version(&self) -> Option<String> {
+        if !self.is_ollama() {
+            return None;
+        }
         let origin = origin_of(&self.cfg.base_url)?;
         let Ok(short) = reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
@@ -327,15 +330,17 @@ impl LlmClient {
 
     /// Try to detect the model's context window (tokens). Best effort:
     /// 1. OpenAI-compatible `GET /models` (`context_length`/`context_window`);
-    /// 2. Ollama's native `GET /api/show` (`model_info...context_length`).
-    /// Returns `None` when the endpoint does not report it.
+    /// 2. Ollama's native `GET /api/show` (`model_info...context_length`) -
+    ///    only probed when the endpoint actually looks like Ollama;
+    /// 3. a model-name heuristic (e.g. DeepSeek 64K/128K suffixes).
+    /// Returns `None` only if nothing is known.
     pub async fn fetch_context_window(&self) -> Option<usize> {
         let Ok(short) = reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
             .connect_timeout(Duration::from_secs(5))
             .build()
         else {
-            return None;
+            return heuristic_context(&self.cfg.model);
         };
         // 1) OpenAI-compatible models list.
         let base = self.cfg.base_url.trim_end_matches('/');
@@ -349,21 +354,33 @@ impl LlmClient {
                 }
             }
         }
-        // 2) Ollama native show.
-        if let Some(origin) = origin_of(&self.cfg.base_url) {
-            let show_url = format!("{origin}/api/show");
-            let body = serde_json::json!({ "name": self.cfg.model });
-            if let Ok(resp) = short.post(&show_url).json(&body).send().await {
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        if let Some(n) = model_context_from_ollama_show(&text) {
-                            return Some(n);
+        // 2) Ollama native show (only for real Ollama endpoints).
+        if self.is_ollama() {
+            if let Some(origin) = origin_of(&self.cfg.base_url) {
+                let show_url = format!("{origin}/api/show");
+                let body = serde_json::json!({ "name": self.cfg.model });
+                if let Ok(resp) = short.post(&show_url).json(&body).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(text) = resp.text().await {
+                            if let Some(n) = model_context_from_ollama_show(&text) {
+                                return Some(n);
+                            }
                         }
                     }
                 }
             }
         }
-        None
+        // 3) Name-based heuristic fallback for cloud providers.
+        heuristic_context(&self.cfg.model)
+    }
+
+    /// Best guess whether the configured endpoint is an Ollama instance.
+    fn is_ollama(&self) -> bool {
+        if let Some(p) = self.cfg.provider.as_deref() {
+            return matches!(p.to_ascii_lowercase().as_str(), "ollama" | "local");
+        }
+        let host = origin_of(&self.cfg.base_url).unwrap_or_default();
+        host.contains("localhost") || host.contains("127.0.0.1") || host.contains("11434")
     }
 
     /// Send the whole conversation (non-streaming) and return the reply text.
@@ -563,6 +580,35 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
     Some(SseEvent::Data(payload.to_string()))
 }
 
+/// Name-based context-window fallback for cloud providers whose `/models`
+/// endpoint does not advertise context (e.g. DeepSeek).
+fn heuristic_context(model: &str) -> Option<usize> {
+    let m = model.to_lowercase();
+    let suffix = [
+        ("1.5m", 1_500_000usize),
+        ("1m", 1_000_000),
+        ("128k", 131_072),
+        ("64k", 65_536),
+        ("32k", 32_768),
+        ("16k", 16_384),
+        ("8k", 8_192),
+        ("4k", 4_096),
+        ("2k", 2_048),
+    ];
+    for (needle, size) in suffix {
+        if m.contains(needle) {
+            return Some(size);
+        }
+    }
+    if m.contains("deepseek") {
+        return Some(65_536);
+    }
+    if m.contains("gpt-4o") {
+        return Some(128_000);
+    }
+    None
+}
+
 /// Extract the model's context window from an OpenAI-compatible `/models`
 /// JSON body, matching by model id.
 fn model_context_from_openai(json: &str, model: &str) -> Option<usize> {
@@ -572,7 +618,13 @@ fn model_context_from_openai(json: &str, model: &str) -> Option<usize> {
         if entry.get("id").and_then(Value::as_str) != Some(model) {
             continue;
         }
-        for key in ["context_length", "context_window", "max_context_length"] {
+        for key in [
+            "context_length",
+            "context_window",
+            "max_context_length",
+            "max_model_len",
+            "context_size",
+        ] {
             if let Some(n) = entry.get(key).and_then(Value::as_u64) {
                 if n > 0 {
                     return Some(n as usize);
@@ -908,5 +960,27 @@ mod detect_tests {
             origin_of("https://host.example/foo/bar").as_deref(),
             Some("https://host.example")
         );
+    }
+}
+
+#[cfg(test)]
+mod heuristic_tests {
+    use super::*;
+
+    #[test]
+    fn deepseek_gets_a_sane_fallback_window() {
+        assert_eq!(heuristic_context("deepseek-chat"), Some(65_536));
+        assert_eq!(heuristic_context("deepseek-reasoner"), Some(65_536));
+    }
+
+    #[test]
+    fn k_suffixes_are_recognized() {
+        assert_eq!(heuristic_context("something-128k"), Some(131_072));
+        assert_eq!(heuristic_context("foo-32k"), Some(32_768));
+    }
+
+    #[test]
+    fn unknown_models_return_none() {
+        assert_eq!(heuristic_context("totally-unknown-model"), None);
     }
 }
