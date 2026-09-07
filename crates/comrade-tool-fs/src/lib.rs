@@ -788,7 +788,7 @@ mod tests {
             fn title(&self) -> String {
                 "test".into()
             }
-            fn set_plan(&self, _steps: Vec<String>) {}
+            fn set_plan(&self, _steps: Vec<comrade_tool::PlanStepDraft>) {}
             fn plan(&self) -> Vec<PlanStep> {
                 vec![]
             }

@@ -98,15 +98,16 @@ impl SessionControl for AgentSession {
         self.title.read().unwrap().clone()
     }
 
-    fn set_plan(&self, steps: Vec<String>) {
+    fn set_plan(&self, steps: Vec<comrade_tool::PlanStepDraft>) {
         let mut plan = Vec::new();
         {
             let mut next = self.next_id.write().unwrap();
             *next = 1;
-            for description in steps {
+            for draft in steps {
                 plan.push(PlanStep {
                     id: *next,
-                    description,
+                    goal: draft.goal,
+                    verification: draft.verification,
                     status: PlanStatus::Pending,
                     note: None,
                 });
@@ -126,7 +127,7 @@ impl SessionControl for AgentSession {
         let mut plan = self.plan.write().unwrap();
         let hit = plan.iter_mut().find(|s| match &target {
             PlanTarget::Id(id) => s.id == *id,
-            PlanTarget::Text(text) => s.description.contains(text.as_str()),
+            PlanTarget::Text(text) => s.goal.contains(text.as_str()),
         });
         match hit {
             Some(step) => {
@@ -170,7 +171,14 @@ impl SessionControl for AgentSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comrade_tool::{PlanStatus, PlanTarget, SessionControl};
+    use comrade_tool::{PlanStatus, PlanStepDraft, PlanTarget, SessionControl};
+
+    fn draft(goal: &str, verification: &str) -> PlanStepDraft {
+        PlanStepDraft {
+            goal: goal.to_string(),
+            verification: verification.to_string(),
+        }
+    }
 
     #[test]
     fn plan_lifecycle() {
@@ -179,16 +187,21 @@ mod tests {
         s.set_title("Rename it");
         assert_eq!(s.title(), "Rename it");
 
-        s.set_plan(vec!["find references".into(), "rename".into()]);
+        s.set_plan(vec![
+            draft("find references", "rgrep shows all call sites"),
+            draft("rename", "cargo check passes"),
+        ]);
         let plan = s.plan();
         assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].id, 1);
+        assert_eq!(plan[0].goal, "find references");
+        assert_eq!(plan[0].verification, "rgrep shows all call sites");
 
         assert!(s.update_plan(PlanTarget::Id(2), PlanStatus::InProgress, None));
         assert_eq!(s.plan()[1].status, PlanStatus::InProgress);
 
         // resetting the plan restarts ids at 1
-        s.set_plan(vec!["only".into()]);
+        s.set_plan(vec![draft("only", "")]);
         assert_eq!(s.plan()[0].id, 1);
 
         s.set_status("main");

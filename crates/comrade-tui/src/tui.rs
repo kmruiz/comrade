@@ -927,7 +927,7 @@ fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
                 format!("{}. ", step.id),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(step.description.clone(), Style::default().fg(text_color)),
+            Span::styled(step.goal.clone(), Style::default().fg(text_color)),
         ];
         if let Some(note) = &step.note {
             spans.push(Span::styled(
@@ -936,6 +936,17 @@ fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
             ));
         }
         lines.push(Line::from(spans));
+        // verification: how this step is proven (keeps steps isolated)
+        let verify = step.verification.trim();
+        if !verify.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("      ", Style::default()),
+                Span::styled(
+                    format!("verify: {verify}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }

@@ -8,7 +8,7 @@ pub mod plan;
 pub mod repo;
 pub mod tool;
 
-pub use plan::{PlanStatus, PlanStep, PlanTarget, SessionControl};
+pub use plan::{PlanStatus, PlanStep, PlanStepDraft, PlanTarget, SessionControl};
 pub use repo::changed_files_abs;
 pub use tool::{
     ApprovalNotes, Tool, ToolContext, ToolRegistry, ToolSpec, UndoLog, UserIo, UserPrompt,

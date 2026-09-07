@@ -73,15 +73,23 @@ struct SetPlan;
 static SET_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "set_plan".into(),
-    description: "Lay out the plan as an ordered checklist of steps before doing work. Call once up front; advance steps with update_plan. Replaces any existing plan.".into(),
+    description: "Lay out the plan before doing work. Each step is an isolated unit with a goal and a verification (how to prove it succeeded), so steps can later be run independently. Replaces any existing plan; advance steps with update_plan.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "steps": {
                 "type": "array",
-                "items": { "type": "string" },
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "goal": { "type": "string", "description": "What this step aims to accomplish." },
+                        "verification": { "type": "string", "description": "How to verify the step succeeded, e.g. \"cargo test passes\" or \"rgrep finds the new call sites\"." }
+                    },
+                    "required": ["goal"],
+                    "additionalProperties": false
+                },
                 "minItems": 1,
-                "description": "Ordered step descriptions."
+                "description": "Ordered steps; keep each one small and self-contained."
             }
         },
         "required": ["steps"],
@@ -98,17 +106,36 @@ impl Tool for SetPlan {
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
         #[derive(Deserialize)]
+        struct StepArg {
+            goal: String,
+            #[serde(default)]
+            verification: String,
+        }
+        #[derive(Deserialize)]
         struct Args {
-            steps: Vec<String>,
+            steps: Vec<StepArg>,
         }
         let args: Args = serde_json::from_value(args)?;
         if args.steps.is_empty() {
             anyhow::bail!("steps must contain at least one item");
         }
-        ctx.session.set_plan(args.steps.clone());
+        for step in &args.steps {
+            if step.goal.trim().is_empty() {
+                anyhow::bail!("each step needs a non-empty `goal`");
+            }
+        }
+        let drafts: Vec<comrade_tool::PlanStepDraft> = args
+            .steps
+            .into_iter()
+            .map(|s| comrade_tool::PlanStepDraft {
+                goal: s.goal,
+                verification: s.verification,
+            })
+            .collect();
+        ctx.session.set_plan(drafts.clone());
         Ok(format!(
             "Plan set with {} step(s). Step ids are 1-based.",
-            args.steps.len()
+            drafts.len()
         ))
     }
 }
@@ -122,12 +149,12 @@ struct UpdatePlan;
 static UPDATE_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "update_plan".into(),
-    description: "Update the status of one plan step (mark in_progress/done/blocked). Identify a step by its 1-based `index` (preferred) or by `text` that appears in its description.".into(),
+    description: "Update the status of one plan step (mark in_progress/done/blocked). Identify a step by its 1-based `index` (preferred) or by `text` that appears in its goal.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "index": { "type": "integer", "minimum": 1, "description": "1-based step id." },
-            "text": { "type": "string", "description": "Text contained in the step description." },
+            "text": { "type": "string", "description": "Text contained in the step goal." },
             "status": { "type": "string", "enum": ["pending", "in_progress", "done", "blocked"] },
             "note": { "type": "string", "description": "Optional note appended to the step." }
         },

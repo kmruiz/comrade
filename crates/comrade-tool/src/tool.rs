@@ -230,7 +230,7 @@ mod tests {
         fn title(&self) -> String {
             "test".into()
         }
-        fn set_plan(&self, _s: Vec<String>) {}
+        fn set_plan(&self, _s: Vec<crate::plan::PlanStepDraft>) {}
         fn plan(&self) -> Vec<PlanStep> {
             vec![]
         }

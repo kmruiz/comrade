@@ -41,14 +41,38 @@ impl fmt::Display for PlanStatus {
     }
 }
 
+/// A step draft as submitted by `set_plan`. Each step is self-contained (goal +
+/// verification), so steps can later be executed by independent agents.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlanStepDraft {
+    /// What this step aims to accomplish.
+    pub goal: String,
+    /// How to know the step succeeded (a command to run, a check, expected
+    /// outcome). Optional but strongly encouraged for isolatable steps.
+    #[serde(default)]
+    pub verification: String,
+}
+
 /// One row of the session plan the agent presents in the UI.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlanStep {
     /// Stable 1-based id assigned when the plan is (re)set.
     pub id: u64,
-    pub description: String,
+    /// What this step aims to accomplish.
+    pub goal: String,
+    /// How to verify the step succeeded (may be empty).
+    pub verification: String,
     pub status: PlanStatus,
     pub note: Option<String>,
+}
+
+impl PlanStep {
+    pub fn draft(goal: &str, verification: &str) -> PlanStepDraft {
+        PlanStepDraft {
+            goal: goal.to_string(),
+            verification: verification.to_string(),
+        }
+    }
 }
 
 /// Selector used by `update_plan`.
@@ -56,7 +80,7 @@ pub struct PlanStep {
 pub enum PlanTarget {
     /// 1-based step id as reported by `set_plan`/`plan()`.
     Id(u64),
-    /// First step whose description contains this text.
+    /// First step whose goal contains this text.
     Text(String),
 }
 
@@ -70,7 +94,7 @@ pub trait SessionControl: Send + Sync {
 
     /// Replace the whole plan with the given steps. ids are assigned
     /// sequentially starting at 1.
-    fn set_plan(&self, steps: Vec<String>);
+    fn set_plan(&self, steps: Vec<PlanStepDraft>);
     /// Current plan snapshot.
     fn plan(&self) -> Vec<PlanStep>;
 
