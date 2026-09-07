@@ -540,7 +540,7 @@ fn search_files(
     Ok(out)
 }
 
-/// Directories never walked by file listings.
+/// Directories never walked by file listings, regardless of ignore files.
 const IGNORED_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -551,22 +551,35 @@ const IGNORED_DIRS: &[&str] = &[
     "dist",
 ];
 
+/// Collect regular files under `dir`, honouring gitignore-style rules
+/// (`.gitignore`, `.ignore`, git excludes/global) and the hardcoded
+/// [`IGNORED_DIRS`]. Backed by the `ignore` crate (ripgrep's walker).
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if IGNORED_DIRS.contains(&name.as_ref()) {
-                continue;
-            }
-            walk(&path, out);
-        } else {
-            out.push(path);
+    let mut builder = ignore::WalkBuilder::new(dir);
+    builder
+        .standard_filters(true)
+        .hidden(true)
+        .require_git(false)
+        .follow_links(false);
+    for result in builder.build() {
+        let Ok(entry) = result else { continue };
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_file() {
+            continue;
         }
+        let Ok(rel) = entry.path().strip_prefix(dir) else {
+            continue;
+        };
+        let skipped = rel
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .any(|seg| IGNORED_DIRS.contains(&seg));
+        if skipped {
+            continue;
+        }
+        out.push(entry.into_path());
     }
 }
 
@@ -664,6 +677,41 @@ mod tests {
             super::search_files(&root, "*.md", "hello", false)
                 .unwrap()
                 .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn walk_honours_gitignore_and_ignore() {
+        let root = std::env::temp_dir().join(format!(
+            "comrade-ignore-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::create_dir_all(root.join("also-ignored")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n**/*.gen.rs\n").unwrap();
+        std::fs::write(root.join(".ignore"), "also-ignored/\n").unwrap();
+        std::fs::write(root.join("ignored/x.rs"), "fn x() {}\n").unwrap();
+        std::fs::write(root.join("also-ignored/y.rs"), "fn y() {}\n").unwrap();
+        std::fs::write(root.join("keep.rs"), "fn keep() {}\n").unwrap();
+        std::fs::write(root.join("junk.gen.rs"), "fn junk() {}\n").unwrap();
+        std::fs::write(root.join("plain.txt"), "hello\n").unwrap();
+
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let mut rels: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.strip_prefix(&root).ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        rels.sort();
+        // ignored/, also-ignored/ and the generated file must be excluded;
+        // .gitignore/.ignore themselves are hidden files, so also absent.
+        assert_eq!(
+            rels,
+            vec!["keep.rs".to_string(), "plain.txt".to_string()],
+            "{rels:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
