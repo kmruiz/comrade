@@ -864,6 +864,7 @@ mod tests {
             user: Arc::new(StubUser),
             undo: Arc::new(StubUndo),
             auto_approve: true,
+            approval: Default::default(),
         };
         let list = ListFiles;
         let args = json!({ "pattern": "**/*.rs", "git_modified_only": true });

@@ -76,23 +76,58 @@ pub struct ToolContext {
     pub undo: std::sync::Arc<dyn UndoLog>,
     /// When true, mutating tools run without asking the user for confirmation.
     pub auto_approve: bool,
+    /// One-shot notes the model supplied for the next confirmation (why the
+    /// action should run, and what could go wrong). Written by the agent loop
+    /// before invoking a tool, read and cleared by [`ToolContext::confirm`].
+    pub approval: std::sync::Arc<std::sync::Mutex<Option<ApprovalNotes>>>,
 }
 
 impl ToolContext {
+    /// Model-supplied reasoning attached to the next approval prompt.
+    pub fn set_approval(&self, notes: ApprovalNotes) {
+        *self.approval.lock().unwrap() = Some(notes);
+    }
+
+    /// Drop any pending approval notes (called at the top of each agent turn).
+    pub fn clear_approval(&self) {
+        *self.approval.lock().unwrap() = None;
+    }
+
+    /// Take (and clear) any pending approval notes.
+    fn take_approval(&self) -> Option<ApprovalNotes> {
+        self.approval.lock().unwrap().take()
+    }
+
     /// Ask the human to approve a mutating operation.
     ///
     /// When `auto_approve` is set this returns `Ok` immediately. Otherwise it
     /// routes a [`UserPrompt::Confirm`] and fails with [`UserReply::Denied`]
-    /// unless the user consents.
+    /// unless the user consents. Any [`ApprovalNotes`] left by the agent are
+    /// rendered above the diff so the human sees the model's reasoning and the
+    /// risks before deciding.
     pub async fn confirm(&self, summary: impl Into<String>, diff: Option<String>) -> Result<()> {
         if self.auto_approve {
             return Ok(());
         }
+        let notes = self.take_approval();
+        let body = match notes {
+            Some(notes) => {
+                let mut text = notes.render();
+                if let Some(d) = diff {
+                    if !d.is_empty() {
+                        text.push_str("\n\n");
+                        text.push_str(&d);
+                    }
+                }
+                Some(text)
+            }
+            None => diff,
+        };
         match self
             .user
             .ask(UserPrompt::Confirm {
                 title: summary.into(),
-                diff,
+                diff: body,
             })
             .await?
         {
@@ -100,6 +135,27 @@ impl ToolContext {
             UserReply::Answer(text) => anyhow::bail!("user denied request ({text:?})"),
             UserReply::Denied => anyhow::bail!("user denied request"),
         }
+    }
+}
+
+/// Reasoning the model attaches to an action that needs human approval.
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalNotes {
+    /// Why this action should run.
+    pub justification: String,
+    /// What could go wrong / blast radius, when the model can say.
+    pub risk: Option<String>,
+}
+
+impl ApprovalNotes {
+    pub fn render(&self) -> String {
+        let mut text = format!("Justification: {}", self.justification.trim());
+        if let Some(risk) = &self.risk {
+            if !risk.trim().is_empty() {
+                text.push_str(&format!("\nRisk: {}", risk.trim()));
+            }
+        }
+        text
     }
 }
 
@@ -156,4 +212,104 @@ pub trait UndoLog: Send + Sync {
 
     /// Number of captured entries.
     async fn len(&self) -> usize;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+
+    use crate::plan::{PlanStatus, PlanStep, PlanTarget, SessionControl};
+
+    use super::*;
+
+    struct NoopSession;
+    impl SessionControl for NoopSession {
+        fn set_title(&self, _t: &str) {}
+        fn title(&self) -> String {
+            "test".into()
+        }
+        fn set_plan(&self, _s: Vec<String>) {}
+        fn plan(&self) -> Vec<PlanStep> {
+            vec![]
+        }
+        fn update_plan(&self, _t: PlanTarget, _s: PlanStatus, _n: Option<String>) -> bool {
+            true
+        }
+        fn finish_plan(&self, _s: Option<String>) {}
+        fn set_status(&self, _s: &str) {}
+        fn status(&self) -> String {
+            String::new()
+        }
+    }
+
+    struct CaptureIo {
+        last: Arc<Mutex<Option<String>>>,
+    }
+    #[async_trait]
+    impl UserIo for CaptureIo {
+        async fn ask(&self, prompt: UserPrompt) -> Result<UserReply> {
+            if let UserPrompt::Confirm { diff, .. } = prompt {
+                *self.last.lock().unwrap() = diff;
+            }
+            Ok(UserReply::Answer("yes".into()))
+        }
+    }
+
+    struct NoopUndo;
+    #[async_trait]
+    impl UndoLog for NoopUndo {
+        async fn capture(&self, _p: &str, _b: String) -> Result<()> {
+            Ok(())
+        }
+        async fn undo_last(&self) -> Result<usize> {
+            Ok(0)
+        }
+        async fn is_empty(&self) -> bool {
+            true
+        }
+        async fn len(&self) -> usize {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_includes_model_justification_and_risk() {
+        let last = Arc::new(Mutex::new(None));
+        let ctx = ToolContext {
+            project_root: PathBuf::from("/tmp/x"),
+            cwd: PathBuf::from("/tmp/x"),
+            session: Arc::new(NoopSession),
+            user: Arc::new(CaptureIo { last: last.clone() }),
+            undo: Arc::new(NoopUndo),
+            auto_approve: false,
+            approval: Default::default(),
+        };
+        ctx.set_approval(ApprovalNotes {
+            justification: "completes the requested rename".into(),
+            risk: Some("touches 2 files; reversible via undo".into()),
+        });
+        ctx.confirm("rename foo -> bar", None).await.unwrap();
+        let shown = last.lock().unwrap().clone().unwrap();
+        assert!(shown.contains("Justification: completes the requested rename"));
+        assert!(shown.contains("Risk: touches 2 files; reversible via undo"));
+    }
+
+    #[tokio::test]
+    async fn confirm_passes_diff_through_when_no_notes() {
+        let last = Arc::new(Mutex::new(None));
+        let ctx = ToolContext {
+            project_root: PathBuf::from("/tmp/x"),
+            cwd: PathBuf::from("/tmp/x"),
+            session: Arc::new(NoopSession),
+            user: Arc::new(CaptureIo { last: last.clone() }),
+            undo: Arc::new(NoopUndo),
+            auto_approve: false,
+            approval: Default::default(),
+        };
+        ctx.confirm("edit", Some("--- a.rs".into())).await.unwrap();
+        let shown = last.lock().unwrap().clone().unwrap();
+        assert_eq!(shown, "--- a.rs");
+    }
 }

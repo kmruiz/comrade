@@ -83,6 +83,10 @@ async fn run_agent_loop(
         }
         iterations += 1;
 
+        // Stale approval notes from a previous turn must not leak into a later
+        // confirmation; the current turn sets them again below.
+        ctx.clear_approval();
+
         ctxm.enforce_budget();
 
         // Stream the model's reply: each content chunk is forwarded to the UI as
@@ -152,6 +156,25 @@ async fn run_agent_loop(
             ));
             continue;
         };
+
+        // Hand the model's justification/risk to whatever confirmation the tool
+        // asks for (mutating tools and run_task).
+        let has_note = !turn
+            .justification
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+            || turn
+                .risk
+                .as_deref()
+                .is_some_and(|r| !r.trim().is_empty() && !r.trim().eq_ignore_ascii_case("none"));
+        if has_note {
+            ctx.set_approval(comrade_tool::ApprovalNotes {
+                justification: turn.justification.clone().unwrap_or_default(),
+                risk: turn.risk.clone(),
+            });
+        }
 
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
         let _ = tx
@@ -329,6 +352,7 @@ mod tests {
             user: Arc::new(FakeUser),
             undo: undo.clone(),
             auto_approve: true,
+            approval: Default::default(),
         };
         let tools = ToolRegistry::new();
         let client = LlmClient::new(&cfg.llm).unwrap();

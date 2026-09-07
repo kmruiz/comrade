@@ -104,6 +104,7 @@ fn new_session(
         user,
         undo: undo.clone(),
         auto_approve: deps.cfg.security.autonomy == comrade_core::Autonomy::Auto,
+        approval: Default::default(),
     };
     (
         SessionBundle {
