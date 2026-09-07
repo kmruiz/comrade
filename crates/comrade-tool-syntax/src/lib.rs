@@ -2,6 +2,8 @@
 
 mod engine;
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use anyhow::Result;
@@ -16,6 +18,34 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(Rename),
         Box::new(ListSymbols),
     ]
+}
+
+/// When `enabled`, the set of files that differ from HEAD.
+fn changed_scope(ctx: &ToolContext, enabled: bool) -> Result<Option<HashSet<PathBuf>>> {
+    if enabled {
+        Ok(Some(comrade_tool::changed_files_abs(&ctx.project_root)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// When a scope is set and an explicit path was given, require that the path is
+/// part of the change set.
+fn guard_path_scope(
+    ctx: &ToolContext,
+    path: &Option<String>,
+    scope: &Option<HashSet<PathBuf>>,
+) -> Result<()> {
+    if let (Some(p), Some(set)) = (path, scope) {
+        let abs = ctx.project_root.join(p);
+        if !abs.starts_with(&ctx.project_root) {
+            anyhow::bail!("path {p:?} escapes the project root");
+        }
+        if !set.contains(&abs) {
+            anyhow::bail!("{p} is not modified (git_modified_only)");
+        }
+    }
+    Ok(())
 }
 
 fn clamp(mut s: String) -> String {
@@ -51,7 +81,8 @@ static FIND_REFERENCES_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
         "type": "object",
         "properties": {
             "symbol": { "type": "string", "description": "Identifier to search for." },
-            "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." }
+            "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD (staged, unstaged, untracked)." }
         },
         "required": ["symbol"],
         "additionalProperties": false
@@ -71,9 +102,18 @@ impl Tool for FindReferences {
             symbol: String,
             #[serde(default)]
             path: Option<String>,
+            #[serde(default)]
+            git_modified_only: bool,
         }
         let args: Args = serde_json::from_value(args)?;
-        let occ = engine::find_occurrences(&ctx.project_root, &args.symbol, args.path.as_deref())?;
+        let scope = changed_scope(ctx, args.git_modified_only)?;
+        guard_path_scope(ctx, &args.path, &scope)?;
+        let occ = engine::find_occurrences(
+            &ctx.project_root,
+            &args.symbol,
+            args.path.as_deref(),
+            scope.as_ref(),
+        )?;
         if occ.is_empty() {
             return Ok(format!("No occurrences of {:?} found.", args.symbol));
         }
@@ -112,7 +152,8 @@ static RENAME_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
         "properties": {
             "symbol": { "type": "string", "description": "Current identifier." },
             "new": { "type": "string", "description": "New identifier." },
-            "path": { "type": "string", "description": "Optional file to restrict the rename to (project-root relative)." }
+            "path": { "type": "string", "description": "Optional file to restrict the rename to (project-root relative)." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only rename occurrences in files that differ from HEAD (staged, unstaged, untracked)." }
         },
         "required": ["symbol", "new"],
         "additionalProperties": false
@@ -134,6 +175,8 @@ impl Tool for Rename {
             new_name: String,
             #[serde(default)]
             path: Option<String>,
+            #[serde(default)]
+            git_modified_only: bool,
         }
         let args: Args = serde_json::from_value(args)?;
         if !is_valid_identifier(&args.symbol) {
@@ -145,7 +188,14 @@ impl Tool for Rename {
         if args.symbol == args.new_name {
             anyhow::bail!("new name equals old name");
         }
-        let edits = engine::rename_edits(&ctx.project_root, &args.symbol, args.path.as_deref())?;
+        let scope = changed_scope(ctx, args.git_modified_only)?;
+        guard_path_scope(ctx, &args.path, &scope)?;
+        let edits = engine::rename_edits(
+            &ctx.project_root,
+            &args.symbol,
+            args.path.as_deref(),
+            scope.as_ref(),
+        )?;
         let total: usize = edits.iter().map(|e| e.spans.len()).sum();
         if total == 0 {
             return Ok(format!(
@@ -208,7 +258,8 @@ static LIST_SYMBOLS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     json_schema: json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "description": "Optional file to inspect (project-root relative). Defaults to the whole project." }
+            "path": { "type": "string", "description": "Optional file to inspect (project-root relative). Defaults to the whole project." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only inspect files that differ from HEAD (staged, unstaged, untracked)." }
         },
         "additionalProperties": false
     }),
@@ -226,9 +277,14 @@ impl Tool for ListSymbols {
         struct Args {
             #[serde(default)]
             path: Option<String>,
+            #[serde(default)]
+            git_modified_only: bool,
         }
         let args: Args = serde_json::from_value(args)?;
-        let symbols = engine::list_symbols(&ctx.project_root, args.path.as_deref())?;
+        let scope = changed_scope(ctx, args.git_modified_only)?;
+        guard_path_scope(ctx, &args.path, &scope)?;
+        let symbols =
+            engine::list_symbols(&ctx.project_root, args.path.as_deref(), scope.as_ref())?;
         if symbols.is_empty() {
             return Ok("No symbols found.".to_string());
         }
@@ -264,11 +320,11 @@ fn main() {
         std::fs::write(root.join("main.rs"), a).unwrap();
         std::fs::write(root.join("notes.txt"), "helper appears here as plain text").unwrap();
 
-        let occ = crate::engine::find_occurrences(&root, "helper", None).unwrap();
+        let occ = crate::engine::find_occurrences(&root, "helper", None, None).unwrap();
         // function definition + call site, but NOT the comment/string or .txt file
         assert_eq!(occ.len(), 2, "occurrences: {occ:#?}");
 
-        let edits = crate::engine::rename_edits(&root, "helper", None).unwrap();
+        let edits = crate::engine::rename_edits(&root, "helper", None, None).unwrap();
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].spans.len(), 2);
         assert_eq!(
@@ -303,7 +359,7 @@ fn area(p: Point) -> i32 { p.x }
 "#,
         )
         .unwrap();
-        let syms = crate::engine::list_symbols(&root, None).unwrap();
+        let syms = crate::engine::list_symbols(&root, None, None).unwrap();
         assert!(syms.iter().any(|s| s.contains("fn area")));
         assert!(syms.iter().any(|s| s.contains("struct Point")));
         assert!(syms.iter().any(|s| s.contains("trait Draw")));

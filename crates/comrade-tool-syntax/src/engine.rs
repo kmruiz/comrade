@@ -6,7 +6,7 @@
 //! document their approximation so the model can prefer an LSP-backed tool
 //! when one is available.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -106,9 +106,14 @@ fn occurrences_in_text<'t>(
 
 /// Collect all occurrences of `symbol` across a project. When `path` is given,
 /// restrict the search to that file.
-pub fn find_occurrences(root: &Path, symbol: &str, path: Option<&str>) -> Result<Vec<Occurrence>> {
+pub fn find_occurrences(
+    root: &Path,
+    symbol: &str,
+    path: Option<&str>,
+    only: Option<&HashSet<PathBuf>>,
+) -> Result<Vec<Occurrence>> {
     let mut out = Vec::new();
-    for (rel, text) in collect_files(root, path)? {
+    for (rel, text) in collect_files(root, path, only)? {
         if let Some(lang) = language_for(
             Path::new(&rel)
                 .extension()
@@ -131,9 +136,14 @@ pub fn find_occurrences(root: &Path, symbol: &str, path: Option<&str>) -> Result
 }
 
 /// Grouped byte-span edits for a symbol rename across the project.
-pub fn rename_edits(root: &Path, symbol: &str, path: Option<&str>) -> Result<Vec<FileEdits>> {
+pub fn rename_edits(
+    root: &Path,
+    symbol: &str,
+    path: Option<&str>,
+    only: Option<&HashSet<PathBuf>>,
+) -> Result<Vec<FileEdits>> {
     let mut grouped: BTreeMap<String, FileEdits> = BTreeMap::new();
-    for (rel, text) in collect_files(root, path)? {
+    for (rel, text) in collect_files(root, path, only)? {
         let ext = Path::new(&rel)
             .extension()
             .and_then(|e| e.to_str())
@@ -151,9 +161,13 @@ pub fn rename_edits(root: &Path, symbol: &str, path: Option<&str>) -> Result<Vec
 
 /// List top-level declarations (functions, structs, enums, traits, impls,
 /// modules) in a file.
-pub fn list_symbols(root: &Path, path: Option<&str>) -> Result<Vec<String>> {
+pub fn list_symbols(
+    root: &Path,
+    path: Option<&str>,
+    only: Option<&HashSet<PathBuf>>,
+) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    for (rel, text) in collect_files(root, path)? {
+    for (rel, text) in collect_files(root, path, only)? {
         let ext = Path::new(&rel)
             .extension()
             .and_then(|e| e.to_str())
@@ -220,12 +234,21 @@ pub fn list_symbols(root: &Path, path: Option<&str>) -> Result<Vec<String>> {
 
 /// Returns (rel_path, contents) for the target files. When `path` is provided
 /// only that file (resolved relative to root) is returned.
-fn collect_files(root: &Path, path: Option<&str>) -> Result<Vec<(String, String)>> {
+fn collect_files(
+    root: &Path,
+    path: Option<&str>,
+    only: Option<&HashSet<PathBuf>>,
+) -> Result<Vec<(String, String)>> {
     let mut files = Vec::new();
     if let Some(p) = path {
         let abs = root.join(p);
         if !abs.starts_with(root) {
             anyhow::bail!("path {p:?} escapes the project root");
+        }
+        if let Some(set) = only {
+            if !set.contains(&abs) {
+                return Ok(Vec::new());
+            }
         }
         files.push((p.trim_start_matches('/').to_string(), abs));
     } else {
@@ -245,6 +268,9 @@ fn collect_files(root: &Path, path: Option<&str>) -> Result<Vec<(String, String)
                 .unwrap_or_else(|_| abs.to_string_lossy().into_owned());
             files.push((rel, abs));
         }
+    }
+    if let Some(set) = only {
+        files.retain(|(_, abs)| set.contains(abs));
     }
     let mut out = Vec::new();
     for (rel, abs) in files {

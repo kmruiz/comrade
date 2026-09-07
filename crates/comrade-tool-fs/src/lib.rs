@@ -4,6 +4,7 @@
 //! through the [`ToolContext`] unless `auto_approve` is set, and record their
 //! first write into the undo log so changes can be rolled back.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -14,6 +15,16 @@ use serde_json::{Value, json};
 
 /// Maximum characters a read/listing returns before truncation.
 const MAX_OUTPUT_CHARS: usize = 6000;
+
+/// When `enabled`, returns the set of files that differ from HEAD; otherwise
+/// `None` (no restriction). Propagates the "not a git repository" error.
+fn changed_scope(ctx: &ToolContext, enabled: bool) -> Result<Option<HashSet<PathBuf>>> {
+    if enabled {
+        Ok(Some(comrade_tool::changed_files_abs(&ctx.project_root)?))
+    } else {
+        Ok(None)
+    }
+}
 
 pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
@@ -76,11 +87,12 @@ struct ListDir;
 static LIST_DIR_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "list_dir".into(),
-    description: "List the entries in a directory (project-root relative). Use to discover files before reading or editing.".into(),
+    description: "List the entries in a directory (project-root relative). Use to discover files before reading or editing. With git_modified_only, only entries containing changes vs HEAD are shown.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "default": ".", "description": "Directory to list, relative to the project root." }
+            "path": { "type": "string", "default": ".", "description": "Directory to list, relative to the project root." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only show entries that differ from HEAD (staged, unstaged, untracked). Requires a git repository." }
         },
         "additionalProperties": false
     }),
@@ -98,11 +110,14 @@ impl Tool for ListDir {
         struct Args {
             #[serde(default = "default_path")]
             path: String,
+            #[serde(default)]
+            git_modified_only: bool,
         }
         fn default_path() -> String {
             ".".to_string()
         }
         let args: Args = serde_json::from_value(args)?;
+        let changed = changed_scope(ctx, args.git_modified_only)?;
         let dir = resolve(ctx, &args.path)?;
         if !dir.is_dir() {
             anyhow::bail!("{:?} is not a directory", display_path(ctx, &dir));
@@ -116,6 +131,14 @@ impl Tool for ListDir {
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let name = e.file_name().to_string_lossy().into_owned();
+            let path = e.path();
+            let include = match &changed {
+                None => true,
+                Some(set) => set.contains(&path) || set.iter().any(|c| c.starts_with(&path)),
+            };
+            if !include {
+                continue;
+            }
             let is_dir = e.file_type().await?.is_dir();
             if is_dir {
                 out.push_str(&format!("{name}/\n"));
@@ -142,7 +165,8 @@ static READ_FILE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(
         "properties": {
             "path": { "type": "string", "description": "File to read, relative to the project root." },
             "start_line": { "type": "integer", "minimum": 1, "description": "First 1-based line to return (default 1)." },
-            "end_line": { "type": "integer", "minimum": 1, "description": "Last 1-based line to return (default: EOF)." }
+            "end_line": { "type": "integer", "minimum": 1, "description": "Last 1-based line to return (default: EOF)." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Error unless the file differs from HEAD (staged, unstaged, untracked)." }
         },
         "required": ["path"],
         "additionalProperties": false
@@ -164,9 +188,20 @@ impl Tool for ReadFile {
             start_line: Option<usize>,
             #[serde(default)]
             end_line: Option<usize>,
+            #[serde(default)]
+            git_modified_only: bool,
         }
         let args: Args = serde_json::from_value(args)?;
+        let changed = changed_scope(ctx, args.git_modified_only)?;
         let file = resolve(ctx, &args.path)?;
+        if let Some(set) = &changed {
+            if !set.contains(&file) {
+                anyhow::bail!(
+                    "{rel} is not modified (git_modified_only)",
+                    rel = display_path(ctx, &file)
+                );
+            }
+        }
         let bytes = tokio::fs::read(&file)
             .await
             .with_context(|| format!("cannot read {}", display_path(ctx, &file)))?;
@@ -355,7 +390,8 @@ static LIST_FILES_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new
     json_schema: json!({
         "type": "object",
         "properties": {
-            "pattern": { "type": "string", "description": "Glob pattern matched against paths relative to the project root." }
+            "pattern": { "type": "string", "description": "Glob pattern matched against paths relative to the project root." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only list files that differ from HEAD (staged, unstaged, untracked)." }
         },
         "required": ["pattern"],
         "additionalProperties": false
@@ -373,8 +409,11 @@ impl Tool for ListFiles {
         #[derive(Deserialize)]
         struct Args {
             pattern: String,
+            #[serde(default)]
+            git_modified_only: bool,
         }
         let args: Args = serde_json::from_value(args)?;
+        let changed = changed_scope(ctx, args.git_modified_only)?;
         let pattern = args.pattern.trim().trim_start_matches("./");
         if pattern.is_empty() || pattern.contains('\\') || pattern.contains("..") {
             anyhow::bail!("invalid glob pattern {:?}", args.pattern);
@@ -386,6 +425,11 @@ impl Tool for ListFiles {
 
         let mut matches = Vec::new();
         for file in files {
+            if let Some(set) = &changed {
+                if !set.contains(&file) {
+                    continue;
+                }
+            }
             let rel = file
                 .strip_prefix(&ctx.project_root)
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
@@ -423,7 +467,8 @@ static RGREP_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
         "properties": {
             "pattern": { "type": "string", "description": "Literal text to search for (not a regex)." },
             "glob": { "type": "string", "default": "**/*", "description": "Glob restricting files to search." },
-            "ignore_case": { "type": "boolean", "default": false, "description": "Case-insensitive match." }
+            "ignore_case": { "type": "boolean", "default": false, "description": "Case-insensitive match." },
+            "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD (staged, unstaged, untracked)." }
         },
         "required": ["pattern"],
         "additionalProperties": false
@@ -445,6 +490,8 @@ impl Tool for RGrep {
             glob: String,
             #[serde(default)]
             ignore_case: bool,
+            #[serde(default)]
+            git_modified_only: bool,
         }
         fn default_glob() -> String {
             "**/*".to_string()
@@ -453,12 +500,14 @@ impl Tool for RGrep {
         if args.pattern.is_empty() {
             anyhow::bail!("`pattern` must not be empty");
         }
+        let changed = changed_scope(ctx, args.git_modified_only)?;
 
         let matches = search_files(
             &ctx.project_root,
             &args.glob,
             &args.pattern,
             args.ignore_case,
+            changed.as_ref(),
         )?;
 
         let total = matches.len();
@@ -475,12 +524,14 @@ impl Tool for RGrep {
 }
 
 /// Search matching lines across files under `root` (relative `glob`), returning
-/// (file, 1-based line, trimmed line text) tuples.
+/// (file, 1-based line, trimmed line text) tuples. When `only` is `Some`, only
+/// files in that set are searched.
 fn search_files(
     root: &Path,
     glob: &str,
     needle: &str,
     ignore_case: bool,
+    only: Option<&HashSet<PathBuf>>,
 ) -> Result<Vec<(String, usize, String)>> {
     let glob = glob.trim().trim_start_matches("./");
     if glob.is_empty() || glob.contains('\\') || glob.contains("..") {
@@ -500,6 +551,11 @@ fn search_files(
 
     let mut out = Vec::new();
     for file in files {
+        if let Some(set) = only {
+            if !set.contains(&file) {
+                continue;
+            }
+        }
         let rel = file
             .strip_prefix(root)
             .map(|p| p.to_string_lossy().replace('\\', "/"))
@@ -664,17 +720,17 @@ mod tests {
         std::fs::write(root.join("src/b.txt"), "just hello text\n").unwrap();
         std::fs::write(root.join("README.md"), "Hello world\n").unwrap();
 
-        let m = super::search_files(&root, "**/*.rs", "hello", false).unwrap();
+        let m = super::search_files(&root, "**/*.rs", "hello", false, None).unwrap();
         assert_eq!(m.len(), 2);
         assert!(m.iter().all(|(f, _, _)| f.ends_with(".rs")));
         // glob restricts to md
-        let m2 = super::search_files(&root, "*.md", "hello", true).unwrap();
+        let m2 = super::search_files(&root, "*.md", "hello", true, None).unwrap();
         assert_eq!(m2.len(), 1);
         assert_eq!(m2[0].0, "README.md");
         assert_eq!(m2[0].2, "Hello world");
         // case-sensitive finds nothing in md
         assert!(
-            super::search_files(&root, "*.md", "hello", false)
+            super::search_files(&root, "*.md", "hello", false, None)
                 .unwrap()
                 .is_empty()
         );
@@ -713,6 +769,115 @@ mod tests {
             vec!["keep.rs".to_string(), "plain.txt".to_string()],
             "{rels:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_files_git_modified_only_scopes_to_changes() {
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use comrade_tool::{
+            PlanStatus, PlanStep, PlanTarget, SessionControl, UndoLog, UserIo, UserPrompt,
+            UserReply,
+        };
+
+        struct StubSession;
+        impl SessionControl for StubSession {
+            fn set_title(&self, _t: &str) {}
+            fn title(&self) -> String {
+                "test".into()
+            }
+            fn set_plan(&self, _steps: Vec<String>) {}
+            fn plan(&self) -> Vec<PlanStep> {
+                vec![]
+            }
+            fn update_plan(&self, _t: PlanTarget, _s: PlanStatus, _n: Option<String>) -> bool {
+                true
+            }
+            fn finish_plan(&self, _s: Option<String>) {}
+            fn set_status(&self, _s: &str) {}
+            fn status(&self) -> String {
+                String::new()
+            }
+        }
+        struct StubUser;
+        #[async_trait]
+        impl UserIo for StubUser {
+            async fn ask(&self, _p: UserPrompt) -> anyhow::Result<UserReply> {
+                Ok(UserReply::Answer("yes".into()))
+            }
+        }
+        struct StubUndo;
+        #[async_trait]
+        impl UndoLog for StubUndo {
+            async fn capture(&self, _p: &str, _b: String) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn undo_last(&self) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+            async fn is_empty(&self) -> bool {
+                true
+            }
+            async fn len(&self) -> usize {
+                0
+            }
+        }
+
+        fn git(root: &std::path::Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "comrade-gitmodified-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@example.com"]);
+        git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("untouched.rs"), "fn u() {}\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "init"]);
+
+        // now a modified + an untracked change
+        std::fs::write(root.join("untouched.rs"), "fn u() { changed }\n").unwrap();
+        std::fs::write(root.join("brand_new.rs"), "fn n() {}\n").unwrap();
+        std::fs::write(root.join("notes.txt"), "not rust\n").unwrap();
+
+        let session: Arc<dyn SessionControl> = Arc::new(StubSession);
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session,
+            user: Arc::new(StubUser),
+            undo: Arc::new(StubUndo),
+            auto_approve: true,
+        };
+        let list = ListFiles;
+        let args = json!({ "pattern": "**/*.rs", "git_modified_only": true });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt.block_on(list.invoke(&ctx, args)).unwrap();
+        assert!(out.contains("untouched.rs"), "{out}");
+        assert!(out.contains("brand_new.rs"), "{out}");
+        assert!(out.contains("2 file(s)"), "{out}");
+        assert!(!out.contains("notes.txt"), "{out}");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
