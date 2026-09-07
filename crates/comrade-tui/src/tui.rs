@@ -1957,6 +1957,25 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
     );
     frame.render_widget(Paragraph::new(Line::from(bar_spans)), rows[1]);
     frame.render_widget(Paragraph::new(Line::from(usage)), rows[2]);
+
+    // Configured delegates ([[delegates]]) shown in the leftover space under
+    // the model gauge; clipped naturally when the panel is short.
+    if !app.cfg.delegates.is_empty() {
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut delegate_lines = vec![Line::from(Span::styled(
+            "delegates:",
+            dim.add_modifier(Modifier::BOLD),
+        ))];
+        for d in &app.cfg.delegates {
+            let label = if d.name == d.llm.model {
+                d.name.clone()
+            } else {
+                format!("{} ({})", d.name, d.llm.model)
+            };
+            delegate_lines.push(Line::from(Span::styled(format!("  {label}"), dim)));
+        }
+        frame.render_widget(Paragraph::new(delegate_lines), rows[3]);
+    }
     let _ = rows;
 }
 
