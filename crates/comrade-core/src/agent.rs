@@ -28,16 +28,14 @@ const MUTATING_TOOLS: &[&str] = &[
 ];
 
 /// Tools that are approval-gated: the model MUST provide `justification` and
-/// `risk` before they run (a human approves based on them).
+/// `risk` before they run (a human approves based on them). `git_commit`,
+/// `run_task` and `run_tests` deliberately are NOT gated: they run directly.
 const APPROVAL_GATED_TOOLS: &[&str] = &[
     "write_file",
     "rename",
-    "git_commit",
-    "run_task",
     "remember",
     "amend_decision",
     "format_code",
-    "run_tests",
     "shell",
 ];
 

@@ -97,13 +97,14 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          \n\
          Args MUST be valid strict JSON: quote every key and every string value, e.g. {\"path\": \"src/main.rs\"}.\n\
          \n\
-         Before running an approval-gated tool — write_file, rename, git_commit, run_task, run_tests, \
+         Before running an approval-gated tool — write_file, rename, \
          format_code, shell, remember, amend_decision — you MUST also write, between Thought and Tool:\n\
          \n\
          Justification: <why this action should run, one or two short lines>\n\
          Risk: <what could go wrong or how invasive it is; write \"Risk: none\" if safe>\n\
          \n\
          Non-gated edits (apply_edit/apply_patch) still ask the human to approve the change, but need no Justification/Risk lines.\n\
+         git_commit, run_task and run_tests run directly without approval.\n\
          Approval-gated tools are refused if you omit either line — repeat the call with both.\n\
          When using native function calls (instead of the Tool/Args text form), pass the same two \
          fields as extra arguments `justification` and `risk` on every approval-gated tool.\n\

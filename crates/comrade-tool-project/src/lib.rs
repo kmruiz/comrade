@@ -68,7 +68,7 @@ struct RunTask;
 static RUN_TASK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "run_task".into(),
-    description: "Run a named project task and return its output. Tasks come from project_model: cargo verbs (build, run, check, test, clippy, fmt, doc, bench, release) and aliases defined in .cargo/config.toml (!-prefixed aliases run as shell). Optionally scope to a subproject with its directory (relative to the root). Interactive: you approve each run unless autonomy is auto.".into(),
+    description: "Run a named project task and return its output. Tasks come from project_model: cargo verbs (build, run, check, test, clippy, fmt, doc, bench, release) and aliases defined in .cargo/config.toml (!-prefixed aliases run as shell). Optionally scope to a subproject with its directory (relative to the root). Runs directly without approval.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -112,10 +112,6 @@ impl Tool for RunTask {
             .unwrap_or_default();
 
         let resolved = tasks::resolve(&ctx.project_root, &args.task, &args.subproject, &extra)?;
-
-        ctx.confirm(format!("run_task: {}", resolved.describe), None)
-            .await?;
-
         let output = tasks::run(&resolved, args.timeout_secs).await?;
         Ok(output)
     }
@@ -168,7 +164,7 @@ struct RunTests;
 static RUN_TESTS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "run_tests".into(),
-    description: "Run the project's tests (cargo test) and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names and key error lines - build noise is filtered out. Use to verify work instead of reading code to reason about correctness. Approval-gated.".into(),
+    description: "Run the project's tests (cargo test) and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names and key error lines - build noise is filtered out. Use to verify work instead of reading code to reason about correctness. Runs directly without approval.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -207,8 +203,6 @@ impl Tool for RunTests {
             .map(|s| s.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default();
         let resolved = tasks::resolve(&ctx.project_root, "test", &args.subproject, &extra)?;
-        ctx.confirm(format!("run_tests: {}", resolved.describe), None)
-            .await?;
         let raw = tasks::run(&resolved, args.timeout_secs).await?;
         Ok(simplify_test_output(&raw))
     }

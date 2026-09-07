@@ -1,7 +1,7 @@
 //! Git tools: `git_status`, `git_diff`, `git_log`, `git_commit`.
 //!
 //! Shells out to the user's `git` so credentials, hooks, and config are reused.
-//! Commits are human-approved through the [`ToolContext`].
+//! `git_commit` runs without human approval.
 
 use std::process::Stdio;
 
@@ -203,7 +203,7 @@ struct GitCommit;
 static GIT_COMMIT_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "git_commit".into(),
-    description: "Stage all changes and create a commit with the given message (interactive; you will be shown the diff and asked to approve). Call git_diff/git_status first to verify what is being committed.".into(),
+    description: "Stage all changes and create a commit with the given message. Call git_diff/git_status first to verify what is being committed.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -227,21 +227,6 @@ impl Tool for GitCommit {
             message: String,
         }
         let args: Args = serde_json::from_value(args)?;
-        let branch = current_branch(ctx).await;
-        let stat = git(ctx, &["diff", "HEAD", "--stat"]).await?;
-        ctx.confirm(
-            format!("git commit on {branch}: {}", args.message),
-            Some(format!(
-                "changes to be committed:\n{}",
-                if stat.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    stat
-                }
-            )),
-        )
-        .await?;
-
         git(ctx, &["add", "-A"]).await?;
         let message_file = write_message_file(&args.message).await?;
         let msg_arg = message_file.to_str().unwrap_or("/dev/null").to_string();
