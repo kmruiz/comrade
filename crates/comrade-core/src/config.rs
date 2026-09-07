@@ -50,7 +50,7 @@ pub struct LlmCfg {
     pub base_url: String,
     /// Optional API key; sent as `Authorization: Bearer` when set.
     pub api_key: Option<String>,
-    /// Model identifier, e.g. `mistral:latest`.
+    /// Model identifier, e.g. `devstral-small-2`.
     pub model: String,
     pub temperature: f32,
     /// Seconds to wait for a response.
@@ -70,7 +70,7 @@ impl Default for LlmCfg {
         Self {
             base_url: "http://localhost:11434/v1".into(),
             api_key: None,
-            model: "mistral:latest".into(),
+            model: "devstral-small-2".into(),
             temperature: 0.2,
             timeout_secs: 600,
             protocol: Protocol::Auto,
