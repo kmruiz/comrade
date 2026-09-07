@@ -403,11 +403,14 @@ impl App {
                 risk,
             } => {
                 // This turn produced a tool call; drop any scaffold-only prose
-                // that was streaming and show a compact card instead. Edit cards
-                // (apply_patch/apply_edit) open by default so the diff is visible.
+                // that was streaming and show a compact card instead. Important
+                // cards (diffs, and run_tests/run_task results) open by default.
                 self.stream.clear();
                 self.activity = Some(name.clone());
-                let open_default = matches!(name.as_str(), "apply_patch" | "apply_edit");
+                let open_default = matches!(
+                    name.as_str(),
+                    "apply_patch" | "apply_edit" | "run_tests" | "run_task"
+                );
                 self.push_msg(Msg::tool(ToolCard {
                     name,
                     args,
@@ -1313,6 +1316,152 @@ fn layout_messages(
     (out, owner, ranges)
 }
 
+// Per-task header helpers: a light "custom UI" per tool family so a chat row
+// is never just a bare task name.
+
+/// Truncate to `max` characters, appending "…" when cut.
+fn cap(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// Collapse a (possibly multi-line) result into a short one-liner.
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    cap(&flat, max)
+}
+
+/// Icon + accent color per tool family, used as the card's leading glyph.
+fn tool_icon(name: &str) -> (&'static str, Color) {
+    match name {
+        "apply_patch" | "apply_edit" => ("±", Color::Cyan),
+        "write_file" => ("✎", Color::Cyan),
+        "run_tests" => ("▶", Color::Yellow),
+        "run_task" => ("▸", Color::Yellow),
+        "shell" => ("$", Color::Green),
+        "git_status" | "git_diff" | "git_log" | "git_commit" => ("↗", Color::Magenta),
+        "read_file" | "read_ranges" => ("≡", Color::Blue),
+        "list_dir" | "list_files" | "rgrep" | "list_symbols" | "find_symbol"
+        | "find_definition" | "read_symbol" | "structural_map" | "references_count"
+        | "find_references" | "project_model" => ("›", Color::DarkGray),
+        _ => ("•", Color::Magenta),
+    }
+}
+
+/// A one-line headline from a tool call's args, so the row shows *what* the
+/// task targeted (file, pattern, symbol, command) instead of just its name.
+fn tool_headline(name: &str, args: &str) -> Option<String> {
+    use serde_json::Value;
+    if args.trim().is_empty() {
+        return None;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(args) else {
+        return None;
+    };
+    let map = match value {
+        Value::Object(m) => m,
+        Value::String(s) => return Some(cap(&s, 80)),
+        _ => return None,
+    };
+    let pick = |keys: &[&str]| -> Option<String> {
+        for k in keys {
+            if let Some(v) = map.get(*k) {
+                let text = match v {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => continue,
+                };
+                if !text.trim().is_empty() {
+                    return Some(cap(text.trim(), 80));
+                }
+            }
+        }
+        None
+    };
+    match name {
+        "read_file" | "read_ranges" | "write_file" => pick(&["path", "file"]),
+        "list_dir" | "list_files" => pick(&["path", "dir", "glob"]),
+        "rgrep" => pick(&["pattern", "glob", "query"]),
+        "find_symbol" | "search_symbols" => pick(&["query", "symbol"]),
+        "find_definition" | "read_symbol" | "rename" | "find_references" | "references_count" => {
+            pick(&["symbol", "query"])
+        }
+        "structural_map" | "list_symbols" => pick(&["path", "kinds"]),
+        "web_search" => pick(&["query"]),
+        "run_task" | "run_tests" => pick(&["task", "command"]),
+        "shell" => pick(&["command", "dir"]),
+        _ => None,
+    }
+}
+
+/// Present a tool call's args as readable `key = value` lines instead of a raw
+/// JSON blob (flattening a single nested `args` object when present).
+fn arg_lines(args: &str) -> Vec<String> {
+    use serde_json::Value;
+    let Ok(value) = serde_json::from_str::<Value>(args) else {
+        let t = args.trim();
+        return if t.is_empty() {
+            vec![]
+        } else {
+            vec![cap(t, 300)]
+        };
+    };
+    let mut map = match value {
+        Value::Object(m) => m,
+        Value::String(s) => return vec![cap(&s, 300)],
+        _ => {
+            return vec![cap(&args.trim(), 300)];
+        }
+    };
+    if let Some(inner) = map.remove("args").and_then(|a| match a {
+        Value::Object(m) => Some(m),
+        _ => None,
+    }) {
+        map = inner;
+    }
+    let scalar = |v: &Value| -> Option<String> {
+        match v {
+            Value::String(s) => Some(cap(s, 160)),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            Value::Array(items) if !items.is_empty() => {
+                let joined = items
+                    .iter()
+                    .filter_map(|i| match i {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(cap(&joined, 160))
+            }
+            _ => None,
+        }
+    };
+    let mut lines = Vec::new();
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    for k in keys {
+        let Some(v) = map.get(k) else {
+            continue;
+        };
+        let Some(text) = scalar(v) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        lines.push(format!("{k}: {text}"));
+    }
+    lines
+}
+
 fn layout_failure(out: &mut Vec<RenderRow>, msg_idx: usize, fail: &TestFail, width: usize) {
     out.push(RenderRow {
         rule: None,
@@ -1347,27 +1496,56 @@ fn layout_failure(out: &mut Vec<RenderRow>, msg_idx: usize, fail: &TestFail, wid
 }
 
 fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width: usize) {
+    let (icon, accent) = tool_icon(&card.name);
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(
+            if card.open { "v " } else { "> " },
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            icon,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {}", card.name),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(h) = tool_headline(&card.name, &card.args) {
+        spans.push(Span::styled(
+            format!("  {h}"),
+            Style::default().fg(Color::White),
+        ));
+    }
+    if let Some(j) = card.justification.as_deref() {
+        spans.push(Span::styled(
+            format!("  · {j}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    // Status: pass/fail mark, plus (when collapsed) a one-line result tail so
+    // the row shows what happened, never just the task's name.
+    if let Some(result) = card.result.as_deref() {
+        let ok = card.ok;
+        spans.push(Span::styled(
+            format!("  {}", if ok { "✓" } else { "✗" }),
+            Style::default()
+                .fg(if ok { Color::Green } else { Color::Red })
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !card.open {
+            let tail = one_line(result, 56);
+            spans.push(Span::styled(
+                format!("  {tail}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
     out.push(RenderRow {
         rule: None,
-        spans: vec![
-            Span::styled(
-                if card.open { "v " } else { "> " },
-                Style::default().fg(Color::Magenta),
-            ),
-            Span::styled(
-                card.name.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                card.justification
-                    .as_deref()
-                    .map(|j| format!("  - {j}"))
-                    .unwrap_or_default(),
-                Style::default().fg(Color::White),
-            ),
-        ],
+        spans,
         tool_header: Some(msg_idx),
     });
     if !card.open {
@@ -1416,17 +1594,20 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             });
         }
     } else {
-        out.push(RenderRow {
-            rule: None,
-            spans: vec![Span::styled("args:", Style::default().fg(Color::DarkGray))],
-            tool_header: None,
-        });
-        for s in plain_wrap(&card.args, width) {
+        let lines = arg_lines(&card.args);
+        if !lines.is_empty() {
             out.push(RenderRow {
                 rule: None,
-                spans: vec![Span::styled(s, Style::default().fg(Color::Magenta))],
+                spans: vec![Span::styled("args:", Style::default().fg(Color::DarkGray))],
                 tool_header: None,
             });
+            for line in lines {
+                out.push(RenderRow {
+                    rule: None,
+                    spans: vec![Span::styled(line, Style::default().fg(Color::Magenta))],
+                    tool_header: None,
+                });
+            }
         }
     }
     if let Some(result) = &card.result {
