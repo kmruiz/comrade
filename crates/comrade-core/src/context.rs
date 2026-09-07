@@ -94,9 +94,12 @@ impl ContextManager {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(|t| t.chars().take(160).collect::<String>());
+        // Keep only a natural-language trace of the turn. We deliberately avoid
+        // bracket/scaffold markers ("[Tool executed]") - models tend to echo
+        // them back as answers.
         let content = match thought {
-            Some(t) => format!("Thought: {t}\n[Tool: {tool} executed]"),
-            None => format!("[Tool: {tool} executed]"),
+            Some(t) => format!("Thought: {t}"),
+            None => format!("Ran {tool}."),
         };
         self.history[idx].content = content;
         // Native-mode tool calls carry the full arguments payload; they are
@@ -104,9 +107,12 @@ impl ContextManager {
         self.history[idx].tool_calls = None;
     }
 
-    /// Condense the last assistant message after a native turn dispatched
-    /// `count` function calls (drops the `tool_calls` arguments payload).
-    pub fn note_turn_done(&mut self, count: usize) {
+    /// After a native turn dispatched its function calls, mark the assistant
+    /// message done. The `tool_calls` must stay intact: the OpenAI wire format
+    /// requires a `role: "tool"` message to follow an assistant message that
+    /// declares the matching `tool_calls`. The content is left as the model
+    /// wrote it (no synthetic marker the model could echo back).
+    pub fn note_turn_done(&mut self) {
         let Some(idx) = self
             .history
             .iter()
@@ -114,10 +120,8 @@ impl ContextManager {
         else {
             return;
         };
-        self.history[idx].content = format!("[{count} tool call(s) executed]");
-        // NOTE: `tool_calls` must stay intact: the OpenAI wire format requires a
-        // `role: "tool"` message to follow an assistant message that declares the
-        // matching `tool_calls`. Stripping them here broke DeepSeek.
+        // content intentionally unchanged
+        let _ = idx;
     }
 
     /// Fit history under the token budget: stub large old observations, then
@@ -330,12 +334,8 @@ mod tests {
             .unwrap();
         assert!(!last_assistant.content.contains("Args:"));
         assert!(!last_assistant.content.contains("xxxxx"));
-        assert!(
-            last_assistant
-                .content
-                .contains("[Tool: apply_edit executed]")
-        );
-        assert!(last_assistant.content.contains("Thought: big edit"));
+        assert!(!last_assistant.content.contains("[Tool"));
+        assert_eq!(last_assistant.content, "Thought: big edit");
     }
 
     #[test]
@@ -422,7 +422,7 @@ mod tool_role_invariant_tests {
         ) {
             cm.push(m);
         }
-        cm.note_turn_done(1);
+        cm.note_turn_done();
         let assistant = cm
             .messages()
             .iter()
@@ -432,7 +432,8 @@ mod tool_role_invariant_tests {
             assistant.tool_calls.is_some(),
             "tool_calls must be preserved"
         );
-        assert!(assistant.content.contains("tool call(s) executed"));
+        // content is untouched - no synthetic marker the model could echo
+        assert!(assistant.content.contains("assistant turn c1"));
     }
 
     #[test]

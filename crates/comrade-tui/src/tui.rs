@@ -22,7 +22,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -1299,73 +1299,180 @@ fn plan_prefix(s: &PlanStatus) -> &'static str {
 
 fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     let area = frame.area();
-    let w = area.width.min(76);
-    let h = 10u16;
+
+    // Build the body lines for the kind of prompt.
+    let (kind_label, is_question, options, mut body) = match &dialog.prompt {
+        UserPrompt::Question { prompt, options } => {
+            let text = if options.is_empty() {
+                format!("{prompt}\n\n(Type your answer below)")
+            } else {
+                prompt.clone()
+            };
+            let mut lines = preview_lines(&text, 96);
+            for (i, o) in options.iter().enumerate() {
+                let mut spans = vec![Span::styled(
+                    format!("{}. ", i + 1),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                spans.push(Span::styled(o.clone(), Style::default().fg(Color::Cyan)));
+                lines.push(Line::from(spans));
+            }
+            (" question ", true, options.clone(), lines)
+        }
+        UserPrompt::Confirm { title, diff } => {
+            let body = preview_lines(diff.as_deref().unwrap_or(title), 96);
+            (" confirm  [y/n] ", false, Vec::new(), body)
+        }
+    };
+    if body.is_empty() {
+        body.push(Line::from(""));
+    }
+
+    // Size the popup to fit, up to almost the whole terminal.
+    let w = area.width.saturating_sub(2).min(100);
+    let max_h = area.height.saturating_sub(2);
+    let content_h = body.len() as u16 + 3; // body + input + hint
+    let h = content_h.clamp(5, max_h.max(5));
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let popup = Rect::new(x, y, w, h);
     frame.render_widget(Clear, popup);
 
-    let title = match dialog.prompt {
-        UserPrompt::Question { .. } => " question ",
-        UserPrompt::Confirm { .. } => " confirm ",
+    let border_color = if is_question {
+        Color::Cyan
+    } else {
+        Color::Yellow
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(Color::Blue));
+        .title(kind_label)
+        .border_style(Style::default().fg(border_color));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let (question, options) = match &dialog.prompt {
-        UserPrompt::Question { prompt, options } => (prompt.clone(), options.clone()),
-        UserPrompt::Confirm { title, diff } => match diff {
-            Some(d) if !d.is_empty() => (format!("{title}\n\n{d}"), vec![]),
-            _ => (title.clone(), vec![]),
-        },
-    };
+    let inner_w = inner.width.saturating_sub(2) as usize;
+    let row_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
 
-    let mut text = vec![Line::from(question), Line::from("")];
-    for (i, o) in options.iter().enumerate() {
-        text.push(Line::from(Span::styled(
-            format!("  {}. {o}", i + 1),
-            Style::default().fg(Color::Cyan),
-        )));
-    }
-    if options.is_empty() {
-        text.push(Line::from(Span::styled(
-            "(y/n)",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    text.push(Line::from(""));
-    text.push(Line::from(vec![
+    // Body, scrollable if it does not fit.
+    let body_view = row_layout[0].height as usize;
+    let scroll = body.len().saturating_sub(body_view) as u16;
+    frame.render_widget(Paragraph::new(body).scroll((scroll, 0)), row_layout[0]);
+
+    // Input row.
+    let input = Line::from(vec![
         Span::styled("> ", Style::default().fg(Color::Green)),
         Span::raw(dialog.buf.clone()),
         Span::styled("_", Style::default().fg(Color::Green)),
-    ]));
+    ]);
+    frame.render_widget(Paragraph::new(input), row_layout[1]);
 
-    let hint = if matches!(dialog.prompt, UserPrompt::Question { .. }) && options.is_empty() {
+    // Hint row.
+    let hint = if is_question && !options.is_empty() {
+        "number: pick    type + enter: submit    esc: cancel"
+    } else if is_question {
         "type + enter: submit    esc: cancel"
-    } else if !options.is_empty() {
-        "number: pick    esc: cancel"
     } else {
-        "y / n    esc: cancel"
+        "y / n    esc: cancel    (you can type a custom answer)"
     };
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(inner);
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), rows[0]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
             Style::default().fg(Color::DarkGray),
         ))),
-        rows[1],
+        row_layout[2],
     );
     let _ = app;
+    let _ = inner_w;
+}
+
+/// Pretty-print a free-form preview (approval diff bodies). Highlights
+/// Justification/Risk labels and edit-style `--- remove ---` / `+++ insert
+/// +++` blocks, plus unified diff markers.
+fn preview_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(10);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    // mode: 0 = normal, 1 = inside a "--- remove ---" block, 2 = "+++ insert +++"
+    let mut mode = 0u8;
+
+    for line in text.lines() {
+        let t = line.trim();
+        if t.eq_ignore_ascii_case("--- remove ---") || t.starts_with("--- remove ") {
+            mode = 1;
+            push_span_line(&mut out, "  ─ remove ─", Color::Red, width, true);
+            continue;
+        }
+        if t.eq_ignore_ascii_case("+++ insert +++") || t.starts_with("+++ insert ") {
+            mode = 2;
+            push_span_line(&mut out, "  ─ insert ─", Color::Green, width, true);
+            continue;
+        }
+        if t.starts_with("Justification:") {
+            mode = 0;
+            push_span_line(&mut out, t, Color::Cyan, width, false);
+            continue;
+        }
+        if t.starts_with("Risk:") {
+            mode = 0;
+            push_span_line(&mut out, t, Color::Yellow, width, false);
+            continue;
+        }
+        let mut color = Color::White;
+        let kind: u8 = 0;
+        if mode == 1 {
+            color = Color::Red;
+        } else if mode == 2 {
+            color = Color::Green;
+        } else if t.starts_with("+++")
+            || t.starts_with("---")
+            || t.starts_with("@@")
+            || t.starts_with("diff ")
+            || t.starts_with("index ")
+        {
+            color = Color::DarkGray;
+        } else if let Some(rest) = t.strip_prefix('+') {
+            color = Color::Green;
+            push_span_line(&mut out, rest, color, width, true);
+            continue;
+        } else if let Some(rest) = t.strip_prefix('-') {
+            color = Color::Red;
+            push_span_line(&mut out, rest, color, width, true);
+            continue;
+        }
+        let _ = kind;
+        push_span_line(&mut out, t, color, width, mode != 0);
+    }
+    if out.is_empty() {
+        out.push(Line::from(""));
+    }
+    out
+}
+
+fn push_span_line(
+    out: &mut Vec<Line<'static>>,
+    text: &str,
+    color: Color,
+    width: usize,
+    hard: bool,
+) {
+    let styled = |s: String| Span::styled(s, Style::default().fg(color));
+    if hard {
+        for cut in hard_cut(text, width) {
+            out.push(Line::from(vec![styled(cut)]));
+        }
+    } else {
+        for wrapped in plain_wrap(text, width) {
+            out.push(Line::from(vec![styled(wrapped)]));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

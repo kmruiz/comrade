@@ -622,7 +622,6 @@ async fn run_native_calls(
 
     ctxm.push(ChatMessage::assistant_with_calls(turn.content, calls));
 
-    let total = prepared.len();
     'calls: for p in prepared {
         let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
         let sig = format!("{} {args_pretty}", p.name);
@@ -729,7 +728,7 @@ async fn run_native_calls(
         ctxm.push(ChatMessage::tool_result(p.id, clamped));
         tracker.record(&p.name, sig);
     }
-    ctxm.note_turn_done(total);
+    ctxm.note_turn_done();
     Ok(())
 }
 
