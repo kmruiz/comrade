@@ -104,6 +104,87 @@ fn read_guard_message(count: usize) -> String {
     )
 }
 
+/// Tools that modify source code (used by the verify-then-commit monitor).
+const CODE_CHANGES: &[&str] = &[
+    "apply_edit",
+    "apply_patch",
+    "write_file",
+    "rename",
+    "format_code",
+    "shell",
+];
+
+/// Update the "is the current change verified?" state after a tool ran.
+fn update_verify_state(name: &str, ok: bool, output: &str, verified_after_change: &mut bool) {
+    if CODE_CHANGES.contains(&name) {
+        *verified_after_change = false;
+    } else if matches!(name, "run_tests" | "run_task") && ok && output.contains("test result: ok.")
+    {
+        *verified_after_change = true;
+    }
+}
+
+fn verify_guard_message() -> String {
+    "You have unverified code changes. Run run_tests (or run_task test) and get them green BEFORE \
+     calling git_commit."
+        .to_string()
+}
+
+/// Classify a failed tool output and attach one short corrective hint.
+fn failure_hint(name: &str, output: &str) -> String {
+    let _ = name;
+    let o = output.to_lowercase();
+    if o.contains("denied") || o.contains("user denied") {
+        return String::new(); // do not nag about human decisions
+    }
+    if o.contains("timed out") || o.contains("timeout") {
+        return "the action timed out - split it into smaller steps or raise the timeout, then retry"
+            .to_string();
+    }
+    if o.contains("connection refused")
+        || o.contains("error sending request")
+        || o.contains("request failed")
+        || o.contains("network")
+    {
+        return "transient network/provider issue - check connectivity and retry once".to_string();
+    }
+    if o.contains("command not found") || o.contains("no such file") || o.contains("not found") {
+        return "a command or path is missing - install it or point at the correct file"
+            .to_string();
+    }
+    if o.contains("test result: failed") || (o.contains("failures:") && o.contains("panicked")) {
+        return "the tests failed - fix the code (or the test) and rerun run_tests".to_string();
+    }
+    if o.contains("error[")
+        || o.contains("cannot find")
+        || o.contains("mismatched types")
+        || o.contains("expected ")
+        || o.contains("--> ")
+    {
+        return "looks like a compile/type error in the code you changed - fix it before rerunning"
+            .to_string();
+    }
+    if o.contains("exit code") || o.contains("exit ") {
+        return "the command exited non-zero - read its output and fix the underlying issue"
+            .to_string();
+    }
+    "read the error, form one hypothesis, change something or update the plan before retrying"
+        .to_string()
+}
+
+/// Render a tool observation, appending a corrective hint on failures.
+fn observation_with_failure_hint(tool_name: &str, ok: bool, output: &str) -> String {
+    let mut text = output.to_string();
+    if !ok {
+        let hint = failure_hint(tool_name, output);
+        if !hint.is_empty() {
+            text.push_str("\n\nHINT: ");
+            text.push_str(&hint);
+        }
+    }
+    render_observation(tool_name, &text)
+}
+
 /// Approval-gated tools advertise `justification` and `risk` as optional native
 /// arguments so the model actually passes them (many models omit fields the
 /// schema forbids via `additionalProperties: false`). The agent strips them
@@ -290,6 +371,9 @@ async fn run_agent_loop(
     let mut plan_nudged = false;
     // Consecutive read-only calls since the last state change (read guard).
     let mut consecutive_reads = 0usize;
+    // Verify-then-commit monitor: false once code changes and true again after
+    // a green test run.
+    let mut verified_after_change = true;
 
     loop {
         if stop.is_cancelled() {
@@ -405,6 +489,7 @@ async fn run_agent_loop(
                 &ctx,
                 &mut tracker,
                 &mut consecutive_reads,
+                &mut verified_after_change,
                 turn,
             )
             .await?;
@@ -569,6 +654,23 @@ async fn run_agent_loop(
             continue;
         }
 
+        // Verify-then-commit monitor: refuse commits of unverified changes.
+        if tool_call.name == "git_commit" && !verified_after_change {
+            let msg = verify_guard_message();
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: tool_call.name.clone(),
+                    output: msg.clone(),
+                    ok: false,
+                })
+                .await;
+            ctxm.push(ChatMessage::new(
+                Role::User,
+                render_observation(&tool_call.name, &msg),
+            ));
+            continue;
+        }
+
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
         let sig = format!("{} {args_pretty}", tool_call.name);
         if let Some(count) = tracker.check(&sig) {
@@ -632,9 +734,10 @@ async fn run_agent_loop(
             })
             .await;
 
+        update_verify_state(&tool_call.name, ok, &clamped, &mut verified_after_change);
         ctxm.push(ChatMessage::new(
             Role::User,
-            render_observation(&tool_call.name, &clamped),
+            observation_with_failure_hint(&tool_call.name, ok, &clamped),
         ));
         tracker.record(&tool_call.name, sig);
         // The tool call is spent: strip its (potentially large) args from the
@@ -653,6 +756,7 @@ async fn run_native_calls(
     ctx: &ToolContext,
     tracker: &mut LoopTracker,
     consecutive_reads: &mut usize,
+    verified_after_change: &mut bool,
     turn: crate::llm::LlmTurn,
 ) -> Result<()> {
     if !turn.content.trim().is_empty() {
@@ -712,6 +816,19 @@ async fn run_native_calls(
         if !allow_read_step(&p.name, consecutive_reads) {
             let count = *consecutive_reads;
             let msg = read_guard_message(count);
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: p.name.clone(),
+                    output: msg.clone(),
+                    ok: false,
+                })
+                .await;
+            ctxm.push(ChatMessage::tool_result(p.id, msg));
+            continue;
+        }
+        // Verify-then-commit monitor (native).
+        if p.name == "git_commit" && !*verified_after_change {
+            let msg = verify_guard_message();
             let _ = tx
                 .send(AgentEvent::ToolResult {
                     name: p.name.clone(),
@@ -822,7 +939,18 @@ async fn run_native_calls(
                 ok,
             })
             .await;
-        ctxm.push(ChatMessage::tool_result(p.id, clamped));
+        update_verify_state(&p.name, ok, &clamped, verified_after_change);
+        let content = if ok {
+            clamped.clone()
+        } else {
+            let hint = failure_hint(&p.name, &clamped);
+            if hint.is_empty() {
+                clamped.clone()
+            } else {
+                format!("{clamped}\n\nHINT: {hint}")
+            }
+        };
+        ctxm.push(ChatMessage::tool_result(p.id, content));
         tracker.record(&p.name, sig);
     }
     ctxm.note_turn_done();
@@ -1598,5 +1726,55 @@ mod read_guard_tests {
         assert_eq!(reads, 0);
         assert!(allow_read_step("rgrep", &mut reads));
         assert_eq!(reads, 1);
+    }
+}
+
+#[cfg(test)]
+mod monitors_tests {
+    use super::*;
+
+    #[test]
+    fn failure_hint_classifies_common_cases() {
+        assert!(failure_hint("shell", "user denied request").is_empty());
+        let t = failure_hint("shell", "the command timed out after 300s and was killed");
+        assert!(t.contains("timed out"), "{t}");
+        let c = failure_hint("run_task", "error[E0308]: mismatched types\n --> src/a.rs");
+        assert!(c.contains("compile"), "{c}");
+        let f = failure_hint(
+            "run_tests",
+            "test result: FAILED. 1 failed\npanicked at src/lib.rs",
+        );
+        assert!(f.contains("tests failed"), "{f}");
+        let g = failure_hint("shell", "any generic failure here");
+        assert!(!g.is_empty());
+    }
+
+    #[test]
+    fn verify_state_tracks_change_and_green_tests() {
+        let mut v = true;
+        // a code edit invalidates verification
+        update_verify_state("apply_edit", true, "Edited src/a.rs.", &mut v);
+        assert!(!v);
+        // a red test run does not re-verify
+        update_verify_state(
+            "run_tests",
+            true,
+            "test result: FAILED. 0 passed; 1 failed",
+            &mut v,
+        );
+        assert!(!v);
+        // a green run does
+        update_verify_state("run_tests", true, "test result: ok. 4 passed", &mut v);
+        assert!(v);
+        // another edit invalidates again
+        update_verify_state("write_file", true, "Wrote src/b.rs.", &mut v);
+        assert!(!v);
+    }
+
+    #[test]
+    fn verify_guard_message_is_actionable() {
+        let m = verify_guard_message();
+        assert!(m.contains("run_tests"));
+        assert!(m.contains("git_commit"));
     }
 }
