@@ -409,7 +409,11 @@ pub async fn run(deps: &Deps) -> Result<()> {
         scroll_top: 0,
         follow: true,
         ctx_tokens: 0,
-        ctx_budget: deps.cfg.context.budget_tokens,
+        ctx_budget: deps
+            .cfg
+            .llm
+            .context_window
+            .unwrap_or(deps.cfg.context.budget_tokens),
         ctx_estimated: true,
         activity: None,
     };
@@ -941,7 +945,7 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
 }
 
 fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" context ");
+    let block = Block::default().borders(Borders::ALL).title(" model ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -958,44 +962,64 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     let width = inner.width as usize;
+    let model = app.cfg.llm.model.clone();
+    let mut model_label = model;
+    if let Some(v) = &app.cfg.llm.model_version {
+        if !v.is_empty() {
+            model_label.push_str("  ");
+            model_label.push_str(v);
+        }
+    }
+    if model_label.chars().count() > width {
+        model_label = model_label.chars().take(width).collect();
+    }
+
     let filled = (ratio * width as f64).floor() as usize;
-    let mut line1 = Vec::new();
-    line1.push(Span::styled(
+    let mut bar_spans = Vec::new();
+    bar_spans.push(Span::styled(
         "#".repeat(filled),
         Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
     ));
-    line1.push(Span::styled(
+    bar_spans.push(Span::styled(
         "-".repeat(width.saturating_sub(filled)),
         Style::default().fg(Color::DarkGray),
     ));
 
-    let mut line2 = vec![Span::styled(
+    let mut usage = vec![Span::styled(
         format!("{pct}% used  "),
         Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
     )];
-    line2.push(Span::styled(
+    usage.push(Span::styled(
         format!("{tokens} / {budget} tokens"),
         Style::default().fg(Color::White),
     ));
-    if app.ctx_estimated {
-        line2.push(Span::styled(
-            " (est.)",
-            Style::default().fg(Color::DarkGray),
-        ));
-    } else {
-        line2.push(Span::styled(" (api)", Style::default().fg(Color::DarkGray)));
-    }
+    usage.push(Span::styled(
+        if app.ctx_estimated {
+            " (est.)"
+        } else {
+            " (api)"
+        },
+        Style::default().fg(Color::DarkGray),
+    ));
 
+    let model_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(0),
         ])
         .split(inner);
-    frame.render_widget(Paragraph::new(Line::from(line1)), rows[0]);
-    frame.render_widget(Paragraph::new(Line::from(line2)), rows[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(model_label, model_style))),
+        rows[0],
+    );
+    frame.render_widget(Paragraph::new(Line::from(bar_spans)), rows[1]);
+    frame.render_widget(Paragraph::new(Line::from(usage)), rows[2]);
     let _ = rows;
 }
 

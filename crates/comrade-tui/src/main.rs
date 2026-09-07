@@ -44,14 +44,13 @@ struct Deps {
     root: PathBuf,
 }
 
-fn build_deps(cli: &Cli) -> Result<Deps> {
+async fn build_deps(cli: &Cli) -> Result<Deps> {
     let mut cfg = Config::load(cli.config.as_deref())
         .context("failed to load config")?
         .config;
     if cli.auto {
         cfg.security.autonomy = comrade_core::Autonomy::Auto;
     }
-    let cfg = Arc::new(cfg);
 
     let root = match &cli.dir {
         Some(d) => d.canonicalize().context("bad --dir")?,
@@ -59,6 +58,23 @@ fn build_deps(cli: &Cli) -> Result<Deps> {
     };
 
     let client = Arc::new(LlmClient::new(&cfg.llm)?);
+
+    // Detect the model's real context window and display identity (unless
+    // configured explicitly) so the model gauge is accurate.
+    if cfg.llm.context_window.is_none() {
+        if let Some(window) = client.fetch_context_window().await {
+            cfg.llm.context_window = Some(window);
+            eprintln!(
+                "[comrade] model {} context window: {window} tokens",
+                cfg.llm.model
+            );
+        }
+    }
+    if cfg.llm.model_version.is_none() {
+        cfg.llm.model_version = client.fetch_model_version().await;
+    }
+    let cfg = Arc::new(cfg);
+
     let tools = Arc::new(build_tools());
     Ok(Deps {
         cfg,
@@ -122,7 +138,7 @@ fn new_session(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let deps = build_deps(&cli)?;
+    let deps = build_deps(&cli).await?;
 
     let interactive = !cli.headless && cli.prompt.is_empty();
     if interactive && !std::io::stdout().is_terminal() {

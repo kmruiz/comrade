@@ -56,13 +56,10 @@ pub async fn run_agent(
     }
     let _ = tx.send(AgentEvent::User(user_input.clone())).await;
 
+    let budget = cfg.effective_budget();
     let mut ctxm = ContextManager::with_system(
-        build_system_prompt(
-            ctx.project_root.to_string_lossy().as_ref(),
-            tools,
-            cfg.context.budget_tokens,
-        ),
-        cfg.context.budget_tokens,
+        build_system_prompt(ctx.project_root.to_string_lossy().as_ref(), tools, budget),
+        budget,
         cfg.context.max_tool_output_chars,
     );
     ctxm.push(ChatMessage::new(Role::User, user_input));
@@ -151,7 +148,7 @@ async fn run_agent_loop(
         let _ = tx
             .send(AgentEvent::ContextStats {
                 tokens,
-                budget: cfg.context.budget_tokens,
+                budget: cfg.effective_budget(),
                 estimated,
             })
             .await;

@@ -57,6 +57,12 @@ pub struct LlmCfg {
     pub timeout_secs: u64,
     /// Tool-calling protocol: auto | native | react.
     pub protocol: Protocol,
+    /// Model context window in tokens. When `None` the app tries to detect it
+    /// from the provider and falls back to the configured context budget.
+    pub context_window: Option<usize>,
+    /// Optional display identity/version string detected from the provider
+    /// (e.g. Ollama "7B (Q4_K_M)").
+    pub model_version: Option<String>,
 }
 
 impl Default for LlmCfg {
@@ -68,6 +74,8 @@ impl Default for LlmCfg {
             temperature: 0.2,
             timeout_secs: 600,
             protocol: Protocol::Auto,
+            context_window: None,
+            model_version: None,
         }
     }
 }
@@ -170,5 +178,13 @@ impl Config {
 
     pub fn auto_approve(&self) -> bool {
         matches!(self.security.autonomy, Autonomy::Auto)
+    }
+
+    /// Token budget to manage the history against: the model's real context
+    /// window when known, otherwise the configured (conservative) budget.
+    pub fn effective_budget(&self) -> usize {
+        self.llm
+            .context_window
+            .unwrap_or(self.context.budget_tokens)
     }
 }

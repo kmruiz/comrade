@@ -299,6 +299,73 @@ impl LlmClient {
         &self.cfg.model
     }
 
+    /// Try to fetch a short display identity/version for the model (Ollama's
+    /// `/api/show` details like "7B (Q4_K_M)"). Returns `None` when the endpoint
+    /// is not Ollama or does not provide details.
+    pub async fn fetch_model_version(&self) -> Option<String> {
+        let origin = origin_of(&self.cfg.base_url)?;
+        let Ok(short) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+        else {
+            return None;
+        };
+        let body = serde_json::json!({ "name": self.cfg.model });
+        let resp = short
+            .post(format!("{origin}/api/show"))
+            .json(&body)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let text = resp.text().await.ok()?;
+        model_version_from_ollama_show(&text)
+    }
+
+    /// Try to detect the model's context window (tokens). Best effort:
+    /// 1. OpenAI-compatible `GET /models` (`context_length`/`context_window`);
+    /// 2. Ollama's native `GET /api/show` (`model_info...context_length`).
+    /// Returns `None` when the endpoint does not report it.
+    pub async fn fetch_context_window(&self) -> Option<usize> {
+        let Ok(short) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+        else {
+            return None;
+        };
+        // 1) OpenAI-compatible models list.
+        let base = self.cfg.base_url.trim_end_matches('/');
+        let models_url = format!("{base}/models");
+        if let Ok(resp) = short.get(&models_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(text) = resp.text().await {
+                    if let Some(n) = model_context_from_openai(&text, &self.cfg.model) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        // 2) Ollama native show.
+        if let Some(origin) = origin_of(&self.cfg.base_url) {
+            let show_url = format!("{origin}/api/show");
+            let body = serde_json::json!({ "name": self.cfg.model });
+            if let Ok(resp) = short.post(&show_url).json(&body).send().await {
+                if resp.status().is_success() {
+                    if let Ok(text) = resp.text().await {
+                        if let Some(n) = model_context_from_ollama_show(&text) {
+                            return Some(n);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Send the whole conversation (non-streaming) and return the reply text.
     pub async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
         let body = ChatRequest::new(&self.cfg.model, messages, false, None, self.cfg.temperature);
@@ -496,6 +563,79 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
     Some(SseEvent::Data(payload.to_string()))
 }
 
+/// Extract the model's context window from an OpenAI-compatible `/models`
+/// JSON body, matching by model id.
+fn model_context_from_openai(json: &str, model: &str) -> Option<usize> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    let data = value.get("data")?.as_array()?;
+    for entry in data {
+        if entry.get("id").and_then(Value::as_str) != Some(model) {
+            continue;
+        }
+        for key in ["context_length", "context_window", "max_context_length"] {
+            if let Some(n) = entry.get(key).and_then(Value::as_u64) {
+                if n > 0 {
+                    return Some(n as usize);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract the context window from an Ollama `/api/show` body by scanning
+/// `model_info` for any `...context_length` integer.
+fn model_context_from_ollama_show(json: &str) -> Option<usize> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    let info = value
+        .get("model_info")
+        .or_else(|| value.get("model"))
+        .or_else(|| Some(&value))?;
+    let mut found: Option<usize> = None;
+    fn walk(v: &Value, last_key: Option<&str>, out: &mut Option<usize>) {
+        match v {
+            Value::Number(n) => {
+                if last_key.is_some_and(|k| k.ends_with("context_length")) {
+                    if let Some(u) = n.as_u64() {
+                        if u > 0 {
+                            *out = Some(u as usize);
+                        }
+                    }
+                }
+            }
+            Value::Object(map) => {
+                for (k, val) in map {
+                    if out.is_some() {
+                        return;
+                    }
+                    walk(val, Some(k.as_str()), out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if out.is_some() {
+                        return;
+                    }
+                    walk(item, last_key, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(info, None, &mut found);
+    found
+}
+
+/// `scheme://host[:port]` from a base URL such as `http://localhost:11434/v1`.
+fn origin_of(base_url: &str) -> Option<String> {
+    let (scheme, rest) = base_url.split_once("://")?;
+    let host = rest.split('/').next().unwrap_or(rest);
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,5 +824,89 @@ mod live_tests {
         assert_eq!(usage.prompt_tokens, 42);
         assert_eq!(usage.completion_tokens, 7);
         assert_eq!(usage.total_tokens, 49);
+    }
+}
+
+/// Extract a display identity from an Ollama `/api/show` body's `details`
+/// object, e.g. "7B (Q4_K_M)".
+fn model_version_from_ollama_show(json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    let details = value.get("details")?.as_object()?;
+    let size = details
+        .get("parameter_size")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let quant = details
+        .get("quantization_level")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (size, quant) {
+        (Some(size), Some(quant)) => Some(format!("{size} ({quant})")),
+        (Some(size), None) => Some(size.to_string()),
+        (None, Some(quant)) => Some(quant.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod detect_tests {
+    use super::*;
+
+    #[test]
+    fn reads_openai_context_window() {
+        let json = r#"{
+          "object": "list",
+          "data": [
+            { "id": "other", "context_length": 4096 },
+            { "id": "mistral:latest", "context_length": 32768 }
+          ]
+        }"#;
+        assert_eq!(
+            model_context_from_openai(json, "mistral:latest"),
+            Some(32768)
+        );
+        assert_eq!(model_context_from_openai(json, "unknown"), None);
+    }
+
+    #[test]
+    fn reads_ollama_show_version() {
+        let json = r#"{
+          "details": {
+            "parameter_size": "7.2B",
+            "quantization_level": "Q4_K_M"
+          }
+        }"#;
+        assert_eq!(
+            model_version_from_ollama_show(json).as_deref(),
+            Some("7.2B (Q4_K_M)")
+        );
+        assert_eq!(model_version_from_ollama_show("{}"), None);
+    }
+
+    #[test]
+    fn reads_ollama_show_context_length() {
+        let json = r#"{
+          "model_info": {
+            "general.architecture": "llama",
+            "llama.context_length": 8192,
+            "llama.embedding_length": 4096
+          }
+        }"#;
+        assert_eq!(model_context_from_ollama_show(json), Some(8192));
+        assert_eq!(model_context_from_ollama_show("{}"), None);
+    }
+
+    #[test]
+    fn origins_are_derived() {
+        assert_eq!(
+            origin_of("http://localhost:11434/v1").as_deref(),
+            Some("http://localhost:11434")
+        );
+        assert_eq!(
+            origin_of("https://host.example/foo/bar").as_deref(),
+            Some("https://host.example")
+        );
     }
 }
