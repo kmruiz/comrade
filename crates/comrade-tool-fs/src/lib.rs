@@ -755,7 +755,7 @@ struct ApplyPatch;
 static APPLY_PATCH_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "apply_patch".into(),
-    description: "Apply a unified diff to files (project-root relative), much more compact than apply_edit: send only +/- hunks with a little surrounding context. Format:\n  --- a/<path>\n  +++ b/<path>\n  @@ ... @@ (ignored)\n    context line\n  - removed line\n  + added line\nEach hunk's old block must appear exactly once in the file. Approval-gated.".into(),
+    description: "Apply a unified diff to files (project-root relative), much more compact than apply_edit: send only +/- hunks with a little surrounding context. Format:\n  --- a/<path>\n  +++ b/<path>\n  @@ ... @@ (ignored)\n    context line\n  - removed line\n  + added line\nEach hunk's old block must appear exactly once in the file. The change is approved by the human before being written.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {

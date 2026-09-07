@@ -316,9 +316,11 @@ impl App {
                 risk,
             } => {
                 // This turn produced a tool call; drop any scaffold-only prose
-                // that was streaming and show a compact card instead.
+                // that was streaming and show a compact card instead. Edit cards
+                // (apply_patch/apply_edit) open by default so the diff is visible.
                 self.stream.clear();
                 self.activity = Some(name.clone());
+                let open_default = matches!(name.as_str(), "apply_patch" | "apply_edit");
                 self.push_msg(Msg::tool(ToolCard {
                     name,
                     args,
@@ -326,7 +328,7 @@ impl App {
                     risk,
                     result: None,
                     ok: true,
-                    open: false,
+                    open: open_default,
                 }));
             }
             AgentEvent::ToolStart { .. } => {}
@@ -732,7 +734,6 @@ fn step_user(users: &[usize], sel: Option<usize>, dir: isize) -> Option<usize> {
 // ---------------------------------------------------------------------------
 // run_tests output parsing
 // ---------------------------------------------------------------------------
-
 /// Parse a `run_tests` summary: counts + duration + one (name, detail) per
 /// failing test (from `---- <name> stdout ----` sections).
 fn parse_test_summary(text: &str) -> TestSummary {
@@ -1082,17 +1083,34 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             });
         }
     }
-    out.push(RenderRow {
-        rule: None,
-        spans: vec![Span::styled("args:", Style::default().fg(Color::DarkGray))],
-        tool_header: None,
-    });
-    for s in plain_wrap(&card.args, width) {
+    if let Some(diff) = colored_diff(&card.name, &card.args) {
         out.push(RenderRow {
             rule: None,
-            spans: vec![Span::styled(s, Style::default().fg(Color::Magenta))],
+            spans: vec![Span::styled("diff:", Style::default().fg(Color::DarkGray))],
             tool_header: None,
         });
+        for (color, text) in diff {
+            for cut in hard_cut(&text, width.saturating_sub(2)) {
+                out.push(RenderRow {
+                    rule: None,
+                    spans: vec![Span::styled(format!("  {cut}"), Style::default().fg(color))],
+                    tool_header: None,
+                });
+            }
+        }
+    } else {
+        out.push(RenderRow {
+            rule: None,
+            spans: vec![Span::styled("args:", Style::default().fg(Color::DarkGray))],
+            tool_header: None,
+        });
+        for s in plain_wrap(&card.args, width) {
+            out.push(RenderRow {
+                rule: None,
+                spans: vec![Span::styled(s, Style::default().fg(Color::Magenta))],
+                tool_header: None,
+            });
+        }
     }
     if let Some(result) = &card.result {
         let color = if card.ok { Color::Green } else { Color::Red };
@@ -1776,5 +1794,80 @@ note: run with `RUST_BACKTRACE=1` for a backtrace
         assert_eq!(s.passed, 4);
         assert_eq!(s.failed, 0);
         assert!(s.cases.is_empty());
+    }
+}
+
+/// Build a colored line diff for edit tools from their JSON args:
+/// - apply_patch: args.diff (a unified diff) - color +/=green, -/=red.
+/// - apply_edit: args.old/args.new - old lines red, new lines green.
+fn colored_diff(name: &str, args_json: &str) -> Option<Vec<(Color, String)>> {
+    let value: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    match name {
+        "apply_patch" => {
+            let diff = value.get("diff")?.as_str()?;
+            let mut rows = Vec::new();
+            for line in diff.lines() {
+                let color = if line.starts_with('+') {
+                    Color::Green
+                } else if line.starts_with('-') {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                };
+                rows.push((color, line.to_string()));
+            }
+            Some(rows)
+        }
+        "apply_edit" => {
+            let old = value.get("old")?.as_str()?;
+            let new = value.get("new")?.as_str()?;
+            let mut rows = Vec::new();
+            for line in old.lines() {
+                rows.push((Color::Red, format!("-{line}")));
+            }
+            for line in new.lines() {
+                rows.push((Color::Green, format!("+{line}")));
+            }
+            Some(rows)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[test]
+    fn apply_patch_colors_unified_diff() {
+        let args =
+            r#"{"diff":"--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}\n"}"#;
+        let rows = colored_diff("apply_patch", args).unwrap();
+        assert!(
+            rows.iter()
+                .any(|(c, t)| *c == Color::Red && t.starts_with("-fn old"))
+        );
+        assert!(
+            rows.iter()
+                .any(|(c, t)| *c == Color::Green && t.starts_with("+fn new"))
+        );
+    }
+
+    #[test]
+    fn apply_edit_builds_red_green_lines() {
+        let old = "fn one() {}\n";
+        let new = "fn one() {}\nfn two() {}\n";
+        let args = format!(
+            r#"{{"path":"a.rs","old":{},"new":{}}}"#,
+            serde_json::to_string(old).unwrap(),
+            serde_json::to_string(new).unwrap()
+        );
+        let rows = colored_diff("apply_edit", &args).unwrap();
+        assert_eq!(rows[0].0, Color::Red);
+        assert_eq!(rows[0].1, "-fn one() {}");
+        assert!(
+            rows.iter()
+                .any(|(c, t)| *c == Color::Green && t.contains("fn two"))
+        );
     }
 }

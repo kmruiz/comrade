@@ -11,15 +11,31 @@ use crate::session::AgentEvent;
 
 /// Tools whose side effects require human approval (and thus mandatory
 /// Justification/Risk). Keep in sync with the tool crates.
-const APPROVAL_GATED_TOOLS: &[&str] = &[
+/// Tools that mutate the workspace (used by the loop tracker to tell "repeat
+/// but state changed" from "repeat doing nothing").
+const MUTATING_TOOLS: &[&str] = &[
     "apply_edit",
+    "apply_patch",
     "write_file",
     "rename",
     "git_commit",
     "run_task",
     "remember",
     "amend_decision",
-    "apply_patch",
+    "format_code",
+    "run_tests",
+    "shell",
+];
+
+/// Tools that are approval-gated: the model MUST provide `justification` and
+/// `risk` before they run (a human approves based on them).
+const APPROVAL_GATED_TOOLS: &[&str] = &[
+    "write_file",
+    "rename",
+    "git_commit",
+    "run_task",
+    "remember",
+    "amend_decision",
     "format_code",
     "run_tests",
     "shell",
@@ -32,7 +48,41 @@ fn is_approval_gated(name: &str) -> bool {
 /// Whether a tool call mutates the workspace (used to tell "repeat but state
 /// changed" apart from "repeat doing nothing").
 fn is_mutating(name: &str) -> bool {
-    APPROVAL_GATED_TOOLS.contains(&name)
+    MUTATING_TOOLS.contains(&name)
+}
+
+/// Approval-gated tools advertise `justification` and `risk` as optional native
+/// arguments so the model actually passes them (many models omit fields the
+/// schema forbids via `additionalProperties: false`). The agent strips them
+/// before invoking the tool.
+fn augmented_spec(mut spec: comrade_tool::ToolSpec) -> comrade_tool::ToolSpec {
+    if !is_approval_gated(&spec.name) {
+        return spec;
+    }
+    let obj = spec.json_schema.as_object_mut();
+    if let Some(obj) = obj {
+        obj.remove("additionalProperties"); // allow the injected keys
+        if let Some(props) = obj
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            props.insert(
+                "justification".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Why this action should run (required for approval)."
+                }),
+            );
+            props.insert(
+                "risk".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "What could go wrong, or \"none\" (required for approval)."
+                }),
+            );
+        }
+    }
+    spec
 }
 
 const LOOP_WINDOW: usize = 8;
@@ -170,7 +220,10 @@ async fn run_agent_loop(
         // Advertise native tools unless the protocol is strictly ReAct.
         let native = cfg.llm.protocol.native_enabled();
         let tool_specs: Option<Vec<comrade_tool::ToolSpec>> = if native {
-            let specs: Vec<_> = tools.iter().map(|t| t.spec().clone()).collect();
+            let specs: Vec<_> = tools
+                .iter()
+                .map(|t| augmented_spec(t.spec().clone()))
+                .collect();
             if specs.is_empty() { None } else { Some(specs) }
         } else {
             None
