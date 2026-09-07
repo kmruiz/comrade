@@ -347,7 +347,7 @@ impl LlmClient {
     ///    DeepSeek) don't reject the probe with 401;
     /// 2. Ollama's native `GET /api/show` (`model_info...context_length`) -
     ///    only probed when the endpoint actually looks like Ollama;
-    /// 3. a model-name heuristic (e.g. DeepSeek 64K/128K suffixes).
+    /// 3. a model-name heuristic (e.g. deepseek-chat -> 128K).
     /// Returns `None` only if nothing is known.
     pub async fn fetch_context_window(&self) -> Option<usize> {
         let Some(short) = probe_client(&self.cfg) else {
@@ -610,6 +610,12 @@ fn heuristic_context(model: &str) -> Option<usize> {
         if m.contains(needle) {
             return Some(size);
         }
+    }
+    match m.as_str() {
+        // DeepSeek's two API models expose a 128K context window, but its
+        // `/models` endpoint does not advertise it.
+        "deepseek-chat" | "deepseek-reasoner" => return Some(131_072),
+        _ => {}
     }
     if m.contains("deepseek") {
         return Some(65_536);
@@ -980,8 +986,11 @@ mod heuristic_tests {
 
     #[test]
     fn deepseek_gets_a_sane_fallback_window() {
-        assert_eq!(heuristic_context("deepseek-chat"), Some(65_536));
-        assert_eq!(heuristic_context("deepseek-reasoner"), Some(65_536));
+        assert_eq!(heuristic_context("deepseek-chat"), Some(131_072));
+        assert_eq!(heuristic_context("deepseek-reasoner"), Some(131_072));
+        // Other names that merely contain "deepseek" keep the conservative
+        // window until we know their real context.
+        assert_eq!(heuristic_context("deepseek-coder-v3"), Some(65_536));
     }
 
     #[test]
