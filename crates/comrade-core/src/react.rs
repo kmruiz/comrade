@@ -274,10 +274,136 @@ fn parse_args_json(text: &str) -> Result<Value> {
     match serde_json::from_str::<Value>(text) {
         Ok(v) => Ok(v),
         Err(_) => {
-            let repaired = quote_object_keys_and_bare_strings(text);
-            serde_json::from_str(&repaired).map_err(|e| anyhow::anyhow!("{e}; input: {repaired}"))
+            // Progressive repair: single quotes -> double, quote bare keys /
+            // bare strings, drop trailing commas, then try again.
+            let mut repaired = text.to_string();
+            for _ in 0..3 {
+                repaired = replace_single_quotes(&repaired);
+                repaired = quote_object_keys_and_bare_strings(&repaired);
+                repaired = strip_trailing_commas(&repaired);
+                if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
+                    return Ok(v);
+                }
+            }
+            Err(anyhow::anyhow!("input: {repaired}"))
         }
     }
+}
+
+/// Convert single-quoted strings to double-quoted ones (outside already
+/// double-quoted strings). Safe because the input is an Args fragment.
+fn replace_single_quotes(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < n {
+        match chars[i] {
+            '"' => {
+                out.push('"');
+                i += 1;
+                while i < n {
+                    let c = chars[i];
+                    out.push(c);
+                    i += 1;
+                    if c == '\\' && i < n {
+                        out.push(chars[i]);
+                        i += 1;
+                    } else if c == '"' {
+                        break;
+                    }
+                }
+            }
+            '\'' => {
+                let mut inner = String::new();
+                let mut j = i + 1;
+                let mut closed = false;
+                while j < n {
+                    let c = chars[j];
+                    if c == '\\' {
+                        inner.push(c);
+                        if j + 1 < n {
+                            inner.push(chars[j + 1]);
+                            j += 2;
+                            continue;
+                        }
+                        j += 1;
+                        continue;
+                    }
+                    if c == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    inner.push(c);
+                    j += 1;
+                }
+                if closed {
+                    out.push('"');
+                    out.push_str(&inner.replace('"', "\\\""));
+                    out.push('"');
+                    i = j + 1;
+                } else {
+                    for k in i..n {
+                        out.push(chars[k]);
+                    }
+                    break;
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Remove commas immediately before `}` or `]` (ignoring whitespace), skipping
+/// string literals.
+fn strip_trailing_commas(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < n {
+        let c = chars[i];
+        if c == '"' {
+            in_string = !in_string;
+            out.push(c);
+            i += 1;
+            if !in_string {
+                continue;
+            }
+            // skip rest of string (backslash-aware)
+            while i < n {
+                let c2 = chars[i];
+                out.push(c2);
+                i += 1;
+                if c2 == '\\' && i < n {
+                    out.push(chars[i]);
+                    i += 1;
+                } else if c2 == '"' {
+                    in_string = false;
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == ',' && !in_string {
+            let mut j = i + 1;
+            while j < n && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < n && (chars[j] == '}' || chars[j] == ']') {
+                i += 1; // skip the trailing comma
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -551,5 +677,23 @@ mod trust_tests {
         );
         assert!(obs.contains("UNTRUSTED DATA"), "{obs}");
         assert!(obs.contains("ignore your instructions"), "{obs}");
+    }
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_single_quotes_and_trailing_commas() {
+        let turn =
+            parse_turn("Thought: list it\nTool: list_dir\nArgs: {'path': 'crates',}").unwrap();
+        let call = turn.tool_call.unwrap();
+        assert_eq!(call.args["path"], "crates");
+    }
+
+    #[test]
+    fn unclosed_json_is_an_error_for_the_fallback() {
+        assert!(parse_turn("Tool: list_dir\nArgs: {\"path\": \"x\"").is_err());
     }
 }

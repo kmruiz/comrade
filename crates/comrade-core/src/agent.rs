@@ -229,7 +229,31 @@ async fn run_agent_loop(
         ctxm.push(ChatMessage::new(Role::Assistant, response.clone()));
         let _ = tx.send(AgentEvent::AssistantText(response.clone())).await;
 
-        let turn_p = parse_turn(&response).context("failed to parse model response")?;
+        let turn_p = match parse_turn(&response) {
+            Ok(t) => t,
+            Err(e) => {
+                // Recoverable model mistake: don't kill the run, ask the model
+                // to resend valid JSON in its next turn.
+                let msg = format!(
+                    "Your previous message could not be parsed ({e:#}). \
+                     Resend the tool call with Args as VALID strict JSON: quote every key and string \
+                     value, no single quotes, no trailing commas."
+                );
+                let _ = tx
+                    .send(AgentEvent::ToolResult {
+                        name: "model_output".into(),
+                        output: msg.clone(),
+                        ok: false,
+                    })
+                    .await;
+                let obs = ctxm.truncate_observation(&format!("ERROR: {msg}"));
+                ctxm.push(ChatMessage::new(
+                    Role::User,
+                    render_observation("model_output", &obs),
+                ));
+                continue;
+            }
+        };
         if let Some(t) = turn_p.thought.as_deref() {
             let _ = tx.send(AgentEvent::Thought(t.to_string())).await;
         }
@@ -1059,7 +1083,132 @@ mod tests {
 
 #[cfg(test)]
 mod loop_tests {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::config::Config;
+    use crate::llm::LlmClient;
+    use crate::session::{AgentEvent, AgentSession};
+    use crate::undo::MemoryUndo;
+    use comrade_tool::{ToolContext, ToolRegistry};
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
+
+    struct IoNoop;
+    #[async_trait::async_trait]
+    impl comrade_tool::UserIo for IoNoop {
+        async fn ask(
+            &self,
+            _p: comrade_tool::UserPrompt,
+        ) -> anyhow::Result<comrade_tool::UserReply> {
+            Ok(comrade_tool::UserReply::Answer("yes".into()))
+        }
+    }
+
+    fn spawn_parse_model() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let calls = Arc::new(AtomicUsize::new(0));
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let mut used = 0usize;
+                loop {
+                    match stream.read(&mut buf[used..]) {
+                        Ok(0) => break,
+                        Ok(r) => {
+                            used += r;
+                            if buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let content = if n == 0 {
+                    "Thought: look\nTool: list_dir\nArgs: {\"path\": \"x\""
+                } else {
+                    "All done."
+                };
+                let half = content.len() / 2;
+                let (a, b) = content.split_at(half);
+                let body = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":{:?}}}}}]}}\n\n\
+                     data: {{\"choices\":[{{\"delta\":{{\"content\":{:?}}}}}]}}\n\n\
+                     data: [DONE]\n\n",
+                    a, b
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn unparseable_args_is_recoverable_not_fatal() {
+        let port = spawn_parse_model();
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "fake".into();
+
+        let (tx, mut events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        let root =
+            std::env::temp_dir().join(format!("comrade-parse-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let undo = Arc::new(MemoryUndo::new(root.clone()));
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(IoNoop),
+            undo: undo.clone(),
+            auto_approve: true,
+            approval: Default::default(),
+        };
+        let tools = ToolRegistry::new();
+        let client = LlmClient::new(&cfg.llm).unwrap();
+
+        let outcome = run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            "go".to_string(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.final_answer, "All done.");
+        assert_eq!(outcome.iterations, 2);
+
+        let mut saw_feedback = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
+        {
+            if let AgentEvent::ToolResult { output, ok, .. } = &ev {
+                if !ok && output.contains("could not be parsed") {
+                    saw_feedback = true;
+                }
+            }
+            if let AgentEvent::RunEnd = ev {
+                break;
+            }
+        }
+        assert!(saw_feedback, "expected a parse-fallback observation");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn identical_call_without_change_is_a_loop() {
