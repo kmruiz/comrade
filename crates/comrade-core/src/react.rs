@@ -62,11 +62,12 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          Args MUST be valid strict JSON: quote every key and every string value, e.g. {\"path\": \"src/main.rs\"}.\n\
          \n\
          Before any action that needs human approval — editing/writing files, renaming symbols, \
-         git commits, run_task — also write, between Thought and Tool:\n\
+         git commits, run_task — you MUST also write, between Thought and Tool:\n\
          \n\
          Justification: <why this action should run, one or two short lines>\n\
          Risk: <what could go wrong or how invasive it is; write \"Risk: none\" if safe>\n\
          \n\
+         Approval-gated tools are refused if you omit either line — repeat the call with both.\n\
          After each tool call you will receive:\n\
          \n\
          Observation: <the tool result>\n\

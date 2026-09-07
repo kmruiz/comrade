@@ -9,6 +9,20 @@ use crate::llm::{ChatMessage, LlmClient, Role};
 use crate::react::{build_system_prompt, parse_turn, render_observation};
 use crate::session::AgentEvent;
 
+/// Tools whose side effects require human approval (and thus mandatory
+/// Justification/Risk). Keep in sync with the tool crates.
+const APPROVAL_GATED_TOOLS: &[&str] = &[
+    "apply_edit",
+    "write_file",
+    "rename",
+    "git_commit",
+    "run_task",
+];
+
+fn is_approval_gated(name: &str) -> bool {
+    APPROVAL_GATED_TOOLS.contains(&name)
+}
+
 /// Result of a finished agent run.
 #[derive(Debug)]
 pub struct AgentOutcome {
@@ -157,19 +171,47 @@ async fn run_agent_loop(
             continue;
         };
 
-        // Hand the model's justification/risk to whatever confirmation the tool
-        // asks for (mutating tools and run_task).
-        let has_note = !turn
-            .justification
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .is_empty()
-            || turn
-                .risk
+        // Approval-gated tools (mutations, task runs) MUST be accompanied by a
+        // Justification and a Risk line, otherwise the human has nothing to
+        // reason with. Ask the model to repeat instead of running them.
+        if is_approval_gated(&tool_call.name) && !ctx.auto_approve {
+            let has_justification = !turn
+                .justification
                 .as_deref()
-                .is_some_and(|r| !r.trim().is_empty() && !r.trim().eq_ignore_ascii_case("none"));
-        if has_note {
+                .unwrap_or("")
+                .trim()
+                .is_empty();
+            let has_risk = !turn.risk.as_deref().unwrap_or("").trim().is_empty();
+            if !has_justification || !has_risk {
+                let missing = [(has_justification, "Justification"), (has_risk, "Risk")]
+                    .iter()
+                    .filter(|(ok, _)| !ok)
+                    .map(|(_, label)| *label)
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                let msg = format!(
+                    "tool `{tool}` is approval-gated and was called without {missing}. \
+                     Do NOT call it again without first writing both lines above the Tool line:\n\
+                     Justification: <why this action should run>\n\
+                     Risk: <what could go wrong, or \"Risk: none\" if safe>\n\
+                     Repeat the call with both fields present.",
+                    tool = tool_call.name,
+                );
+                let _ = tx
+                    .send(AgentEvent::ToolResult {
+                        name: tool_call.name.clone(),
+                        output: msg.clone(),
+                        ok: false,
+                    })
+                    .await;
+                let obs = ctxm.truncate_observation(&format!("ERROR: {msg}"));
+                ctxm.push(ChatMessage::new(
+                    Role::User,
+                    render_observation(&tool_call.name, &obs),
+                ));
+                continue;
+            }
+            // Both fields present: surface them on the approval prompt.
             ctx.set_approval(comrade_tool::ApprovalNotes {
                 justification: turn.justification.clone().unwrap_or_default(),
                 risk: turn.risk.clone(),
@@ -283,10 +325,12 @@ mod tests {
         }
     }
 
-    /// Scripted model: 1st call streams a ReAct turn that invokes an unknown
-    /// tool (exercises the error/observation path), 2nd call streams a final
-    /// answer.
-    fn spawn_fake_model() -> u16 {
+    /// Scripted model serving one reply per HTTP request, streamed in two SSE
+    /// chunks to exercise the accumulator. Requests past the end get the last
+    /// canned reply.
+    fn spawn_model_with(responses: &[&str]) -> u16 {
+        let responses: Vec<String> = responses.iter().map(|s| s.to_string()).collect();
+        let responses = Arc::new(responses);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -308,11 +352,10 @@ mod tests {
                         Err(_) => break,
                     }
                 }
-                let content = if n == 0 {
-                    "Thought: try a tool\nTool: no_such_tool\nArgs: {\"x\": 1}"
-                } else {
-                    "All done."
-                };
+                let content = responses
+                    .get(n)
+                    .map(String::as_str)
+                    .unwrap_or_else(|| responses.last().map(String::as_str).unwrap_or("All done."));
                 // Split into two SSE chunks to exercise the accumulator.
                 let half = content.len() / 2;
                 let (a, b) = content.split_at(half);
@@ -331,6 +374,13 @@ mod tests {
             }
         });
         port
+    }
+
+    fn spawn_fake_model() -> u16 {
+        spawn_model_with(&[
+            "Thought: try a tool\nTool: no_such_tool\nArgs: {\"x\": 1}",
+            "All done.",
+        ])
     }
 
     #[tokio::test]
@@ -394,6 +444,144 @@ mod tests {
             saw_unknown_tool,
             "expected the unknown-tool error observation"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stand-in for an approval-gated tool: records invocations and asks for
+    /// confirmation like the real write_file would.
+    struct RecordingWrite {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl comrade_tool::Tool for RecordingWrite {
+        fn spec(&self) -> &comrade_tool::ToolSpec {
+            static SPEC: std::sync::LazyLock<comrade_tool::ToolSpec> =
+                std::sync::LazyLock::new(|| comrade_tool::ToolSpec {
+                    name: "write_file".into(),
+                    description: "write a file (test)".into(),
+                    json_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                });
+            &SPEC
+        }
+        async fn invoke(
+            &self,
+            ctx: &ToolContext,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ctx.confirm("write_file (test)", None).await?;
+            Ok("wrote file".into())
+        }
+    }
+
+    fn gated_registry(calls: Arc<std::sync::atomic::AtomicUsize>) -> ToolRegistry {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(RecordingWrite { calls }));
+        tools
+    }
+
+    #[tokio::test]
+    async fn approval_gated_tool_refused_without_justification_and_risk() {
+        let port = spawn_model_with(&[
+            "Thought: write it\nTool: write_file\nArgs: {\"path\": \"x.rs\", \"content\": \"a\"}",
+            "All done.",
+        ]);
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "fake".into();
+
+        let (tx, mut events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        let root = std::env::temp_dir().join(format!("comrade-gated-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let undo = Arc::new(MemoryUndo::new(root.clone()));
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: undo.clone(),
+            auto_approve: false,
+            approval: Default::default(),
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools = gated_registry(calls.clone());
+        let client = LlmClient::new(&cfg.llm).unwrap();
+
+        let outcome = run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            "do it".to_string(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.final_answer, "All done.");
+        // tool was never executed (no side effects, no confirm shown)
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let mut saw_refusal = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
+        {
+            match ev {
+                AgentEvent::ToolResult { output, ok, .. } => {
+                    if !ok && output.contains("approval-gated") {
+                        saw_refusal = true;
+                    }
+                }
+                AgentEvent::RunEnd => break,
+                _ => {}
+            }
+        }
+        assert!(saw_refusal, "expected an approval-gated refusal");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn approval_gated_tool_runs_when_notes_present() {
+        let port = spawn_model_with(&[
+            "Thought: write it\nJustification: needed to add the requested file\nRisk: none\nTool: write_file\nArgs: {\"path\": \"y.rs\", \"content\": \"b\"}",
+            "All done.",
+        ]);
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "fake".into();
+
+        let (tx, _events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        let root = std::env::temp_dir().join(format!("comrade-notes-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let undo = Arc::new(MemoryUndo::new(root.clone()));
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: undo.clone(),
+            auto_approve: false,
+            approval: Default::default(),
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools = gated_registry(calls.clone());
+        let client = LlmClient::new(&cfg.llm).unwrap();
+
+        let outcome = run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            "do it".to_string(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.final_answer, "All done.");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
