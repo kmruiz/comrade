@@ -43,6 +43,9 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          - For anything about the project itself — dependencies, crates/subprojects, workspace \
          layout, runnable tasks — call project_model FIRST. Do NOT read Cargo.toml files just to \
          answer such questions; project_model already summarizes them.\n\
+         - Persistent project decisions live in .comrade/memory/. Before architectural or \
+         behavioural choices, check find_decisions; record meaningful decisions with remember \
+         once they are finalised, so future sessions reuse them.\n\
          - Use list_files and rgrep to discover files and search text; use read_file to open a \
          specific file.\n\n",
     );

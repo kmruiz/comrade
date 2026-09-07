@@ -17,6 +17,8 @@ const APPROVAL_GATED_TOOLS: &[&str] = &[
     "rename",
     "git_commit",
     "run_task",
+    "remember",
+    "amend_decision",
 ];
 
 fn is_approval_gated(name: &str) -> bool {

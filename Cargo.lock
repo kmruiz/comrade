@@ -287,6 +287,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "comrade-tool-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "comrade-tool",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "comrade-tool-project"
 version = "0.1.0"
 dependencies = [
@@ -336,6 +348,7 @@ dependencies = [
  "comrade-tool",
  "comrade-tool-fs",
  "comrade-tool-git",
+ "comrade-tool-memory",
  "comrade-tool-project",
  "comrade-tool-session",
  "comrade-tool-syntax",
