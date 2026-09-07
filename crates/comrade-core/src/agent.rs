@@ -25,6 +25,66 @@ fn is_approval_gated(name: &str) -> bool {
     APPROVAL_GATED_TOOLS.contains(&name)
 }
 
+/// Whether a tool call mutates the workspace (used to tell "repeat but state
+/// changed" apart from "repeat doing nothing").
+fn is_mutating(name: &str) -> bool {
+    APPROVAL_GATED_TOOLS.contains(&name)
+}
+
+const LOOP_WINDOW: usize = 8;
+const MAX_LOOP_REFUSALS: usize = 3;
+
+/// Detects no-progress loops: the same exact tool call repeated while nothing
+/// changed in between. Each detected repeat is refused; after several refusals
+/// the run aborts instead of burning the whole budget.
+#[derive(Default)]
+struct LoopTracker {
+    /// (canonical call signature, mutation counter at the time it ran).
+    recent: std::collections::VecDeque<(String, u64)>,
+    /// How many mutating calls have executed; identical calls on either side of
+    /// a mutation are not considered a loop.
+    mutation_seq: u64,
+    /// Consecutive refusals per signature.
+    refusals: std::collections::HashMap<String, usize>,
+}
+
+impl LoopTracker {
+    /// Returns the refusal count when this exact call was already made with no
+    /// state change since (i.e. a no-progress repeat), else `None`.
+    fn check(&mut self, sig: &str) -> Option<usize> {
+        let repeats_without_change = self
+            .recent
+            .iter()
+            .any(|(s, seq)| s == sig && *seq == self.mutation_seq);
+        if !repeats_without_change {
+            return None;
+        }
+        let count = self.refusals.entry(sig.to_string()).or_insert(0);
+        *count += 1;
+        Some(*count)
+    }
+
+    /// Note a tool call that actually ran (mutation or read).
+    fn record(&mut self, name: &str, sig: String) {
+        if is_mutating(name) {
+            self.mutation_seq += 1;
+        }
+        self.recent.push_back((sig, self.mutation_seq));
+        if self.recent.len() > LOOP_WINDOW {
+            self.recent.pop_front();
+        }
+    }
+}
+
+/// Message fed back when a tool call is refused as a no-progress repeat.
+fn loop_refusal(tool: &str) -> String {
+    format!(
+        "tool `{tool}` was already called with exactly these arguments and nothing changed since. \
+         Repeating it will not make progress. Change something first (edit a file, run a different \
+         tool, verify state) or give your final answer. Do NOT call `{tool}` again with identical arguments."
+    )
+}
+
 /// Result of a finished agent run.
 #[derive(Debug)]
 pub struct AgentOutcome {
@@ -86,6 +146,7 @@ async fn run_agent_loop(
 ) -> Result<AgentOutcome> {
     let max_iterations = cfg.agent.max_iterations;
     let mut iterations = 0usize;
+    let mut tracker = LoopTracker::default();
 
     loop {
         if stop.is_cancelled() {
@@ -155,7 +216,7 @@ async fn run_agent_loop(
 
         // Native function calls: dispatch them (possibly several per turn).
         if !turn.tool_calls.is_empty() {
-            run_native_calls(&mut ctxm, &tx, tools, &ctx, turn).await?;
+            run_native_calls(&mut ctxm, &tx, tools, &ctx, &mut tracker, turn).await?;
             continue;
         }
 
@@ -250,6 +311,40 @@ async fn run_agent_loop(
         }
 
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
+        let sig = format!("{} {args_pretty}", tool_call.name);
+        if let Some(count) = tracker.check(&sig) {
+            if count >= MAX_LOOP_REFUSALS {
+                let msg = format!(
+                    "ERROR: detected a loop: `{sig}` repeated {}x without any state change",
+                    count
+                );
+                let _ = tx
+                    .send(AgentEvent::ToolResult {
+                        name: tool_call.name.clone(),
+                        output: msg.clone(),
+                        ok: false,
+                    })
+                    .await;
+                bail!(
+                    "detected a loop: agent repeated `{}` {count}x without making progress",
+                    tool_call.name
+                );
+            }
+            let msg = loop_refusal(&tool_call.name);
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: tool_call.name.clone(),
+                    output: msg.clone(),
+                    ok: false,
+                })
+                .await;
+            let obs = ctxm.truncate_observation(&format!("ERROR: {msg}"));
+            ctxm.push(ChatMessage::new(
+                Role::User,
+                render_observation(&tool_call.name, &obs),
+            ));
+            continue;
+        }
         let _ = tx
             .send(AgentEvent::ToolCall {
                 name: tool_call.name.clone(),
@@ -283,6 +378,7 @@ async fn run_agent_loop(
             Role::User,
             render_observation(&tool_call.name, &clamped),
         ));
+        tracker.record(&tool_call.name, sig);
         // The tool call is spent: strip its (potentially large) args from the
         // stored assistant message so they are not re-sent every later turn.
         ctxm.note_tool_done(&tool_call.name, turn_p.thought.as_deref());
@@ -297,6 +393,7 @@ async fn run_native_calls(
     tx: &mpsc::Sender<AgentEvent>,
     tools: &ToolRegistry,
     ctx: &ToolContext,
+    tracker: &mut LoopTracker,
     turn: crate::llm::LlmTurn,
 ) -> Result<()> {
     if !turn.content.trim().is_empty() {
@@ -352,6 +449,7 @@ async fn run_native_calls(
     let total = prepared.len();
     for p in prepared {
         let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
+        let sig = format!("{} {args_pretty}", p.name);
         let _ = tx
             .send(AgentEvent::ToolCall {
                 name: p.name.clone(),
@@ -391,6 +489,35 @@ async fn run_native_calls(
             });
         }
 
+        if let Some(count) = tracker.check(&sig) {
+            if count >= MAX_LOOP_REFUSALS {
+                let msg = format!(
+                    "ERROR: detected a loop: `{sig}` repeated {count}x without any state change"
+                );
+                let _ = tx
+                    .send(AgentEvent::ToolResult {
+                        name: p.name.clone(),
+                        output: msg.clone(),
+                        ok: false,
+                    })
+                    .await;
+                bail!(
+                    "detected a loop: agent repeated `{}` {count}x without making progress",
+                    p.name
+                );
+            }
+            let msg = loop_refusal(&p.name);
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: p.name.clone(),
+                    output: msg.clone(),
+                    ok: false,
+                })
+                .await;
+            ctxm.push(ChatMessage::tool_result(p.id, msg));
+            continue;
+        }
+
         let Some(tool) = tools.get(&p.name) else {
             let msg = format!("unknown tool {:?}; choose from the listed tools", p.name);
             let _ = tx
@@ -425,6 +552,7 @@ async fn run_native_calls(
             })
             .await;
         ctxm.push(ChatMessage::tool_result(p.id, clamped));
+        tracker.record(&p.name, sig);
     }
     ctxm.note_turn_done(total);
     Ok(())
@@ -926,5 +1054,41 @@ mod tests {
         }
         assert!(saw_refusal, "expected native approval-gated refusal");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    #[test]
+    fn identical_call_without_change_is_a_loop() {
+        let mut t = LoopTracker::default();
+        let sig = "read_file {\"path\":\"a.rs\"}".to_string();
+        assert_eq!(t.check(&sig), None);
+        t.record("read_file", sig.clone());
+        // same call again, nothing changed -> refused (count 1, then 2)
+        assert_eq!(t.check(&sig), Some(1));
+        assert_eq!(t.check(&sig), Some(2));
+        assert_eq!(t.check(&sig), Some(3));
+    }
+
+    #[test]
+    fn repeat_after_a_mutation_is_allowed() {
+        let mut t = LoopTracker::default();
+        let sig = "run_task {\"task\":\"test\"}".to_string();
+        t.record("run_task", sig.clone());
+        assert_eq!(t.check(&sig), Some(1));
+
+        // a mutating call in between bumps the sequence; identical test re-run ok
+        t.record("apply_edit", "apply_edit {..}".to_string());
+        assert_eq!(t.check(&sig), None);
+    }
+
+    #[test]
+    fn different_arguments_are_not_a_loop() {
+        let mut t = LoopTracker::default();
+        t.record("read_file", "read_file a".to_string());
+        assert_eq!(t.check(&"read_file b".to_string()), None);
     }
 }
