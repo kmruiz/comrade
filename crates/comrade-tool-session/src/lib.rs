@@ -31,6 +31,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(RenameSession),
         Box::new(SetPlan),
         Box::new(UpdatePlan),
+        Box::new(SetStepModel),
         Box::new(FinishPlan),
         Box::new(SetStatusBar),
         Box::new(AskQuestion),
@@ -262,6 +263,113 @@ impl Tool for UpdatePlan {
 }
 
 // ---------------------------------------------------------------------------
+// set_step_model
+// ---------------------------------------------------------------------------
+
+struct SetStepModel;
+
+static SET_STEP_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "set_step_model".into(),
+    description: "Change which model runs an existing plan step, e.g. to hand a pending \\\"self\\\" step to a delegate or to take a delegate-assigned step back onto yourself. Identify the step by its 1-based `index` (preferred) or by `text` in its goal, and give the `model` that will run it: \\\"self\\\" for you, or a configured delegate name. Refused while the step is in_progress or done: only pending or blocked steps can be reassigned. Reassigning clears the step's delegation record, so the newly assigned model must actually run the step before it can be marked done.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "index": { "type": "integer", "minimum": 1, "description": "1-based step id." },
+            "text": { "type": "string", "description": "Text contained in the step goal." },
+            "model": { "type": "string", "description": "The model that will now run this step: \"self\" for the main agent, or a configured delegate name (see the delegate tool's model listing)." }
+        },
+        "required": ["model"],
+        "oneOf": [
+            { "required": ["index"] },
+            { "required": ["text"] }
+        ],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for SetStepModel {
+    fn spec(&self) -> &ToolSpec {
+        &SET_STEP_MODEL_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            index: Option<u64>,
+            #[serde(default)]
+            text: Option<String>,
+            model: String,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        if args.model.trim().is_empty() {
+            anyhow::bail!(
+                "set_step_model needs the `model` that will now run the step: {AGENT_MODEL:?} \
+                 (\"self\") for yourself, or one of the delegate names listed by the `delegate` tool"
+            );
+        }
+        let target = match (args.index, args.text.as_deref()) {
+            (Some(i), _) if i >= 1 => PlanTarget::Id(i),
+            (None, Some(t)) if !t.is_empty() => PlanTarget::Text(t.to_string()),
+            _ => anyhow::bail!(
+                "set_step_model requires either a 1-based `index` or non-empty `text`"
+            ),
+        };
+        let model = args.model.trim().to_string();
+
+        // Friendly pre-checks against a snapshot: only pending or blocked steps
+        // may change model, and a no-op is reported as such.
+        let steps = ctx.session.plan();
+        let matched = steps.iter().find(|s| match &target {
+            PlanTarget::Id(id) => s.id == *id,
+            PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+        });
+        if let Some(step) = matched {
+            if matches!(step.status, PlanStatus::InProgress | PlanStatus::Done) {
+                anyhow::bail!(
+                    "plan step {} is {} — a step's model can only be changed while it is \
+                     pending or blocked, not once a model is working it or it is done",
+                    step.id,
+                    step.status
+                );
+            }
+            if step.model == model {
+                let open = steps
+                    .iter()
+                    .filter(|s| matches!(s.status, PlanStatus::Pending | PlanStatus::InProgress))
+                    .count();
+                return Ok(format!(
+                    "Step {} is already assigned to {model:?}; nothing changed. {open} step(s) \
+                     still open.",
+                    step.id
+                ));
+            }
+        }
+
+        match ctx.session.reassign_step_model(&target, &model) {
+            Ok(true) => {
+                let open = ctx
+                    .session
+                    .plan()
+                    .into_iter()
+                    .filter(|s| matches!(s.status, PlanStatus::Pending | PlanStatus::InProgress))
+                    .count();
+                Ok(format!(
+                    "Step now assigned to model {model:?}. Reassignment cleared its delegation \
+                     record, so that model must run the step before it can be marked done. {open} \
+                     step(s) still open."
+                ))
+            }
+            Ok(false) => anyhow::bail!("no step matched the given index/text"),
+            Err(why) => anyhow::bail!("{why}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // finish_plan
 // ---------------------------------------------------------------------------
 
@@ -429,7 +537,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{FinishPlan, SetPlan, UpdatePlan};
+    use super::{FinishPlan, SetPlan, SetStepModel, UpdatePlan};
 
     /// A real-enough session: stores the plan and which steps the `delegate`
     /// tool has run, exactly like `AgentSession` does.
@@ -503,6 +611,32 @@ mod tests {
         }
         fn step_was_delegated(&self, id: u64) -> bool {
             self.delegated.lock().unwrap().contains(&id)
+        }
+        fn reassign_step_model(
+            &self,
+            target: &PlanTarget,
+            model: &str,
+        ) -> std::result::Result<bool, String> {
+            let step_id = {
+                let mut plan = self.plan.lock().unwrap();
+                let Some(step) = plan.iter_mut().find(|s| match &target {
+                    PlanTarget::Id(id) => s.id == *id,
+                    PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+                }) else {
+                    return Ok(false);
+                };
+                if matches!(step.status, PlanStatus::InProgress | PlanStatus::Done) {
+                    return Err(format!(
+                        "plan step {} is {} — a step's model can only be changed while it is \
+                         pending or blocked",
+                        step.id, step.status
+                    ));
+                }
+                step.model = model.trim().to_string();
+                step.id
+            };
+            self.delegated.lock().unwrap().remove(&step_id);
+            Ok(true)
         }
         fn set_status(&self, _s: &str) {}
         fn status(&self) -> String {
@@ -652,5 +786,116 @@ mod tests {
         c.session.mark_step_delegated(1);
         FinishPlan.invoke(&c, json!({})).await.unwrap();
         assert_eq!(c.session.plan()[0].status, PlanStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn set_step_model_reassigns_a_pending_self_step_to_a_delegate() {
+        let c = ctx(StubSession::with_plan(vec![plain_step()]));
+        let out = SetStepModel
+            .invoke(&c, json!({ "index": 1, "model": "cheap" }))
+            .await
+            .unwrap();
+        assert!(out.contains("\"cheap\""), "{out}");
+        assert_eq!(c.session.plan()[0].model, "cheap");
+    }
+
+    #[tokio::test]
+    async fn set_step_model_takes_a_delegate_step_back_onto_self() {
+        // Reassigning clears the delegation record: the "cheap" run no longer
+        // counts, so the step cannot be marked done without a new delegate run.
+        let c = ctx(StubSession::with_plan(vec![delegated_step()]));
+        c.session.mark_step_delegated(1);
+        assert!(c.session.step_was_delegated(1));
+        let out = SetStepModel
+            .invoke(&c, json!({ "index": 1, "model": "self" }))
+            .await
+            .unwrap();
+        assert!(out.contains("cleared"), "{out}");
+        assert_eq!(c.session.plan()[0].model, AGENT_MODEL);
+        assert!(!c.session.step_was_delegated(1));
+    }
+
+    #[tokio::test]
+    async fn set_step_model_reassigns_by_goal_text_and_allows_blocked_steps() {
+        let c = ctx(StubSession::with_plan(vec![
+            plain_step(),
+            delegated_step(),
+            plain_step(),
+        ]));
+        // block step 2 (goal "write the helper fn")
+        c.session
+            .update_plan(PlanTarget::Id(2), PlanStatus::Blocked, None);
+        let out = SetStepModel
+            .invoke(&c, json!({ "text": "helper fn", "model": "groq" }))
+            .await
+            .unwrap();
+        assert!(out.contains("\"groq\""), "{out}");
+        assert_eq!(c.session.plan()[1].model, "groq");
+    }
+
+    #[tokio::test]
+    async fn set_step_model_refuses_in_progress_and_done_steps() {
+        let c = ctx(StubSession::with_plan(vec![plain_step(), plain_step()]));
+        c.session
+            .update_plan(PlanTarget::Id(1), PlanStatus::InProgress, None);
+        c.session
+            .update_plan(PlanTarget::Id(2), PlanStatus::Done, None);
+        let err = SetStepModel
+            .invoke(&c, json!({ "index": 1, "model": "cheap" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("in_progress"), "{err}");
+        assert!(err.to_string().contains("pending or blocked"), "{err}");
+        let err = SetStepModel
+            .invoke(&c, json!({ "index": 2, "model": "cheap" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("done"), "{err}");
+        assert_eq!(c.session.plan()[0].model, AGENT_MODEL);
+        assert_eq!(c.session.plan()[1].model, AGENT_MODEL);
+    }
+
+    #[tokio::test]
+    async fn set_step_model_rejects_blank_models_and_unknown_targets() {
+        let c = ctx(StubSession::with_plan(vec![plain_step()]));
+        let err = SetStepModel
+            .invoke(&c, json!({ "index": 1, "model": "   " }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("`model`"), "{err}");
+        assert!(err.to_string().contains("self"), "{err}");
+        let err = SetStepModel
+            .invoke(&c, json!({ "index": 99, "model": "cheap" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no step matched"), "{err}");
+        let err = SetStepModel
+            .invoke(&c, json!({ "model": "cheap" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("`index`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn set_step_model_is_a_no_op_when_the_model_is_unchanged() {
+        let c = ctx(StubSession::with_plan(vec![delegated_step()]));
+        let out = SetStepModel
+            .invoke(&c, json!({ "index": 1, "model": "cheap" }))
+            .await
+            .unwrap();
+        assert!(out.contains("already assigned"), "{out}");
+        assert_eq!(c.session.plan()[0].model, "cheap");
+    }
+
+    #[tokio::test]
+    async fn set_step_model_accepts_an_unknown_model_value() {
+        // Delegate names are validated by the `delegate` tool, not here (mirrors
+        // set_plan): an arbitrary non-blank model is stored verbatim.
+        let c = ctx(StubSession::with_plan(vec![plain_step()]));
+        SetStepModel
+            .invoke(&c, json!({ "index": 1, "model": "claude" }))
+            .await
+            .unwrap();
+        assert_eq!(c.session.plan()[0].model, "claude");
     }
 }

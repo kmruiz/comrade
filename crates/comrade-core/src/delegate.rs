@@ -11,9 +11,10 @@
 //!
 //! Two hard limits keep the parent in control:
 //! - The delegate's tool registry excludes `git_commit` (only the tech lead
-//!   commits), the session/UI tools (`set_plan`, `update_plan`, `finish_plan`,
-//!   `rename_session`, `set_status_bar`, `ask_question`) and `delegate` itself
-//!   (no recursion). See [`DENIED_FOR_DELEGATES`].
+//!   commits), the session/UI tools (`set_plan`, `update_plan`,
+//!   `set_step_model`, `finish_plan`, `rename_session`, `set_status_bar`,
+//!   `ask_question`) and `delegate` itself (no recursion). See
+//!   [`DENIED_FOR_DELEGATES`].
 //! - The delegate tool call is approval-gated like any mutation: the human
 //!   approves handing the task off once, then every nested tool call the
 //!   delegate makes runs auto-approved (its context has `auto_approve` set).
@@ -36,10 +37,11 @@ pub const TOOL_NAME: &str = "delegate";
 
 /// Tools a delegate must never see, by spec name. Only the tech lead commits,
 /// plans, renames the session or asks the human; `delegate` is excluded so a
-/// delegate cannot recurse. Everything else in the main registry — including
-/// the mutating tools (write_file, apply_edit/apply_patch, shell, run_task,
-/// remember, amend_decision) — is fair game because the delegate runs
-/// auto-approved under a one-shot human handoff.
+/// delegate cannot recurse, and `set_step_model` is excluded so a delegate
+/// cannot reassign its own (or any) plan step while working. Everything else
+/// in the main registry — including the mutating tools (write_file,
+/// apply_edit/apply_patch, shell, run_task, remember, amend_decision) — is fair
+/// game because the delegate runs auto-approved under a one-shot human handoff.
 pub const DENIED_FOR_DELEGATES: &[&str] = &[
     "git_commit",
     "delegate",
@@ -48,6 +50,7 @@ pub const DENIED_FOR_DELEGATES: &[&str] = &[
     "set_status_bar",
     "set_plan",
     "update_plan",
+    "set_step_model",
     "finish_plan",
 ];
 
@@ -1217,6 +1220,7 @@ mod tests {
         assert!(DelegateTool::denied_for_delegates("ask_question"));
         assert!(DelegateTool::denied_for_delegates("set_plan"));
         assert!(DelegateTool::denied_for_delegates("update_plan"));
+        assert!(DelegateTool::denied_for_delegates("set_step_model"));
         assert!(DelegateTool::denied_for_delegates("finish_plan"));
         assert!(DelegateTool::denied_for_delegates("rename_session"));
         assert!(DelegateTool::denied_for_delegates("set_status_bar"));

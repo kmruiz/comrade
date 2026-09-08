@@ -141,6 +141,24 @@ pub trait SessionControl: Send + Sync {
         false
     }
 
+    /// Reassign which model runs an existing plan step, e.g. to hand a step
+    /// assigned to the main model ([`AGENT_MODEL`]) to a delegate, or to take a
+    /// delegate-assigned step back onto yourself.
+    ///
+    /// Allowed only while the step is `Pending` or `Blocked`: a step that is
+    /// `InProgress` (a model is already working it) or `Done` keeps its model.
+    ///
+    /// Reassignment also clears the step's delegation record ([`Self::step_was_delegated`]
+    /// becomes false), so the newly assigned model must actually run the step
+    /// before a delegated step can be marked done.
+    ///
+    /// Returns `Ok(true)` when the step was reassigned, `Ok(false)` when no step
+    /// matched `target`, and `Err(reason)` when the matched step may not be
+    /// reassigned.
+    fn reassign_step_model(&self, _target: &PlanTarget, _model: &str) -> Result<bool, String> {
+        Err("reassigning a step's model is not supported by this session".to_string())
+    }
+
     fn set_status(&self, status: &str);
     fn status(&self) -> String;
 }

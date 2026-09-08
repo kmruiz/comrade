@@ -184,6 +184,33 @@ impl SessionControl for AgentSession {
         self.delegated.read().unwrap().contains(&step_id)
     }
 
+    fn reassign_step_model(&self, target: &PlanTarget, model: &str) -> Result<bool, String> {
+        let step_id = {
+            let mut plan = self.plan.write().unwrap();
+            let hit = plan.iter_mut().find(|s| match target {
+                PlanTarget::Id(id) => s.id == *id,
+                PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+            });
+            let Some(step) = hit else {
+                return Ok(false);
+            };
+            if matches!(step.status, PlanStatus::InProgress | PlanStatus::Done) {
+                return Err(format!(
+                    "plan step {} is {} — a step's model can only be changed while it is \
+                     pending or blocked",
+                    step.id, step.status
+                ));
+            }
+            step.model = model.trim().to_string();
+            step.id
+        };
+        // A new model must actually run the step: drop the old delegation
+        // record so update_plan/finish_plan keep enforcing the delegate run.
+        self.delegated.write().unwrap().remove(&step_id);
+        self.emit(AgentEvent::PlanChanged);
+        Ok(true)
+    }
+
     fn set_status(&self, status: &str) {
         *self.status.write().unwrap() = status.to_string();
         self.emit(AgentEvent::StatusChanged);
@@ -197,7 +224,7 @@ impl SessionControl for AgentSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comrade_tool::{PlanStatus, PlanStepDraft, PlanTarget, SessionControl};
+    use comrade_tool::{AGENT_MODEL, PlanStatus, PlanStepDraft, PlanTarget, SessionControl};
 
     fn draft(goal: &str, verification: &str) -> PlanStepDraft {
         PlanStepDraft {
@@ -267,5 +294,76 @@ mod tests {
         s.finish_plan(Some("done".into()));
         assert!(s.finished_summary().is_some());
         assert!(s.plan().iter().all(|p| p.status == PlanStatus::Done));
+    }
+
+    #[test]
+    fn reassign_changes_model_and_clears_delegation_record() {
+        let (tx, _rx) = mpsc::channel(16);
+        let s = AgentSession::new(tx);
+        s.set_plan(vec![
+            PlanStepDraft {
+                goal: "step one".into(),
+                verification: String::new(),
+                model: "mistral".into(),
+                context: String::new(),
+            },
+            PlanStepDraft {
+                goal: "step two".into(),
+                verification: String::new(),
+                model: AGENT_MODEL.into(),
+                context: String::new(),
+            },
+            PlanStepDraft {
+                goal: "step three".into(),
+                verification: String::new(),
+                model: AGENT_MODEL.into(),
+                context: String::new(),
+            },
+            PlanStepDraft {
+                goal: "step four".into(),
+                verification: String::new(),
+                model: AGENT_MODEL.into(),
+                context: String::new(),
+            },
+        ]);
+        s.mark_step_delegated(1);
+        assert!(s.step_was_delegated(1));
+
+        // pending step: model changes and the delegation record is cleared so
+        // the newly assigned model must actually run the step.
+        assert!(
+            s.reassign_step_model(&PlanTarget::Id(1), AGENT_MODEL)
+                .unwrap()
+        );
+        assert_eq!(s.plan()[0].model, AGENT_MODEL);
+        assert!(!s.step_was_delegated(1));
+
+        // delegate -> delegate via text target also works on a blocked step.
+        s.update_plan(PlanTarget::Id(2), PlanStatus::Blocked, None);
+        assert!(
+            s.reassign_step_model(&PlanTarget::Text("step two".into()), "groq")
+                .unwrap()
+        );
+        assert_eq!(s.plan()[1].model, "groq");
+
+        // done / in_progress steps are protected.
+        s.update_plan(PlanTarget::Id(3), PlanStatus::Done, None);
+        s.update_plan(PlanTarget::Id(4), PlanStatus::InProgress, None);
+        let err = s
+            .reassign_step_model(&PlanTarget::Id(3), "mistral")
+            .unwrap_err();
+        assert!(err.contains("done"), "unexpected error: {err}");
+        let err = s
+            .reassign_step_model(&PlanTarget::Id(4), "mistral")
+            .unwrap_err();
+        assert!(err.contains("in_progress"), "unexpected error: {err}");
+        assert_eq!(s.plan()[3].model, AGENT_MODEL);
+        assert_eq!(s.plan()[2].model, AGENT_MODEL);
+
+        // unknown target -> Ok(false), nothing changed.
+        assert!(
+            !s.reassign_step_model(&PlanTarget::Id(99), "mistral")
+                .unwrap()
+        );
     }
 }

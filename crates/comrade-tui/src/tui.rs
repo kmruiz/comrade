@@ -17,7 +17,9 @@ use comrade_core::{
     AgentEvent, AgentSession, ChatMessage, ContextManager, DelegateCfg, MemoryUndo, Role,
     build_session_context, run_agent_with_history,
 };
-use comrade_tool::{PlanStatus, SessionControl, ToolContext, UserIo, UserPrompt, UserReply};
+use comrade_tool::{
+    AGENT_MODEL, PlanStatus, PlanTarget, SessionControl, ToolContext, UserIo, UserPrompt, UserReply,
+};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -210,6 +212,27 @@ struct Dialog {
     reply: oneshot::Sender<UserReply>,
 }
 
+/// A plan step offered in the Ctrl-A "assign a model" overlay.
+struct PickStep {
+    id: u64,
+    goal: String,
+    model: String,
+}
+
+/// Human-in-the-loop "assign a model" overlay (Ctrl-A): the human picks one
+/// plan step (pending/blocked only — a step being worked or done is never
+/// offered), then picks the model that will run it ("self" or a configured
+/// delegate).
+struct ModelPick {
+    steps: Vec<PickStep>,
+    /// Cursor over `steps` (while picking the step) or over `models` (once
+    /// `model_sel` is Some).
+    sel: usize,
+    models: Vec<String>,
+    /// None = still choosing the step; Some(i) = choosing the model at `i`.
+    model_sel: Option<usize>,
+}
+
 struct App {
     cfg: Arc<comrade_core::Config>,
     client: Arc<comrade_core::LlmClient>,
@@ -241,6 +264,8 @@ struct App {
     dialogs: Vec<Dialog>,
     /// True while the open dialog buffers a follow-up question to the model.
     dialog_ask: bool,
+    /// Human-driven "assign a model to a plan step" overlay (Ctrl-A), when open.
+    pick: Option<ModelPick>,
     /// Sends a follow-up question's answer back from the ask-the-model task.
     dialog_ask_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Follow-up Q/A shown inside the confirm dialog.
@@ -774,6 +799,153 @@ impl App {
             self.answer_top(UserReply::Answer(p));
         }
     }
+
+    /// Open the Ctrl-A overlay: offer every plan step that is still pending or
+    /// blocked (a step a model is working on, or already done, keeps its model)
+    /// plus the candidate models: "self" and each configured delegate.
+    fn open_model_pick(&mut self) {
+        if self.pick.is_some() || !self.dialogs.is_empty() {
+            return;
+        }
+        let steps: Vec<PickStep> = self
+            .session
+            .plan()
+            .into_iter()
+            .filter(|s| !matches!(s.status, PlanStatus::Done | PlanStatus::InProgress))
+            .map(|s| PickStep {
+                id: s.id,
+                goal: s.goal,
+                model: s.model,
+            })
+            .collect();
+        if steps.is_empty() {
+            self.push_meta(
+                "no plan step can be reassigned right now: every step is in progress or done. \
+                 Ctrl-A assigns a model to a pending or blocked step.",
+            );
+            return;
+        }
+        let mut models = vec![AGENT_MODEL.to_string()];
+        models.extend(self.cfg.delegates.iter().map(|d| d.name.clone()));
+        self.pick = Some(ModelPick {
+            steps,
+            sel: 0,
+            models,
+            model_sel: None,
+        });
+    }
+
+    /// Move the Ctrl-A cursor (`dir` = -1/1). In step phase it walks the plan
+    /// steps; once a model column is open it walks the candidate models.
+    fn pick_nav(&mut self, dir: isize) {
+        let Some(p) = &mut self.pick else {
+            return;
+        };
+        let len = if p.model_sel.is_some() {
+            p.models.len()
+        } else {
+            p.steps.len()
+        };
+        if len == 0 {
+            return;
+        }
+        let cur = if p.model_sel.is_some() {
+            p.model_sel.unwrap_or(0) as isize
+        } else {
+            p.sel as isize
+        };
+        let next = (cur + dir).rem_euclid(len as isize) as usize;
+        if p.model_sel.is_some() {
+            p.model_sel = Some(next);
+        } else {
+            p.sel = next;
+        }
+    }
+
+    /// Apply the chosen model to the chosen step via the session, then close
+    /// the overlay. Guard errors (e.g. a delegate started the step meanwhile)
+    /// surface as a chat Meta message.
+    fn apply_pick(&mut self) {
+        let Some(p) = &self.pick else {
+            return;
+        };
+        let step = p.steps[p.sel.min(p.steps.len().saturating_sub(1))].id;
+        let Some(model_idx) = p.model_sel else {
+            return;
+        };
+        let Some(model) = p.models.get(model_idx) else {
+            return;
+        };
+        let (step_id, model) = (step, model.clone());
+        self.pick = None;
+        match self
+            .session
+            .reassign_step_model(&PlanTarget::Id(step_id), &model)
+        {
+            Ok(true) => self.push_meta(format!(
+                "plan step {step_id} now assigned to model {model:?}"
+            )),
+            Ok(false) => self.push_meta(format!("plan step {step_id} no longer exists")),
+            Err(why) => self.push_meta(format!("cannot reassign plan step {step_id}: {why}")),
+        }
+    }
+
+    /// Keys while the Ctrl-A overlay is open.
+    fn handle_pick_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.pick = None,
+            KeyCode::Char('a') if ctrl => self.pick = None,
+            KeyCode::Up | KeyCode::Char('k') if !ctrl => self.pick_nav(-1),
+            KeyCode::Down | KeyCode::Char('j') if !ctrl => self.pick_nav(1),
+            KeyCode::Right | KeyCode::Enter => {
+                // Open the model column on the currently selected step.
+                if self
+                    .pick
+                    .as_ref()
+                    .is_some_and(|p| p.model_sel.is_none() && !p.models.is_empty())
+                {
+                    if let Some(p) = &mut self.pick {
+                        p.model_sel = Some(0);
+                    }
+                } else if self.pick.as_ref().is_some_and(|p| p.model_sel.is_some()) {
+                    // Enter confirms a highlighted model.
+                    self.apply_pick();
+                }
+            }
+            KeyCode::Left | KeyCode::Backspace => {
+                if let Some(p) = &mut self.pick {
+                    if p.model_sel.is_some() {
+                        p.model_sel = None;
+                    }
+                }
+            }
+            KeyCode::Char(c)
+                if !ctrl && self.pick.as_ref().is_some_and(|p| p.model_sel.is_some()) =>
+            {
+                if let Some(d) = c.to_digit(10) {
+                    if d >= 1 {
+                        self.apply_pick_to_index(d as usize - 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Digits 1..=N pick a model directly (single keypress, no Enter).
+    fn apply_pick_to_index(&mut self, model_idx: usize) {
+        let Some(p) = &self.pick else {
+            return;
+        };
+        let Some(_) = p.models.get(model_idx) else {
+            return;
+        };
+        if let Some(p) = &mut self.pick {
+            p.model_sel = Some(model_idx);
+        }
+        self.apply_pick();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +985,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         dialog_ask: false,
         dialog_ask_tx: None,
         dialog_conv: Vec::new(),
+        pick: None,
         chat_rect: Rect::default(),
         row_targets: Vec::new(),
         row_msg: Vec::new(),
@@ -955,11 +1128,20 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                     return true;
                 }
             }
+            if app.pick.is_some() {
+                app.handle_pick_key(key);
+                return false;
+            }
             if app.search.is_some() {
                 return handle_search_key(app, key);
             }
             if !app.dialogs.is_empty() {
                 return handle_dialog_key(app, key.code);
+            }
+            // Ctrl-A opens the "assign a model to a plan step" overlay.
+            if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.open_model_pick();
+                return false;
             }
             // Ctrl-F opens the chat-history search.
             if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1411,7 +1593,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
         ),
         Span::raw("  "),
         Span::styled(
-            "enter:run shift-enter:newline alt-backspace:word esc:cancel ctrl-c:quit ctrl-f:search ctrl-p/n:block alt-p/n:user tab:toggle",
+            "enter:run shift-enter:newline alt-backspace:word esc:cancel ctrl-c:quit ctrl-f:search ctrl-p/n:block alt-p/n:user ctrl-a:assign tab:toggle",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -1481,6 +1663,9 @@ fn draw(app: &mut App, frame: &mut Frame) {
 
     if let Some(d) = app.dialogs.first() {
         draw_dialog(app, d, frame);
+    }
+    if let Some(p) = &app.pick {
+        draw_model_pick(p, frame);
     }
 }
 
@@ -2396,6 +2581,131 @@ fn plan_prefix(s: &PlanStatus) -> &'static str {
         PlanStatus::Done => "+",
         PlanStatus::Blocked => "x",
     }
+}
+
+/// The Ctrl-A "assign a model" overlay: choose a plan step (pending/blocked
+/// only), then choose which model runs it.
+fn draw_model_pick(pick: &ModelPick, frame: &mut Frame) {
+    let area = frame.area();
+    let w = area.width.saturating_sub(2).min(92);
+    let max_h = area.height.saturating_sub(2);
+    let width = usize::from(w).saturating_sub(4).max(16);
+    let picking_model = pick.model_sel.is_some();
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut sel_line = 0usize;
+
+    if picking_model {
+        let step = &pick.steps[pick.sel.min(pick.steps.len().saturating_sub(1))];
+        lines.push(Line::from(Span::styled(
+            format!("which model runs step {}?", step.id),
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::from(Span::styled(
+            flat(&step.goal),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        for (i, m) in pick.models.iter().enumerate() {
+            let selected = pick.model_sel == Some(i);
+            let mut st = Style::default().fg(if selected { Color::White } else { Color::Cyan });
+            if selected {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            let toks = vec![
+                tok(
+                    if selected { "> " } else { "  " },
+                    Style::default().fg(if selected {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                tok(format!("{}. ", i + 1), Style::default().fg(Color::DarkGray)),
+                tok(m.clone(), st),
+            ];
+            if selected {
+                sel_line = lines.len();
+            }
+            for wl in wrap_toks(&toks, width) {
+                push_tok_line(&mut lines, &wl);
+            }
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "pick the step to reassign (pending/blocked only):",
+            Style::default().fg(Color::Yellow),
+        )));
+        for (i, s) in pick.steps.iter().enumerate() {
+            let selected = i == pick.sel;
+            let mut st = Style::default().fg(if selected {
+                Color::White
+            } else {
+                Color::DarkGray
+            });
+            if selected {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            let mut toks = vec![
+                tok(
+                    if selected { "> " } else { "  " },
+                    Style::default().fg(if selected {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                tok(format!("{}. ", s.id), Style::default().fg(Color::DarkGray)),
+                tok(flat(&s.goal), st),
+            ];
+            if !s.model.is_empty() {
+                toks.push(tok(
+                    format!("  [{}]", s.model),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            if selected {
+                sel_line = lines.len();
+            }
+            for wl in wrap_toks(&toks, width) {
+                push_tok_line(&mut lines, &wl);
+            }
+        }
+    }
+
+    let hint = if picking_model {
+        "↑/↓ or j/k move · 1..N assigns · enter confirms · esc/← back to steps"
+    } else {
+        "↑/↓ or j/k move · →/enter picks a model · ctrl-a/esc closes"
+    };
+
+    let content_h = lines.len() as u16;
+    let h = (content_h + 3).clamp(6, max_h.max(6));
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" assign model ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let view = usize::from(rows[0].height).max(1);
+    let scroll = sel_line.saturating_sub(view.saturating_sub(1)) as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), rows[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
 }
 
 fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
