@@ -87,6 +87,16 @@ pub struct PlanStep {
     pub context: String,
     pub status: PlanStatus,
     pub note: Option<String>,
+    /// Wall-clock millis (UNIX epoch) when the step was first marked
+    /// `InProgress` (started being worked), None until then.
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
+    /// Elapsed millis once the step reached a terminal status (`Done` or
+    /// `Blocked`), measured from `started_at_ms`. None while the step is still
+    /// running or when it finished without ever being started (e.g. force-finished
+    /// by `finish_plan` while still `Pending`).
+    #[serde(default)]
+    pub took_ms: Option<u64>,
 }
 
 impl PlanStep {
@@ -98,6 +108,61 @@ impl PlanStep {
             context: String::new(),
         }
     }
+
+    /// Transition this step to `status` with a fresh note, recording how long
+    /// the step took (see [`Self::update_at`] for the timing rules).
+    pub fn update(&mut self, status: PlanStatus, note: Option<String>) {
+        self.update_at(status, note, now_ms());
+    }
+
+    /// Transition this step to `status` using `now_ms` as the current wall
+    /// clock (injected so tests are deterministic).
+    ///
+    /// Timing rules:
+    /// - becoming `InProgress` from a terminal status (Done/Blocked) restarts
+    ///   the clock; otherwise the first `InProgress` sets the start time (fix
+    ///   rounds keep the same start);
+    /// - becoming `Done`/`Blocked` freezes the elapsed time;
+    /// - going back to `Pending` (e.g. a delegate run aborted) clears any
+    ///   partial timing so the next attempt measures only itself.
+    pub fn update_at(&mut self, status: PlanStatus, note: Option<String>, now_ms: u64) {
+        if let Some(n) = note {
+            let t = n.trim();
+            if !t.is_empty() {
+                self.note = Some(t.to_string());
+            }
+        }
+        if self.status == status {
+            return;
+        }
+        match status {
+            PlanStatus::Pending => {
+                self.started_at_ms = None;
+                self.took_ms = None;
+            }
+            PlanStatus::InProgress => {
+                if matches!(self.status, PlanStatus::Done | PlanStatus::Blocked) {
+                    self.started_at_ms = None;
+                    self.took_ms = None;
+                }
+                self.started_at_ms.get_or_insert(now_ms);
+            }
+            PlanStatus::Done | PlanStatus::Blocked => {
+                if let Some(started) = self.started_at_ms {
+                    self.took_ms = Some(now_ms.saturating_sub(started));
+                }
+            }
+        }
+        self.status = status;
+    }
+}
+
+/// Current wall-clock time in millis since the UNIX epoch.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Selector used by `update_plan`.
@@ -161,4 +226,90 @@ pub trait SessionControl: Send + Sync {
 
     fn set_status(&self, status: &str);
     fn status(&self) -> String;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step() -> PlanStep {
+        PlanStep {
+            id: 1,
+            goal: "g".into(),
+            verification: String::new(),
+            model: String::new(),
+            context: String::new(),
+            status: PlanStatus::Pending,
+            note: None,
+            started_at_ms: None,
+            took_ms: None,
+        }
+    }
+
+    #[test]
+    fn inprogress_then_done_records_elapsed() {
+        let mut s = step();
+        s.update_at(PlanStatus::InProgress, None, 1_000);
+        assert_eq!(s.started_at_ms, Some(1_000));
+        assert_eq!(s.took_ms, None);
+        // note-only fix rounds don't restart the clock
+        s.update_at(
+            PlanStatus::InProgress,
+            Some("working: fix 1/5".into()),
+            5_000,
+        );
+        assert_eq!(s.started_at_ms, Some(1_000));
+        s.update_at(PlanStatus::Done, None, 6_000);
+        assert_eq!(s.took_ms, Some(5_000));
+        assert_eq!(s.status, PlanStatus::Done);
+        // repeated Done is a no-op for timing
+        s.update_at(PlanStatus::Done, None, 9_999);
+        assert_eq!(s.took_ms, Some(5_000));
+    }
+
+    #[test]
+    fn pending_never_started_has_no_duration() {
+        let mut s = step();
+        s.update_at(PlanStatus::Done, None, 10_000);
+        assert_eq!(s.status, PlanStatus::Done);
+        assert_eq!(s.took_ms, None);
+    }
+
+    #[test]
+    fn back_to_pending_clears_partial_timing() {
+        let mut s = step();
+        s.update_at(PlanStatus::InProgress, None, 100);
+        s.update_at(
+            PlanStatus::Pending,
+            Some("delegate failed to run".into()),
+            200,
+        );
+        assert_eq!(s.started_at_ms, None);
+        assert_eq!(s.took_ms, None);
+        // next attempt measures only itself
+        s.update_at(PlanStatus::InProgress, None, 300);
+        s.update_at(PlanStatus::Done, None, 350);
+        assert_eq!(s.took_ms, Some(50));
+        assert_eq!(s.note.as_deref(), Some("delegate failed to run"));
+    }
+
+    #[test]
+    fn rerun_after_blocked_restarts_the_clock() {
+        let mut s = step();
+        s.update_at(PlanStatus::InProgress, None, 1_000);
+        s.update_at(PlanStatus::Blocked, None, 2_000);
+        assert_eq!(s.took_ms, Some(1_000));
+        s.update_at(PlanStatus::InProgress, None, 3_000);
+        s.update_at(PlanStatus::Done, None, 3_200);
+        assert_eq!(s.took_ms, Some(200));
+    }
+
+    #[test]
+    fn note_is_trimmed_and_blank_notes_ignored() {
+        let mut s = step();
+        s.update_at(PlanStatus::InProgress, Some("  hello  ".into()), 1);
+        assert_eq!(s.note.as_deref(), Some("hello"));
+        s.update_at(PlanStatus::InProgress, Some("   ".into()), 2);
+        assert_eq!(s.note.as_deref(), Some("hello"));
+    }
 }

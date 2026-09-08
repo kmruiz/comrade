@@ -559,6 +559,8 @@ mod tests {
                     context: d.context,
                     status: PlanStatus::Pending,
                     note: None,
+                    started_at_ms: None,
+                    took_ms: None,
                 })
                 .collect();
             StubSession {
@@ -590,19 +592,14 @@ mod tests {
             }) else {
                 return false;
             };
-            step.status = status;
-            if let Some(n) = note {
-                if !n.trim().is_empty() {
-                    step.note = Some(n.trim().to_string());
-                }
-            }
+            step.update(status, note);
             true
         }
         fn finish_plan(&self, _summary: Option<String>) {
             let mut plan = self.plan.lock().unwrap();
             for step in plan.iter_mut() {
                 if !matches!(step.status, PlanStatus::Done | PlanStatus::Blocked) {
-                    step.status = PlanStatus::Done;
+                    step.update(PlanStatus::Done, None);
                 }
             }
         }

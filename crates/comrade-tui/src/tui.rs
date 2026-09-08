@@ -19,7 +19,8 @@ use comrade_core::{
     build_session_context, run_agent_with_history,
 };
 use comrade_tool::{
-    AGENT_MODEL, PlanStatus, PlanTarget, SessionControl, ToolContext, UserIo, UserPrompt, UserReply,
+    AGENT_MODEL, PlanStatus, PlanStep, PlanTarget, SessionControl, ToolContext, UserIo, UserPrompt,
+    UserReply,
 };
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -4033,11 +4034,14 @@ fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
             PlanStatus::Blocked => Color::Red,
             PlanStatus::Pending => Color::DarkGray,
         };
-        let text_color = if step.status == PlanStatus::Done {
-            Color::DarkGray
-        } else {
-            Color::White
-        };
+        // A finished step collapses to a single line: the note and the
+        // verification (which mattered while it was being worked) are dropped,
+        // and the goal is truncated so the row never wraps.
+        if step.status == PlanStatus::Done {
+            push_tok_line(&mut lines, &collapsed_done_toks(step, width));
+            continue;
+        }
+        let text_color = Color::White;
         let mut toks = vec![
             tok(
                 format!("{} ", plan_prefix(&step.status)),
@@ -4106,6 +4110,60 @@ fn plan_prefix(s: &PlanStatus) -> &'static str {
         PlanStatus::Done => "+",
         PlanStatus::Blocked => "x",
     }
+}
+
+/// One styled, non-wrapping row for a finished plan step: the status glyph, the
+/// step number, the goal truncated to fit `width`, the model that ran it and —
+/// when the step was actually started — how long it took ("· 2m 5s"). The note
+/// and verification details are intentionally omitted: done steps stay at one
+/// line so the panel reads as a collapsed checklist.
+fn collapsed_done_toks(step: &PlanStep, width: usize) -> Vec<Tok> {
+    let status_glyph = tok(
+        format!("{} ", plan_prefix(&PlanStatus::Done)),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    );
+    let head = tok(
+        format!("{}. ", step.id),
+        Style::default().fg(Color::DarkGray),
+    );
+    let model = if step.model.is_empty() {
+        None
+    } else {
+        Some(tok(
+            format!("  [{}]", step.model),
+            Style::default().fg(Color::Cyan),
+        ))
+    };
+    let duration = step.took_ms.map(|ms| {
+        tok(
+            format!("  · {}", fmt_dur_ms(ms as u128)),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )
+    });
+    // Fixed-width parts (glyph, number, model tag, duration): the goal gets the
+    // remainder so the row is exactly one line wide. One extra cell is reserved
+    // for the "…" cap() appends when it truncates.
+    let fixed: usize = 2 // "X " glyph + space
+        + head.text.chars().count()
+        + model.as_ref().map_or(0, |t| t.text.chars().count())
+        + duration.as_ref().map_or(0, |t| t.text.chars().count());
+    let goal_max = width.saturating_sub(fixed + 1);
+    let goal = tok(
+        cap(&flat(&step.goal), goal_max),
+        Style::default().fg(Color::DarkGray),
+    );
+    let mut toks = vec![status_glyph, head, goal];
+    if let Some(t) = model {
+        toks.push(t);
+    }
+    if let Some(t) = duration {
+        toks.push(t);
+    }
+    toks
 }
 
 /// The Ctrl-A "assign a model" overlay: choose a plan step (pending/blocked
@@ -6185,5 +6243,75 @@ mod section_tests {
         let mut collapsed = vec![true];
         expand_section(&mut collapsed, &chat, 99);
         assert_eq!(collapsed, vec![true]);
+    }
+}
+
+#[cfg(test)]
+mod plan_step_tests {
+    use super::*;
+
+    fn done_step(id: u64, goal: &str, model: &str, took: Option<u64>) -> PlanStep {
+        PlanStep {
+            id,
+            goal: goal.into(),
+            verification: "cargo test".into(),
+            model: model.into(),
+            context: String::new(),
+            status: PlanStatus::Done,
+            note: Some("working: fix 1/5".into()),
+            started_at_ms: Some(1_000),
+            took_ms: took,
+        }
+    }
+
+    fn line_text(toks: &[Tok]) -> String {
+        toks.iter().map(|t| t.text.as_str()).collect()
+    }
+
+    #[test]
+    fn done_step_collapses_to_one_line_with_duration() {
+        let step = done_step(2, "add section model", "self", Some(125_000));
+        let toks = collapsed_done_toks(&step, 80);
+        let text = line_text(&toks);
+        assert!(text.starts_with("+ 2. "), "{text}");
+        assert!(text.contains("add section model"), "{text}");
+        assert!(text.contains("[self]"), "{text}");
+        assert!(text.contains("· 2m 5s"), "{text}");
+        // no note, no verification on the collapsed line
+        assert!(!text.contains("fix 1/5"), "{text}");
+        assert!(!text.contains("cargo test"), "{text}");
+        assert!(text.chars().count() <= 80, "{text}");
+    }
+
+    #[test]
+    fn done_step_omits_duration_when_never_started() {
+        let step = done_step(1, "short goal", "", None);
+        let text = line_text(&collapsed_done_toks(&step, 80));
+        assert!(!text.contains('·'), "{text}");
+        assert!(!text.contains('['), "{text}");
+        assert!(text.starts_with("+ 1. short goal"), "{text}");
+    }
+
+    #[test]
+    fn done_step_truncates_goal_to_fit_narrow_panel() {
+        let long = "a very long goal ".repeat(6);
+        let step = done_step(3, &long, "qwen", Some(3_500));
+        let toks = collapsed_done_toks(&step, 24);
+        let text = line_text(&toks);
+        assert!(text.chars().count() <= 24, "{text}");
+        // goal was truncated (ellipsis mid-line, before the model/duration)
+        assert!(text.contains('…'), "{text}");
+        assert!(text.contains("[qwen]"), "{text}");
+        assert!(text.contains("· 3.5s"), "{text}");
+    }
+
+    #[test]
+    fn short_durations_render_as_subsecond() {
+        let step = done_step(1, "g", "", Some(420));
+        let text = line_text(&collapsed_done_toks(&step, 60));
+        assert!(text.contains("· 420ms"), "{text}");
+        let step = done_step(1, "g", "", Some(3_500));
+        let text = line_text(&collapsed_done_toks(&step, 60));
+        assert!(text.contains("· 3.5s"), "{text}");
     }
 }

@@ -132,6 +132,8 @@ impl SessionControl for AgentSession {
                     context: draft.context,
                     status: PlanStatus::Pending,
                     note: None,
+                    started_at_ms: None,
+                    took_ms: None,
                 });
                 *next += 1;
             }
@@ -154,12 +156,9 @@ impl SessionControl for AgentSession {
         });
         match hit {
             Some(step) => {
-                step.status = status;
-                if let Some(n) = note {
-                    if !n.trim().is_empty() {
-                        step.note = Some(n.trim().to_string());
-                    }
-                }
+                // Route the transition through PlanStep::update so per-step
+                // timing (started_at_ms / took_ms) is recorded.
+                step.update(status, note);
                 drop(plan);
                 self.emit(AgentEvent::PlanChanged);
                 true
@@ -173,7 +172,7 @@ impl SessionControl for AgentSession {
             let mut plan = self.plan.write().unwrap();
             for step in plan.iter_mut() {
                 if !matches!(step.status, PlanStatus::Done | PlanStatus::Blocked) {
-                    step.status = PlanStatus::Done;
+                    step.update(PlanStatus::Done, None);
                 }
             }
         }
