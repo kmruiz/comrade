@@ -3910,7 +3910,10 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
     if let Some((old, new)) = extract_diff_sides(&card.name, &card.args) {
         out.push(RenderRow {
             rule: None,
-            spans: vec![Span::styled("diff:", Style::default().fg(Color::DarkGray))],
+            spans: vec![Span::styled(
+                edit_diff_label(&card.name, &card.args, card.result.as_deref()),
+                Style::default().fg(Color::DarkGray),
+            )],
             tool_header: None,
         });
         const MAX_DIFF_ROWS: usize = 200;
@@ -5659,6 +5662,68 @@ note: run with `RUST_BACKTRACE=1` for a backtrace
 // side-by-side diff rendering for edit tools
 // ---------------------------------------------------------------------------
 
+/// A single `@@ -a,b +c,d @@` hunk header token inside `text`, if any.
+fn hunk_token(text: &str) -> Option<String> {
+    let start = text.find("@@ ")?;
+    let rest = &text[start..];
+    let end = rest.find(" @@")?;
+    Some(rest[..end + 3].to_string())
+}
+
+/// Header label for an edit tool's diff rows: the edited file plus the hunk
+/// line numbers. For `apply_edit` the numbers come from the tool result (which
+/// now reports `(@@ -a,b +c,d @@)`); for `apply_patch` they are parsed from its
+/// own `@@` header. Falls back to plain `diff:` when nothing is derivable.
+fn edit_diff_label(name: &str, args_json: &str, result: Option<&str>) -> String {
+    let value: Option<serde_json::Value> = serde_json::from_str(args_json).ok();
+    let pick_path = |keys: &[&str]| -> Option<String> {
+        let map = value.as_ref()?.as_object()?;
+        for k in keys {
+            if let Some(s) = map.get(*k).and_then(serde_json::Value::as_str) {
+                if !s.trim().is_empty() {
+                    return Some(s.trim().to_string());
+                }
+            }
+        }
+        None
+    };
+    let (rel, hunk) = match name {
+        "apply_edit" => (pick_path(&["path", "file"]), result.and_then(hunk_token)),
+        "apply_patch" => {
+            let diff = value
+                .as_ref()
+                .and_then(|v| v.get("diff"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let files: Vec<&str> = diff
+                .lines()
+                .filter_map(|l| l.strip_prefix("+++ b/"))
+                .map(str::trim)
+                .collect();
+            let rel = match files.as_slice() {
+                [f] => Some((*f).to_string()),
+                // Multi-file patches: don't pin the hunk numbers to one file.
+                _ => None,
+            };
+            (
+                rel,
+                if files.len() == 1 {
+                    hunk_token(diff)
+                } else {
+                    None
+                },
+            )
+        }
+        _ => (None, None),
+    };
+    match (rel, hunk) {
+        (Some(rel), Some(hunk)) => format!("diff  {rel}  {hunk}"),
+        (Some(rel), None) => format!("diff  {rel}"),
+        (None, Some(hunk)) => format!("diff  {hunk}"),
+        (None, None) => "diff:".to_string(),
+    }
+}
+
 /// Pull the changed line sequences out of an edit tool's JSON args:
 /// `(removed, added)`.
 fn extract_diff_sides(name: &str, args_json: &str) -> Option<(Vec<String>, Vec<String>)> {
@@ -5946,6 +6011,40 @@ mod diff_tests {
         let (old, new) = extract_diff_sides("apply_patch", &args).unwrap();
         assert_eq!(old, vec!["fn old() {}"]);
         assert_eq!(new, vec!["fn new() {}"]);
+    }
+
+    #[test]
+    fn edit_diff_label_shows_file_and_hunk_numbers() {
+        // apply_patch: file + @@ come from its own diff text.
+        let diff = "--- a/a.rs\n+++ b/a.rs\n@@ -1,3 +1,3 @@\n-fn old() {}\n+fn new() {}\n";
+        let args = serde_json::json!({ "diff": diff }).to_string();
+        assert_eq!(
+            edit_diff_label("apply_patch", &args, None),
+            "diff  a.rs  @@ -1,3 +1,3 @@"
+        );
+        // apply_edit: file from args, numbers from the tool result token.
+        let args = serde_json::json!({ "path": "src/lib.rs", "old": "a", "new": "b" }).to_string();
+        assert_eq!(
+            edit_diff_label(
+                "apply_edit",
+                &args,
+                Some("Edited src/lib.rs: replaced 1 exact block (@@ -12,2 +12,3 @@).")
+            ),
+            "diff  src/lib.rs  @@ -12,2 +12,3 @@"
+        );
+        // No result yet: file only.
+        assert_eq!(
+            edit_diff_label("apply_edit", &args, None),
+            "diff  src/lib.rs"
+        );
+        // Nothing derivable falls back to the plain label.
+        assert_eq!(edit_diff_label("rgrep", "{}", None), "diff:");
+    }
+
+    #[test]
+    fn hunk_token_finds_last_terminator() {
+        assert_eq!(hunk_token("@@ -1 +1 @@"), Some("@@ -1 +1 @@".to_string()));
+        assert_eq!(hunk_token("no hunk here"), None);
     }
 
     #[test]

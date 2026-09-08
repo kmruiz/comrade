@@ -86,6 +86,32 @@ fn clamp(mut s: String) -> String {
     s
 }
 
+/// 1-based file line containing byte offset `byte` in `text`.
+fn line_of(text: &str, byte: usize) -> usize {
+    1 + text[..byte.min(text.len())]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count()
+}
+
+/// Unified-diff hunk header for an apply_edit: the old block starts at the
+/// line containing its first byte; the replacement lands at the same line.
+/// Returns e.g. `@@ -12,3 +12,4 @@` (new side count is 0 for a pure delete).
+fn edit_location(before: &str, old: &str, new: &str) -> String {
+    let start = before.find(old).expect("caller verified exactly one match");
+    let old_end = line_of(before, start + old.len().saturating_sub(1));
+    let old_span = old_end - line_of(before, start) + 1;
+    let new_span = if new.is_empty() {
+        0
+    } else {
+        let after = before.replacen(old, new, 1);
+        let new_end = line_of(&after, start + new.len().saturating_sub(1));
+        new_end - line_of(&after, start) + 1
+    };
+    let start = line_of(before, start);
+    format!("@@ -{start},{old_span} +{start},{new_span} @@")
+}
+
 // ---------------------------------------------------------------------------
 // list_dir
 // ---------------------------------------------------------------------------
@@ -313,11 +339,12 @@ impl Tool for ApplyEdit {
             );
         }
         let after = before.replacen(&args.old, &args.new, 1);
+        let loc = edit_location(&before, &args.old, &args.new);
         ctx.undo.capture(&rel, before.clone()).await?;
         ctx.confirm(
             format!("apply_edit {rel}"),
             Some(format!(
-                "{rel}\n--- remove ---\n{}\n+++ insert +++\n{}",
+                "{rel}\n{loc}\n--- remove ---\n{}\n+++ insert +++\n{}",
                 args.old, args.new
             )),
         )
@@ -325,7 +352,7 @@ impl Tool for ApplyEdit {
         tokio::fs::write(&file, after)
             .await
             .with_context(|| format!("cannot write {rel}"))?;
-        Ok(format!("Edited {rel}: replaced 1 exact block."))
+        Ok(format!("Edited {rel}: replaced 1 exact block ({loc})."))
     }
 }
 
@@ -966,6 +993,29 @@ fn apply_hunks(before: &str, hunks: &[Hunk]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_of_counts_newlines_before_byte() {
+        assert_eq!(line_of("a\nb\nc", 0), 1);
+        assert_eq!(line_of("a\nb\nc", 1), 1); // the '\n' itself is line 1's
+        assert_eq!(line_of("a\nb\nc", 2), 2);
+        assert_eq!(line_of("a\nb\nc", 4), 3);
+        assert_eq!(line_of("", 0), 1);
+    }
+
+    #[test]
+    fn edit_location_reports_line_range() {
+        let before = "line one\nline two\nline three\nline four\n";
+        // Replace whole line 2 with two lines.
+        let loc = edit_location(before, "line two\n", "line 2a\nline 2b\n");
+        assert_eq!(loc, "@@ -2,1 +2,2 @@");
+        // Replace line 3 with nothing (delete).
+        let loc = edit_location(before, "line three\n", "");
+        assert_eq!(loc, "@@ -3,1 +3,0 @@");
+        // A single-line replacement elsewhere keeps line 1 untouched.
+        let loc = edit_location(before, "line one\n", "first line\n");
+        assert_eq!(loc, "@@ -1,1 +1,1 @@");
+    }
 
     #[test]
     fn glob_rules() {
