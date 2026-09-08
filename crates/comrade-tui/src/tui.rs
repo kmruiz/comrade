@@ -8,7 +8,7 @@
 //! - assistant/user text is rendered as markdown
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use arboard::Clipboard;
@@ -40,6 +40,11 @@ use crate::{Deps, new_session};
 const PROMPT_GUTTER: u16 = 2;
 /// Max rows the prompt editor may occupy before it scrolls internally.
 const PROMPT_MAX_ROWS: usize = 5;
+/// Mode-line background while auto-approve is active: a warm orange so the
+/// bar reads as "warning: changes are applied without asking".
+const AUTO_BAR_BG: Color = Color::Rgb(203, 106, 15);
+/// Keybinding hints shown right-aligned on the mode line when wide enough.
+const LEGEND: &str = "enter:run shift-enter:newline alt-backspace:word esc:cancel ctrl-space:auto ctrl-c:quit ctrl-f:search ctrl-p/n:block alt-p/n:user ctrl-a:assign tab:toggle";
 
 // ---------------------------------------------------------------------------
 // UserIo bridging into the UI event loop
@@ -255,6 +260,15 @@ struct App {
     running: bool,
     /// Auto-accept mode: approvals are answered "yes" without prompting.
     auto_accept: bool,
+    /// Latest repo snapshot for the mode line.
+    git: GitBarInfo,
+    git_rx: mpsc::Receiver<GitBarInfo>,
+    git_tx: mpsc::Sender<GitBarInfo>,
+    /// True while a background git refresh is in flight.
+    git_inflight: bool,
+    /// Earliest instant the background refresh may run again (backed off to
+    /// 10 s when the cwd is not a repo so we don't spawn failing `git`s).
+    git_gate: Option<Instant>,
     chat: Vec<Msg>,
     /// Raw current model output (not yet committed to a message).
     stream: String,
@@ -294,6 +308,22 @@ struct App {
     balance: Option<String>,
     /// Name of the tool currently running (auto status while no agent text).
     activity: Option<String>,
+}
+
+/// Snapshot of the repo state shown on the emacs-style mode line, refreshed in
+/// the background (see [`App::refresh_git`]).
+#[derive(Clone, Debug, Default)]
+struct GitBarInfo {
+    /// Current branch name (absent when not inside a git work tree).
+    branch: Option<String>,
+    /// Total inserted/removed lines vs HEAD (staged + unstaged).
+    ins: u64,
+    del: u64,
+    /// Newly added/untracked files and deleted files (file-level git status).
+    added_files: u64,
+    deleted_files: u64,
+    /// True when the working directory is inside a git work tree.
+    repo: bool,
 }
 
 impl App {
@@ -518,6 +548,41 @@ impl App {
             stop.cancel();
         }
         self.push_meta("cancelling...");
+    }
+
+    /// True when approvals run without prompting: either the config autonomy
+    /// is `auto` (`ctx_base.auto_approve`) or the user toggled ctrl-space.
+    fn auto_mode_on(&self) -> bool {
+        self.auto_accept || self.ctx_base.auto_approve
+    }
+
+    /// Store a freshly fetched repo snapshot.
+    fn on_git(&mut self, info: GitBarInfo) {
+        let backoff = if info.repo {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(10)
+        };
+        self.git_gate = Some(Instant::now() + backoff);
+        self.git_inflight = false;
+        self.git = info;
+    }
+
+    /// Kick a background `git` refresh, at most once per backoff window.
+    fn refresh_git(&mut self) {
+        if self.git_inflight {
+            return;
+        }
+        if self.git_gate.is_some_and(|gate| Instant::now() < gate) {
+            return;
+        }
+        self.git_inflight = true;
+        let tx = self.git_tx.clone();
+        let root = self.root.clone();
+        tokio::spawn(async move {
+            let info = fetch_git_bar(&root).await;
+            let _ = tx.send(info).await;
+        });
     }
 
     fn on_agent_event(&mut self, event: AgentEvent) {
@@ -958,6 +1023,7 @@ impl App {
 pub async fn run(deps: &Deps) -> Result<()> {
     let (asks_tx, asks_rx) = mpsc::channel::<PendingAsk>(16);
     let (dialog_ans_tx, mut dialog_ans_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (git_tx, git_rx) = mpsc::channel::<GitBarInfo>(4);
     let user = Arc::new(TuiUserIo { tx: asks_tx });
     let (bundle, events_tx, events_rx) = new_session(deps, user);
 
@@ -980,6 +1046,11 @@ pub async fn run(deps: &Deps) -> Result<()> {
         stop: None,
         running: false,
         auto_accept: false,
+        git: GitBarInfo::default(),
+        git_rx,
+        git_tx,
+        git_inflight: false,
+        git_gate: None,
         chat: Vec::new(),
         stream: String::new(),
         input: Editor::new(),
@@ -1030,6 +1101,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
 
     // First frame immediately, so the UI is visible before any input.
     let _ = terminal.draw(|f| draw(&mut app, f));
+    app.refresh_git();
 
     let res = loop {
         tokio::select! {
@@ -1080,7 +1152,14 @@ pub async fn run(deps: &Deps) -> Result<()> {
                     app.dialog_conv.push(format!("A: {answer}"));
                 }
             }
+            git = app.git_rx.recv() => {
+                match git {
+                    Some(info) => app.on_git(info),
+                    None => break Err(anyhow::anyhow!("git refresh channel closed")),
+                }
+            }
         }
+        app.refresh_git();
         let _ = terminal.draw(|f| draw(&mut app, f));
     };
 
@@ -1576,32 +1655,106 @@ fn draw(app: &mut App, frame: &mut Frame) {
             (String::new(), Color::DarkGray)
         }
     };
-    let footer = Line::from(vec![
-        Span::styled(
+
+    // ---- Emacs-style mode line (bottom row) -----------------------------
+    // Left: repo (branch + inserted/removed lines, added/deleted files),
+    // agent state (IDLE/RUNNING) and mode (auto/ask). The whole bar turns a
+    // warm orange while auto-approve is active so the "changes land without
+    // asking" mode reads as a warning. The key legend survives on the far
+    // right when the terminal is wide enough.
+    let auto = app.auto_mode_on();
+    let on_auto = |fg: Color| -> Color { if auto { Color::Black } else { fg } };
+    let bar_style = Style::default()
+        .bg(if auto { AUTO_BAR_BG } else { Color::Blue })
+        .fg(if auto { Color::Black } else { Color::White });
+
+    let mut spans: Vec<Span> = Vec::new();
+    if app.git.repo {
+        if let Some(branch) = &app.git.branch {
+            spans.push(Span::styled(
+                branch.clone(),
+                bar_style.add_modifier(Modifier::BOLD),
+            ));
+        }
+        let git = &app.git;
+        if git.ins > 0 {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("+{}", git.ins),
+                bar_style.fg(on_auto(Color::LightGreen)),
+            ));
+        }
+        if git.del > 0 {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("-{}", git.del),
+                bar_style.fg(on_auto(Color::LightRed)),
+            ));
+        }
+        if git.added_files > 0 {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("+{}f", git.added_files),
+                bar_style.fg(on_auto(Color::LightGreen)),
+            ));
+        }
+        if git.deleted_files > 0 {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("-{}f", git.deleted_files),
+                bar_style.fg(on_auto(Color::LightRed)),
+            ));
+        }
+    }
+    if !spans.is_empty() {
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(
+        run_state,
+        bar_style
+            .fg(if app.running {
+                on_auto(Color::LightGreen)
+            } else {
+                on_auto(Color::Yellow)
+            })
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        if auto { "auto" } else { "ask" },
+        bar_style.add_modifier(Modifier::BOLD),
+    ));
+    if !status_msg.trim().is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
             status_msg,
-            Style::default()
-                .fg(status_color)
+            bar_style
+                .fg(on_auto(status_color))
                 .add_modifier(Modifier::ITALIC),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            run_state,
-            Style::default()
-                .fg(if app.running {
-                    Color::Green
-                } else {
-                    Color::Yellow
-                })
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "enter:run shift-enter:newline alt-backspace:word esc:cancel ctrl-c:quit ctrl-f:search ctrl-p/n:block alt-p/n:user ctrl-a:assign tab:toggle",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
+        ));
+    }
+
     frame.render_widget(Paragraph::new(header), rows[0]);
-    frame.render_widget(Paragraph::new(footer).alignment(Alignment::Right), rows[3]);
+
+    // The bar spans the whole row; the key legend is right-aligned in the
+    // leftover width and drops first on narrow terminals.
+    let legend_w = (LEGEND.chars().count() as u16).min(rows[3].width.saturating_sub(60));
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(legend_w)])
+        .split(rows[3]);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(bar_style),
+        bottom[0],
+    );
+    if legend_w > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(LEGEND))
+                .style(bar_style)
+                .alignment(Alignment::Right),
+            bottom[1],
+        );
+    }
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -3792,5 +3945,122 @@ mod search_tests {
         let fail = Msg::failure("flaky_test".into(), "assert left == right".into());
         assert!(msg_matches(&fail, "flaky"));
         assert!(msg_matches(&fail, "left == right"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mode-line git snapshot (background refresh)
+// ---------------------------------------------------------------------------
+
+async fn run_git(root: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Count newly added files (staged `A` or untracked `??`) and deleted files
+/// (`D` in either the index or the work tree) from `git status --porcelain`.
+fn status_file_counts(porcelain: &str) -> (u64, u64) {
+    let mut added = 0u64;
+    let mut deleted = 0u64;
+    for line in porcelain.lines() {
+        let mut chars = line.chars();
+        let (Some(x), Some(y)) = (chars.next(), chars.next()) else {
+            continue;
+        };
+        match (x, y) {
+            ('?', '?') => added += 1,
+            ('A', _) => added += 1,
+            ('D', _) | (_, 'D') => deleted += 1,
+            _ => {}
+        }
+    }
+    (added, deleted)
+}
+
+/// Sum inserted/removed lines from `git diff --numstat` output; binary rows
+/// (`-\t-`) are skipped.
+fn numstat_totals(numstat: &str) -> (u64, u64) {
+    let mut ins = 0u64;
+    let mut del = 0u64;
+    for line in numstat.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let (Some(a), Some(d)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if let (Ok(a), Ok(d)) = (a.parse::<u64>(), d.parse::<u64>()) {
+            ins += a;
+            del += d;
+        }
+    }
+    (ins, del)
+}
+
+async fn fetch_git_bar(root: &std::path::Path) -> GitBarInfo {
+    let inside = run_git(root, &["rev-parse", "--is-inside-work-tree"])
+        .await
+        .map(|s| s.trim() == "true")
+        .unwrap_or(false);
+    if !inside {
+        return GitBarInfo::default();
+    }
+    let branch = run_git(root, &["branch", "--show-current"])
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let porcelain = run_git(root, &["status", "--porcelain"])
+        .await
+        .unwrap_or_default();
+    let (added_files, deleted_files) = status_file_counts(&porcelain);
+    let (ins_a, del_a) = numstat_totals(
+        &run_git(root, &["diff", "--numstat"])
+            .await
+            .unwrap_or_default(),
+    );
+    let (ins_b, del_b) = numstat_totals(
+        &run_git(root, &["diff", "--cached", "--numstat"])
+            .await
+            .unwrap_or_default(),
+    );
+    GitBarInfo {
+        branch,
+        ins: ins_a + ins_b,
+        del: del_a + del_b,
+        added_files,
+        deleted_files,
+        repo: true,
+    }
+}
+
+#[cfg(test)]
+mod mode_bar_tests {
+    use super::*;
+
+    #[test]
+    fn porcelain_counts_added_deleted_and_untracked() {
+        let out =
+            " M lib.rs\nA  new.rs\n?? scratch/x\n D gone.rs\nAM staged.rs\nR  old.rs -> new.rs\n";
+        // added: A new.rs, ?? scratch/x, AM staged.rs; deleted: D gone.rs.
+        assert_eq!(status_file_counts(out), (3, 1));
+    }
+
+    #[test]
+    fn porcelain_ignores_clean_and_renames() {
+        let out = " M mod.rs\nR  a.rs -> b.rs\n";
+        assert_eq!(status_file_counts(out), (0, 0));
+    }
+
+    #[test]
+    fn numstat_sums_only_numeric_rows() {
+        let out = "1\t1\tsrc/a.rs\n-\t-\timg.png\n10\t3\tsrc/c d.rs\n";
+        assert_eq!(numstat_totals(out), (11, 4));
+        assert_eq!(numstat_totals(""), (0, 0));
     }
 }
