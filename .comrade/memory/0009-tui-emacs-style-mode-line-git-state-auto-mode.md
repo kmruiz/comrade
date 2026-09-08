@@ -12,3 +12,6 @@ Mode line semantics (user-confirmed): +line/-line are total inserted/removed lin
 ## Consequences
 Parsers status_file_counts() and numstat_totals() are pure and unit-tested in mod mode_bar_tests at the bottom of tui.rs. The mode line only refreshes git while the UI is drawing (event-driven), so an idle terminal can show stale git stats until the next keypress/agent event. Both crates/comrade-core/src/delegate.rs and crates/comrade-tool-session/src/lib.rs had unrelated uncommitted edits (tool-prompt wording) before this task; do not fold them into unrelated commits without checking.
 
+
+## Note
+Keybinding legend removed from the right slot of the mode line (keys still handled); the right-aligned segment now shows the app name "comrade" (APP_TAG in tui.rs) and the top-left header no longer prints "comrade |".

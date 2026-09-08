@@ -14,7 +14,7 @@ use anyhow::{Context as _, Result};
 use arboard::Clipboard;
 use async_trait::async_trait;
 use comrade_core::{
-    AgentEvent, AgentSession, ChatMessage, ContextManager, DelegateCfg, MemoryUndo, Role,
+    AgentEvent, AgentSession, ChatMessage, ContextManager, DelegateCfg, Role,
     build_session_context, run_agent_with_history,
 };
 use comrade_tool::{
@@ -246,7 +246,6 @@ struct App {
     root: std::path::PathBuf,
 
     session: Arc<AgentSession>,
-    undo: Arc<MemoryUndo>,
     ctx_base: ToolContext,
     /// Rolling conversation history shared across task runs in this session:
     /// kept between prompts (never wiped at task end) and compacted
@@ -1034,7 +1033,6 @@ pub async fn run(deps: &Deps) -> Result<()> {
         tools: deps.tools.clone(),
         root: deps.root.clone(),
         session: bundle.session.clone(),
-        undo: bundle.undo.clone(),
         ctx_base: bundle.ctx_base.clone(),
         history: Arc::new(tokio::sync::Mutex::new(build_session_context(
             &deps.cfg,
@@ -1602,6 +1600,27 @@ fn after<'a>(line: &'a str, needle: &str) -> Option<&'a str> {
 // chat rendering / markdown
 // ---------------------------------------------------------------------------
 
+/// Path shown leftmost on the mode line: `~`-abbreviated when `root` sits
+/// under `$HOME` (Emacs-style), absolute otherwise.
+fn home_path(root: &std::path::Path) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    home_path_with(root, home.as_deref())
+}
+
+/// [`home_path`] with the home directory passed in, so it can be tested
+/// without touching process-global env vars.
+fn home_path_with(root: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    if let Some(home) = home {
+        if let Ok(rel) = root.strip_prefix(home) {
+            if rel.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rel.to_string_lossy());
+        }
+    }
+    root.to_string_lossy().into_owned()
+}
+
 fn draw(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
@@ -1614,10 +1633,11 @@ fn draw(app: &mut App, frame: &mut Frame) {
         prompt_rows.len().clamp(1, PROMPT_MAX_ROWS)
     };
 
+    // No top bar: the mode line is the single status row (Emacs-style), so the
+    // chat gets the whole height minus the prompt and the bottom bar.
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(prompt_h as u16),
             Constraint::Length(1),
@@ -1625,24 +1645,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
         .split(area);
 
     let run_state = if app.running { "RUNNING" } else { "IDLE" };
-    let undo_count = app.undo.entry_count();
 
-    let header = Line::from(vec![
-        Span::styled(
-            format!(" {} ", app.session.title()),
-            Style::default()
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            app.root.to_string_lossy().into_owned(),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("  "),
-        Span::styled("undo:", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!("{undo_count}")),
-    ]);
     let (status_msg, status_color) = {
         let agent = app.session.status();
         if !agent.trim().is_empty() {
@@ -1735,15 +1738,20 @@ fn draw(app: &mut App, frame: &mut Frame) {
         ));
     }
 
-    frame.render_widget(Paragraph::new(header), rows[0]);
-
     // The bar spans the whole row; the app name is right-aligned in its own
     // segment and drops first on narrow terminals.
-    let tag_w = (APP_TAG.chars().count() as u16).min(rows[3].width.saturating_sub(60));
+    let tag_w = (APP_TAG.chars().count() as u16).min(rows[2].width.saturating_sub(60));
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(tag_w)])
-        .split(rows[3]);
+        .split(rows[2]);
+    // Current directory goes leftmost on the mode line, abbreviated to ~/...
+    // when it lives under $HOME (absolute otherwise).
+    spans.insert(
+        0,
+        Span::styled(home_path(&app.root), bar_style.add_modifier(Modifier::BOLD)),
+    );
+    spans.insert(1, Span::raw(" "));
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(bar_style),
         bottom[0],
@@ -1760,7 +1768,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Percentage(30)])
-        .split(rows[1]);
+        .split(rows[0]);
     draw_chat(app, frame, cols[0]);
     // The model panel shows three fixed rows (label, gauge, usage) plus one row
     // per wrapped delegate line under them; grow it so delegate text is never
@@ -1772,7 +1780,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
         usize::from(cols[1].width.saturating_sub(2)).max(1),
     );
     let delegate_h = delegate_rows.as_ref().map_or(0, |r| r.len() as u16 - 1);
-    let stats_h = (6 + delegate_h).min(rows[1].height);
+    let stats_h = (6 + delegate_h).min(rows[0].height);
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(stats_h), Constraint::Min(0)])
@@ -1813,9 +1821,9 @@ fn draw(app: &mut App, frame: &mut Frame) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
-        frame.render_widget(Paragraph::new(search_line), rows[2]);
+        frame.render_widget(Paragraph::new(search_line), rows[1]);
     } else {
-        draw_prompt(app, frame, rows[2], &prompt_rows, prompt_win, prompt_cur);
+        draw_prompt(app, frame, rows[1], &prompt_rows, prompt_win, prompt_cur);
     }
 
     if let Some(d) = app.dialogs.first() {
@@ -3458,6 +3466,31 @@ mod tests {
         for l in &lines {
             assert!(l.chars().count() <= 20, "line too wide: {l:?}");
         }
+    }
+
+    #[test]
+    fn home_path_tilde_abbreviates_under_home() {
+        let home = std::path::Path::new("/home/alice");
+        assert_eq!(
+            home_path_with(std::path::Path::new("/home/alice/code/comrade"), Some(home)),
+            "~/code/comrade"
+        );
+        // The home directory itself collapses to a bare tilde.
+        assert_eq!(
+            home_path_with(std::path::Path::new("/home/alice"), Some(home)),
+            "~"
+        );
+    }
+
+    #[test]
+    fn home_path_stays_absolute_outside_home() {
+        let home = std::path::Path::new("/home/alice");
+        assert_eq!(
+            home_path_with(std::path::Path::new("/srv/other/proj"), Some(home)),
+            "/srv/other/proj"
+        );
+        // No $HOME set: fall back to the absolute path unchanged.
+        assert_eq!(home_path_with(std::path::Path::new("/x/y"), None), "/x/y");
     }
 
     #[test]

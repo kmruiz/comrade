@@ -146,7 +146,6 @@ fn delegate_registry() -> ToolRegistry {
 /// how to drive `user` (TUI dialogs or headless stdin/policy).
 struct SessionBundle {
     session: Arc<comrade_core::AgentSession>,
-    undo: Arc<MemoryUndo>,
     ctx_base: ToolContext,
 }
 
@@ -170,15 +169,7 @@ fn new_session(
         auto_approve: deps.cfg.security.autonomy == comrade_core::Autonomy::Auto,
         approval: Default::default(),
     };
-    (
-        SessionBundle {
-            session,
-            undo,
-            ctx_base,
-        },
-        tx,
-        rx,
-    )
+    (SessionBundle { session, ctx_base }, tx, rx)
 }
 
 #[tokio::main]
