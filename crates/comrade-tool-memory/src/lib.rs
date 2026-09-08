@@ -41,7 +41,7 @@ struct Remember;
 static REMEMBER_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "remember".into(),
-    description: "Record a meaningful project decision as a persistent, ADR-style entry under .comrade/memory/ so future sessions can reuse it (find_decisions/read_decision). Approval-gated: include Justification and Risk. Use sparingly for decisions worth remembering, not for every action.".into(),
+    description: "Write what a future session must find, reuse, or avoid as a persistent run book under .comrade/memory/ (find_decisions/read_decision). Format: title + context, numbered steps of ACTION -> VERIFICATION stored as summary/context/decision/consequences. Approval-gated: include Justification and Risk.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
