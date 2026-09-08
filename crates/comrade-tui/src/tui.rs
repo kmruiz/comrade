@@ -1695,6 +1695,13 @@ pub async fn run(deps: &Deps) -> Result<()> {
     let _ = terminal.draw(|f| draw(&mut app, f));
     app.refresh_git();
 
+    // A periodic wake-up while a run is in flight, so the plan window's spinner
+    // keeps rotating even when no agent or terminal events arrive (e.g. during
+    // a silent, long-running tool call). Idle frames never poll it (guard), and
+    // a wake-up only reaches the shared redraw below the select.
+    let mut spin = tokio::time::interval(Duration::from_millis(100));
+    spin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     let res = loop {
         tokio::select! {
             ev = kev_rx.recv() => {
@@ -1749,6 +1756,10 @@ pub async fn run(deps: &Deps) -> Result<()> {
                     Some(info) => app.on_git(info),
                     None => break Err(anyhow::anyhow!("git refresh channel closed")),
                 }
+            }
+            _ = spin.tick(), if app.running => {
+                // Spinner wake-up only: the redraw below re-renders the plan
+                // panel with the next glyph frame.
             }
         }
         app.refresh_git();
@@ -4097,11 +4108,7 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
-    let finished = app.session.finished_summary().is_some();
-    let block =
-        Block::default()
-            .borders(Borders::ALL)
-            .title(if finished { " plan ok " } else { " plan " });
+    let block = Block::default().borders(Borders::ALL).title(" plan ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -4131,9 +4138,10 @@ fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
             continue;
         }
         let text_color = Color::White;
+        let now = now_ms();
         let mut toks = vec![
             tok(
-                format!("{} ", plan_prefix(&step.status)),
+                format!("{} ", plan_glyph(&step.status, now)),
                 Style::default().fg(color),
             ),
             tok(
@@ -4192,12 +4200,32 @@ fn push_tok_line(lines: &mut Vec<Line>, line: &[Tok]) {
     lines.push(Line::from(spans));
 }
 
-fn plan_prefix(s: &PlanStatus) -> &'static str {
+/// Spinner frames cycled by wall-clock time for an in-progress step (all
+/// width-1 braille glyphs, so a wrapped plan row's width does not change as it
+/// rotates).
+const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+/// Milliseconds one spinner frame stays on screen.
+const SPINNER_FRAME_MS: u128 = 100;
+
+/// Milliseconds since the Unix epoch (for picking the spinner frame).
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// The status glyph shown before a plan step: "-" for pending, a rotating
+/// spinner for in-progress, a tick for done and a cross for failed/blocked.
+fn plan_glyph(s: &PlanStatus, now_ms: u128) -> &'static str {
     match s {
         PlanStatus::Pending => "-",
-        PlanStatus::InProgress => "o",
-        PlanStatus::Done => "+",
-        PlanStatus::Blocked => "x",
+        PlanStatus::InProgress => {
+            let frame = ((now_ms / SPINNER_FRAME_MS) as usize) % SPINNER_FRAMES.len();
+            SPINNER_FRAMES[frame]
+        }
+        PlanStatus::Done => "✓",
+        PlanStatus::Blocked => "✗",
     }
 }
 
@@ -4208,7 +4236,7 @@ fn plan_prefix(s: &PlanStatus) -> &'static str {
 /// line so the panel reads as a collapsed checklist.
 fn collapsed_done_toks(step: &PlanStep, width: usize) -> Vec<Tok> {
     let status_glyph = tok(
-        format!("{} ", plan_prefix(&PlanStatus::Done)),
+        format!("{} ", plan_glyph(&PlanStatus::Done, 0)),
         Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
@@ -6399,7 +6427,7 @@ mod plan_step_tests {
         let step = done_step(2, "add section model", "self", Some(125_000));
         let toks = collapsed_done_toks(&step, 80);
         let text = line_text(&toks);
-        assert!(text.starts_with("+ 2. "), "{text}");
+        assert!(text.starts_with("✓ 2. "), "{text}");
         assert!(text.contains("add section model"), "{text}");
         assert!(text.contains("[self]"), "{text}");
         assert!(text.contains("· 2m 5s"), "{text}");
@@ -6415,7 +6443,7 @@ mod plan_step_tests {
         let text = line_text(&collapsed_done_toks(&step, 80));
         assert!(!text.contains('·'), "{text}");
         assert!(!text.contains('['), "{text}");
-        assert!(text.starts_with("+ 1. short goal"), "{text}");
+        assert!(text.starts_with("✓ 1. short goal"), "{text}");
     }
 
     #[test]
@@ -6439,5 +6467,25 @@ mod plan_step_tests {
         let step = done_step(1, "g", "", Some(3_500));
         let text = line_text(&collapsed_done_toks(&step, 60));
         assert!(text.contains("· 3.5s"), "{text}");
+    }
+
+    #[test]
+    fn plan_glyphs_tick_cross_dash_and_spinner() {
+        // Stable glyphs for the non-running statuses.
+        assert_eq!(plan_glyph(&PlanStatus::Done, 0), "✓");
+        assert_eq!(plan_glyph(&PlanStatus::Blocked, 0), "✗");
+        assert_eq!(plan_glyph(&PlanStatus::Pending, 0), "-");
+        // The in-progress spinner picks a frame from the rotation by time and
+        // every frame is a single-width glyph.
+        for ms in [0u128, 100, 350, 799] {
+            let g = plan_glyph(&PlanStatus::InProgress, ms);
+            assert!(SPINNER_FRAMES.contains(&g), "{g}");
+            assert_eq!(g.chars().count(), 1);
+        }
+        // Advancing one full rotation period moves to the next frame.
+        assert_ne!(
+            plan_glyph(&PlanStatus::InProgress, 0),
+            plan_glyph(&PlanStatus::InProgress, 100)
+        );
     }
 }
