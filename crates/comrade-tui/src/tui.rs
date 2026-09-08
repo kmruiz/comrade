@@ -456,6 +456,33 @@ impl Mx {
         let len = self.matches.len() as isize;
         self.sel = (((self.sel as isize + dir) % len) + len) as usize % len as usize;
     }
+
+    /// Emacs-style Tab completion: extend the query to the longest common
+    /// prefix shared by every current match. With a single match that is the
+    /// full command name. When nothing is typed (or the matches share no
+    /// longer prefix) the query is left alone and the full candidate list
+    /// stays visible, mirroring `M-x`'s "Tab shows the completions" step.
+    fn complete(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let lcp = self
+            .matches
+            .iter()
+            .map(|c| c.name())
+            .reduce(|acc, name| common_prefix(acc, name))
+            .unwrap_or("");
+        if lcp.len() > self.query.len() {
+            self.query = lcp.to_string();
+            self.refresh();
+        }
+    }
+}
+
+/// Longest common prefix of two strings.
+fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
+    let n = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+    &a[..a.char_indices().nth(n).map_or(a.len(), |(i, _)| i)]
 }
 
 struct App {
@@ -1846,16 +1873,12 @@ fn handle_mx_key(app: &mut App, key: KeyEvent) -> MxKeyOutcome {
             }
             MxKeyOutcome::Handled
         }
-        // Tab completes the query with the highlighted command's name.
+        // Tab completes emacs-style: with nothing typed it leaves the query
+        // alone (the full task list stays up); with a shared prefix it fills
+        // in as much as every match agrees on.
         KeyCode::Tab => {
-            if let Some(name) = app
-                .mx
-                .as_ref()
-                .and_then(|m| m.matches.get(m.sel))
-                .map(|c| c.name().to_string())
-            {
-                app.mx.as_mut().unwrap().query = name;
-                app.mx.as_mut().unwrap().refresh();
+            if let Some(m) = &mut app.mx {
+                m.complete();
             }
             MxKeyOutcome::Handled
         }
@@ -4482,6 +4505,41 @@ fn strip_react_scaffolding(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_prefix_shared() {
+        assert_eq!(
+            common_prefix("move-block-down", "move-block-up"),
+            "move-block-"
+        );
+        assert_eq!(common_prefix("abc", "abd"), "ab");
+        assert_eq!(common_prefix("quit", "quit"), "quit");
+        assert_eq!(common_prefix("backward-word", "beginning-of-line"), "b");
+        assert_eq!(common_prefix("kill-word", ""), "");
+    }
+
+    #[test]
+    fn mx_complete_fills_shared_prefix() {
+        let mut mx = Mx::open();
+        // Empty query: Tab must not yank the first command in — the full list
+        // stays visible (emacs shows the completion list instead).
+        mx.complete();
+        assert_eq!(mx.query, "");
+        assert_eq!(mx.matches.len(), MxCommand::ALL.len());
+        // Narrow to the two "move-block-*" commands and complete the prefix.
+        mx.query = "move-b".to_string();
+        mx.refresh();
+        assert_eq!(mx.matches.len(), 2);
+        mx.complete();
+        assert_eq!(mx.query, "move-block-");
+        assert_eq!(mx.matches.len(), 2);
+        // Disambiguate: a single match completes to its full name.
+        mx.query = "move-block-d".to_string();
+        mx.refresh();
+        assert_eq!(mx.matches.len(), 1);
+        mx.complete();
+        assert_eq!(mx.query, "move-block-down");
+    }
 
     #[test]
     fn strips_react_scaffolding() {
