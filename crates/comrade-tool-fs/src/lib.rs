@@ -1197,6 +1197,7 @@ mod tests {
             undo: Arc::new(StubUndo),
             auto_approve: true,
             approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
         };
         let list = ListFiles;
         let args = json!({ "pattern": "**/*.rs", "git_modified_only": true });
@@ -1284,6 +1285,7 @@ mod tests {
             undo: Arc::new(StubUndo),
             auto_approve: true,
             approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

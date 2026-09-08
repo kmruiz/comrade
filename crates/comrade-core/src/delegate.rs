@@ -456,6 +456,7 @@ impl Tool for DelegateTool {
             ctx,
             system,
             user_prompt,
+            &target.cfg.name,
             native,
             &self.limits,
         )
@@ -573,6 +574,7 @@ async fn run_delegate_subagent(
     parent_ctx: &ToolContext,
     system: String,
     user_prompt: String,
+    author: &str,
     native: bool,
     limits: &DelegateLimits,
 ) -> Result<String> {
@@ -628,10 +630,15 @@ async fn run_delegate_subagent(
                     continue;
                 }
                 let output = match tools.get(&tc.name) {
-                    Some(tool) => match tool.invoke(&dctx, args).await {
-                        Ok(out) => out,
-                        Err(e) => format!("ERROR: {e:#}"),
-                    },
+                    Some(tool) => {
+                        dctx.events.tool_call(author, &tc.name, &args_pretty).await;
+                        let r = match tool.invoke(&dctx, args).await {
+                            Ok(out) => (out, true),
+                            Err(e) => (format!("ERROR: {e:#}"), false),
+                        };
+                        dctx.events.tool_result(author, &tc.name, &r.0, r.1).await;
+                        r.0
+                    }
                     None => format!("unknown tool {:?}; choose from the listed tools", tc.name),
                 };
                 let clamped = ctxm.truncate_observation(&output);
@@ -688,10 +695,16 @@ async fn run_delegate_subagent(
             ));
             continue;
         };
-        let output = match tool.invoke(&dctx, tool_call.args).await {
-            Ok(out) => out,
-            Err(e) => format!("ERROR: {e:#}"),
+        dctx.events
+            .tool_call(author, &tool_call.name, &args_pretty)
+            .await;
+        let (output, ok) = match tool.invoke(&dctx, tool_call.args).await {
+            Ok(out) => (out, true),
+            Err(e) => (format!("ERROR: {e:#}"), false),
         };
+        dctx.events
+            .tool_result(author, &tool_call.name, &output, ok)
+            .await;
         let clamped = ctxm.truncate_observation(&output);
         ctxm.push(ChatMessage::new(
             Role::User,
@@ -762,6 +775,7 @@ mod tests {
             undo: Arc::new(MemoryUndo::new("/tmp/x".into())),
             auto_approve: true,
             approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
         }
     }
 
@@ -1404,6 +1418,81 @@ mod tests {
             1,
             "delegate must have run its write_file tool once"
         );
+    }
+
+    /// The delegate's sub-agent tool calls must reach the session's event
+    /// channel (tagged with the delegate's configured name) so the chat can
+    /// show what the delegate is doing while it works.
+    #[tokio::test]
+    async fn delegate_tool_activity_streams_as_chat_events() {
+        let write_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(StubTool {
+            calls: write_calls.clone(),
+        }));
+
+        let tool_call_turn = json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let final_turn =
+            json!({"choices": [{"message": {"content": "done, file written"}}]}).to_string();
+        let base = scripted_server(vec![tool_call_turn, final_turn]);
+
+        let cfg = Config {
+            delegates: vec![delegate("cheap", &base)],
+            ..Config::default()
+        };
+        let tool = DelegateTool::new(&cfg.delegates, registry, DelegateLimits::default())
+            .unwrap()
+            .unwrap();
+
+        // A context wired to a real event channel instead of the no-op sink.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let mut ctx = test_ctx();
+        ctx.events = Arc::new(crate::session::SessionEvents(tx));
+
+        let out = tool
+            .invoke(&ctx, json!({"model": "cheap", "task": "write src/a.rs"}))
+            .await
+            .unwrap();
+        assert!(out.contains("done, file written"), "{out}");
+
+        // Drain the emitted activity: one call and one result, both tagged with
+        // the delegate's configured name so the chat can attribute them.
+        let mut seen_call = false;
+        let mut seen_result = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                crate::session::AgentEvent::DelegateToolCall { model, name, .. } => {
+                    seen_call = true;
+                    assert_eq!(model, "cheap");
+                    assert_eq!(name, "write_file");
+                }
+                crate::session::AgentEvent::DelegateToolResult {
+                    model, name, ok, ..
+                } => {
+                    seen_result = true;
+                    assert_eq!(model, "cheap");
+                    assert_eq!(name, "write_file");
+                    assert!(ok);
+                }
+                _ => {}
+            }
+        }
+        assert!(seen_call, "expected a DelegateToolCall event");
+        assert!(seen_result, "expected a DelegateToolResult event");
     }
 
     /// A registry that contains exactly one recording stub `write_file` tool.

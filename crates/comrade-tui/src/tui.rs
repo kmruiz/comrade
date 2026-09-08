@@ -693,6 +693,30 @@ impl App {
         })
     }
 
+    /// Find the most recent still-visible tool card authored by a delegate
+    /// (name *and* model both match), so a delegate's result attaches to the
+    /// delegate's own card even when the main model calls the same tool later
+    /// in the same stretch.
+    fn last_delegate_tool_mut(&mut self, name: &str, model: &str) -> Option<&mut ToolCard> {
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
+        self.chat.iter_mut().rev().find_map(|m| match &mut m.tool {
+            Some(c) if c.name == name && c.author.as_deref() == Some(model) => Some(c),
+            _ => None,
+        })
+    }
+
+    /// Record the elapsed wall time of a delegate's `name` card once its result
+    /// arrives.
+    fn stamp_delegate_taken(&mut self, name: &str, model: &str) {
+        if let Some(card) = self.last_delegate_tool_mut(name, model) {
+            if card.taken_ms.is_none() {
+                if let Some(started) = card.started {
+                    card.taken_ms = Some(started.elapsed().as_millis());
+                }
+            }
+        }
+    }
+
     /// Record the elapsed wall time of the last `name` card once its result
     /// arrives (a no-op for cards that never started or already got stamped).
     fn stamp_taken(&mut self, name: &str) {
@@ -1087,6 +1111,7 @@ impl App {
             undo,
             auto_approve: self.cfg.auto_approve(),
             approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
         };
         self.session = session;
         self.ctx_base = ctx_base;
@@ -1297,6 +1322,62 @@ impl App {
             }
             AgentEvent::AccountBalance(balance) => {
                 self.balance = Some(balance);
+            }
+            AgentEvent::DelegateToolCall { model, name, args } => {
+                // A delegated sub-agent started a tool call: surface it as its
+                // own card under the delegate's model name, so the chat shows
+                // what the delegate is doing while the main model is parked
+                // waiting on the hand-off.
+                self.activity = Some(name.clone());
+                let open_default = matches!(
+                    name.as_str(),
+                    "apply_patch" | "apply_edit" | "run_tests" | "run_task"
+                );
+                self.push_msg(Msg::tool(ToolCard {
+                    name,
+                    author: Some(model),
+                    args,
+                    justification: None,
+                    risk: None,
+                    result: None,
+                    ok: true,
+                    open: open_default,
+                    started: Some(std::time::Instant::now()),
+                    taken_ms: None,
+                    tokens: None,
+                }));
+            }
+            AgentEvent::DelegateToolResult {
+                model,
+                name,
+                output,
+                ok,
+            } => {
+                self.activity = None;
+                if name == "run_tests" && output.contains("test result:") {
+                    let summary = parse_test_summary(&output);
+                    let fails = summary.failed;
+                    let passed = summary.passed;
+                    let duration = if summary.duration.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {}", summary.duration)
+                    };
+                    if let Some(card) = self.last_delegate_tool_mut(&name, &model) {
+                        card.ok = fails == 0;
+                        card.result = Some(format!("{passed} passed, {fails} failed{duration}"));
+                    }
+                    for (test_name, detail) in summary.cases {
+                        self.push_failure(test_name, detail);
+                    }
+                    if fails == 0 && passed > 0 {
+                        self.push_meta(format!("{model}: all {passed} tests passed"));
+                    }
+                } else if let Some(card) = self.last_delegate_tool_mut(&name, &model) {
+                    card.result = Some(output);
+                    card.ok = ok;
+                }
+                self.stamp_delegate_taken(&name, &model);
             }
         }
     }
@@ -3795,9 +3876,13 @@ fn run_usage(children: &[Msg]) -> (Option<u128>, usize) {
 fn layout_run(out: &mut Vec<RenderRow>, msg_idx: usize, children: &[Msg]) {
     let d = run_digest(children);
     let dim = Style::default().fg(Color::DarkGray);
+    // Attribute the run to whoever did the work. The parent's `delegate`
+    // hand-off card names the main model, not the sub-agent that actually ran
+    // the stretch, so skip it when picking the author label.
     let author = children
         .iter()
         .filter_map(|m| m.tool.as_ref())
+        .filter(|t| t.name != "delegate")
         .filter_map(|t| t.author.as_deref())
         .next();
     let status = if d.calls > 0 && d.ok {
@@ -5537,6 +5622,38 @@ mod tests {
         let flat: String = out[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("1.2k tok"), "{flat}");
         assert!(flat.contains("3.4s"), "{flat}");
+    }
+
+    #[test]
+    fn run_digest_credits_the_delegate_not_the_handoff() {
+        // A folded delegation stretch: the parent's `delegate` hand-off card is
+        // authored by the main model, the delegate's own tools by the delegate.
+        // The digest header must attribute the run to the delegate model.
+        fn card(name: &str, author: Option<&str>) -> Msg {
+            Msg::tool(ToolCard {
+                name: name.into(),
+                author: author.map(String::from),
+                args: "{}".into(),
+                justification: None,
+                risk: None,
+                result: Some("done".into()),
+                ok: true,
+                open: false,
+                started: Some(Instant::now()),
+                taken_ms: Some(10),
+                tokens: None,
+            })
+        }
+        let children = vec![
+            card("delegate", Some("ollama/lead")),
+            card("apply_patch", Some("mistral")),
+            card("run_tests", Some("mistral")),
+        ];
+        let mut out = Vec::new();
+        layout_run(&mut out, 3, &children);
+        let flat: String = out[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(flat.contains("mistral"), "{flat}");
+        assert!(!flat.contains("ollama/lead"), "{flat}");
     }
 
     #[test]

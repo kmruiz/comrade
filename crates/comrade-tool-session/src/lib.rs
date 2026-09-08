@@ -675,6 +675,7 @@ mod tests {
             undo: Arc::new(NoopUndo),
             auto_approve: true,
             approval: Arc::new(Mutex::new(None)),
+            events: Arc::new(comrade_tool::NoopEvents),
         }
     }
 

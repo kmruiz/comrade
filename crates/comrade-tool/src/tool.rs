@@ -80,6 +80,31 @@ pub struct ToolContext {
     /// action should run, and what could go wrong). Written by the agent loop
     /// before invoking a tool, read and cleared by [`ToolContext::confirm`].
     pub approval: std::sync::Arc<std::sync::Mutex<Option<ApprovalNotes>>>,
+    /// Live activity a long-running tool wants to surface in the UI while it
+    /// runs. The agent core wires this to the session's event channel so the
+    /// `delegate` tool can stream what its sub-agent is doing, as it happens.
+    pub events: std::sync::Arc<dyn ActivityEvents>,
+}
+
+/// Sink a tool can report UI-visible activity through while it runs (e.g. the
+/// `delegate` tool streaming its sub-agent's tool calls). `author` names the
+/// model performing the action; callers without a UI use [`NoopEvents`].
+#[async_trait]
+pub trait ActivityEvents: Send + Sync {
+    /// A tool call began.
+    async fn tool_call(&self, author: &str, name: &str, args: &str);
+    /// A tool call finished.
+    async fn tool_result(&self, author: &str, name: &str, output: &str, ok: bool);
+}
+
+/// An [`ActivityEvents`] sink that discards everything: the default when no UI
+/// is attached (tests, headless runs without a viewer).
+pub struct NoopEvents;
+
+#[async_trait]
+impl ActivityEvents for NoopEvents {
+    async fn tool_call(&self, _author: &str, _name: &str, _args: &str) {}
+    async fn tool_result(&self, _author: &str, _name: &str, _output: &str, _ok: bool) {}
 }
 
 impl ToolContext {
@@ -285,6 +310,7 @@ mod tests {
             undo: Arc::new(NoopUndo),
             auto_approve: false,
             approval: Default::default(),
+            events: Arc::new(crate::NoopEvents),
         };
         ctx.set_approval(ApprovalNotes {
             justification: "completes the requested rename".into(),
@@ -307,6 +333,7 @@ mod tests {
             undo: Arc::new(NoopUndo),
             auto_approve: false,
             approval: Default::default(),
+            events: Arc::new(crate::NoopEvents),
         };
         ctx.confirm("edit", Some("--- a.rs".into())).await.unwrap();
         let shown = last.lock().unwrap().clone().unwrap();

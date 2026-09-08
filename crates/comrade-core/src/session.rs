@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
-use comrade_tool::{PlanStatus, PlanStep, PlanTarget, SessionControl};
+use async_trait::async_trait;
+use comrade_tool::{ActivityEvents, PlanStatus, PlanStep, PlanTarget, SessionControl};
 use tokio::sync::mpsc;
 
 /// Events emitted by the session and the agent loop, consumed by the UI.
@@ -61,6 +62,54 @@ pub enum AgentEvent {
         budget: usize,
         estimated: bool,
     },
+    /// A tool call made by a delegated sub-agent started. `model` is the
+    /// delegate's configured name, so the UI can show the action under the
+    /// delegate instead of the main model.
+    DelegateToolCall {
+        model: String,
+        name: String,
+        args: String,
+    },
+    /// A tool call made by a delegated sub-agent finished.
+    DelegateToolResult {
+        model: String,
+        name: String,
+        output: String,
+        ok: bool,
+    },
+}
+
+/// Bridges a session's UI event channel to the [`ActivityEvents`] sink carried
+/// by every [`comrade_tool::ToolContext`], so tools that run their own
+/// sub-agent loop (the `delegate` tool) can stream what that sub-agent is
+/// doing into the chat as it happens. The agent loop attaches one of these to
+/// the run's context at start; events are tagged with the delegate's name.
+pub struct SessionEvents(pub mpsc::Sender<AgentEvent>);
+
+#[async_trait]
+impl ActivityEvents for SessionEvents {
+    async fn tool_call(&self, author: &str, name: &str, args: &str) {
+        let _ = self
+            .0
+            .send(AgentEvent::DelegateToolCall {
+                model: author.to_string(),
+                name: name.to_string(),
+                args: args.to_string(),
+            })
+            .await;
+    }
+
+    async fn tool_result(&self, author: &str, name: &str, output: &str, ok: bool) {
+        let _ = self
+            .0
+            .send(AgentEvent::DelegateToolResult {
+                model: author.to_string(),
+                name: name.to_string(),
+                output: output.to_string(),
+                ok,
+            })
+            .await;
+    }
 }
 
 /// Observable session state. Doubles as the [`SessionControl`] implementation
