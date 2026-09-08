@@ -2223,7 +2223,12 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
             } else {
                 format!("{} ({})", d.name, d.llm.model)
             };
-            delegate_lines.push(Line::from(Span::styled(format!("  {label}"), dim)));
+            let mut line = format!("  {label}");
+            if !d.description.trim().is_empty() {
+                line.push_str(" — ");
+                line.push_str(d.description.trim());
+            }
+            delegate_lines.push(Line::from(Span::styled(line, dim)));
         }
         frame.render_widget(Paragraph::new(delegate_lines), rows[3]);
     }

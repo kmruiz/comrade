@@ -97,6 +97,18 @@ pub struct DelegateTool {
     limits: DelegateLimits,
 }
 
+/// One advertising line for the tech lead: `- name` or `- name: description`.
+/// The `description` is the config blurb of when to use that delegate — it is
+/// what the tech lead reads to pick the right developer for a task — so it must
+/// appear everywhere delegates are listed (tool doc, `model` arg, errors).
+/// Blank blurbs degrade to the plain `- name` line.
+fn delegate_line(name: &str, description: &str) -> String {
+    match description.trim() {
+        "" => format!("  - {name}"),
+        desc => format!("  - {name}: {desc}"),
+    }
+}
+
 impl DelegateTool {
     /// Whether `name` is a tool a delegate must never see (see
     /// [`DENIED_FOR_DELEGATES`]). Kept as a method so comrade-tui's registry
@@ -147,9 +159,9 @@ impl DelegateTool {
             });
         }
 
-        let name_list = names
+        let listing = delegates
             .iter()
-            .map(|n| format!("  - {n}"))
+            .map(|d| delegate_line(&d.name, &d.description))
             .collect::<Vec<_>>()
             .join("\n");
         let description = format!(
@@ -192,8 +204,8 @@ delegates now write files and share the repo/session/undo, do not batch two \
 delegates that will touch the same files — parallel delegates manage their \
 own conflicts.
 
-Configured delegates:
-{name_list}"
+Configured delegates — pick the one whose description best fits the task:
+{listing}"
         );
 
         let schema = json!({
@@ -207,7 +219,9 @@ Configured delegates:
                 "model": {
                     "type": "string",
                     "enum": names,
-                    "description": "Which configured delegate model should do the work (must match the step's model when `step` is given)"
+                    "description": format!(
+                        "Which configured delegate model should do the work (must match the step's model when `step` is given). Choose the delegate whose description best fits the task:\n{listing}"
+                    )
                 },
                 "task": {
                     "type": "string",
@@ -373,13 +387,13 @@ impl Tool for DelegateTool {
         };
 
         let Some(target) = self.targets.iter().find(|t| t.cfg.name == model) else {
-            let known = self
+            let listed = self
                 .targets
                 .iter()
-                .map(|t| t.cfg.name.as_str())
+                .map(|t| delegate_line(&t.cfg.name, &t.cfg.description))
                 .collect::<Vec<_>>()
-                .join(", ");
-            bail!("unknown delegate model {model:?}. Configured: {known}");
+                .join("\n");
+            bail!("unknown delegate model {model:?}. Configured delegates:\n{listed}");
         };
 
         let user_prompt = if feedback.is_empty() {
@@ -834,6 +848,26 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(models, vec!["groq-fast", "mistral"]);
+        // The tool description and the `model` argument both advertise the
+        // delegates with their descriptions, so the tech lead picks a delegate
+        // by what the blurb says fits the task.
+        let spec_desc = &tool.spec().description;
+        assert!(spec_desc.contains("Configured delegates"), "{spec_desc}");
+        assert!(
+            spec_desc.contains("groq-fast: groq-fast test delegate"),
+            "{spec_desc}"
+        );
+        assert!(
+            spec_desc.contains("mistral: mistral test delegate"),
+            "{spec_desc}"
+        );
+        let model_desc = schema["properties"]["model"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            model_desc.contains("mistral: mistral test delegate"),
+            "{model_desc}"
+        );
         assert!(schema["properties"]["task"].is_object());
         assert!(schema["properties"]["step"].is_object());
         // `step` alone, or `model` + `task` (oneOf), are the two call shapes.
@@ -847,6 +881,27 @@ mod tests {
         };
         assert!(requires("step"));
         assert!(requires("model") && requires("task"));
+    }
+
+    #[test]
+    fn blank_blurbs_degrade_to_bare_name_lines() {
+        let cfg = Config {
+            delegates: vec![
+                delegate("with-blurb", "http://x/v1"),
+                DelegateCfg {
+                    description: "   ".into(),
+                    ..delegate("bare", "http://x/v1")
+                },
+            ],
+            ..Config::default()
+        };
+        let tool = mk_delegate(&cfg.delegates).unwrap().unwrap();
+        let desc = tool.spec().description.clone();
+        assert!(
+            desc.contains("with-blurb: with-blurb test delegate"),
+            "{desc}"
+        );
+        assert!(desc.trim_end().ends_with("  - bare"), "{desc}");
     }
 
     #[tokio::test]
@@ -890,6 +945,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown delegate model"));
+        // The error repeats the pick list (name + description) so a wrong
+        // guess teaches the tech lead which delegate fits next time.
+        assert!(
+            err.to_string().contains("cheap: cheap test delegate"),
+            "{err}"
+        );
 
         let err = tool
             .invoke(&ctx, json!({"model": "cheap", "task": "   "}))
