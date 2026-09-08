@@ -62,6 +62,45 @@ impl ToolRegistry {
     }
 }
 
+/// UI -> running-task steering channel. While a run is in flight the human can
+/// type a short message ("steer") that whichever model currently owns the run —
+/// the main agent or, nested inside it, a delegated sub-agent — sees as a user
+/// message at its next rest point (between model requests). One [`Steer`] is
+/// created per run and cloned into every context that runs a model loop, so all
+/// loops drain the same receiver and the one executing at the moment gets the
+/// message. A run with no steering UI (headless, tests) has
+/// [`ToolContext::steer`] set to `None`.
+#[derive(Clone)]
+pub struct Steer {
+    rx: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+}
+
+impl Steer {
+    /// Create a steering pipe. Keep the returned sender on the UI side of the
+    /// run and hand the [`Steer`] (receiver side) to the run context. Sending
+    /// fails once the run has ended and dropped its receiver, which is how the
+    /// UI learns a steer was too late.
+    pub fn channel() -> (Steer, tokio::sync::mpsc::UnboundedSender<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Steer {
+                rx: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
+            },
+            tx,
+        )
+    }
+
+    /// Take every steering message queued so far, without waiting.
+    pub async fn drain(&self) -> Vec<String> {
+        let mut rx = self.rx.lock().await;
+        let mut out = Vec::new();
+        while let Ok(text) = rx.try_recv() {
+            out.push(text);
+        }
+        out
+    }
+}
+
 /// Everything a tool invocation needs access to for the current session.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -91,6 +130,11 @@ pub struct ToolContext {
     /// of freezing the run at "working". The agent loop sets it at run start;
     /// `None` in tests, headless runs and contexts with no live run.
     pub stop: Option<CancellationToken>,
+    /// Live steering pipe from the UI into this run, when one exists (see
+    /// [`Steer`]). The agent loop and the delegate sub-agent loop both drain it
+    /// at their rest points, so a message typed while either is running is
+    /// delivered to whichever owns the loop. `None` in headless runs and tests.
+    pub steer: Option<Steer>,
 }
 
 /// Sink a tool can report UI-visible activity through while it runs (e.g. the
@@ -310,6 +354,7 @@ mod tests {
             auto_approve: false,
             approval: Default::default(),
             events: Arc::new(crate::NoopEvents),
+            steer: None,
             stop: None,
         };
         ctx.set_approval(ApprovalNotes {
@@ -332,6 +377,7 @@ mod tests {
             auto_approve: false,
             approval: Default::default(),
             events: Arc::new(crate::NoopEvents),
+            steer: None,
             stop: None,
         };
         ctx.confirm("edit", Some("--- a.rs".into())).await.unwrap();

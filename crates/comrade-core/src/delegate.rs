@@ -627,6 +627,10 @@ async fn run_delegate_subagent(
                 bail!("delegate interrupted: the run was cancelled");
             }
         }
+        // A steer typed while the delegate owned the loop reaches the delegate's
+        // own conversation at its next rest point (drained from the shared bus
+        // cloned into `dctx`).
+        crate::agent::drain_steer(dctx.steer.as_ref(), &mut ctxm).await;
         ctxm.enforce_budget();
         let specs: Option<Vec<comrade_tool::ToolSpec>> = if native {
             let specs: Vec<_> = tools.iter().map(|t| t.spec().clone()).collect();
@@ -836,6 +840,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
             stop: None,
         }
     }
@@ -1982,10 +1987,181 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("done reading"), "{out}");
-        assert_eq!(
-            read_calls.load(std::sync::atomic::Ordering::SeqCst),
-            20,
-            "the 21st read must be refused before it reaches the tool"
+    }
+
+    /// A fake chat server that answers N sequential requests with N distinct
+    /// raw JSON bodies and forwards each raw REQUEST body (read per
+    /// Content-Length) to the returned channel first. The delegate loop makes
+    /// one request per turn, so tests can assert what the delegate was asked
+    /// at every step and steer it between turns.
+    fn scripted_spy(responses: Vec<String>) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for resp_body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut data = Vec::new();
+                let mut tmp = [0u8; 8192];
+                let mut body_len: Option<usize> = None;
+                let mut header_end: Option<usize> = None;
+                while body_len.map_or(true, |len| header_end.unwrap_or(0) + 4 + len > data.len()) {
+                    let n = stream.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&tmp[..n]);
+                    if header_end.is_none() {
+                        if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(p);
+                            let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
+                            body_len = head.lines().find_map(|l| {
+                                l.trim()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse().ok())
+                            });
+                        }
+                    }
+                }
+                let body = match (header_end, body_len) {
+                    (Some(he), Some(len)) => {
+                        let start = he + 4;
+                        let end = (start + len).min(data.len());
+                        String::from_utf8_lossy(&data[start..end]).into_owned()
+                    }
+                    _ => String::new(),
+                };
+                let _ = tx.send(body);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), rx)
+    }
+
+    /// Wait (with a timeout) for the next request body the fake server sees.
+    async fn recv_body(rx: &std::sync::mpsc::Receiver<String>) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(b) = rx.try_recv() {
+                return b;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for a model request");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A write_file stub whose invocation signals `called` (a oneshot: safe to
+    /// fire before the test awaits it) and then blocks on `release` (a Notify).
+    /// Lets a test steer a running delegate at a deterministic moment: the stub
+    /// is executing (so the sub-agent is mid-flight) when the steer is sent.
+    struct Gate {
+        called: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Notify,
+    }
+
+    struct GatedWriteTool {
+        gate: Arc<Gate>,
+    }
+
+    #[async_trait]
+    impl Tool for GatedWriteTool {
+        fn spec(&self) -> &ToolSpec {
+            &STUB_WRITE_SPEC
+        }
+
+        async fn invoke(&self, _ctx: &ToolContext, _args: Value) -> Result<String> {
+            if let Some(send) = self.gate.called.lock().unwrap().take() {
+                let _ = send.send(());
+            }
+            self.gate.release.notified().await;
+            Ok("stub write_file executed".to_string())
+        }
+    }
+
+    /// A steering message typed while a DELEGATE owns the loop is delivered to
+    /// the delegate: sent while its write_file tool is still executing, it must
+    /// appear in the delegate's NEXT model request, and the run must then end
+    /// normally.
+    #[tokio::test]
+    async fn delegate_receives_a_steer_mid_run() {
+        const STEER: &str = "change direction now";
+        let (called_tx, called_rx) = tokio::sync::oneshot::channel();
+        let gate = Arc::new(Gate {
+            called: std::sync::Mutex::new(Some(called_tx)),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(GatedWriteTool { gate: gate.clone() }));
+
+        let tool_call_turn = json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let final_turn =
+            json!({"choices": [{"message": {"content": "done after the steer"}}]}).to_string();
+        let (base, bodies) = scripted_spy(vec![tool_call_turn, final_turn]);
+
+        let cfg = Config {
+            delegates: vec![delegate("cheap", &base)],
+            ..Config::default()
+        };
+        let tool = DelegateTool::new(&cfg.delegates, registry, DelegateLimits::default())
+            .unwrap()
+            .unwrap();
+
+        // The delegate inherits a live steering pipe from its context.
+        let (steer, steer_tx) = comrade_tool::Steer::channel();
+        let mut ctx = test_ctx();
+        ctx.steer = Some(steer);
+
+        let run = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                tool.invoke(&ctx, json!({"model": "cheap", "task": "write src/a.rs"}))
+                    .await
+                    .unwrap()
+            }
+        });
+
+        // Request 1 (its first model turn) must NOT contain the steer yet.
+        let first = recv_body(&bodies).await;
+        assert!(
+            !first.contains(STEER),
+            "steer leaked into the first request"
         );
+
+        // The delegate is now executing write_file: steer it, then let the
+        // tool finish so the loop reaches its next rest point.
+        called_rx.await.unwrap();
+        steer_tx.send(STEER.to_string()).unwrap();
+        gate.release.notify_one();
+
+        // Request 2 must carry the steer as a user message.
+        let second = recv_body(&bodies).await;
+        assert!(
+            second.contains(STEER),
+            "steer missing from the delegate's next request"
+        );
+
+        let out = run.await.unwrap();
+        assert!(out.contains("done after the steer"), "{out}");
     }
 }

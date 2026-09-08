@@ -351,9 +351,11 @@ enum MxCommand {
     MoveUserDown,
     MoveUserUp,
     NewSession,
+    QueuePrompt,
     Quit,
     ReloadConfig,
     SearchChat,
+    SteerPrompt,
     SubmitPrompt,
     ToggleAutoAccept,
     ToggleToolCard,
@@ -378,9 +380,11 @@ impl MxCommand {
         MxCommand::MoveUserDown,
         MxCommand::MoveUserUp,
         MxCommand::NewSession,
+        MxCommand::QueuePrompt,
         MxCommand::Quit,
         MxCommand::ReloadConfig,
         MxCommand::SearchChat,
+        MxCommand::SteerPrompt,
         MxCommand::SubmitPrompt,
         MxCommand::ToggleAutoAccept,
         MxCommand::ToggleToolCard,
@@ -404,9 +408,11 @@ impl MxCommand {
             MxCommand::MoveUserDown => "move-user-down",
             MxCommand::MoveUserUp => "move-user-up",
             MxCommand::NewSession => "new-session",
+            MxCommand::QueuePrompt => "queue-prompt",
             MxCommand::Quit => "quit",
             MxCommand::ReloadConfig => "reload-config",
             MxCommand::SearchChat => "search-chat-history",
+            MxCommand::SteerPrompt => "steer",
             MxCommand::SubmitPrompt => "submit-prompt",
             MxCommand::ToggleAutoAccept => "toggle-auto-accept",
             MxCommand::ToggleToolCard => "toggle-tool-card",
@@ -434,9 +440,11 @@ impl MxCommand {
             MxCommand::NewSession => None,
             // Palette-only: shows the configured MCP servers in the chat.
             MxCommand::ListMcpServers => None,
+            MxCommand::QueuePrompt => Some("C-<return>"),
             MxCommand::Quit => Some("C-c"),
             MxCommand::ReloadConfig => Some("C-r"),
             MxCommand::SearchChat => Some("C-s"),
+            MxCommand::SteerPrompt => Some("<return>"),
             MxCommand::SubmitPrompt => Some("<return>"),
             MxCommand::ToggleAutoAccept => Some("C-SPC"),
             MxCommand::ToggleToolCard => Some("tab"),
@@ -461,9 +469,11 @@ impl MxCommand {
             MxCommand::MoveUserDown => "jump to the next message you sent",
             MxCommand::MoveUserUp => "jump to the previous message you sent",
             MxCommand::NewSession => "start a fresh session (clears the chat, plan and context)",
+            MxCommand::QueuePrompt => "hold the prompt and submit it when the current run ends",
             MxCommand::Quit => "quit the cockpit",
             MxCommand::ReloadConfig => "reload the config file without restarting",
             MxCommand::SearchChat => "search the chat history",
+            MxCommand::SteerPrompt => "send the prompt to the running agent or delegate now",
             MxCommand::SubmitPrompt => "send the prompt to the agent",
             MxCommand::ToggleAutoAccept => "toggle auto-accept of approvals",
             MxCommand::ToggleToolCard => {
@@ -574,6 +584,15 @@ struct App {
     /// abort a run that ignores the cancel token (see [`App::cancel_run`]).
     run_handle: Option<tokio::task::JoinHandle<()>>,
     running: bool,
+    /// Sender end of the in-flight run's steering pipe (`None` while idle).
+    /// Sending fails once the run has ended and dropped its receiver.
+    steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// A prompt queued (ctrl-Enter) while a run was active: submitted as the
+    /// next run when the current one ends, or given back to the prompt bar if
+    /// the run was cancelled (never auto-run after an explicit cancel).
+    queued_prompt: Option<String>,
+    /// True once the in-flight run was cancelled by the user (Esc / cancel-run).
+    run_cancelled: bool,
     /// Instant of the last terminal repaint, used to cap event-driven redraws
     /// to ~30 fps while a run is streaming (a fast local model can otherwise
     /// flood the repaint path; see freeze notes #25/#29).
@@ -1000,10 +1019,18 @@ impl App {
         if self.running || prompt.trim().is_empty() {
             return;
         }
+        // Every run gets a fresh steering pipe: the UI keeps the sender and the
+        // run task keeps the receiver (via `ctx.steer`), so a message typed
+        // mid-run reaches the agent loop - and, nested inside it, a delegate's
+        // sub-loop, which clones the same context.
+        let (steer, steer_tx) = comrade_tool::Steer::channel();
+        let mut ctx = self.ctx_base.clone();
+        ctx.steer = Some(steer);
+        self.steer_tx = Some(steer_tx);
+        self.run_cancelled = false;
         let cfg = self.cfg.clone();
         let client = self.client.clone();
         let tools = self.tools.clone();
-        let ctx = self.ctx_base.clone();
         // One conversation per session: every task appends to the same history,
         // which the agent compacts itself as it approaches the token budget.
         let history = self.history.clone();
@@ -1044,6 +1071,7 @@ impl App {
         if let Some(stop) = &self.stop {
             stop.cancel();
         }
+        self.run_cancelled = true;
         self.push_meta("cancelling...");
         // Abort guarantee: Esc must always end the run. Several awaits in the
         // run path (tool.invoke, event-channel sends, the post-run balance
@@ -1073,6 +1101,67 @@ impl App {
                 }
             });
         }
+    }
+
+    /// Render a message the human sent in the chat (submitted prompts, steers
+    /// and queued messages alike): fold whatever the run produced before it
+    /// into a digest, then show the message as a user band.
+    fn show_user(&mut self, text: &str) {
+        self.stream.clear();
+        self.fold_completed();
+        self.push_msg(Msg::authored(MsgKind::User, "you", text));
+    }
+
+    /// Submit whatever is in the prompt bar: when a run is in flight the text
+    /// steers the running agent/delegate; when idle it starts a new run.
+    fn submit_prompt(&mut self) {
+        let prompt = self.input.take_text();
+        if prompt.trim().is_empty() {
+            return;
+        }
+        if self.running {
+            self.steer(prompt);
+        } else {
+            self.start_run(prompt);
+        }
+    }
+
+    /// Send the prompt text straight to the currently running agent or
+    /// delegate as a steering message: it is injected into that model's
+    /// conversation at the run's next rest point. If the run ended just as the
+    /// user pressed Enter the text is submitted as a normal new run instead,
+    /// so it is never silently dropped.
+    fn steer(&mut self, text: String) {
+        self.show_user(&text);
+        let delivered = self
+            .steer_tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(text.clone()).is_ok());
+        if !delivered {
+            self.push_meta("run ended before the steer landed; submitting as a new task");
+            self.start_run(text);
+        }
+    }
+
+    /// Queue whatever is in the prompt bar for the NEXT run (ctrl-Enter): the
+    /// current run never sees it, and once the run ends the text is submitted
+    /// automatically. When idle there is nothing to queue behind, so it
+    /// behaves like a plain submit.
+    fn queue_prompt(&mut self) {
+        if !self.running {
+            self.submit_prompt();
+            return;
+        }
+        let text = self.input.take_text();
+        if text.trim().is_empty() {
+            return;
+        }
+        match self.queued_prompt.take() {
+            Some(existing) => self.queued_prompt = Some(existing + "\n\n" + &text),
+            None => self.queued_prompt = Some(text.clone()),
+        }
+        self.show_user(&text);
+        self.push_meta("queued for the next run (ctrl-enter again to append)");
     }
 
     /// Re-read the config file from disk and swap the live model client, tool
@@ -1178,6 +1267,7 @@ impl App {
             auto_approve: self.cfg.auto_approve(),
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
             stop: None,
         };
         self.session = session;
@@ -1200,6 +1290,9 @@ impl App {
         self.was_at_bottom = true;
         self.ctx_tokens = 0;
         self.ctx_estimated = true;
+        self.steer_tx = None;
+        self.queued_prompt = None;
+        self.run_cancelled = false;
         self.push_meta("started a fresh session");
     }
 
@@ -1250,6 +1343,7 @@ impl App {
                 self.running = false;
                 self.stop = None;
                 self.run_handle = None;
+                self.steer_tx = None;
                 self.stream.clear();
                 self.activity = None;
                 // The cancel watchdog may emit a second RunEnd after aborting a
@@ -1260,13 +1354,28 @@ impl App {
                     // end here without a final answer) before the status note.
                     self.fold_completed();
                     self.push_meta("run finished");
+                    // A prompt queued while the run was active becomes the next
+                    // run now -- unless the user cancelled, in which case the
+                    // text is given back to the prompt bar instead of being
+                    // auto-submitted against their intent.
+                    let queued = self.queued_prompt.take();
+                    let cancelled = self.run_cancelled;
+                    self.run_cancelled = false;
+                    if let Some(queued) = queued {
+                        if cancelled {
+                            for ch in queued.chars() {
+                                self.input.insert(ch);
+                            }
+                            self.push_meta(
+                                "run cancelled: the queued prompt is back in the prompt bar",
+                            );
+                        } else {
+                            self.start_run(queued);
+                        }
+                    }
                 }
             }
-            AgentEvent::User(u) => {
-                self.stream.clear();
-                self.fold_completed();
-                self.push_msg(Msg::authored(MsgKind::User, "you", u));
-            }
+            AgentEvent::User(u) => self.show_user(&u),
             AgentEvent::Delta(d) => {
                 self.stream.push_str(&d);
                 if self.stream.chars().count() > 40_000 {
@@ -1540,15 +1649,12 @@ impl App {
             MxCommand::MoveUserDown => self.move_user(1),
             MxCommand::MoveUserUp => self.move_user(-1),
             MxCommand::NewSession => self.new_session(),
+            MxCommand::QueuePrompt => self.queue_prompt(),
             MxCommand::Quit => return true,
             MxCommand::ReloadConfig => self.reload_config(),
             MxCommand::SearchChat => self.search = Some(Search::new()),
-            MxCommand::SubmitPrompt => {
-                if !self.running {
-                    let prompt = self.input.take_text();
-                    self.start_run(prompt);
-                }
-            }
+            MxCommand::SteerPrompt => self.submit_prompt(),
+            MxCommand::SubmitPrompt => self.submit_prompt(),
             MxCommand::ToggleAutoAccept => self.toggle_auto_accept(),
             MxCommand::ToggleToolCard => {
                 if let Some(idx) = self.sel {
@@ -1840,6 +1946,9 @@ pub async fn run(deps: &Deps) -> Result<()> {
         stop: None,
         run_handle: None,
         running: false,
+        steer_tx: None,
+        queued_prompt: None,
+        run_cancelled: false,
         last_draw: std::time::Instant::now(),
         auto_accept: false,
         git: GitBarInfo::default(),
@@ -2107,13 +2216,24 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                         app.cancel_run();
                     }
                 }
+                KeyCode::Enter if ctrl => {
+                    // Ctrl+Enter while a run is active queues the prompt for
+                    // the NEXT run; when idle it submits like plain Enter.
+                    if app.running {
+                        app.queue_prompt();
+                    } else {
+                        app.submit_prompt();
+                    }
+                }
                 KeyCode::Enter => {
                     if shift {
                         // Shift+Enter inserts a newline instead of submitting.
                         app.input.insert('\n');
-                    } else if !app.running {
-                        let prompt = app.input.take_text();
-                        app.start_run(prompt);
+                    } else {
+                        // Enter submits the prompt: it starts a run when idle,
+                        // and steers the running agent/delegate while a run is
+                        // in flight.
+                        app.submit_prompt();
                     }
                 }
                 KeyCode::Tab => {

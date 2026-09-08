@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result, bail};
-use comrade_tool::{ToolContext, ToolRegistry};
+use comrade_tool::{Steer, ToolContext, ToolRegistry};
 use futures_util::future::join_all;
 use std::future::Future;
 use std::pin::Pin;
@@ -323,6 +323,23 @@ pub struct AgentOutcome {
     pub iterations: usize,
 }
 
+/// Inject any steering messages the human typed while a run was in flight into
+/// the model history. Steers are only ever applied at a loop's rest point —
+/// the top of an iteration, before the next model request and after the
+/// previous turn's tool results were pushed — so message ordering with
+/// assistant tool calls stays API-valid. The root agent loop and a nested
+/// delegate sub-loop drain the same [`Steer`] bus (shared via
+/// [`ToolContext::steer`]); whichever owns the loop at the moment receives the
+/// message, and leftovers are seen by the root once a delegate hands back.
+pub(crate) async fn drain_steer(steer: Option<&Steer>, history: &mut ContextManager) {
+    let Some(steer) = steer else {
+        return;
+    };
+    for text in steer.drain().await {
+        history.push(ChatMessage::new(Role::User, text));
+    }
+}
+
 /// Build the rolling message history (system prompt + budget manager) for one
 /// session. Sessions that run many tasks keep the returned manager and hand it
 /// to [`run_agent_with_history`] each time, so context survives task
@@ -449,6 +466,11 @@ async fn run_agent_loop(
         // Stale approval notes from a previous turn must not leak into a later
         // confirmation; the current turn sets them again below.
         ctx.clear_approval();
+
+        // A steer typed while this run was in flight reaches the model at its
+        // next rest point, injected BEFORE the budget is enforced so compaction
+        // can still make room for it.
+        drain_steer(ctx.steer.as_ref(), ctxm).await;
 
         ctxm.enforce_budget();
 
@@ -1255,6 +1277,152 @@ mod tests {
         ])
     }
 
+    /// Like [`spawn_model_with`], but each raw REQUEST body (read per
+    /// Content-Length) is forwarded to the returned channel first, so tests
+    /// can assert what the agent was actually asked on every turn.
+    fn spawn_model_spy(responses: &[&str]) -> (u16, std::sync::mpsc::Receiver<String>) {
+        let responses: Vec<String> = responses.iter().map(|s| s.to_string()).collect();
+        let responses = Arc::new(responses);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let calls = Arc::new(AtomicUsize::new(0));
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let mut data = Vec::new();
+                let mut tmp = [0u8; 8192];
+                let mut body_len: Option<usize> = None;
+                let mut header_end: Option<usize> = None;
+                while body_len.map_or(true, |len| header_end.unwrap_or(0) + 4 + len > data.len()) {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(r) => {
+                            data.extend_from_slice(&tmp[..r]);
+                            if header_end.is_none() {
+                                if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    header_end = Some(p);
+                                    let head =
+                                        String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
+                                    body_len = head.lines().find_map(|l| {
+                                        l.trim()
+                                            .strip_prefix("content-length:")
+                                            .and_then(|v| v.trim().parse().ok())
+                                    });
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let body = match (header_end, body_len) {
+                    (Some(he), Some(len)) => {
+                        let start = he + 4;
+                        let end = (start + len).min(data.len());
+                        String::from_utf8_lossy(&data[start..end]).into_owned()
+                    }
+                    _ => String::new(),
+                };
+                let _ = tx.send(body);
+                let content = responses
+                    .get(n)
+                    .map(String::as_str)
+                    .unwrap_or_else(|| responses.last().map(String::as_str).unwrap_or("All done."));
+                // Split into two SSE chunks to exercise the accumulator.
+                let half = content.len() / 2;
+                let (a, b) = content.split_at(half);
+                let body = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":{:?}}}}}]}}\n\n\
+                     data: {{\"choices\":[{{\"delta\":{{\"content\":{:?}}}}}]}}\n\n\
+                     data: [DONE]\n\n",
+                    a, b
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (port, rx)
+    }
+
+    /// Wait (with a timeout) for the next request body the fake model saw.
+    async fn recv_body(rx: &std::sync::mpsc::Receiver<String>) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(b) = rx.try_recv() {
+                return b;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for a model request");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A message pushed into the run's steering pipe is drained at the top of
+    /// the loop and injected into the model history as a user message, so the
+    /// very first model request carries it (mid-run steers take the same
+    /// per-iteration drain path).
+    #[tokio::test]
+    async fn queued_steer_reaches_the_first_model_request() {
+        let (port, bodies) = spawn_model_spy(&[
+            "Thought: try a tool\nTool: no_such_tool\nArgs: {\"x\": 1}",
+            "All done.",
+        ]);
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "fake".into();
+
+        let (tx, _events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        let root = std::env::temp_dir().join(format!("comrade-agent-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let undo = Arc::new(MemoryUndo::new(root.clone()));
+
+        let (steer, steer_tx) = comrade_tool::Steer::channel();
+        steer_tx
+            .send("stop reading and implement now".to_string())
+            .unwrap();
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: undo.clone(),
+            auto_approve: true,
+            approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: Some(steer),
+            stop: None,
+        };
+        let tools = ToolRegistry::new();
+        let client = LlmClient::new(&cfg.llm).unwrap();
+
+        let outcome = run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            "do the thing".to_string(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.final_answer, "All done.");
+
+        let first = recv_body(&bodies).await;
+        assert!(
+            first.contains("stop reading and implement now"),
+            "the steer must ride in the first model request"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn agent_streams_and_loops_until_final() {
         let port = spawn_fake_model();
@@ -1285,6 +1453,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
             stop: None,
         };
         let tools = ToolRegistry::new();
@@ -1396,6 +1565,7 @@ mod tests {
             auto_approve: false,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
             stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1468,6 +1638,7 @@ mod tests {
             auto_approve: false,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
             stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1567,6 +1738,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
             stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1746,6 +1918,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
             stop: None,
         };
         let delegate_tool = crate::delegate::DelegateTool::new(
@@ -1834,6 +2007,7 @@ mod tests {
             auto_approve: false,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
             stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1977,6 +2151,7 @@ mod loop_tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
             stop: None,
         };
         let tools = ToolRegistry::new();

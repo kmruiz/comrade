@@ -1198,6 +1198,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
             stop: None,
         };
         let list = ListFiles;
@@ -1287,6 +1288,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
             stop: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
