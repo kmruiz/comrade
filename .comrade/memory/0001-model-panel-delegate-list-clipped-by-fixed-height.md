@@ -13,3 +13,6 @@ User report: "in the model section of the UI, the delegate list is empty" even t
 ## Consequences
 When no delegates are configured the height is unchanged (6), so the default layout is identical. With many delegates the model panel grows at the plan panel's expense (plan is Min(0)); many-delegate configs could squeeze the plan to zero height on small terminals.
 
+
+## Note
+Follow-up: delegate lines were still overflowing the panel once descriptions were shown (name + model + " — " + blurb, often far wider than the 30% right column). Fixed in tui.rs by word-wrapping each entry to the panel inner width via a shared delegate_panel_rows() helper (used by both draw() for sizing stats_h and draw_stats for rendering), with descriptions collapsed to single spaces; the model panel now grows by the wrapped row count and is capped at rows[1].height. Regression test: delegate_panel_rows_wrap_inside_the_panel_width (36 tui tests pass).

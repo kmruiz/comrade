@@ -14,8 +14,8 @@ use anyhow::{Context as _, Result};
 use arboard::Clipboard;
 use async_trait::async_trait;
 use comrade_core::{
-    AgentEvent, AgentSession, ChatMessage, ContextManager, MemoryUndo, Role, build_session_context,
-    run_agent_with_history,
+    AgentEvent, AgentSession, ChatMessage, ContextManager, DelegateCfg, MemoryUndo, Role,
+    build_session_context, run_agent_with_history,
 };
 use comrade_tool::{PlanStatus, SessionControl, ToolContext, UserIo, UserPrompt, UserReply};
 use crossterm::event::{
@@ -1423,10 +1423,17 @@ fn draw(app: &mut App, frame: &mut Frame) {
         .constraints([Constraint::Min(20), Constraint::Percentage(30)])
         .split(rows[1]);
     draw_chat(app, frame, cols[0]);
-    // The model panel shows one fixed row (label) plus one row per configured
-    // delegate under the usage line; grow it so delegate names are never
+    // The model panel shows three fixed rows (label, gauge, usage) plus one row
+    // per wrapped delegate line under them; grow it so delegate text is never
     // clipped out of view. The plan panel takes whatever is left.
-    let stats_h = 6 + app.cfg.delegates.len() as u16;
+    // (6 = 2 border + 3 fixed rows + 1 header + the "delegates:" line's slack;
+    // keeping the no-delegate layout unchanged at 6.)
+    let delegate_rows = delegate_panel_rows(
+        &app.cfg.delegates,
+        usize::from(cols[1].width.saturating_sub(2)).max(1),
+    );
+    let delegate_h = delegate_rows.as_ref().map_or(0, |r| r.len() as u16 - 1);
+    let stats_h = (6 + delegate_h).min(rows[1].height);
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(stats_h), Constraint::Min(0)])
@@ -2156,6 +2163,47 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
     }
 }
 
+/// The rows rendered under "delegates:" in the model panel, each one fitted to
+/// `width` columns so no delegate line can spill past the panel's right edge
+/// (or off the screen on a narrow terminal). `None` when no delegate is
+/// configured. Mirrors the plan panel: long names/models/descriptions are
+/// collapsed to single spaces and word-wrapped.
+fn delegate_panel_rows(delegates: &[DelegateCfg], width: usize) -> Option<Vec<Line<'static>>> {
+    if delegates.is_empty() {
+        return None;
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+    let width = width.max(1);
+    let mut rows = vec![Line::from(Span::styled(
+        "delegates:",
+        dim.add_modifier(Modifier::BOLD),
+    ))];
+    // Reserve two columns of left indent for the wrapped body.
+    let body_width = width.saturating_sub(2).max(1);
+    for d in delegates {
+        let label = if d.name == d.llm.model {
+            d.name.clone()
+        } else {
+            format!("{} ({})", d.name, d.llm.model)
+        };
+        let mut text = label;
+        if !d.description.trim().is_empty() {
+            text.push_str(" — ");
+            text.push_str(d.description.trim());
+        }
+        for wrapped in wrap_toks(&[tok(flat(&text), dim)], body_width) {
+            let mut spans = vec![Span::styled("  ", dim)];
+            spans.extend(
+                wrapped
+                    .iter()
+                    .map(|t| Span::styled(t.text.clone(), t.style)),
+            );
+            rows.push(Line::from(spans));
+        }
+    }
+    Some(rows)
+}
+
 fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" model ");
     let inner = block.inner(area);
@@ -2240,27 +2288,10 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(usage)), rows[2]);
 
     // Configured delegates ([[delegates]]) shown in the leftover space under
-    // the model gauge; clipped naturally when the panel is short.
-    if !app.cfg.delegates.is_empty() {
-        let dim = Style::default().fg(Color::DarkGray);
-        let mut delegate_lines = vec![Line::from(Span::styled(
-            "delegates:",
-            dim.add_modifier(Modifier::BOLD),
-        ))];
-        for d in &app.cfg.delegates {
-            let label = if d.name == d.llm.model {
-                d.name.clone()
-            } else {
-                format!("{} ({})", d.name, d.llm.model)
-            };
-            let mut line = format!("  {label}");
-            if !d.description.trim().is_empty() {
-                line.push_str(" — ");
-                line.push_str(d.description.trim());
-            }
-            delegate_lines.push(Line::from(Span::styled(line, dim)));
-        }
-        frame.render_widget(Paragraph::new(delegate_lines), rows[3]);
+    // the model gauge; word-wrapped to the panel width so long names or
+    // descriptions never spill past the right edge.
+    if let Some(delegate_rows) = delegate_panel_rows(&app.cfg.delegates, width) {
+        frame.render_widget(Paragraph::new(delegate_rows), rows[3]);
     }
     let _ = rows;
 }
@@ -3003,6 +3034,47 @@ mod tests {
         assert!(parse_delegate_reply("ERROR: delegate mistral failed").is_none());
         assert!(parse_delegate_reply("").is_none());
         assert!(parse_delegate_reply("delegate replied:\nno name").is_none());
+    }
+
+    #[test]
+    fn delegate_panel_rows_wrap_inside_the_panel_width() {
+        // A delegate whose label + model + description is far wider than the
+        // model panel must be wrapped, never left to spill past the edge.
+        let mut d = DelegateCfg::default();
+        d.name = "mistral".into();
+        d.llm.model = "ollama/mistral:7b".into();
+        d.description =
+            "Cheap and fast, good for basic coding tasks and summarising long outputs.".into();
+        let rows = delegate_panel_rows(&[d], 24).expect("rows for a configured delegate");
+        assert_eq!(rows[0].width(), 10); // "delegates:"
+        let joined: String = rows[1..]
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            rows.len() >= 4,
+            "a description wider than the panel must wrap onto several rows"
+        );
+        // Wrapping may split the blurb across rows, but must never drop a word.
+        for word in [
+            "mistral",
+            "ollama/mistral:7b",
+            "Cheap",
+            "summarising",
+            "outputs.",
+        ] {
+            assert!(joined.contains(word), "lost {word} in {joined:?}");
+        }
+        for row in &rows {
+            assert!(
+                usize::from(row.width()) <= 24,
+                "delegate row wider than the panel: {:?}",
+                row
+            );
+        }
+        // No delegate configured → the panel keeps its legacy fixed height.
+        assert!(delegate_panel_rows(&[], 24).is_none());
     }
 
     #[test]
