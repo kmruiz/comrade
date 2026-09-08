@@ -74,7 +74,7 @@ impl UserIo for TuiUserIo {
 // chat model
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum MsgKind {
     /// A message from the human user.
     User,
@@ -90,8 +90,14 @@ enum MsgKind {
     Reasoning,
     /// A reply from a delegated model, shown under that model's name.
     Delegate,
+    /// A folded digest of one completed stretch of activity (tool calls,
+    /// reasoning, failures, meta notes) between two spoken messages. The
+    /// original messages are kept in `Msg::children` and unfolded back on
+    /// demand, so per-card expand/copy/search keep working.
+    Run,
 }
 
+#[derive(Clone)]
 struct ToolCard {
     name: String,
     /// Display name of the model that invoked the tool (None for legacy rows).
@@ -105,6 +111,7 @@ struct ToolCard {
 }
 
 /// One failed test: name + captured failure detail.
+#[derive(Clone)]
 struct TestFail {
     name: String,
     detail: String,
@@ -121,6 +128,7 @@ struct TestSummary {
     cases: Vec<(String, String)>,
 }
 
+#[derive(Clone)]
 struct Msg {
     kind: MsgKind,
     text: String,
@@ -131,6 +139,9 @@ struct Msg {
     author: Option<String>,
     /// Open state of a collapsible Reasoning block.
     open: bool,
+    /// The original messages behind a folded [`MsgKind::Run`] digest. Empty for
+    /// every other kind.
+    children: Vec<Msg>,
 }
 
 impl Msg {
@@ -142,6 +153,7 @@ impl Msg {
             fail: None,
             author: None,
             open: false,
+            children: Vec::new(),
         }
     }
     fn authored(kind: MsgKind, author: impl Into<String>, text: impl Into<String>) -> Self {
@@ -152,6 +164,7 @@ impl Msg {
             fail: None,
             author: Some(author.into()),
             open: false,
+            children: Vec::new(),
         }
     }
     fn tool(card: ToolCard) -> Self {
@@ -162,6 +175,7 @@ impl Msg {
             fail: None,
             author: None,
             open: false,
+            children: Vec::new(),
         }
     }
     fn failure(name: String, detail: String) -> Self {
@@ -176,6 +190,19 @@ impl Msg {
             }),
             author: None,
             open: false,
+            children: Vec::new(),
+        }
+    }
+    /// A folded digest holding the messages of one completed activity stretch.
+    fn run(children: Vec<Msg>) -> Self {
+        Msg {
+            kind: MsgKind::Run,
+            text: String::new(),
+            tool: None,
+            fail: None,
+            author: None,
+            open: false,
+            children,
         }
     }
 }
@@ -364,6 +391,15 @@ impl App {
     }
 
     fn toggle_tool(&mut self, idx: usize) {
+        let is_run = match self.chat.get(idx).map(|m| m.kind) {
+            Some(MsgKind::Run) => true,
+            _ => false,
+        };
+        if is_run {
+            // Toggling a folded digest unfolds it back into its messages.
+            self.expand_run(idx);
+            return;
+        }
         if let Some(m) = self.chat.get_mut(idx) {
             match m.kind {
                 MsgKind::Tool => {
@@ -379,6 +415,48 @@ impl App {
                 MsgKind::Reasoning => m.open = !m.open,
                 _ => {}
             }
+        }
+    }
+
+    /// Replace one folded digest with its children in place, then move the
+    /// selection onto the first child so Tab keeps drilling into it.
+    fn expand_run(&mut self, idx: usize) {
+        let Some(&(start, _)) = self.msg_ranges.get(idx) else {
+            unfold_run(&mut self.chat, idx);
+            if idx < self.chat.len() {
+                self.sel = Some(idx);
+            }
+            return;
+        };
+        unfold_run(&mut self.chat, idx);
+        self.sel = Some(idx.min(self.chat.len().saturating_sub(1)));
+        self.follow = false;
+        self.was_at_bottom = false;
+        self.scroll_top = start;
+    }
+
+    /// Fold every completed stretch of activity into a one-line digest. Runs
+    /// while a search is open would shift the search's message indices, so it
+    /// waits until the search closes. The selection cursor is re-anchored when
+    /// the fold swallows the message it pointed at.
+    fn fold_completed(&mut self) {
+        if self.search.is_some() {
+            return;
+        }
+        let sel = self.sel;
+        let spans = fold_completed_runs(&mut self.chat);
+        if spans.is_empty() {
+            return;
+        }
+        if let Some(mut s) = sel {
+            for &(start, len) in &spans {
+                if s > start && s < start + len {
+                    s = start;
+                } else if s >= start + len {
+                    s = s - (len - 1);
+                }
+            }
+            self.sel = (s < self.chat.len()).then_some(s);
         }
     }
 
@@ -450,19 +528,24 @@ impl App {
 
     // --- Ctrl-F search over chat history ----------------------------------
 
-    /// Recompute match indices from the current query, then jump to the first.
-    fn refresh_search(&mut self) {
+    /// All chat indices whose message matches the current query (folded run
+    /// digests match through their children).
+    fn collect_matches(&self) -> Vec<usize> {
         let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
-            return;
+            return Vec::new();
         };
         let ql = query.to_lowercase();
-        let matches: Vec<usize> = self
-            .chat
+        self.chat
             .iter()
             .enumerate()
             .filter(|(_, m)| msg_matches(m, &ql))
             .map(|(i, _)| i)
-            .collect();
+            .collect()
+    }
+
+    /// Recompute match indices from the current query, then jump to the first.
+    fn refresh_search(&mut self) {
+        let matches = self.collect_matches();
         if let Some(s) = &mut self.search {
             s.matches = matches;
             s.cur = 0;
@@ -471,7 +554,8 @@ impl App {
     }
 
     /// Scroll the current search match into view; expand collapsed cards so the
-    /// matched content is actually visible.
+    /// matched content is actually visible. A match inside a folded run digest
+    /// unfolds the digest first, then jumps to the child that actually matched.
     fn goto_search_match(&mut self) {
         let Some(idx) = self
             .search
@@ -480,6 +564,32 @@ impl App {
         else {
             return;
         };
+        let mut idx = idx;
+        let folded = match self.chat.get(idx).map(|m| m.kind) {
+            Some(MsgKind::Run) => true,
+            _ => false,
+        };
+        if folded {
+            let anchor = idx;
+            unfold_run(&mut self.chat, idx);
+            let matches = self.collect_matches();
+            if matches.is_empty() {
+                // Nothing matched once unfolded (should not happen): park on the
+                // first child of the digest.
+                idx = idx.min(self.chat.len().saturating_sub(1));
+                if let Some(s) = &mut self.search {
+                    s.matches.clear();
+                    s.cur = 0;
+                }
+            } else {
+                let cur = matches.iter().position(|&m| m >= anchor).unwrap_or(0);
+                idx = matches[cur];
+                if let Some(s) = &mut self.search {
+                    s.matches = matches;
+                    s.cur = cur;
+                }
+            }
+        }
         self.select_block(idx);
         if let Some(m) = self.chat.get_mut(idx) {
             if let Some(card) = &mut m.tool {
@@ -598,10 +708,14 @@ impl App {
                 self.stop = None;
                 self.stream.clear();
                 self.activity = None;
+                // Compact whatever the run left behind (interrupted runs end
+                // here without a final answer) before the status note.
+                self.fold_completed();
                 self.push_meta("run finished");
             }
             AgentEvent::User(u) => {
                 self.stream.clear();
+                self.fold_completed();
                 self.push_msg(Msg::authored(MsgKind::User, "you", u));
             }
             AgentEvent::Delta(d) => {
@@ -699,6 +813,9 @@ impl App {
             AgentEvent::FinalAnswer(a) => {
                 self.stream.clear();
                 self.activity = None;
+                // The stretch of tools that produced this answer is done: fold
+                // it to a digest so the answer reads cleanly above it.
+                self.fold_completed();
                 let visible = strip_react_scaffolding(&a);
                 if !visible.trim().is_empty() {
                     let author = self.actor_label();
@@ -742,6 +859,9 @@ impl App {
                     card.result = Some(format!("replied ({} chars)", reply.chars().count()));
                 }
                 if !reply.trim().is_empty() {
+                    // The delegate hand-off stretch (reads + the delegate call)
+                    // is done: fold it so the reply reads as a clean block.
+                    self.fold_completed();
                     self.push_msg(Msg::authored(MsgKind::Delegate, model, reply));
                 }
                 return;
@@ -1505,6 +1625,8 @@ fn search_step(state: Option<(usize, usize)>, dir: isize) -> Option<usize> {
 }
 
 /// Lowercased, searchable text of a message (chat body + tool/failure cards).
+/// A folded [`MsgKind::Run`] digest exposes every child, so Ctrl-F still finds
+/// text inside a collapsed run and copy_selected copies the whole stretch.
 fn msg_searchable(msg: &Msg) -> String {
     let mut s = msg.text.clone();
     if let Some(t) = &msg.tool {
@@ -1519,6 +1641,10 @@ fn msg_searchable(msg: &Msg) -> String {
     }
     if let Some(f) = &msg.fail {
         s.push_str(&format!("\n{}\n{}", f.name, f.detail));
+    }
+    for c in &msg.children {
+        s.push('\n');
+        s.push_str(&msg_searchable(c));
     }
     s
 }
@@ -2050,6 +2176,7 @@ fn layout_messages(
     for (i, msg) in app.chat.iter().enumerate() {
         let start = out.len();
         match msg.kind {
+            MsgKind::Run => layout_run(&mut out, i, &msg.children),
             MsgKind::Failure => layout_failure(&mut out, i, msg.fail.as_ref().unwrap(), width),
             MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), width),
             MsgKind::Reasoning => layout_reasoning(
@@ -2129,6 +2256,176 @@ fn layout_messages(
         }
     }
     (out, owner, ranges)
+}
+
+// ---------------------------------------------------------------------------
+// run folding: collapse a completed stretch of activity into one digest row
+// ---------------------------------------------------------------------------
+
+/// Kinds that belong to a folded run when they appear between two spoken
+/// messages (User/Assistant/Delegate): tool calls, failure blocks, reasoning
+/// and the grey status notes that interleave with them. Agent `error:` notes
+/// are left out on purpose: they are the reason an interrupted run stopped, so
+/// they stay visible instead of being buried in a digest.
+fn is_run_member(m: &Msg) -> bool {
+    match m.kind {
+        MsgKind::Tool | MsgKind::Reasoning | MsgKind::Failure => true,
+        MsgKind::Meta => !m.text.trim_start().starts_with("error:"),
+        _ => false,
+    }
+}
+
+/// Whether a folded span carries at least one tool call or failure. Pure
+/// reasoning/meta notes are left as-is: they already read as one line each.
+fn span_has_action(msgs: &[Msg]) -> bool {
+    msgs.iter()
+        .any(|m| matches!(m.kind, MsgKind::Tool | MsgKind::Failure))
+}
+
+/// A completed segment is folded into a single digest row whose children keep
+/// every original message (closed, so the transcript stays short) for later
+/// unfold. Spoken messages and already-folded digests split spans and are
+/// never themselves folded. Returns the replaced `(start, len)` ranges so
+/// callers can fix up cached message indices (selection cursor).
+fn fold_completed_runs(chat: &mut Vec<Msg>) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    let n = chat.len();
+    while i < n {
+        if !is_run_member(&chat[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && is_run_member(&chat[i]) {
+            i += 1;
+        }
+        let len = i - start;
+        if span_has_action(&chat[start..i]) {
+            spans.push((start, len));
+        }
+    }
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(chat.len());
+    let mut cursor = 0;
+    for &(start, len) in &spans {
+        out.extend(chat[cursor..start].iter().cloned());
+        let mut children: Vec<Msg> = chat[start..start + len].to_vec();
+        // Auto-collapse stale open cards (diffs, test results, failures,
+        // reasoning) now that the stretch has finished.
+        for m in &mut children {
+            match m.kind {
+                MsgKind::Tool => {
+                    if let Some(c) = &mut m.tool {
+                        c.open = false;
+                    }
+                }
+                MsgKind::Failure => {
+                    if let Some(f) = &mut m.fail {
+                        f.open = false;
+                    }
+                }
+                MsgKind::Reasoning => m.open = false,
+                _ => {}
+            }
+        }
+        out.push(Msg::run(children));
+        cursor = start + len;
+    }
+    out.extend(chat[cursor..].iter().cloned());
+    *chat = out;
+    spans
+}
+
+/// Replace one folded [`MsgKind::Run`] digest with its original children, in
+/// place, so every child becomes a normal selectable/searchable message again.
+fn unfold_run(chat: &mut Vec<Msg>, idx: usize) {
+    let is_run = match chat.get(idx).map(|m| m.kind) {
+        Some(MsgKind::Run) => true,
+        _ => false,
+    };
+    if !is_run {
+        return;
+    }
+    let children = std::mem::take(&mut chat[idx].children);
+    let mut rest = chat.split_off(idx + 1);
+    chat.pop(); // drop the emptied digest
+    chat.extend(children);
+    chat.append(&mut rest);
+}
+
+/// Reading/search tools are the chat's filler: many calls, little news. They
+/// are rendered dimmed and skipped in a run digest's action summary.
+fn is_read_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "read_ranges"
+            | "list_dir"
+            | "list_files"
+            | "rgrep"
+            | "list_symbols"
+            | "find_symbol"
+            | "find_definition"
+            | "read_symbol"
+            | "structural_map"
+            | "references_count"
+            | "find_references"
+            | "project_model"
+    )
+}
+
+/// What a folded run did, boiled down for its one-line header: how many tool
+/// calls, whether anything failed, and the non-read tools used (with counts).
+struct RunDigest {
+    calls: usize,
+    ok: bool,
+    failed: usize,
+    actions: String,
+}
+
+fn run_digest(children: &[Msg]) -> RunDigest {
+    let calls = children.iter().filter(|m| m.kind == MsgKind::Tool).count();
+    let failed = children
+        .iter()
+        .filter(|m| {
+            m.kind == MsgKind::Failure
+                || (m.kind == MsgKind::Tool && m.tool.as_ref().is_some_and(|t| !t.ok))
+        })
+        .count();
+    // Non-read tool names in first-seen order, counts folded in (×n).
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    for m in children {
+        if let Some(t) = &m.tool {
+            if is_read_tool(&t.name) {
+                continue;
+            }
+            if let Some((_, c)) = seen.iter_mut().find(|(n, _)| *n == t.name) {
+                *c += 1;
+            } else {
+                seen.push((t.name.clone(), 1));
+            }
+        }
+    }
+    let actions = seen
+        .iter()
+        .map(|(n, c)| {
+            if *c > 1 {
+                format!("{n} ×{c}")
+            } else {
+                n.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    RunDigest {
+        calls,
+        ok: failed == 0,
+        failed,
+        actions,
+    }
 }
 
 // Per-task header helpers: a light "custom UI" per tool family so a chat row
@@ -2415,23 +2712,100 @@ fn layout_failure(out: &mut Vec<RenderRow>, msg_idx: usize, fail: &TestFail, wid
     }
 }
 
+/// One-line digest of a folded run: clicking/Tab unfolds it back into its
+/// original messages.
+fn layout_run(out: &mut Vec<RenderRow>, msg_idx: usize, children: &[Msg]) {
+    let d = run_digest(children);
+    let dim = Style::default().fg(Color::DarkGray);
+    let author = children
+        .iter()
+        .filter_map(|m| m.tool.as_ref())
+        .filter_map(|t| t.author.as_deref())
+        .next();
+    let status = if d.calls > 0 && d.ok {
+        Some(Span::styled(
+            "✓",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else if d.failed > 0 {
+        Some(Span::styled(
+            format!(
+                "✗ {}{}",
+                d.failed,
+                if d.failed > 1 { " failed" } else { " failure" }
+            ),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        None
+    };
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled("> ", dim),
+        Span::styled(
+            "task run",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(a) = author {
+        spans.push(Span::styled(format!(" · {a}"), dim));
+    }
+    if d.calls > 0 {
+        spans.push(Span::styled(
+            format!(" · {} call{}", d.calls, if d.calls == 1 { "" } else { "s" }),
+            dim,
+        ));
+    }
+    if let Some(s) = status {
+        spans.push(Span::styled("  ", dim));
+        spans.push(s);
+    }
+    if !d.actions.is_empty() {
+        spans.push(Span::styled(format!("  · {}", cap(&d.actions, 60)), dim));
+    }
+    out.push(RenderRow {
+        rule: None,
+        spans,
+        tool_header: Some(msg_idx),
+    });
+}
+
 fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width: usize) {
     let (icon, accent) = tool_icon(&card.name);
-    let mut spans: Vec<Span<'static>> = vec![
-        Span::styled(
-            if card.open { "v " } else { "> " },
-            Style::default().fg(Color::DarkGray),
-        ),
+    // Reading/search tools are the chat's filler; dim them so prose and the
+    // actions that changed something stand out (visual tier 3).
+    let read = is_read_tool(&card.name);
+    let glyph = if read {
+        Span::styled(icon, Style::default().fg(Color::DarkGray))
+    } else {
         Span::styled(
             icon,
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ),
+        )
+    };
+    let name = if read {
+        Span::styled(
+            format!(" {}", card.name),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
         Span::styled(
             format!(" {}", card.name),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
+        )
+    };
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(
+            if card.open { "v " } else { "> " },
+            Style::default().fg(Color::DarkGray),
         ),
+        glyph,
+        name,
     ];
     if let Some(a) = card.author.as_deref() {
         spans.push(Span::styled(
@@ -2442,7 +2816,7 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
     if let Some(h) = tool_headline(&card.name, &card.args) {
         spans.push(Span::styled(
             format!("  {h}"),
-            Style::default().fg(Color::White),
+            Style::default().fg(if read { Color::DarkGray } else { Color::White }),
         ));
     }
     if let Some(j) = card.justification.as_deref() {
@@ -3603,6 +3977,192 @@ mod tests {
         assert_eq!(step_user(&users, Some(4), 1), None); // already at last user
         assert_eq!(step_user(&users, Some(4), -1), Some(0));
         assert_eq!(step_user(&[], Some(0), 1), None);
+    }
+
+    // --- run folding ------------------------------------------------------
+
+    fn tool_card(name: &str, args: &str, ok: bool, open: bool) -> Msg {
+        Msg::tool(ToolCard {
+            name: name.into(),
+            author: Some("model".into()),
+            args: args.into(),
+            justification: None,
+            risk: None,
+            result: None,
+            ok,
+            open,
+        })
+    }
+
+    fn kinds(chat: &[Msg]) -> Vec<MsgKind> {
+        chat.iter().map(|m| m.kind).collect()
+    }
+
+    #[test]
+    fn run_folding_compresses_tool_spans_between_prose() {
+        let mut chat = vec![
+            Msg::authored(MsgKind::User, "you", "do the thing"),
+            Msg::authored(MsgKind::Reasoning, "model", "let me look"),
+            tool_card("read_file", r#"{"path":"src/x.rs"}"#, true, false),
+            tool_card("apply_patch", r#"{"path":"src/x.rs"}"#, true, true),
+            Msg::text(MsgKind::Meta, "all 3 tests passed"),
+            Msg::authored(MsgKind::Assistant, "model", "done"),
+            tool_card("run_task", r#"{"task":"fmt"}"#, true, false),
+            Msg::authored(MsgKind::Assistant, "model", "also formatted"),
+        ];
+        let spans = fold_completed_runs(&mut chat);
+        assert_eq!(spans, vec![(1, 4), (6, 1)]);
+        assert_eq!(
+            kinds(&chat),
+            vec![
+                MsgKind::User,
+                MsgKind::Run,
+                MsgKind::Assistant,
+                MsgKind::Run,
+                MsgKind::Assistant,
+            ]
+        );
+        // Reasoning + read + apply_patch + the status note ride inside the
+        // digest; nothing is lost.
+        assert_eq!(chat[1].children.len(), 4);
+        assert_eq!(chat[3].children.len(), 1);
+        assert_eq!(chat[3].children[0].kind, MsgKind::Tool);
+    }
+
+    #[test]
+    fn run_folding_skips_pure_meta_and_reasoning() {
+        // A lone grey note ("run finished") is not an action stretch and stays
+        // visible as-is.
+        let mut chat = vec![
+            Msg::authored(MsgKind::User, "you", "hi"),
+            Msg::text(MsgKind::Meta, "waiting for your input"),
+            Msg::authored(MsgKind::Assistant, "model", "ok"),
+            Msg::authored(MsgKind::Reasoning, "model", "thinking only"),
+        ];
+        assert!(fold_completed_runs(&mut chat).is_empty());
+        assert_eq!(
+            kinds(&chat),
+            vec![
+                MsgKind::User,
+                MsgKind::Meta,
+                MsgKind::Assistant,
+                MsgKind::Reasoning,
+            ]
+        );
+    }
+
+    #[test]
+    fn error_notes_stay_visible_outside_the_digest() {
+        // An interrupted run must not bury the "why it stopped" note inside the
+        // folded digest: the error line acts as a boundary and stays on screen.
+        let mut chat = vec![
+            Msg::authored(MsgKind::User, "you", "go"),
+            tool_card("apply_patch", "{}", true, false),
+            Msg::text(MsgKind::Meta, "error: agent interrupted by user"),
+        ];
+        fold_completed_runs(&mut chat);
+        assert_eq!(
+            kinds(&chat),
+            vec![MsgKind::User, MsgKind::Run, MsgKind::Meta]
+        );
+        assert!(chat[2].text.starts_with("error:"));
+        assert_eq!(chat[1].children.len(), 1);
+    }
+
+    #[test]
+    fn run_folding_auto_collapses_stale_open_bodies() {
+        let mut chat = vec![
+            tool_card("apply_patch", r#"{"path":"a"}"#, true, true),
+            Msg::text(MsgKind::Meta, "approved"),
+            tool_card("run_task", r#"{"task":"t"}"#, false, true),
+        ];
+        fold_completed_runs(&mut chat);
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].kind, MsgKind::Run);
+        let children = &chat[0].children;
+        assert!(!children[0].tool.as_ref().unwrap().open);
+        assert!(!children[2].tool.as_ref().unwrap().open);
+    }
+
+    #[test]
+    fn unfolded_run_restores_the_original_messages() {
+        let mut chat = vec![
+            Msg::authored(MsgKind::User, "you", "go"),
+            tool_card("rgrep", r#"{"pattern":"x"}"#, true, false),
+            tool_card("run_tests", "[]", true, true),
+            Msg::authored(MsgKind::Assistant, "model", "done"),
+        ];
+        fold_completed_runs(&mut chat);
+        assert_eq!(chat[1].kind, MsgKind::Run);
+        let folded = chat.clone();
+        unfold_run(&mut chat, 1);
+        assert_eq!(kinds(&chat).len(), 4);
+        assert_eq!(chat[1].kind, MsgKind::Tool);
+        assert_eq!(chat[1].children.len(), 0);
+        // Children come back in order; the digest itself is gone.
+        let back: Vec<MsgKind> = folded[1].children.iter().map(|m| m.kind).collect();
+        assert_eq!(back, vec![MsgKind::Tool, MsgKind::Tool]);
+        // Unfolding a non-digest is a no-op.
+        let mut chat2 = chat.clone();
+        unfold_run(&mut chat2, 0);
+        assert_eq!(chat2.len(), chat.len());
+    }
+
+    #[test]
+    fn run_digest_counts_calls_and_skips_reads_in_actions() {
+        let children = vec![
+            tool_card("read_file", "{}", true, false),
+            tool_card("rgrep", "{}", true, false),
+            tool_card("apply_patch", "{}", true, false),
+            tool_card("run_tests", "{}", true, false),
+        ];
+        let d = run_digest(&children);
+        assert_eq!(d.calls, 4);
+        assert!(d.ok);
+        assert_eq!(d.failed, 0);
+        assert!(!d.actions.contains("read_file"));
+        assert!(!d.actions.contains("rgrep"));
+        assert!(d.actions.contains("apply_patch"));
+        assert!(d.actions.contains("run_tests"));
+
+        let failing = vec![tool_card("run_task", "{}", false, false)];
+        let d = run_digest(&failing);
+        assert!(!d.ok);
+        assert_eq!(d.failed, 1);
+
+        // Repeated actions are counted (×n).
+        let repeated = vec![
+            tool_card("apply_patch", "{}", true, false),
+            tool_card("apply_patch", "{}", true, false),
+        ];
+        assert!(run_digest(&repeated).actions.contains("apply_patch ×2"));
+    }
+
+    #[test]
+    fn folded_run_is_searchable_and_copied_through_its_children() {
+        let children = vec![tool_card("run_tests", r#"{"args":"tests"}"#, false, false)];
+        let run = Msg::run(children);
+        let searchable = msg_searchable(&run);
+        assert!(searchable.contains("run_tests"));
+        assert!(msg_matches(&run, "run_tests"));
+        // Folded content is found even though only the digest row renders.
+        assert!(msg_matches(&run, "tests"));
+    }
+
+    #[test]
+    fn run_digest_renders_as_one_clickable_header_row() {
+        let children = vec![
+            tool_card("read_file", "{}", true, false),
+            tool_card("apply_patch", "{}", true, false),
+        ];
+        let mut out = Vec::new();
+        layout_run(&mut out, 7, &children);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tool_header, Some(7));
+        let flat: String = out[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(flat.contains("task run"), "{flat}");
+        assert!(flat.contains("2 calls"), "{flat}");
+        assert!(flat.contains("✓"), "{flat}");
     }
 
     #[test]
