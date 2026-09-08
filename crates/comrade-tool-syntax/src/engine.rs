@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 
 const MAX_FILE_BYTES: u64 = 1_000_000;
 
@@ -174,24 +174,30 @@ pub struct SymbolDef {
     pub body: Option<String>,
 }
 
-/// Find the declaration of `symbol` across the project (or `path`).
+/// Find the declaration of `symbol` across the project (or `path`). `kind`
+/// optionally narrows to one declaration kind (short label, e.g. `"fn"`); a
+/// leading kind prefix on `symbol` itself ("fn compute") is stripped and used
+/// as the filter.
 pub fn find_definition(
     root: &Path,
     symbol: &str,
     path: Option<&str>,
     only: Option<&HashSet<PathBuf>>,
+    kind: Option<&str>,
 ) -> Result<Option<SymbolDef>> {
-    find_decl(root, symbol, path, only, false)
+    find_decl(root, symbol, path, only, kind, false)
 }
 
-/// Find the declaration of `symbol` and return its whole body.
+/// Find the declaration of `symbol` and return its whole body. See
+/// [`find_definition`] for the `kind` semantics.
 pub fn read_symbol(
     root: &Path,
     symbol: &str,
     path: Option<&str>,
     only: Option<&HashSet<PathBuf>>,
+    kind: Option<&str>,
 ) -> Result<Option<SymbolDef>> {
-    find_decl(root, symbol, path, only, true)
+    find_decl(root, symbol, path, only, kind, true)
 }
 
 fn find_decl(
@@ -199,8 +205,21 @@ fn find_decl(
     symbol: &str,
     path: Option<&str>,
     only: Option<&HashSet<PathBuf>>,
+    kind: Option<&str>,
     want_body: bool,
 ) -> Result<Option<SymbolDef>> {
+    // A kind keyword smuggled into the symbol ("fn compute") becomes the kind
+    // filter; the bare identifier is what must equal a declaration's name.
+    let (prefix_kind, symbol) = split_kind_prefix(symbol);
+    let kind = match (prefix_kind, kind) {
+        (Some(p), Some(k)) if !p.eq_ignore_ascii_case(k) => {
+            bail!(
+                "symbol {symbol:?} already names kind {p:?}, which conflicts with the kind filter {k:?}"
+            )
+        }
+        (Some(p), _) => Some(p),
+        (None, k) => k,
+    };
     for (rel, text) in collect_files(root, path, only)? {
         let ext = Path::new(&rel)
             .extension()
@@ -219,6 +238,7 @@ fn find_decl(
         loop {
             let node = cursor.node();
             if is_decl_kind(node.kind())
+                && kind.is_none_or(|k| short_kind(node.kind()).eq_ignore_ascii_case(k))
                 && let Some(name) = node.child_by_field_name("name")
                 && name.utf8_text(text.as_bytes()).unwrap_or("") == symbol
             {
@@ -270,6 +290,34 @@ fn is_decl_kind(kind: &str) -> bool {
     )
 }
 
+/// Short kind labels the tree-sitter tools accept as filters (mirrors
+/// [`short_kind`]). Rust source keywords doubled as decl labels stay distinct
+/// because a name filter always operates on the bare identifier after the
+/// keyword: "fn" is the function kind, "type" the type-alias kind.
+pub const KIND_LABELS: &[&str] = &[
+    "fn", "struct", "enum", "trait", "impl", "mod", "type", "static", "const",
+];
+
+/// When `input` starts with a kind keyword followed by whitespace ("fn
+/// compute", "struct Config"), split it into the kind label and the bare
+/// remainder. Returns `(None, input)` untouched otherwise. Case-insensitive on
+/// the keyword; the keyword must be whitespace-delimited so names like
+/// `typewriter` are never mistaken for a `type` prefix.
+pub fn split_kind_prefix(input: &str) -> (Option<&'static str>, &str) {
+    let head_end = input.find(char::is_whitespace).unwrap_or(input.len());
+    let head = &input[..head_end];
+    for &label in KIND_LABELS {
+        if head.eq_ignore_ascii_case(label) {
+            let rest = input[head_end..].trim_start();
+            if !rest.is_empty() {
+                return (Some(label), rest);
+            }
+            break;
+        }
+    }
+    (None, input)
+}
+
 /// One-line "head" of a declaration node: text up to the opening `{`, whitespace
 /// collapsed, capped.
 fn signature_of(node: &tree_sitter::Node, text: &str) -> String {
@@ -313,7 +361,9 @@ fn collect_decl_rows(
             continue;
         };
         let mut cursor = tree.walk();
-        let mut descend = true;
+        // Depth-first visit where every node is processed exactly once: descend
+        // eagerly and only ascend when a node has no children or no siblings,
+        // so a node is never re-visited after climbing back onto it.
         loop {
             let node = cursor.node();
             if is_decl_kind(node.kind()) || node.kind() == "impl_item" {
@@ -345,19 +395,13 @@ fn collect_decl_rows(
                     });
                 }
             }
-            if descend && cursor.goto_first_child() {
+            if cursor.goto_first_child() {
                 continue;
             }
-            loop {
-                if cursor.goto_next_sibling() {
-                    descend = true;
-                    break;
-                }
+            while !cursor.goto_next_sibling() {
                 if !cursor.goto_parent() {
                     return Ok(rows);
                 }
-                descend = false;
-                break;
             }
         }
     }
@@ -392,17 +436,31 @@ pub fn list_symbol_signatures(
 
 /// Find declarations whose name contains `query` (case-insensitive). Returns
 /// rows `kind name | signature @ line` so the caller can pick the right symbol
-/// and then read only its body.
+/// and then read only its body. `kind` optionally narrows to one declaration
+/// kind; a leading kind keyword in `query` itself ("fn compute") is stripped
+/// and used as the filter, so a bare name search never has to carry "fn ".
 pub fn search_symbols(
     root: &Path,
     query: &str,
     path: Option<&str>,
     only: Option<&HashSet<PathBuf>>,
+    kind: Option<&str>,
 ) -> Result<Vec<String>> {
+    let (prefix_kind, query) = split_kind_prefix(query);
+    let kind = match (prefix_kind, kind) {
+        (Some(p), Some(k)) if !p.eq_ignore_ascii_case(k) => {
+            bail!(
+                "query {query:?} already names kind {p:?}, which conflicts with the kind filter {k:?}"
+            )
+        }
+        (Some(p), _) => Some(p),
+        (None, k) => k,
+    };
     let q = query.to_lowercase();
     Ok(collect_decl_rows(root, path, only)?
         .into_iter()
         .filter(|r| r.text.to_lowercase().contains(&q))
+        .filter(|r| kind.is_none_or(|k| r.label.eq_ignore_ascii_case(k)))
         .map(|r| format!("{} {} | {} @ {}", r.label, r.text, r.signature, r.line))
         .collect())
 }

@@ -2,6 +2,8 @@
 
 mod engine;
 
+use engine::KIND_LABELS;
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -76,6 +78,25 @@ fn is_valid_identifier(s: &str) -> bool {
     chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
+/// Validate an optional declaration-kind filter. Accepts the short labels
+/// (`fn`, `struct`, ...) case-insensitively and returns the canonical label.
+fn normalize_kind(kind: Option<&str>) -> Result<Option<&str>> {
+    let Some(k) = kind.map(str::trim).filter(|k| !k.is_empty()) else {
+        return Ok(None);
+    };
+    KIND_LABELS
+        .iter()
+        .find(|l| l.eq_ignore_ascii_case(k))
+        .copied()
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown kind {k:?}; expected one of {}",
+                KIND_LABELS.join(", ")
+            )
+        })
+}
+
 // ---------------------------------------------------------------------------
 // find_references
 // ---------------------------------------------------------------------------
@@ -115,18 +136,21 @@ impl Tool for FindReferences {
             git_modified_only: bool,
         }
         let args: Args = serde_json::from_value(args)?;
+        // A "fn foo" style kind keyword is not an identifier: strip it so the
+        // token search looks for the bare name.
+        let symbol = engine::split_kind_prefix(&args.symbol).1;
         let scope = changed_scope(ctx, args.git_modified_only)?;
         guard_path_scope(ctx, &args.path, &scope)?;
         let occ = engine::find_occurrences(
             &ctx.project_root,
-            &args.symbol,
+            symbol,
             args.path.as_deref(),
             scope.as_ref(),
         )?;
         if occ.is_empty() {
-            return Ok(format!("No occurrences of {:?} found.", args.symbol));
+            return Ok(format!("No occurrences of {:?} found.", symbol));
         }
-        let mut out = format!("Occurrences of {}:\n", args.symbol);
+        let mut out = format!("Occurrences of {symbol}:\n");
         let mut seen = 0usize;
         for o in &occ {
             out.push_str(&format!(
@@ -188,28 +212,29 @@ impl Tool for Rename {
             git_modified_only: bool,
         }
         let args: Args = serde_json::from_value(args)?;
-        if !is_valid_identifier(&args.symbol) {
-            anyhow::bail!("{:?} is not a valid identifier", args.symbol);
+        // "fn helper" means the helper: kind keywords are not part of the name.
+        let symbol = engine::split_kind_prefix(&args.symbol).1;
+        if !is_valid_identifier(symbol) {
+            anyhow::bail!("{symbol:?} is not a valid identifier");
         }
         if !is_valid_identifier(&args.new_name) {
             anyhow::bail!("{:?} is not a valid identifier", args.new_name);
         }
-        if args.symbol == args.new_name {
+        if symbol == args.new_name {
             anyhow::bail!("new name equals old name");
         }
         let scope = changed_scope(ctx, args.git_modified_only)?;
         guard_path_scope(ctx, &args.path, &scope)?;
         let edits = engine::rename_edits(
             &ctx.project_root,
-            &args.symbol,
+            symbol,
             args.path.as_deref(),
             scope.as_ref(),
         )?;
         let total: usize = edits.iter().map(|e| e.spans.len()).sum();
         if total == 0 {
             return Ok(format!(
-                "No occurrences of {:?} found; nothing renamed.",
-                args.symbol
+                "No occurrences of {symbol:?} found; nothing renamed."
             ));
         }
 
@@ -237,7 +262,6 @@ impl Tool for Rename {
         ctx.confirm(
             format!(
                 "rename {symbol} -> {new_name} ({total} occurrences)",
-                symbol = args.symbol,
                 new_name = args.new_name
             ),
             Some(preview),
@@ -311,11 +335,6 @@ impl Tool for ListSymbols {
 // structural_map
 // ---------------------------------------------------------------------------
 
-/// Short kind labels accepted by the `kinds` filter, mirroring the engine.
-const KIND_LABELS: &[&str] = &[
-    "fn", "struct", "enum", "trait", "impl", "mod", "type", "static", "const",
-];
-
 struct StructuralMap;
 
 static STRUCTURAL_MAP_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
@@ -388,11 +407,12 @@ struct FindDefinition;
 static FIND_DEFINITION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "find_definition".into(),
-    description: "Locate where a symbol is defined and return its kind, one-line signature, and file:line — never the whole body. Cheaper than reading the file when you only need to know a declaration.".into(),
+    description: "Locate where a symbol is defined and return its kind, one-line signature, and file:line — never the whole body. Cheaper than reading the file when you only need to know a declaration. Pass the bare identifier; the optional type narrows to one declaration kind, and a leading \"fn \" style prefix in symbol is stripped automatically.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "symbol": { "type": "string", "description": "Identifier to locate." },
+            "symbol": { "type": "string", "description": "Identifier to locate (bare name, not \"fn name\")." },
+            "type": { "type": "string", "enum": KIND_LABELS, "description": "Optional declaration kind to narrow to (fn, struct, enum, trait, impl, mod, type, static, const)." },
             "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." },
             "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD." }
         },
@@ -412,29 +432,44 @@ impl Tool for FindDefinition {
         #[derive(Deserialize)]
         struct Args {
             symbol: String,
+            #[serde(default, rename = "type")]
+            kind: Option<String>,
             #[serde(default)]
             path: Option<String>,
             #[serde(default)]
             git_modified_only: bool,
         }
         let args: Args = serde_json::from_value(args)?;
+        let kind = normalize_kind(args.kind.as_deref())?;
+        // Report the bare name (kind keywords in the input are a filter, not
+        // part of the identifier), and detect prefix-vs-filter conflicts.
+        let (pfx, bare) = engine::split_kind_prefix(&args.symbol);
+        if let (Some(p), Some(k)) = (pfx, kind) {
+            if !p.eq_ignore_ascii_case(k) {
+                anyhow::bail!(
+                    "symbol {:?} already names kind {p:?}, which conflicts with the type filter {k:?}",
+                    bare
+                );
+            }
+        }
         let scope = changed_scope(ctx, args.git_modified_only)?;
         guard_path_scope(ctx, &args.path, &scope)?;
         match engine::find_definition(
             &ctx.project_root,
-            &args.symbol,
+            bare,
             args.path.as_deref(),
             scope.as_ref(),
+            pfx.or(kind),
         )? {
             Some(def) => Ok(format!(
                 "`{symbol}` defined at {file}:{line}\nkind: {kind}\nsignature: {signature}",
-                symbol = args.symbol,
+                symbol = bare,
                 file = def.file,
                 line = def.line,
                 kind = def.kind,
                 signature = def.signature
             )),
-            None => Ok(format!("No definition found for {:?}.", args.symbol)),
+            None => Ok(format!("No definition found for {:?}.", bare)),
         }
     }
 }
@@ -448,11 +483,12 @@ struct ReadSymbol;
 static READ_SYMBOL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "read_symbol".into(),
-    description: "Read just one symbol's declaration body (function, struct, enum, trait, const, ...) with its file:line and signature. Use before editing a specific item instead of reading the whole file.".into(),
+    description: "Read just one symbol's declaration body (function, struct, enum, trait, const, ...) with its file:line and signature. Use before editing a specific item instead of reading the whole file. Pass the bare identifier; the optional type narrows to one declaration kind, and a leading \"fn \" style prefix in symbol is stripped automatically.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "symbol": { "type": "string", "description": "Identifier whose declaration body to read." },
+            "symbol": { "type": "string", "description": "Identifier whose declaration body to read (bare name, not \"fn name\")." },
+            "type": { "type": "string", "enum": KIND_LABELS, "description": "Optional declaration kind to narrow to (fn, struct, enum, trait, impl, mod, type, static, const)." },
             "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." },
             "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD." }
         },
@@ -472,26 +508,41 @@ impl Tool for ReadSymbol {
         #[derive(Deserialize)]
         struct Args {
             symbol: String,
+            #[serde(default, rename = "type")]
+            kind: Option<String>,
             #[serde(default)]
             path: Option<String>,
             #[serde(default)]
             git_modified_only: bool,
         }
         let args: Args = serde_json::from_value(args)?;
+        let kind = normalize_kind(args.kind.as_deref())?;
+        // Kind keywords in the input are a filter, not part of the identifier:
+        // report the bare name and hand the engine the stripped identifier.
+        let (pfx, bare) = engine::split_kind_prefix(&args.symbol);
+        if let (Some(p), Some(k)) = (pfx, kind) {
+            if !p.eq_ignore_ascii_case(k) {
+                anyhow::bail!(
+                    "symbol {:?} already names kind {p:?}, which conflicts with the type filter {k:?}",
+                    bare
+                );
+            }
+        }
         let scope = changed_scope(ctx, args.git_modified_only)?;
         guard_path_scope(ctx, &args.path, &scope)?;
         match engine::read_symbol(
             &ctx.project_root,
-            &args.symbol,
+            bare,
             args.path.as_deref(),
             scope.as_ref(),
+            pfx.or(kind),
         )? {
             Some(def) => {
                 let body = def.body.unwrap_or_default();
                 let lines = body.lines().count();
                 let mut out = format!(
                     "`{symbol}` ({kind}) at {file}:{line}\n{signature}\n---- ({lines} lines)\n",
-                    symbol = args.symbol,
+                    symbol = bare,
                     kind = def.kind,
                     file = def.file,
                     line = def.line,
@@ -500,7 +551,7 @@ impl Tool for ReadSymbol {
                 out.push_str(&body);
                 Ok(clamp(out))
             }
-            None => Ok(format!("No definition found for {:?}.", args.symbol)),
+            None => Ok(format!("No definition found for {:?}.", bare)),
         }
     }
 }
@@ -544,16 +595,17 @@ impl Tool for ReferencesCount {
             git_modified_only: bool,
         }
         let args: Args = serde_json::from_value(args)?;
+        let symbol = engine::split_kind_prefix(&args.symbol).1;
         let scope = changed_scope(ctx, args.git_modified_only)?;
         guard_path_scope(ctx, &args.path, &scope)?;
         let occ = engine::find_occurrences(
             &ctx.project_root,
-            &args.symbol,
+            symbol,
             args.path.as_deref(),
             scope.as_ref(),
         )?;
         if occ.is_empty() {
-            return Ok(format!("`{}` has no references.", args.symbol));
+            return Ok(format!("`{symbol}` has no references."));
         }
         let mut per_file: std::collections::BTreeMap<&str, usize> =
             std::collections::BTreeMap::new();
@@ -562,10 +614,7 @@ impl Tool for ReferencesCount {
         }
         let total = occ.len();
         let files = per_file.len();
-        let mut out = format!(
-            "`{}`: {total} reference(s) across {files} file(s)\n",
-            args.symbol
-        );
+        let mut out = format!("`{symbol}`: {total} reference(s) across {files} file(s)\n");
         for (file, count) in per_file.iter().take(8) {
             out.push_str(&format!("  {count:>4}  {file}\n"));
         }
@@ -585,11 +634,12 @@ struct FindSymbol;
 static FIND_SYMBOL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "find_symbol".into(),
-    description: "Find declarations whose name contains the query (case-insensitive), across the project or a file. Returns kind, name, one-line signature and file:line so you can locate the right symbol and then read only its body with read_symbol.".into(),
+    description: "Find declarations whose NAME contains the query (case-insensitive), across the project or a file. Pass the bare name only (query=\"build\"), not a keyword like \"fn build\" — a leading kind prefix is stripped automatically into the type filter. Returns kind, name, one-line signature and file:line so you can locate the right symbol and then read only its body with read_symbol.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "query": { "type": "string", "description": "Substring of a symbol name, e.g. \"build\", \"Error\"." },
+            "query": { "type": "string", "description": "Substring of a symbol name, e.g. \"build\", \"Error\". Do NOT prefix it with a kind keyword (\"fn build\")." },
+            "type": { "type": "string", "enum": KIND_LABELS, "description": "Optional declaration kind to filter by (fn, struct, enum, trait, impl, mod, type, static, const)." },
             "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." },
             "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD." },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Max matches to return." }
@@ -610,6 +660,8 @@ impl Tool for FindSymbol {
         #[derive(Deserialize)]
         struct Args {
             query: String,
+            #[serde(default, rename = "type")]
+            kind: Option<String>,
             #[serde(default)]
             path: Option<String>,
             #[serde(default)]
@@ -624,6 +676,7 @@ impl Tool for FindSymbol {
         if args.query.trim().is_empty() {
             anyhow::bail!("query must not be empty");
         }
+        let kind = normalize_kind(args.kind.as_deref())?;
         let scope = changed_scope(ctx, args.git_modified_only)?;
         guard_path_scope(ctx, &args.path, &scope)?;
         let mut rows = engine::search_symbols(
@@ -631,6 +684,7 @@ impl Tool for FindSymbol {
             &args.query,
             args.path.as_deref(),
             scope.as_ref(),
+            kind,
         )?;
         let total = rows.len();
         rows.truncate(args.limit);
@@ -740,7 +794,7 @@ struct Thing { a: i32 }
         )
         .unwrap();
 
-        let def = crate::engine::find_definition(&root, "compute", None, None)
+        let def = crate::engine::find_definition(&root, "compute", None, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(def.file, "lib.rs");
@@ -752,7 +806,7 @@ struct Thing { a: i32 }
         );
         assert!(def.body.is_none());
 
-        let full = crate::engine::read_symbol(&root, "compute", None, None)
+        let full = crate::engine::read_symbol(&root, "compute", None, None, None)
             .unwrap()
             .unwrap();
         let body = full.body.unwrap();
@@ -760,13 +814,13 @@ struct Thing { a: i32 }
         assert!(body.contains("y + 1"));
 
         // struct found too
-        let s = crate::engine::find_definition(&root, "Thing", None, None)
+        let s = crate::engine::find_definition(&root, "Thing", None, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(s.kind, "struct");
 
         assert!(
-            crate::engine::find_definition(&root, "nope", None, None)
+            crate::engine::find_definition(&root, "nope", None, None, None)
                 .unwrap()
                 .is_none()
         );
@@ -876,6 +930,8 @@ fn main() {}
 mod find_symbol_tests {
     use std::path::PathBuf;
 
+    use super::{engine, normalize_kind};
+
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "comrade-findsym-{}-{:?}",
@@ -894,7 +950,7 @@ mod find_symbol_tests {
             "pub fn build_config() {}\nfn run_build() {}\nstruct Config {}\n",
         )
         .unwrap();
-        let hits = crate::engine::search_symbols(&root, "build", None, None).unwrap();
+        let hits = crate::engine::search_symbols(&root, "build", None, None, None).unwrap();
         assert!(
             hits.iter().any(|h| h.contains("fn build_config")),
             "{hits:?}"
@@ -902,5 +958,93 @@ mod find_symbol_tests {
         assert!(hits.iter().any(|h| h.contains("fn run_build")), "{hits:?}");
         assert!(!hits.iter().any(|h| h.contains("struct Config")));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_kind_prefix_only_accepts_whitespace_delimited_keywords() {
+        assert_eq!(engine::split_kind_prefix("fn build"), (Some("fn"), "build"));
+        assert_eq!(engine::split_kind_prefix("Fn build"), (Some("fn"), "build"));
+        assert_eq!(
+            engine::split_kind_prefix("struct Config"),
+            (Some("struct"), "Config")
+        );
+        // A bare identifier (even one starting with a keyword) is untouched.
+        assert_eq!(
+            engine::split_kind_prefix("typewriter"),
+            (None, "typewriter")
+        );
+        assert_eq!(engine::split_kind_prefix("fnfoo"), (None, "fnfoo"));
+        assert_eq!(engine::split_kind_prefix("build"), (None, "build"));
+        // Keyword alone or with only whitespace after it: no prefix to split.
+        assert_eq!(engine::split_kind_prefix("fn"), (None, "fn"));
+        assert_eq!(engine::split_kind_prefix("fn "), (None, "fn "));
+    }
+
+    #[test]
+    fn kind_prefix_query_still_finds_the_fn() {
+        // The agent's sloppy habit: "fn build" should search names, not fail.
+        let root = scratch();
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub fn build_config() {}\nfn run_build() {}\nstruct Config {}\n",
+        )
+        .unwrap();
+        let hits = engine::search_symbols(&root, "fn build", None, None, None).unwrap();
+        assert!(
+            hits.iter().any(|h| h.contains("fn build_config")),
+            "{hits:?}"
+        );
+        assert!(hits.iter().any(|h| h.contains("fn run_build")), "{hits:?}");
+        assert!(
+            !hits.iter().any(|h| h.contains("struct Config")),
+            "{hits:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn type_filter_narrows_by_declaration_kind() {
+        let root = scratch();
+        std::fs::write(
+            root.join("lib.rs"),
+            "fn config() {}\nstruct Config {}\nenum ConfigKind {}\n",
+        )
+        .unwrap();
+        let fns = engine::search_symbols(&root, "config", None, None, Some("fn")).unwrap();
+        assert_eq!(fns.len(), 1, "{fns:?}");
+        assert!(fns[0].starts_with("fn config"), "{fns:?}");
+        let structs = engine::search_symbols(&root, "config", None, None, Some("Struct")).unwrap();
+        assert_eq!(structs.len(), 1, "{structs:?}");
+        assert!(structs[0].starts_with("struct Config"), "{structs:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_definition_strips_prefix_and_conflict_bails() {
+        let root = scratch();
+        std::fs::write(root.join("lib.rs"), "pub fn area() {}\nstruct Thing {}\n").unwrap();
+        let def = engine::find_definition(&root, "fn area", None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(def.kind, "fn");
+        assert_eq!(def.signature, "pub fn area()");
+        // A prefix that contradicts an explicit type filter is an error.
+        assert!(engine::find_definition(&root, "fn area", None, None, Some("struct")).is_err());
+        // Kind filter alone finds the declaration too.
+        let t = engine::find_definition(&root, "Thing", None, None, Some("struct"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.kind, "struct");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalize_kind_validates_labels() {
+        assert_eq!(normalize_kind(None).unwrap(), None);
+        assert_eq!(normalize_kind(Some("fn")).unwrap(), Some("fn"));
+        assert_eq!(normalize_kind(Some("Struct")).unwrap(), Some("struct"));
+        assert_eq!(normalize_kind(Some("  fn  ")).unwrap(), Some("fn"));
+        assert!(normalize_kind(Some("method")).is_err());
+        assert_eq!(normalize_kind(Some("  ")).unwrap(), None);
     }
 }
