@@ -560,7 +560,7 @@ struct App {
     history: Arc<tokio::sync::Mutex<ContextManager>>,
 
     events_tx: mpsc::Sender<AgentEvent>,
-    events_rx: mpsc::Receiver<AgentEvent>,
+    events_rx: mpsc::UnboundedReceiver<AgentEvent>,
     asks_rx: mpsc::Receiver<PendingAsk>,
 
     stop: Option<CancellationToken>,
@@ -1027,7 +1027,8 @@ impl App {
             }
             // Refresh the provider account balance after the run finishes.
             if let Some(balance) = client.fetch_account_balance().await {
-                let _ = balance_tx.send(AgentEvent::AccountBalance(balance)).await;
+                // Cosmetic status: never let the run park behind a busy UI.
+                let _ = balance_tx.try_send(AgentEvent::AccountBalance(balance));
             }
         });
         self.run_handle = Some(handle);

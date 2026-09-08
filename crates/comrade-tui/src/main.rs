@@ -37,6 +37,26 @@ struct Cli {
     auto: bool,
 }
 
+/// Spawn the task that relays agent events from the run-facing bounded
+/// channel to the UI's unbounded queue. The run task streams into `tx` and
+/// awaits each send, so `rx` must be drained on its own task: otherwise a UI
+/// that is busy repainting (or wedged) fills the bounded channel and parks
+/// the run mid-turn (freeze notes #25/#29). The relay never blocks — the
+/// unbounded `ui_tx` side cannot exert back-pressure — and it is the only
+/// place a receive on the run's event channel waits.
+fn spawn_event_relay(
+    mut rx: tokio::sync::mpsc::Receiver<comrade_core::AgentEvent>,
+    ui_tx: tokio::sync::mpsc::UnboundedSender<comrade_core::AgentEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if ui_tx.send(ev).is_err() {
+                break; // UI is gone; drop the rest.
+            }
+        }
+    });
+}
+
 /// Shared runtime dependencies for a session.
 struct Deps {
     cfg: Arc<Config>,
@@ -167,9 +187,20 @@ fn new_session(
 ) -> (
     SessionBundle,
     tokio::sync::mpsc::Sender<comrade_core::AgentEvent>,
-    tokio::sync::mpsc::Receiver<comrade_core::AgentEvent>,
+    tokio::sync::mpsc::UnboundedReceiver<comrade_core::AgentEvent>,
 ) {
+    // The run task streams AgentEvents into `tx` (cap 512) and awaits each
+    // send, so a slow UI must never be able to back-pressure the run (freeze
+    // notes #25/#29: a wedged repaint filled the channel and parked the run
+    // at turn end, making the app look dead). A dedicated relay task drains
+    // `tx` and hands events to the UI over an unbounded channel, so the run
+    // always makes progress; the UI consumes the unbounded side at its own
+    // pace (repaint capping, not queue back-pressure, throttles it). All
+    // channel operations that can wait now run on background tasks/threads,
+    // never on the UI event loop.
     let (tx, rx) = tokio::sync::mpsc::channel(512);
+    let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_event_relay(rx, ui_tx);
     let session = Arc::new(comrade_core::AgentSession::new(tx.clone()));
     let undo = Arc::new(MemoryUndo::new(deps.root.clone()));
     let ctx_base = ToolContext {
@@ -183,7 +214,7 @@ fn new_session(
         events: Arc::new(comrade_tool::NoopEvents),
         stop: None,
     };
-    (SessionBundle { session, ctx_base }, tx, rx)
+    (SessionBundle { session, ctx_base }, tx, ui_rx)
 }
 
 #[tokio::main]
@@ -200,5 +231,38 @@ async fn main() -> Result<()> {
         tui::run(&deps).await
     } else {
         headless::run(&deps, &cli.prompt).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The run task streams AgentEvents into the bounded channel and awaits
+    /// each send (agent.rs), so the relay must keep the bounded side drained
+    /// even when nothing is consuming the UI queue yet. This asserts the
+    /// freeze-#29 property: an awaited sender is never parked behind a full
+    /// channel while the relay runs.
+    #[tokio::test]
+    async fn event_relay_keeps_awaited_senders_unblocked() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_event_relay(rx, ui_tx);
+
+        // Far more events than the bounded capacity, each awaited as the real
+        // run task would send them.
+        let total = 2000usize;
+        for i in 0..total {
+            let _ = tx
+                .send(comrade_core::AgentEvent::Delta(format!("{i}")))
+                .await;
+        }
+        drop(tx); // Close the run-facing side so the relay exits when drained.
+
+        let mut received = 0usize;
+        while ui_rx.recv().await.is_some() {
+            received += 1;
+        }
+        assert_eq!(received, total, "every sent event must reach the UI queue");
     }
 }
