@@ -233,6 +233,49 @@ struct RenderRow {
     tool_header: Option<usize>,
 }
 
+/// Cached row layout of `chat` (the live stream preview is laid out fresh on
+/// every frame, so it is not part of this cache).
+///
+/// Rebuilding rows means re-tokenising and re-wrapping every message body via
+/// `md_to_lines`, which with a long transcript costs milliseconds per frame.
+/// Frames where nothing chat-affecting changed (typing in the input, scrolling,
+/// selection moves, search navigation, most streaming deltas) reuse this cache
+/// and only render the visible rows.
+struct ChatRowsCache {
+    width: usize,
+    /// Value of `App::chat_epoch` when this cache was built.
+    epoch: u64,
+    rows: Vec<RenderRow>,
+    /// Owning chat-message index per row (parallel to `rows`).
+    owner: Vec<Option<usize>>,
+    /// Per chat-message row span (start row, height).
+    ranges: Vec<(usize, usize)>,
+}
+
+/// Return the chat row layout for `(epoch, width)`, rebuilding it from
+/// `chat`/`collapsed` via [`layout_chat_rows`] when the cache is stale or
+/// absent, and reusing it otherwise.
+fn chat_cache<'a>(
+    cache: &'a mut Option<ChatRowsCache>,
+    epoch: u64,
+    width: usize,
+    chat: &[Msg],
+    collapsed: &[bool],
+) -> &'a ChatRowsCache {
+    let stale = !matches!(cache, Some(c) if c.epoch == epoch && c.width == width);
+    if stale {
+        let (rows, owner, ranges) = layout_chat_rows(chat, collapsed, "", width);
+        *cache = Some(ChatRowsCache {
+            width,
+            epoch,
+            rows,
+            owner,
+            ranges,
+        });
+    }
+    cache.as_ref().expect("cache just (re)built")
+}
+
 /// Active incremental search over the chat history (Ctrl-S).
 struct Search {
     /// Raw query as typed by the user (matched case-insensitively).
@@ -529,6 +572,12 @@ struct App {
     /// 10 s when the cwd is not a repo so we don't spawn failing `git`s).
     git_gate: Option<Instant>,
     chat: Vec<Msg>,
+    /// Bumped on every change to `chat` content or `section_collapsed` so the
+    /// cached row layout (`chat_rows_cache`) is rebuilt on the next draw.
+    chat_epoch: u64,
+    /// Cached row layout of `chat`, reused across frames while nothing that
+    /// affects the layout changed (see [`ChatRowsCache`]).
+    chat_rows_cache: Option<ChatRowsCache>,
     /// Org-style section (one exchange per user turn) collapse state, indexed
     /// by section ordinal = the turn's rank among `MsgKind::User` messages.
     /// User messages are only ever appended (run-digest folds splice only
@@ -617,6 +666,7 @@ impl App {
     }
 
     fn push_msg(&mut self, msg: Msg) {
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
         if self.chat.len() >= 400 {
             self.chat.remove(0);
         }
@@ -628,6 +678,9 @@ impl App {
     }
 
     fn last_tool_mut(&mut self, name: &str) -> Option<&mut ToolCard> {
+        // Callers mutate the returned card (result/open/taken_ms), which affects
+        // the row layout: conservatively invalidate the layout cache.
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
         self.chat.iter_mut().rev().find_map(|m| match &mut m.tool {
             Some(c) if c.name == name || name.is_empty() => Some(c),
             _ => None,
@@ -650,11 +703,13 @@ impl App {
 
     /// Expand the section a chat message belongs to (no-op when not collapsed).
     fn expand_section_at(&mut self, msg_idx: usize) {
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
         expand_section(&mut self.section_collapsed, &self.chat, msg_idx);
     }
 
     /// Toggle the section a chat message belongs to (no-op outside a section).
     fn toggle_section_at(&mut self, msg_idx: usize) {
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
         toggle_section(
             &mut self.section_collapsed,
             &self.chat,
@@ -664,6 +719,7 @@ impl App {
     }
 
     fn toggle_tool(&mut self, idx: usize) {
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
         // A user-turn heading is an org-style section header: toggling it
         // folds/unfolds the whole exchange, not a single card.
         if matches!(self.chat.get(idx).map(|m| m.kind), Some(MsgKind::User)) {
@@ -700,6 +756,7 @@ impl App {
     /// Replace one folded digest with its children in place, then move the
     /// selection onto the first child so Tab keeps drilling into it.
     fn expand_run(&mut self, idx: usize) {
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
         let Some(&(start, _)) = self.msg_ranges.get(idx) else {
             unfold_run(&mut self.chat, idx);
             if idx < self.chat.len() {
@@ -722,6 +779,7 @@ impl App {
         if self.search.is_some() {
             return;
         }
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
         let sel = self.sel;
         let spans = fold_completed_runs(&mut self.chat);
         if spans.is_empty() {
@@ -837,6 +895,7 @@ impl App {
     /// matched content is actually visible. A match inside a folded run digest
     /// unfolds the digest first, then jumps to the child that actually matched.
     fn goto_search_match(&mut self) {
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
         let Some(idx) = self
             .search
             .as_ref()
@@ -1581,6 +1640,8 @@ pub async fn run(deps: &Deps) -> Result<()> {
         git_inflight: false,
         git_gate: None,
         chat: Vec::new(),
+        chat_epoch: 0,
+        chat_rows_cache: None,
         section_collapsed: Vec::new(),
         stream: String::new(),
         input: Editor::new(),
@@ -2914,14 +2975,27 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(block, area);
 
     let width = inner.width.saturating_sub(2) as usize; // prefix column + spacing
-    let (rows, row_msg, ranges) = layout_messages(app, width);
+    // Reuse the row layout of `chat` across frames while nothing chat-affecting
+    // changed (typing, scrolling, search, most streaming deltas), instead of
+    // re-tokenising and re-wrapping every message body on each draw.
+    let cache = chat_cache(
+        &mut app.chat_rows_cache,
+        app.chat_epoch,
+        width,
+        &app.chat,
+        &app.section_collapsed,
+    );
 
-    app.chat_rect = inner;
-    app.row_targets = rows.iter().map(|r| r.tool_header).collect();
-    app.row_msg = row_msg;
-    app.msg_ranges = ranges;
-    app.view_rows = inner.height as usize;
-    let max = rows.len().saturating_sub(inner.height as usize);
+    // The live streaming preview is transient: laid out fresh every frame.
+    let mut preview: Vec<Vec<Span<'static>>> = if app.stream.is_empty() {
+        Vec::new()
+    } else {
+        let visible = strip_react_scaffolding(&app.stream);
+        md_to_lines(&visible, width)
+    };
+
+    let total_rows = cache.rows.len() + preview.len();
+    let max = total_rows.saturating_sub(inner.height as usize);
     // Autoscroll: stay pinned to the bottom while following a run or while the
     // user is already at the bottom of the chat.
     if app.follow || app.was_at_bottom {
@@ -2931,6 +3005,16 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     let offset = app.scroll_top;
     app.was_at_bottom = app.scroll_top >= max;
 
+    // Per-row bookkeeping the event handlers index into (mouse, selection,
+    // search): chat rows come from the cache, preview rows are un-owned.
+    app.chat_rect = inner;
+    app.row_targets = cache.rows.iter().map(|r| r.tool_header).collect();
+    app.row_targets.resize(total_rows, None);
+    app.row_msg = cache.owner.clone();
+    app.row_msg.resize(total_rows, None);
+    app.msg_ranges = cache.ranges.clone();
+    app.view_rows = inner.height as usize;
+
     let sel_start = app.sel.and_then(|i| app.msg_ranges.get(i)).map(|&(s, _)| s);
     // Row span of the currently selected search match, if any.
     let search_hl = app
@@ -2938,32 +3022,37 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
         .as_ref()
         .and_then(|s| s.matches.get(s.cur))
         .and_then(|&idx| app.msg_ranges.get(idx).copied());
-    let lines: Vec<Line> = rows
-        .iter()
-        .enumerate()
-        .map(|(row, r)| {
+
+    // Build Lines only for the rows actually on screen.
+    let height = inner.height as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(height.min(total_rows));
+    let chat_rows = cache.rows.len();
+    for row in offset..total_rows.min(offset + height) {
+        if row < chat_rows {
+            let r = &cache.rows[row];
             let in_match = search_hl.is_some_and(|(start, len)| row >= start && row < start + len);
-            let band = app
-                .row_msg
-                .get(row)
-                .and_then(|o| *o)
+            let band = cache.owner[row]
                 .and_then(|i| app.chat.get(i))
                 .filter(|m| m.kind == MsgKind::User)
                 .map(|_| user_band_bg());
-            render_row_line(r, Some(row) == sel_start, in_match, band, width)
-        })
-        .collect();
+            lines.push(render_row_line(
+                r,
+                Some(row) == sel_start,
+                in_match,
+                band,
+                width,
+            ));
+        } else {
+            // Streaming preview row: un-owned, never banded/selected.
+            let spans = std::mem::take(&mut preview[row - chat_rows]);
+            let mut sp = Vec::with_capacity(spans.len() + 1);
+            sp.push(Span::styled("  ", Style::default()));
+            sp.extend(spans);
+            lines.push(Line::from(sp));
+        }
+    }
 
-    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
-}
-
-/// Lay the chat out into rows. Returns (rows, msg-owner per row, per-message
-/// row spans). The live streaming preview is appended without an owner.
-fn layout_messages(
-    app: &App,
-    width: usize,
-) -> (Vec<RenderRow>, Vec<Option<usize>>, Vec<(usize, usize)>) {
-    layout_chat_rows(&app.chat, &app.section_collapsed, &app.stream, width)
+    frame.render_widget(Paragraph::new(lines).scroll((0, 0)), inner);
 }
 
 /// Pure row layout for a chat transcript. Org-style sections: each user turn is
@@ -6243,6 +6332,43 @@ mod section_tests {
         let mut collapsed = vec![true];
         expand_section(&mut collapsed, &chat, 99);
         assert_eq!(collapsed, vec![true]);
+    }
+
+    #[test]
+    fn chat_cache_reuses_rows_while_epoch_and_width_are_stable() {
+        let mut cache: Option<ChatRowsCache> = None;
+        let chat = two_exchanges();
+        // First call builds the layout; a second call with the same epoch and
+        // width must reuse it unchanged (the row layout is frame-stable).
+        let c = chat_cache(&mut cache, 7, 60, &chat, &[]);
+        let ranges = c.ranges.clone();
+        let owner = c.owner.clone();
+        let rows = c.rows.len();
+        let c2 = chat_cache(&mut cache, 7, 60, &chat, &[]);
+        assert_eq!(c2.ranges, ranges);
+        assert_eq!(c2.owner, owner);
+        assert_eq!(c2.rows.len(), rows);
+    }
+
+    #[test]
+    fn chat_cache_relayouts_on_width_change_and_epoch_bump() {
+        let mut cache: Option<ChatRowsCache> = None;
+        let chat = two_exchanges();
+        chat_cache(&mut cache, 1, 60, &chat, &[]);
+        // A narrower terminal width re-wraps text: the row count must change.
+        let narrow = chat_cache(&mut cache, 1, 12, &chat, &[]);
+        let narrow_rows = narrow.rows.len();
+        // An epoch bump (any chat/collapse mutation) must also rebuild.
+        let collapsed = chat_cache(&mut cache, 2, 12, &chat, &[true, false]);
+        assert!(
+            collapsed.rows.len() < narrow_rows,
+            "collapsing exchange 0 must shrink the layout"
+        );
+        // The rebuilt cache equals a fresh pure layout of the same inputs.
+        let (rows, owner, ranges) = layout_chat_rows(&chat, &[true, false], "", 12);
+        assert_eq!(collapsed.rows.len(), rows.len());
+        assert_eq!(collapsed.owner, owner);
+        assert_eq!(collapsed.ranges, ranges);
     }
 }
 
