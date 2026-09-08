@@ -345,6 +345,7 @@ enum MxCommand {
     ForwardWord,
     InsertNewline,
     KillWord,
+    ListMcpServers,
     MoveBlockDown,
     MoveBlockUp,
     MoveUserDown,
@@ -371,6 +372,7 @@ impl MxCommand {
         MxCommand::ForwardWord,
         MxCommand::InsertNewline,
         MxCommand::KillWord,
+        MxCommand::ListMcpServers,
         MxCommand::MoveBlockDown,
         MxCommand::MoveBlockUp,
         MxCommand::MoveUserDown,
@@ -396,6 +398,7 @@ impl MxCommand {
             MxCommand::ForwardWord => "forward-word",
             MxCommand::InsertNewline => "insert-newline",
             MxCommand::KillWord => "kill-word",
+            MxCommand::ListMcpServers => "list-mcp-servers",
             MxCommand::MoveBlockDown => "move-block-down",
             MxCommand::MoveBlockUp => "move-block-up",
             MxCommand::MoveUserDown => "move-user-down",
@@ -429,6 +432,8 @@ impl MxCommand {
             MxCommand::MoveUserUp => Some("C-S-p"),
             // Starts a fresh session: unbound, run it from the M-x palette.
             MxCommand::NewSession => None,
+            // Palette-only: shows the configured MCP servers in the chat.
+            MxCommand::ListMcpServers => None,
             MxCommand::Quit => Some("C-c"),
             MxCommand::ReloadConfig => Some("C-r"),
             MxCommand::SearchChat => Some("C-s"),
@@ -450,6 +455,7 @@ impl MxCommand {
             MxCommand::ForwardWord => "move the prompt cursor forward one word",
             MxCommand::InsertNewline => "insert a newline in the prompt",
             MxCommand::KillWord => "delete the word after the prompt cursor",
+            MxCommand::ListMcpServers => "show the configured MCP servers",
             MxCommand::MoveBlockDown => "move to the next chat block",
             MxCommand::MoveBlockUp => "move to the previous chat block",
             MxCommand::MoveUserDown => "jump to the next message you sent",
@@ -1125,6 +1131,30 @@ impl App {
         self.tools = Arc::new(tools);
     }
 
+    /// M-x list-mcp-servers: show the servers configured under `[mcp.servers]`
+    /// as a chat note — one line per server (stdio shows the command, http the
+    /// base URL).
+    fn list_mcp_servers(&mut self) {
+        let servers = &self.cfg.mcp.servers;
+        if servers.is_empty() {
+            self.push_meta("no MCP servers configured");
+            return;
+        }
+        let rows: Vec<String> = servers
+            .iter()
+            .map(|s| {
+                let transport = match &s.transport {
+                    comrade_core::McpTransport::Stdio { command, .. } => {
+                        format!("stdio ({command})")
+                    }
+                    comrade_core::McpTransport::Http { url } => format!("http ({url})"),
+                };
+                format!("  {}: {transport}", s.name)
+            })
+            .collect();
+        self.push_meta(format!("configured MCP servers:\n{}", rows.join("\n")));
+    }
+
     /// Start a fresh session in place, replacing the current one: a brand-new
     /// [`AgentSession`] (plan/status/title reset), a new undo log and tool
     /// context, a clean rolling conversation history, and an empty chat
@@ -1504,6 +1534,7 @@ impl App {
             MxCommand::ForwardWord => self.input.move_word_right(false),
             MxCommand::InsertNewline => self.input.insert('\n'),
             MxCommand::KillWord => self.input.delete_word(),
+            MxCommand::ListMcpServers => self.list_mcp_servers(),
             MxCommand::MoveBlockDown => self.move_block(1),
             MxCommand::MoveBlockUp => self.move_block(-1),
             MxCommand::MoveUserDown => self.move_user(1),
@@ -5175,6 +5206,23 @@ mod tests {
         assert_eq!(mx.matches.len(), 1);
         mx.complete();
         assert_eq!(mx.query, "move-block-down");
+    }
+
+    #[test]
+    fn mx_all_is_sorted_by_name() {
+        let names: Vec<&str> = MxCommand::ALL.iter().map(|c| c.name()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "MxCommand::ALL must stay sorted by name");
+    }
+
+    #[test]
+    fn mx_list_mcp_servers_metadata() {
+        let cmd = MxCommand::ListMcpServers;
+        assert_eq!(cmd.name(), "list-mcp-servers");
+        assert_eq!(cmd.keys(), None, "list-mcp-servers is palette-only");
+        assert!(!cmd.desc().is_empty());
+        assert!(MxCommand::ALL.contains(&cmd));
     }
 
     #[test]
