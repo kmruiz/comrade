@@ -1393,9 +1393,13 @@ fn draw(app: &mut App, frame: &mut Frame) {
         .constraints([Constraint::Min(20), Constraint::Percentage(30)])
         .split(rows[1]);
     draw_chat(app, frame, cols[0]);
+    // The model panel shows one fixed row (label) plus one row per configured
+    // delegate under the usage line; grow it so delegate names are never
+    // clipped out of view. The plan panel takes whatever is left.
+    let stats_h = 6 + app.cfg.delegates.len() as u16;
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(0)])
+        .constraints([Constraint::Length(stats_h), Constraint::Min(0)])
         .split(cols[1]);
     draw_stats(app, frame, right[0]);
     draw_plan(app, frame, right[1]);
