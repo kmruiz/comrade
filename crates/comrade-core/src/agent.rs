@@ -484,12 +484,22 @@ async fn run_agent_loop(
                 Err(anyhow::anyhow!("agent interrupted by user"))
             }
         };
+        let turn = match stream_result {
+            Ok(turn) => turn,
+            Err(e) => {
+                // Interrupted (usually user cancel): return immediately,
+                // WITHOUT draining the delta forwarder. The forwarder can be
+                // parked awaiting a full UI event channel; draining it here
+                // would wedge the run in an await that never sees the cancel
+                // token, making Esc unable to end it. Once delta_tx is dropped
+                // (on return) the forwarder's channel closes and it exits.
+                return Err(e);
+            }
+        };
         drop(delta_tx);
         // Drain the delta queue so the UI sees every token, not just those the
         // forwarder got to before we moved on.
         let _ = forwarder.await;
-
-        let turn = stream_result?;
 
         // Real usage from the API when reported (prompt_tokens = context the
         // model actually saw); fall back to our estimate otherwise.

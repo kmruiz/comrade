@@ -564,6 +564,9 @@ struct App {
     asks_rx: mpsc::Receiver<PendingAsk>,
 
     stop: Option<CancellationToken>,
+    /// JoinHandle of the in-flight run task, used by the cancel watchdog to
+    /// abort a run that ignores the cancel token (see [`App::cancel_run`]).
+    run_handle: Option<tokio::task::JoinHandle<()>>,
     running: bool,
     /// Auto-accept mode: approvals are answered "yes" without prompting.
     auto_accept: bool,
@@ -1001,7 +1004,7 @@ impl App {
         self.running = true;
         self.follow = true;
         self.sel = None;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             {
                 // Runs are serialized (self.running), so the guard is
                 // uncontended; it only exists to give the task owned access.
@@ -1023,6 +1026,7 @@ impl App {
                 let _ = balance_tx.send(AgentEvent::AccountBalance(balance)).await;
             }
         });
+        self.run_handle = Some(handle);
     }
 
     fn cancel_run(&mut self) {
@@ -1030,6 +1034,34 @@ impl App {
             stop.cancel();
         }
         self.push_meta("cancelling...");
+        // Abort guarantee: Esc must always end the run. Several awaits in the
+        // run path (tool.invoke, event-channel sends, the post-run balance
+        // refresh) do not watch the cancel token, so a stalled local model
+        // server (e.g. LM Studio) can wedge the run in one of them forever.
+        // Watchdog: if the run task has not ended shortly after the cancel,
+        // abort it outright and emit RunEnd so the UI always regains control.
+        const GRACE: Duration = Duration::from_millis(1500);
+        if let Some(handle) = self.run_handle.take() {
+            let tx = self.events_tx.clone();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + GRACE;
+                loop {
+                    if handle.is_finished() {
+                        // The run ended on its own; its RunEnd is already queued.
+                        return;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        handle.abort();
+                        // The aborted task never sends RunEnd; synthesize it so
+                        // the UI clears the running state. Duplicate RunEnds are
+                        // harmless (see on_agent_event).
+                        let _ = tx.send(AgentEvent::RunEnd).await;
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+        }
     }
 
     /// Re-read the config file from disk and swap the live model client, tool
@@ -1179,14 +1211,21 @@ impl App {
                 self.activity = None;
             }
             AgentEvent::RunEnd => {
+                let was_running = self.running;
                 self.running = false;
                 self.stop = None;
+                self.run_handle = None;
                 self.stream.clear();
                 self.activity = None;
-                // Compact whatever the run left behind (interrupted runs end
-                // here without a final answer) before the status note.
-                self.fold_completed();
-                self.push_meta("run finished");
+                // The cancel watchdog may emit a second RunEnd after aborting a
+                // wedged run; report the transition (fold + status note) only
+                // once.
+                if was_running {
+                    // Compact whatever the run left behind (interrupted runs
+                    // end here without a final answer) before the status note.
+                    self.fold_completed();
+                    self.push_meta("run finished");
+                }
             }
             AgentEvent::User(u) => {
                 self.stream.clear();
@@ -1763,6 +1802,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         events_rx,
         asks_rx,
         stop: None,
+        run_handle: None,
         running: false,
         auto_accept: false,
         git: GitBarInfo::default(),
