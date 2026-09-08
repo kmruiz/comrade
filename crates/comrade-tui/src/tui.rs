@@ -2,7 +2,8 @@
 //!
 //! Chat layout:
 //! - no emojis
-//! - user messages carry a cyan rule on the left of every wrapped line
+//! - user messages are a soft lighter band (chat background lifted by a touch,
+//!   see `USER_BG_ALPHA`) with a cyan rule on the left of every wrapped line
 //! - agent tool calls render as a compact card (tool + justification); clicking
 //!   (or the mouse wheel) opens the details
 //! - assistant/user text is rendered as markdown
@@ -1931,6 +1932,63 @@ fn push_seg(spans: &mut Vec<Span<'static>>, text: &str, a: usize, b: usize, sele
     spans.push(span);
 }
 
+/// Compose the visual `Line` for one chat row.
+///
+/// `sel` swaps the gutter to a yellow `> ` (the selected block); `in_match`
+/// yellow-highlights the row's text (current search hit). `band` tints the
+/// whole row edge-to-edge with a soft background (user messages): when set,
+/// the span area is padded with styled spaces so the band runs flush to the
+/// chat border on short lines.
+fn render_row_line(
+    r: &RenderRow,
+    sel: bool,
+    in_match: bool,
+    band: Option<Color>,
+    width: usize,
+) -> Line<'static> {
+    let prefix_style = |bg: Option<Color>, fg: Option<Color>| {
+        let mut s = Style::default();
+        if let Some(c) = bg {
+            s = s.bg(c);
+        }
+        if let Some(c) = fg {
+            s = s.fg(c);
+        }
+        s
+    };
+    let prefix = if sel {
+        Span::styled(
+            "> ",
+            prefix_style(band, Some(Color::Yellow)).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        match r.rule {
+            Some(color) => Span::styled(
+                "| ",
+                prefix_style(band, Some(color)).add_modifier(Modifier::BOLD),
+            ),
+            None => Span::styled("  ", prefix_style(band, None)),
+        }
+    };
+    let mut spans: Vec<Span> = Vec::with_capacity(r.spans.len() + 1);
+    spans.push(prefix);
+    for s in &r.spans {
+        let bg = if in_match { Some(Color::Yellow) } else { band };
+        match bg {
+            Some(c) => spans.push(s.clone().patch_style(Style::default().bg(c))),
+            None => spans.push(s.clone()),
+        }
+    }
+    if let Some(b) = band {
+        let used: usize = r.spans.iter().map(|s| s.content.chars().count()).sum();
+        let pad = width.saturating_sub(used);
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), Style::default().bg(b)));
+        }
+    }
+    Line::from(spans)
+}
+
 fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" chat ");
     let inner = block.inner(area);
@@ -1966,32 +2024,14 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
         .enumerate()
         .map(|(row, r)| {
             let in_match = search_hl.is_some_and(|(start, len)| row >= start && row < start + len);
-            let prefix = if Some(row) == sel_start {
-                Line::from(vec![Span::styled(
-                    "> ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )])
-            } else {
-                match r.rule {
-                    Some(color) => Line::from(vec![Span::styled(
-                        "| ",
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    )]),
-                    None => Line::from("  "),
-                }
-            };
-            let mut line = prefix;
-            for s in &r.spans {
-                let span = if in_match {
-                    s.clone().patch_style(Style::default().bg(Color::Yellow))
-                } else {
-                    s.clone()
-                };
-                line.push_span(span);
-            }
-            line
+            let band = app
+                .row_msg
+                .get(row)
+                .and_then(|o| *o)
+                .and_then(|i| app.chat.get(i))
+                .filter(|m| m.kind == MsgKind::User)
+                .map(|_| user_band_bg());
+            render_row_line(r, Some(row) == sel_start, in_match, band, width)
         })
         .collect();
 
@@ -3459,6 +3499,54 @@ mod tests {
     }
 
     #[test]
+    fn user_band_pads_row_to_width_keeping_rule() {
+        let row = RenderRow {
+            rule: Some(Color::Cyan),
+            spans: vec![Span::raw("hi")],
+            tool_header: None,
+        };
+        let line = render_row_line(&row, false, false, Some(Color::Rgb(1, 2, 3)), 10);
+        let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        // prefix "| " + "hi" + pad to the span-area width (10): 12 cells total,
+        // which equals the chat area width for rows with a 2-cell gutter.
+        assert_eq!(flat, "| hi        ", "{flat}");
+        assert_eq!(flat.chars().count(), 12);
+    }
+
+    #[test]
+    fn unbanded_row_is_not_padded() {
+        let row = RenderRow {
+            rule: None,
+            spans: vec![Span::raw("hi")],
+            tool_header: None,
+        };
+        let line = render_row_line(&row, false, false, None, 10);
+        let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(flat, "  hi", "{flat}");
+    }
+
+    #[test]
+    fn selected_row_swaps_rule_for_marker() {
+        let row = RenderRow {
+            rule: Some(Color::Cyan),
+            spans: vec![Span::raw("hi")],
+            tool_header: None,
+        };
+        let line = render_row_line(&row, true, false, None, 10);
+        let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(flat, "> hi", "{flat}");
+    }
+
+    #[test]
+    fn user_band_bg_lightens_the_chat_base() {
+        let Color::Rgb(r, g, b) = user_band_bg() else {
+            panic!("user band must be an rgb color");
+        };
+        // Every channel sits strictly above the assumed chat background.
+        assert!(r > DIFF_BASE_BG.0 && g > DIFF_BASE_BG.1 && b > DIFF_BASE_BG.2);
+    }
+
+    #[test]
     fn wraps_long_paragraph() {
         let text = "word ".repeat(50);
         let lines = md_text(&text, 20);
@@ -3742,6 +3830,17 @@ const DIFF_BASE_BG: (u8, u8, u8) = (0x13, 0x14, 0x18);
 const DIFF_TINT_REMOVED: (u8, u8, u8) = (0xff, 0x47, 0x47);
 const DIFF_TINT_ADDED: (u8, u8, u8) = (0x3c, 0xd0, 0x6c);
 const DIFF_TINT_ALPHA: f32 = 0.22;
+/// How far the user-message band is lifted above the chat background. This is
+/// the single knob to retune when the terminal theme changes (light terminals
+/// will want a darker tint over a light base instead).
+const USER_BG_ALPHA: f32 = 0.08;
+
+/// Background for a user-message band: the chat base lightened by a touch of
+/// white so a user turn reads as a soft org-mode body block. Blended with the
+/// same technique as the diff tints above.
+fn user_band_bg() -> Color {
+    blend_rgb(DIFF_BASE_BG, (0xff, 0xff, 0xff), USER_BG_ALPHA)
+}
 
 fn blend_rgb(base: (u8, u8, u8), tint: (u8, u8, u8), alpha: f32) -> Color {
     let mix = |b: u8, t: u8| (b as f32 * (1.0 - alpha) + t as f32 * alpha).round() as u8;
