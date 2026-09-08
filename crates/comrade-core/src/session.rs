@@ -35,7 +35,6 @@ pub enum AgentEvent {
         name: String,
         args: String,
         justification: Option<String>,
-        risk: Option<String>,
         tokens: Option<usize>,
     },
     /// A tool call began (legacy marker; details are in `ToolCall`).

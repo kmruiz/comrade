@@ -135,8 +135,8 @@ impl ToolContext {
     /// When `auto_approve` is set this returns `Ok` immediately. Otherwise it
     /// routes a [`UserPrompt::Confirm`] and fails with [`UserReply::Denied`]
     /// unless the user consents. Any [`ApprovalNotes`] left by the agent are
-    /// rendered above the diff so the human sees the model's reasoning and the
-    /// risks before deciding.
+    /// rendered above the diff so the human sees the model's reasoning before
+    /// deciding.
     pub async fn confirm(&self, summary: impl Into<String>, diff: Option<String>) -> Result<()> {
         if self.auto_approve {
             return Ok(());
@@ -175,19 +175,11 @@ impl ToolContext {
 pub struct ApprovalNotes {
     /// Why this action should run.
     pub justification: String,
-    /// What could go wrong / blast radius, when the model can say.
-    pub risk: Option<String>,
 }
 
 impl ApprovalNotes {
     pub fn render(&self) -> String {
-        let mut text = format!("Justification: {}", self.justification.trim());
-        if let Some(risk) = &self.risk {
-            if !risk.trim().is_empty() {
-                text.push_str(&format!("\nRisk: {}", risk.trim()));
-            }
-        }
-        text
+        format!("Justification: {}", self.justification.trim())
     }
 }
 
@@ -307,7 +299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirm_includes_model_justification_and_risk() {
+    async fn confirm_includes_model_justification() {
         let last = Arc::new(Mutex::new(None));
         let ctx = ToolContext {
             project_root: PathBuf::from("/tmp/x"),
@@ -322,12 +314,10 @@ mod tests {
         };
         ctx.set_approval(ApprovalNotes {
             justification: "completes the requested rename".into(),
-            risk: Some("touches 2 files; reversible via undo".into()),
         });
         ctx.confirm("rename foo -> bar", None).await.unwrap();
         let shown = last.lock().unwrap().clone().unwrap();
         assert!(shown.contains("Justification: completes the requested rename"));
-        assert!(shown.contains("Risk: touches 2 files; reversible via undo"));
     }
 
     #[tokio::test]

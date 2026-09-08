@@ -9,8 +9,6 @@ pub struct ParsedTurn {
     pub thought: Option<String>,
     /// Model-supplied reason for the pending action (shown on approval).
     pub justification: Option<String>,
-    /// Model-supplied risk assessment for the pending action.
-    pub risk: Option<String>,
     /// The requested tool call, if the model asked for one.
     pub tool_call: Option<ToolCall>,
     /// When `tool_call` is `None`, this is the model's final answer.
@@ -203,13 +201,12 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          shell, remember, amend_decision — you MUST also write, between Thought and Tool:\n\
          \n\
          Justification: <why this action should run, one or two short lines>\n\
-         Risk: <what could go wrong or how invasive it is; write \"Risk: none\" if safe>\n\
          \n\
-         Non-gated edits (apply_edit/apply_patch) still ask the human to approve the change, but need no Justification/Risk lines.\n\
+         Non-gated edits (apply_edit/apply_patch) still ask the human to approve the change, but need no Justification line.\n\
          git_commit, run_task and run_tests run directly without approval.\n\
-         Approval-gated tools are refused if you omit either line — repeat the call with both.\n\
-         When using native function calls (instead of the Tool/Args text form), pass the same two \
-         fields as extra arguments `justification` and `risk` on every approval-gated tool.\n\
+         Approval-gated tools are refused if you omit it — repeat the call with the field present.\n\
+         When using native function calls (instead of the Tool/Args text form), pass the justification \
+         as an extra `justification` argument on every approval-gated tool.\n\
          After each tool call you will receive:\n\
          \n\
          Observation: <the tool result>\n\
@@ -278,13 +275,11 @@ pub fn parse_turn(text: &str) -> Result<ParsedTurn> {
     let trimmed = text.trim();
     let thought = extract_thought(trimmed);
     let justification = extract_section(trimmed, "Justification:");
-    let risk = extract_section(trimmed, "Risk:");
 
     let Some(tool_idx) = find_marker(trimmed, "Tool:") else {
         return Ok(ParsedTurn {
             thought,
             justification,
-            risk,
             tool_call: None,
             final_text: trimmed.to_string(),
         });
@@ -321,7 +316,6 @@ pub fn parse_turn(text: &str) -> Result<ParsedTurn> {
     Ok(ParsedTurn {
         thought,
         justification,
-        risk,
         tool_call: Some(ToolCall { name, args }),
         final_text: trimmed.to_string(),
     })
@@ -723,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_justification_and_risk() {
+    fn extracts_justification_and_ignores_a_stray_risk_line() {
         let turn = parse_turn(
             "Thought: stage the change\nJustification: completes the rename the user asked for\nRisk: modifies one file; reversible via undo\nTool: git_commit\nArgs: {\"message\": \"rename foo\"}",
         )
@@ -732,15 +726,11 @@ mod tests {
             turn.justification.as_deref(),
             Some("completes the rename the user asked for")
         );
-        assert_eq!(
-            turn.risk.as_deref(),
-            Some("modifies one file; reversible via undo")
-        );
         assert!(turn.tool_call.is_some());
     }
 
     #[test]
-    fn justification_without_risk_is_fine() {
+    fn justification_alone_is_parsed() {
         let turn = parse_turn(
             "Thought: write it\nJustification: add the requested test file\nTool: write_file\nArgs: {\"path\": \"t.rs\", \"content\": \"x\"}",
         )
@@ -749,7 +739,7 @@ mod tests {
             turn.justification.as_deref(),
             Some("add the requested test file")
         );
-        assert!(turn.risk.is_none());
+        assert!(turn.tool_call.is_some());
     }
 
     #[test]

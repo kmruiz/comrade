@@ -256,7 +256,7 @@ struct Shell;
 static SHELL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "shell".into(),
-    description: "Run an arbitrary shell command via bash in the project (optionally in a subdirectory) and return its output. Powerful: use only when no dedicated tool fits. Approval-gated: include Justification and Risk.".into(),
+    description: "Run an arbitrary shell command via bash in the project (optionally in a subdirectory) and return its output. Powerful: use only when no dedicated tool fits. Approval-gated: include Justification.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {

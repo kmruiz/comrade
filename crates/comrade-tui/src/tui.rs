@@ -105,7 +105,6 @@ struct ToolCard {
     author: Option<String>,
     args: String,
     justification: Option<String>,
-    risk: Option<String>,
     result: Option<String>,
     ok: bool,
     open: bool,
@@ -1208,7 +1207,6 @@ impl App {
                 name,
                 args,
                 justification,
-                risk,
                 tokens,
             } => {
                 // This turn produced a tool call: keep whatever the model was
@@ -1226,7 +1224,6 @@ impl App {
                     author: Some(self.actor_label()),
                     args,
                     justification,
-                    risk,
                     result: None,
                     ok: true,
                     open: open_default,
@@ -1339,7 +1336,6 @@ impl App {
                     author: Some(model),
                     args,
                     justification: None,
-                    risk: None,
                     result: None,
                     ok: true,
                     open: open_default,
@@ -2457,11 +2453,10 @@ fn msg_searchable(msg: &Msg) -> String {
     let mut s = msg.text.clone();
     if let Some(t) = &msg.tool {
         s.push_str(&format!(
-            "\n{}\n{}\n{}\n{}\n{}",
+            "\n{}\n{}\n{}\n{}",
             t.name,
             t.args,
             t.justification.as_deref().unwrap_or(""),
-            t.risk.as_deref().unwrap_or(""),
             t.result.as_deref().unwrap_or(""),
         ));
     }
@@ -4037,15 +4032,6 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             });
         }
     }
-    if let Some(risk) = &card.risk {
-        for s in plain_wrap(&format!("risk: {risk}"), width) {
-            out.push(RenderRow {
-                rule: None,
-                spans: vec![Span::styled(s, Style::default().fg(Color::Yellow))],
-                tool_header: None,
-            });
-        }
-    }
     if let Some((old, new)) = extract_diff_sides(&card.name, &card.args) {
         out.push(RenderRow {
             rule: None,
@@ -4670,7 +4656,7 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
 }
 
 /// Pretty-print a free-form preview (approval diff bodies). Highlights
-/// Justification/Risk labels and edit-style `--- remove ---` / `+++ insert
+/// Justification labels and edit-style `--- remove ---` / `+++ insert
 /// +++` blocks, plus unified diff markers.
 fn preview_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     let width = width.max(10);
@@ -4707,11 +4693,6 @@ fn preview_lines(text: &str, width: usize) -> Vec<Line<'static>> {
                 width,
                 false,
             );
-            continue;
-        }
-        if t.starts_with("Risk:") {
-            mode = 0;
-            push_span_line(&mut out, t, Color::Yellow, width, false);
             continue;
         }
         let mut color = Color::White;
@@ -5335,7 +5316,6 @@ mod tests {
             author: Some("model".into()),
             args: args.into(),
             justification: None,
-            risk: None,
             result: None,
             ok,
             open,
@@ -5532,7 +5512,6 @@ mod tests {
             author: Some("model".into()),
             args: r#"{"pattern":"fold","glob":"*.rs"}"#.into(),
             justification: None,
-            risk: None,
             result: Some("5 matches".into()),
             ok: true,
             open: false,
@@ -5573,7 +5552,6 @@ mod tests {
             author: Some("model".into()),
             args: "{}".into(),
             justification: None,
-            risk: None,
             result: Some("done".into()),
             ok: true,
             open: false,
@@ -5636,7 +5614,6 @@ mod tests {
                 author: author.map(String::from),
                 args: "{}".into(),
                 justification: None,
-                risk: None,
                 result: Some("done".into()),
                 ok: true,
                 open: false,
@@ -5665,7 +5642,6 @@ mod tests {
                 author: Some("model".into()),
                 args: "{}".into(),
                 justification: None,
-                risk: None,
                 result: Some("3 passed".into()),
                 ok: true,
                 open,
@@ -6279,7 +6255,6 @@ mod search_tests {
             author: Some("ollama/x".into()),
             args: r#"{"task":"test"}"#.into(),
             justification: Some("verify the suite".into()),
-            risk: Some("none".into()),
             result: Some("3 passed".into()),
             ok: true,
             open: true,
@@ -6430,7 +6405,6 @@ mod section_tests {
                 author: Some("assistant".into()),
                 args: String::new(),
                 justification: None,
-                risk: None,
                 result: Some("ok".into()),
                 ok: true,
                 open: false,

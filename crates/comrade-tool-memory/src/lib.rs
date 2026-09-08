@@ -41,7 +41,7 @@ struct Remember;
 static REMEMBER_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "remember".into(),
-    description: "Write what a future session must find, reuse, or avoid as a persistent run book under .comrade/memory/ (find_decisions/read_decision). Format: title + context, numbered steps of ACTION -> VERIFICATION stored as summary/context/decision/consequences. Approval-gated: include Justification and Risk.".into(),
+    description: "Write what a future session must find, reuse, or avoid as a persistent run book under .comrade/memory/ (find_decisions/read_decision). Format: title + context, numbered steps of ACTION -> VERIFICATION stored as summary/context/decision/consequences. Approval-gated: include Justification.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -221,7 +221,7 @@ struct AmendDecision;
 static AMEND_DECISION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "amend_decision".into(),
-    description: "Update an existing decision: change its status (proposed/accepted/superseded/rejected) and/or append a Note. Approval-gated: include Justification and Risk.".into(),
+    description: "Update an existing decision: change its status (proposed/accepted/superseded/rejected) and/or append a Note. Approval-gated: include Justification.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {

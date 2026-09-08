@@ -24,7 +24,7 @@ fn usage_total(u: &Usage) -> Option<usize> {
 }
 
 /// Tools whose side effects require human approval (and thus mandatory
-/// Justification/Risk). Keep in sync with the tool crates.
+/// Justification). Keep in sync with the tool crates.
 /// Tools that mutate the workspace (used by the loop tracker to tell "repeat
 /// but state changed" from "repeat doing nothing").
 const MUTATING_TOOLS: &[&str] = &[
@@ -42,8 +42,8 @@ const MUTATING_TOOLS: &[&str] = &[
     "shell",
 ];
 
-/// Tools that are approval-gated: the model MUST provide `justification` and
-/// `risk` before they run (a human approves based on them). `git_commit`,
+/// Tools that are approval-gated: the model MUST provide a `justification`
+/// before they run (a human approves based on it). `git_commit`,
 /// `run_task` and `run_tests` deliberately are NOT gated: they run directly.
 /// `delegate` IS gated: handing a task to a sub-agent that will edit the
 /// workspace deserves the same one-shot approval as the edits themselves.
@@ -202,9 +202,9 @@ fn observation_with_failure_hint(tool_name: &str, ok: bool, output: &str) -> Str
     render_observation(tool_name, &text)
 }
 
-/// Approval-gated tools advertise `justification` and `risk` as optional native
-/// arguments so the model actually passes them (many models omit fields the
-/// schema forbids via `additionalProperties: false`). The agent strips them
+/// Approval-gated tools advertise `justification` as an optional native
+/// argument so the model actually passes it (many models omit fields the
+/// schema forbids via `additionalProperties: false`). The agent strips it
 /// before invoking the tool.
 fn augmented_spec(mut spec: comrade_tool::ToolSpec) -> comrade_tool::ToolSpec {
     if !is_approval_gated(&spec.name) {
@@ -222,13 +222,6 @@ fn augmented_spec(mut spec: comrade_tool::ToolSpec) -> comrade_tool::ToolSpec {
                 serde_json::json!({
                     "type": "string",
                     "description": "Why this action should run (required for approval)."
-                }),
-            );
-            props.insert(
-                "risk".into(),
-                serde_json::json!({
-                    "type": "string",
-                    "description": "What could go wrong, or \"none\" (required for approval)."
                 }),
             );
         }
@@ -624,8 +617,8 @@ async fn run_agent_loop(
         };
 
         // Approval-gated tools (mutations, task runs) MUST be accompanied by a
-        // Justification and a Risk line, otherwise the human has nothing to
-        // reason with. Ask the model to repeat instead of running them.
+        // Justification line, otherwise the human has nothing to reason with.
+        // Ask the model to repeat instead of running them.
         if is_approval_gated(&tool_call.name) && !ctx.auto_approve {
             let has_justification = !turn_p
                 .justification
@@ -633,20 +626,12 @@ async fn run_agent_loop(
                 .unwrap_or("")
                 .trim()
                 .is_empty();
-            let has_risk = !turn_p.risk.as_deref().unwrap_or("").trim().is_empty();
-            if !has_justification || !has_risk {
-                let missing = [(has_justification, "Justification"), (has_risk, "Risk")]
-                    .iter()
-                    .filter(|(ok, _)| !ok)
-                    .map(|(_, label)| *label)
-                    .collect::<Vec<_>>()
-                    .join(" and ");
+            if !has_justification {
                 let msg = format!(
-                    "tool `{tool}` is approval-gated and was called without {missing}. \
-                     Do NOT call it again without first writing both lines above the Tool line:\n\
+                    "tool `{tool}` is approval-gated and was called without a Justification. \
+                     Do NOT call it again without first writing the line above the Tool line:\n\
                      Justification: <why this action should run>\n\
-                     Risk: <what could go wrong, or \"Risk: none\" if safe>\n\
-                     Repeat the call with both fields present.",
+                     Repeat the call with that field present.",
                     tool = tool_call.name,
                 );
                 let _ = tx
@@ -663,10 +648,9 @@ async fn run_agent_loop(
                 ));
                 continue;
             }
-            // Both fields present: surface them on the approval prompt.
+            // Surface the model's reasoning on the approval prompt.
             ctx.set_approval(comrade_tool::ApprovalNotes {
                 justification: turn_p.justification.clone().unwrap_or_default(),
-                risk: turn_p.risk.clone(),
             });
         }
 
@@ -771,7 +755,6 @@ async fn run_agent_loop(
                 name: tool_call.name.clone(),
                 args: args_pretty.clone(),
                 justification: turn_p.justification.clone(),
-                risk: turn_p.risk.clone(),
                 tokens: turn.usage.as_ref().and_then(usage_total),
             })
             .await;
@@ -810,7 +793,7 @@ async fn run_agent_loop(
 
 /// Dispatch a turn's native function calls. The assistant message with all
 /// `tool_calls` is recorded first; each call then gets a `Role::Tool` result.
-/// Approval-gated calls require `justification`/`risk` in their arguments.
+/// Approval-gated calls require `justification` in their arguments.
 async fn run_native_calls(
     ctxm: &mut ContextManager,
     tx: &mpsc::Sender<AgentEvent>,
@@ -832,7 +815,6 @@ async fn run_native_calls(
         name: String,
         args: serde_json::Value,
         justification: Option<String>,
-        risk: Option<String>,
     }
 
     let mut prepared = Vec::new();
@@ -849,11 +831,9 @@ async fn run_native_calls(
                 .map(str::to_string)
         };
         let justification = text("justification");
-        let risk = text("risk");
         let mut clean = parsed.clone();
         if let Some(obj) = clean.as_object_mut() {
             obj.remove("justification");
-            obj.remove("risk");
         }
         calls.push(crate::llm::ToolCallMsg {
             id: mc.id.clone(),
@@ -865,7 +845,6 @@ async fn run_native_calls(
             name: mc.name,
             args: clean,
             justification,
-            risk,
         });
     }
 
@@ -922,23 +901,14 @@ async fn run_native_calls(
                 name: p.name.clone(),
                 args: args_pretty.clone(),
                 justification: p.justification.clone(),
-                risk: p.risk.clone(),
                 tokens: turn_tokens.take(),
             })
             .await;
         if is_approval_gated(&p.name) && !ctx.auto_approve {
-            let has_j = p.justification.is_some();
-            let has_r = p.risk.is_some();
-            if !has_j || !has_r {
-                let missing = [(has_j, "justification"), (has_r, "risk")]
-                    .iter()
-                    .filter(|(ok, _)| !ok)
-                    .map(|(_, l)| *l)
-                    .collect::<Vec<_>>()
-                    .join(" and ");
+            if p.justification.is_none() {
                 let msg = format!(
-                    "tool `{name}` is approval-gated and was called without {missing}. \
-                     Repeat the call passing `justification` and `risk` as arguments.",
+                    "tool `{name}` is approval-gated and was called without `justification`. \
+                     Repeat the call passing `justification` as an argument.",
                     name = p.name,
                 );
                 let _ = tx
@@ -953,7 +923,6 @@ async fn run_native_calls(
             }
             ctx.set_approval(comrade_tool::ApprovalNotes {
                 justification: p.justification.clone().unwrap_or_default(),
-                risk: p.risk.clone(),
             });
         }
 
@@ -1350,7 +1319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_gated_tool_refused_without_justification_and_risk() {
+    async fn approval_gated_tool_refused_without_justification() {
         let port = spawn_model_with(&[
             "Thought: write it\nTool: write_file\nArgs: {\"path\": \"x.rs\", \"content\": \"a\"}",
             "All done.",
@@ -1424,7 +1393,7 @@ mod tests {
     #[tokio::test]
     async fn approval_gated_tool_runs_when_notes_present() {
         let port = spawn_model_with(&[
-            "Thought: write it\nJustification: needed to add the requested file\nRisk: none\nTool: write_file\nArgs: {\"path\": \"y.rs\", \"content\": \"b\"}",
+            "Thought: write it\nJustification: needed to add the requested file\nTool: write_file\nArgs: {\"path\": \"y.rs\", \"content\": \"b\"}",
             "All done.",
         ]);
         let mut cfg = Config::default();
@@ -1477,8 +1446,8 @@ mod tests {
     }
 
     /// Serve one native tool-call request (streamed `tool_calls`), then a final
-    /// text answer. When `gated` the tool call targets write_file without
-    /// justification/risk.
+    /// text answer. When `gated` the tool call targets write_file without a
+    /// justification.
     fn spawn_native_model() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1838,7 +1807,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome.final_answer, "All done.");
-        // gated native call without justification/risk never reached the tool
+        // gated native call without justification never reached the tool
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let mut saw_refusal = false;
