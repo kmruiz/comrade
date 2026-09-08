@@ -45,12 +45,17 @@ struct Deps {
     root: PathBuf,
     /// DeepSeek account balance (total), when available.
     balance: Option<String>,
+    /// Path the live config was read from (None when only defaults apply), so
+    /// the TUI can re-read it on a config-reload command.
+    config_source: Option<PathBuf>,
+    /// True when the CLI forced autonomy=auto; re-applied on config reloads.
+    auto_forced: bool,
 }
 
 async fn build_deps(cli: &Cli) -> Result<Deps> {
-    let mut cfg = Config::load(cli.config.as_deref())
-        .context("failed to load config")?
-        .config;
+    let loaded = Config::load(cli.config.as_deref()).context("failed to load config")?;
+    let config_source = loaded.source;
+    let mut cfg = loaded.config;
     if cli.auto {
         cfg.security.autonomy = comrade_core::Autonomy::Auto;
     }
@@ -89,6 +94,8 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
         tools,
         root,
         balance,
+        config_source,
+        auto_forced: cli.auto,
     })
 }
 

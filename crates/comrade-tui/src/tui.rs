@@ -307,6 +307,7 @@ enum MxCommand {
     MoveUserDown,
     MoveUserUp,
     Quit,
+    ReloadConfig,
     SearchChat,
     SubmitPrompt,
     ToggleAutoAccept,
@@ -331,6 +332,7 @@ impl MxCommand {
         MxCommand::MoveUserDown,
         MxCommand::MoveUserUp,
         MxCommand::Quit,
+        MxCommand::ReloadConfig,
         MxCommand::SearchChat,
         MxCommand::SubmitPrompt,
         MxCommand::ToggleAutoAccept,
@@ -354,6 +356,7 @@ impl MxCommand {
             MxCommand::MoveUserDown => "move-user-down",
             MxCommand::MoveUserUp => "move-user-up",
             MxCommand::Quit => "quit",
+            MxCommand::ReloadConfig => "reload-config",
             MxCommand::SearchChat => "search-chat-history",
             MxCommand::SubmitPrompt => "submit-prompt",
             MxCommand::ToggleAutoAccept => "toggle-auto-accept",
@@ -379,6 +382,7 @@ impl MxCommand {
             MxCommand::MoveUserDown => Some("C-S-n"),
             MxCommand::MoveUserUp => Some("C-S-p"),
             MxCommand::Quit => Some("C-c"),
+            MxCommand::ReloadConfig => Some("C-r"),
             MxCommand::SearchChat => Some("C-s"),
             MxCommand::SubmitPrompt => Some("<return>"),
             MxCommand::ToggleAutoAccept => Some("C-SPC"),
@@ -403,6 +407,7 @@ impl MxCommand {
             MxCommand::MoveUserDown => "jump to the next message you sent",
             MxCommand::MoveUserUp => "jump to the previous message you sent",
             MxCommand::Quit => "quit the cockpit",
+            MxCommand::ReloadConfig => "reload the config file without restarting",
             MxCommand::SearchChat => "search the chat history",
             MxCommand::SubmitPrompt => "send the prompt to the agent",
             MxCommand::ToggleAutoAccept => "toggle auto-accept of approvals",
@@ -490,6 +495,11 @@ struct App {
     client: Arc<comrade_core::LlmClient>,
     tools: Arc<comrade_tool::ToolRegistry>,
     root: std::path::PathBuf,
+    /// Path the live config was read from (None = defaults only), so a reload
+    /// command can re-read it without restarting.
+    config_source: Option<std::path::PathBuf>,
+    /// True when the CLI forced autonomy=auto; re-applied on config reloads.
+    auto_forced: bool,
 
     session: Arc<AgentSession>,
     ctx_base: ToolContext,
@@ -899,6 +909,62 @@ impl App {
         self.push_meta("cancelling...");
     }
 
+    /// Re-read the config file from disk and swap the live model client, tool
+    /// registry (so `[[delegates]]` changes take effect) and approval policy.
+    /// Only applies while idle: a run in flight keeps the config it started
+    /// with. On any error the old config stays active and the failure is shown.
+    fn reload_config(&mut self) {
+        if self.running {
+            self.push_meta("cannot reload config while a run is in flight");
+            return;
+        }
+        let loaded = match comrade_core::Config::load(self.config_source.as_deref()) {
+            Ok(l) => l,
+            Err(e) => {
+                self.push_meta(format!("config reload failed: {e:#}"));
+                return;
+            }
+        };
+        let mut cfg = loaded.config;
+        let source = loaded.source;
+        if self.auto_forced {
+            cfg.security.autonomy = comrade_core::Autonomy::Auto;
+        }
+        // The context window and model version are detected against the live
+        // endpoint at startup; keep them across a reload unless the new config
+        // pins them explicitly.
+        if cfg.llm.context_window.is_none() {
+            cfg.llm.context_window = self.cfg.llm.context_window;
+        }
+        if cfg.llm.model_version.is_none() {
+            cfg.llm.model_version = self.cfg.llm.model_version.clone();
+        }
+        let client = match comrade_core::LlmClient::new(&cfg.llm) {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_meta(format!("config reload failed: {e:#}"));
+                return;
+            }
+        };
+        let tools = match crate::build_tools(&cfg) {
+            Ok(t) => t,
+            Err(e) => {
+                self.push_meta(format!("config reload failed: {e:#}"));
+                return;
+            }
+        };
+        self.ctx_base.auto_approve = cfg.auto_approve();
+        self.ctx_budget = cfg.effective_budget();
+        let from = source
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "defaults".into());
+        self.push_meta(format!("config reloaded from {from}"));
+        self.cfg = Arc::new(cfg);
+        self.client = Arc::new(client);
+        self.tools = Arc::new(tools);
+    }
+
     /// True when approvals run without prompting: either the config autonomy
     /// is `auto` (`ctx_base.auto_approve`) or the user toggled ctrl-space.
     fn auto_mode_on(&self) -> bool {
@@ -1175,6 +1241,7 @@ impl App {
             MxCommand::MoveUserDown => self.move_user(1),
             MxCommand::MoveUserUp => self.move_user(-1),
             MxCommand::Quit => return true,
+            MxCommand::ReloadConfig => self.reload_config(),
             MxCommand::SearchChat => self.search = Some(Search::new()),
             MxCommand::SubmitPrompt => {
                 if !self.running {
@@ -1458,6 +1525,8 @@ pub async fn run(deps: &Deps) -> Result<()> {
         client: deps.client.clone(),
         tools: deps.tools.clone(),
         root: deps.root.clone(),
+        config_source: deps.config_source.clone(),
+        auto_forced: deps.auto_forced,
         session: bundle.session.clone(),
         ctx_base: bundle.ctx_base.clone(),
         history: Arc::new(tokio::sync::Mutex::new(build_session_context(
@@ -1651,6 +1720,11 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
             // Ctrl-S opens the chat-history search.
             if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.search = Some(Search::new());
+                return false;
+            }
+            // Ctrl-R re-reads the config file without restarting.
+            if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.reload_config();
                 return false;
             }
             // Emacs-style chat navigation. Plain Ctrl+p/n move block to block;
