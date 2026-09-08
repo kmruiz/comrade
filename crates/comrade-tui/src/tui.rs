@@ -2957,7 +2957,10 @@ fn is_read_tool(name: &str) -> bool {
 }
 
 /// What a folded run did, boiled down for its one-line header: how many tool
-/// calls, whether anything failed, and the non-read tools used (with counts).
+/// calls, whether anything failed, and the tools used, aggregated into
+/// "name ×n" items (rgrep ×5 reads as one item, never five). Mutating tools
+/// come first; read/search tools trail them so a long read-heavy run still
+/// shows the actions that changed something.
 struct RunDigest {
     calls: usize,
     ok: bool,
@@ -2974,13 +2977,11 @@ fn run_digest(children: &[Msg]) -> RunDigest {
                 || (m.kind == MsgKind::Tool && m.tool.as_ref().is_some_and(|t| !t.ok))
         })
         .count();
-    // Non-read tool names in first-seen order, counts folded in (×n).
+    // Tool names in first-seen order, counts folded in (×n) — reads included
+    // so a stretch of lookups collapses into one countable token per tool.
     let mut seen: Vec<(String, usize)> = Vec::new();
     for m in children {
         if let Some(t) = &m.tool {
-            if is_read_tool(&t.name) {
-                continue;
-            }
             if let Some((_, c)) = seen.iter_mut().find(|(n, _)| *n == t.name) {
                 *c += 1;
             } else {
@@ -2988,6 +2989,9 @@ fn run_digest(children: &[Msg]) -> RunDigest {
             }
         }
     }
+    // Stable sort: mutating tools keep first-seen order and lead the summary;
+    // read/search tools group dimly behind them.
+    seen.sort_by_key(|(n, _)| is_read_tool(n));
     let actions = seen
         .iter()
         .map(|(n, c)| {
@@ -3397,18 +3401,14 @@ fn layout_run(out: &mut Vec<RenderRow>, msg_idx: usize, children: &[Msg]) {
     if let Some(a) = author {
         spans.push(Span::styled(format!(" · {a}"), dim));
     }
-    if d.calls > 0 {
-        spans.push(Span::styled(
-            format!(" · {} call{}", d.calls, if d.calls == 1 { "" } else { "s" }),
-            dim,
-        ));
+    // The aggregated tool names ARE the summary (rgrep ×5 · apply_patch), so
+    // the raw call count is noise; the ✓/✗ state follows the actions.
+    if !d.actions.is_empty() {
+        spans.push(Span::styled(format!("  · {}", cap(&d.actions, 100)), dim));
     }
     if let Some(s) = status {
         spans.push(Span::styled("  ", dim));
         spans.push(s);
-    }
-    if !d.actions.is_empty() {
-        spans.push(Span::styled(format!("  · {}", cap(&d.actions, 60)), dim));
     }
     let (ms, tokens) = run_usage(children);
     if tokens > 0 {
@@ -3458,27 +3458,28 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
         glyph,
         name,
     ];
-    if let Some(a) = card.author.as_deref() {
-        spans.push(Span::styled(
-            format!(" · {a}"),
-            Style::default().fg(Color::DarkGray),
-        ));
+    // Collapsed rows are the task's name, nothing more: no author, no request
+    // preview, no result tail — all of that lives behind the card (open it).
+    // While the call is still running or awaiting approval its args matter
+    // (a pending apply_patch must say what it touches), so the one-line
+    // "what it targets" headline and justification ride along only then.
+    let pending = card.result.is_none() && !card.open;
+    if pending {
+        if let Some(h) = tool_headline(&card.name, &card.args) {
+            spans.push(Span::styled(
+                format!("  {h}"),
+                Style::default().fg(if read { Color::DarkGray } else { Color::White }),
+            ));
+        }
+        if let Some(j) = card.justification.as_deref() {
+            spans.push(Span::styled(
+                format!("  · {j}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
-    if let Some(h) = tool_headline(&card.name, &card.args) {
-        spans.push(Span::styled(
-            format!("  {h}"),
-            Style::default().fg(if read { Color::DarkGray } else { Color::White }),
-        ));
-    }
-    if let Some(j) = card.justification.as_deref() {
-        spans.push(Span::styled(
-            format!("  · {j}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    // Status: pass/fail mark, plus (when collapsed) a one-line result tail so
-    // the row shows what happened, never just the task's name.
-    if let Some(result) = card.result.as_deref() {
+    // Status: a bare pass/fail mark once the call finished — no inline result.
+    if card.result.is_some() {
         let ok = card.ok;
         spans.push(Span::styled(
             format!("  {}", if ok { "✓" } else { "✗" }),
@@ -3486,13 +3487,6 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
                 .fg(if ok { Color::Green } else { Color::Red })
                 .add_modifier(Modifier::BOLD),
         ));
-        if !card.open {
-            let tail = one_line(result, 56);
-            spans.push(Span::styled(
-                format!("  {tail}"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
     }
     // How long the call took is always shown once it finished; the real tokens
     // of the model request behind it are shown when the card is open.
@@ -3517,6 +3511,15 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
     });
     if !card.open {
         return;
+    }
+    if let Some(j) = card.justification.as_deref() {
+        for s in plain_wrap(&format!("justification: {j}"), width) {
+            out.push(RenderRow {
+                rule: None,
+                spans: vec![Span::styled(s, Style::default().fg(Color::DarkGray))],
+                tool_header: None,
+            });
+        }
     }
     if let Some(risk) = &card.risk {
         for s in plain_wrap(&format!("risk: {risk}"), width) {
@@ -4833,21 +4836,24 @@ mod tests {
     }
 
     #[test]
-    fn run_digest_counts_calls_and_skips_reads_in_actions() {
+    fn run_digest_counts_calls_and_aggregates_reads_into_actions() {
         let children = vec![
             tool_card("read_file", "{}", true, false),
+            tool_card("rgrep", "{}", true, false),
             tool_card("rgrep", "{}", true, false),
             tool_card("apply_patch", "{}", true, false),
             tool_card("run_tests", "{}", true, false),
         ];
         let d = run_digest(&children);
-        assert_eq!(d.calls, 4);
+        assert_eq!(d.calls, 5);
         assert!(d.ok);
         assert_eq!(d.failed, 0);
-        assert!(!d.actions.contains("read_file"));
-        assert!(!d.actions.contains("rgrep"));
-        assert!(d.actions.contains("apply_patch"));
-        assert!(d.actions.contains("run_tests"));
+        // Every tool is in the summary now — reads are aggregated, not dropped,
+        // and repeated lookups fold into one countable item (rgrep ×2).
+        assert!(d.actions.contains("read_file"), "{}", d.actions);
+        assert!(d.actions.contains("rgrep ×2"), "{}", d.actions);
+        assert!(d.actions.contains("apply_patch"), "{}", d.actions);
+        assert!(d.actions.contains("run_tests"), "{}", d.actions);
 
         let failing = vec![tool_card("run_task", "{}", false, false)];
         let d = run_digest(&failing);
@@ -4885,8 +4891,53 @@ mod tests {
         assert_eq!(out[0].tool_header, Some(7));
         let flat: String = out[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("task run"), "{flat}");
-        assert!(flat.contains("2 calls"), "{flat}");
+        // The header names the tools (reads aggregated in, never a bare
+        // "N calls" count) and marks the outcome.
+        assert!(flat.contains("apply_patch"), "{flat}");
+        assert!(flat.contains("read_file"), "{flat}");
+        assert!(!flat.contains("calls"), "{flat}");
         assert!(flat.contains("✓"), "{flat}");
+    }
+
+    #[test]
+    fn finished_tool_row_is_just_name_and_status() {
+        // A finished call in a folded run renders as its task name + ✓/✗ and
+        // duration — no request headline, no author, no inline result text.
+        let card = ToolCard {
+            name: "rgrep".into(),
+            author: Some("model".into()),
+            args: r#"{"pattern":"fold","glob":"*.rs"}"#.into(),
+            justification: None,
+            risk: None,
+            result: Some("5 matches".into()),
+            ok: true,
+            open: false,
+            started: Some(Instant::now()),
+            taken_ms: Some(120),
+            tokens: None,
+        };
+        let mut out = Vec::new();
+        layout_tool(&mut out, 1, &card, 60);
+        assert_eq!(out.len(), 1, "collapsed: header row only");
+        let flat: String = out[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(flat.contains("rgrep"), "{flat}");
+        assert!(flat.contains("✓"), "{flat}");
+        assert!(flat.contains("120ms"), "{flat}");
+        assert!(!flat.contains("fold"), "{flat}"); // no request preview
+        assert!(!flat.contains("5 matches"), "{flat}"); // no result tail
+        assert!(!flat.contains("model"), "{flat}"); // no author
+        // Opening the card exposes the request and result again.
+        let mut card = card;
+        card.open = true;
+        let mut out = Vec::new();
+        layout_tool(&mut out, 1, &card, 60);
+        let body: String = out
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(body.contains("args:"), "{body}");
+        assert!(body.contains("5 matches"), "{body}");
     }
 
     // --- usage display: durations, tokens, reasoning default-open -----------
