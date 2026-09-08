@@ -108,6 +108,15 @@ struct ToolCard {
     result: Option<String>,
     ok: bool,
     open: bool,
+    /// When the call reached the UI (wall clock), to measure how long it took.
+    started: Option<std::time::Instant>,
+    /// Elapsed wall time once the call finished (None while still running or
+    /// when the run was interrupted before the result arrived).
+    taken_ms: Option<u128>,
+    /// Real tokens of the model request that produced this call, when the
+    /// endpoint reported usage (first call of a multi-call turn only, so
+    /// per-run sums count each request once).
+    tokens: Option<usize>,
 }
 
 /// One failed test: name + captured failure detail.
@@ -204,6 +213,13 @@ impl Msg {
             open: false,
             children,
         }
+    }
+    /// A thinking block under `author`. Reasoning is visible (expanded) by
+    /// default; the user can still collapse it with Tab.
+    fn reasoning(author: impl Into<String>, text: impl Into<String>) -> Self {
+        let mut m = Msg::authored(MsgKind::Reasoning, author, text);
+        m.open = true;
+        m
     }
 }
 
@@ -366,10 +382,16 @@ impl App {
     /// drop the preview.
     fn commit_stream_reasoning(&mut self) {
         if let Some(visible) = reasoning_from_stream(&self.stream) {
-            let author = self.actor_label();
-            self.push_msg(Msg::authored(MsgKind::Reasoning, author, visible));
+            self.push_reasoning(visible);
         }
         self.stream.clear();
+    }
+
+    /// Push a thinking block under the main model's name. Reasoning is visible
+    /// (expanded) by default; the user can still collapse it with Tab.
+    fn push_reasoning(&mut self, text: impl Into<String>) {
+        let author = self.actor_label();
+        self.push_msg(Msg::reasoning(author, text));
     }
 
     fn push_msg(&mut self, msg: Msg) {
@@ -388,6 +410,18 @@ impl App {
             Some(c) if c.name == name || name.is_empty() => Some(c),
             _ => None,
         })
+    }
+
+    /// Record the elapsed wall time of the last `name` card once its result
+    /// arrives (a no-op for cards that never started or already got stamped).
+    fn stamp_taken(&mut self, name: &str) {
+        if let Some(card) = self.last_tool_mut(name) {
+            if card.taken_ms.is_none() {
+                if let Some(started) = card.started {
+                    card.taken_ms = Some(started.elapsed().as_millis());
+                }
+            }
+        }
     }
 
     fn toggle_tool(&mut self, idx: usize) {
@@ -733,6 +767,7 @@ impl App {
                 args,
                 justification,
                 risk,
+                tokens,
             } => {
                 // This turn produced a tool call: keep whatever the model was
                 // saying before the call as a visible reasoning block, then
@@ -753,6 +788,9 @@ impl App {
                     result: None,
                     ok: true,
                     open: open_default,
+                    started: Some(std::time::Instant::now()),
+                    taken_ms: None,
+                    tokens,
                 }));
             }
             AgentEvent::ToolStart { .. } => {}
@@ -792,6 +830,7 @@ impl App {
                     card.result = Some(output);
                     card.ok = ok;
                 }
+                self.stamp_taken(&name);
             }
             AgentEvent::AssistantText(_) => {
                 // The full assistant text is redundant with the `Delta` stream;
@@ -806,8 +845,7 @@ impl App {
                 self.stream.clear();
                 let t = t.trim();
                 if !t.is_empty() {
-                    let author = self.actor_label();
-                    self.push_msg(Msg::authored(MsgKind::Reasoning, author, t.to_string()));
+                    self.push_reasoning(t.to_string());
                 }
             }
             AgentEvent::FinalAnswer(a) => {
@@ -2328,8 +2366,8 @@ fn fold_completed_runs(chat: &mut Vec<Msg>) -> Vec<(usize, usize)> {
     for &(start, len) in &spans {
         out.extend(chat[cursor..start].iter().cloned());
         let mut children: Vec<Msg> = chat[start..start + len].to_vec();
-        // Auto-collapse stale open cards (diffs, test results, failures,
-        // reasoning) now that the stretch has finished.
+        // Auto-collapse stale open cards (diffs, test results, failures) now
+        // that the stretch has finished; reasoning stays expanded by default.
         for m in &mut children {
             match m.kind {
                 MsgKind::Tool => {
@@ -2342,7 +2380,6 @@ fn fold_completed_runs(chat: &mut Vec<Msg>) -> Vec<(usize, usize)> {
                         f.open = false;
                     }
                 }
-                MsgKind::Reasoning => m.open = false,
                 _ => {}
             }
         }
@@ -2727,6 +2764,71 @@ fn layout_failure(out: &mut Vec<RenderRow>, msg_idx: usize, fail: &TestFail, wid
     }
 }
 
+/// Compact human duration from milliseconds: "140ms", "3.4s", "2m 5s".
+fn fmt_dur_ms(ms: u128) -> String {
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    if ms < 60_000 {
+        let s = ms / 1_000;
+        if ms % 1_000 == 0 {
+            return format!("{s}s");
+        }
+        return format!("{s}.{}s", ms % 1_000 / 100);
+    }
+    let total_s = ms / 1_000;
+    if total_s % 60 == 0 {
+        format!("{}m", total_s / 60)
+    } else {
+        format!("{}m {}s", total_s / 60, total_s % 60)
+    }
+}
+
+/// Compact token count: "231", "1.2k", "3.4M".
+fn fmt_tokens(n: usize) -> String {
+    let fmt = |v: f64, unit: &str| -> String {
+        if (v - v.trunc()).abs() < 1e-9 {
+            format!("{}{unit}", v as usize)
+        } else {
+            format!("{v:.1}{unit}")
+        }
+    };
+    if n >= 1_000_000 {
+        fmt(n as f64 / 1_000_000.0, "M")
+    } else if n >= 1_000 {
+        fmt(n as f64 / 1_000.0, "k")
+    } else {
+        n.to_string()
+    }
+}
+
+/// Aggregated usage of a folded run's tool calls: the wall time of the whole
+/// stretch (first call started .. last call finished) and the total real
+/// tokens of the model requests behind them (each request counted once).
+/// Returns `(None, 0)` when no finished call carries timing.
+fn run_usage(children: &[Msg]) -> (Option<u128>, usize) {
+    let mut tokens = 0usize;
+    let mut start: Option<Instant> = None;
+    let mut end: Option<Instant> = None;
+    for m in children {
+        let Some(c) = &m.tool else { continue };
+        if let Some(t) = c.tokens {
+            tokens += t;
+        }
+        let (Some(s), Some(ms)) = (c.started, c.taken_ms) else {
+            continue;
+        };
+        let e = s + Duration::from_millis(ms as u64);
+        start = Some(start.map_or(s, |st| st.min(s)));
+        end = Some(end.map_or(e, |en| en.max(e)));
+    }
+    let ms = match (start, end) {
+        (Some(s), Some(e)) => Some(e.duration_since(s).as_millis()),
+        _ => None,
+    };
+    (ms, tokens)
+}
+
 /// One-line digest of a folded run: clicking/Tab unfolds it back into its
 /// original messages.
 fn layout_run(out: &mut Vec<RenderRow>, msg_idx: usize, children: &[Msg]) {
@@ -2780,6 +2882,13 @@ fn layout_run(out: &mut Vec<RenderRow>, msg_idx: usize, children: &[Msg]) {
     }
     if !d.actions.is_empty() {
         spans.push(Span::styled(format!("  · {}", cap(&d.actions, 60)), dim));
+    }
+    let (ms, tokens) = run_usage(children);
+    if tokens > 0 {
+        spans.push(Span::styled(format!("  · {} tok", fmt_tokens(tokens)), dim));
+    }
+    if let Some(ms) = ms {
+        spans.push(Span::styled(format!("  · {}", fmt_dur_ms(ms)), dim));
     }
     out.push(RenderRow {
         rule: None,
@@ -2854,6 +2963,22 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             let tail = one_line(result, 56);
             spans.push(Span::styled(
                 format!("  {tail}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    // How long the call took is always shown once it finished; the real tokens
+    // of the model request behind it are shown when the card is open.
+    if let Some(ms) = card.taken_ms {
+        spans.push(Span::styled(
+            format!("  · {}", fmt_dur_ms(ms)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if card.open {
+        if let Some(tok) = card.tokens {
+            spans.push(Span::styled(
+                format!("  · {} tok", fmt_tokens(tok)),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -4025,6 +4150,9 @@ mod tests {
             result: None,
             ok,
             open,
+            started: None,
+            taken_ms: None,
+            tokens: None,
         })
     }
 
@@ -4197,6 +4325,120 @@ mod tests {
         assert!(flat.contains("task run"), "{flat}");
         assert!(flat.contains("2 calls"), "{flat}");
         assert!(flat.contains("✓"), "{flat}");
+    }
+
+    // --- usage display: durations, tokens, reasoning default-open -----------
+
+    /// A finished tool card carrying explicit timing/token data.
+    fn timed_card(started: Instant, taken_ms: u128, tokens: Option<usize>) -> Msg {
+        Msg::tool(ToolCard {
+            name: "apply_patch".into(),
+            author: Some("model".into()),
+            args: "{}".into(),
+            justification: None,
+            risk: None,
+            result: Some("done".into()),
+            ok: true,
+            open: false,
+            started: Some(started),
+            taken_ms: Some(taken_ms),
+            tokens,
+        })
+    }
+
+    #[test]
+    fn durations_and_tokens_format_compactly() {
+        assert_eq!(fmt_dur_ms(140), "140ms");
+        assert_eq!(fmt_dur_ms(3_000), "3s");
+        assert_eq!(fmt_dur_ms(3_450), "3.4s");
+        assert_eq!(fmt_dur_ms(125_000), "2m 5s");
+        assert_eq!(fmt_dur_ms(60_000), "1m");
+        assert_eq!(fmt_tokens(231), "231");
+        assert_eq!(fmt_tokens(1_000), "1k");
+        assert_eq!(fmt_tokens(1_234), "1.2k");
+        assert_eq!(fmt_tokens(3_400_000), "3.4M");
+    }
+
+    #[test]
+    fn run_usage_spans_first_to_last_call_and_sums_tokens() {
+        let t0 = Instant::now();
+        let children = vec![
+            timed_card(t0, 1_000, Some(100)),
+            timed_card(t0 + Duration::from_millis(2_000), 500, Some(200)),
+        ];
+        let (ms, tokens) = run_usage(&children);
+        assert_eq!(ms, Some(2_500));
+        assert_eq!(tokens, 300);
+        // No finished call: no timing; no reported usage: no tokens.
+        let bare = vec![tool_card("apply_patch", "{}", true, false)];
+        assert_eq!(run_usage(&bare), (None, 0));
+    }
+
+    #[test]
+    fn digest_row_shows_time_and_tokens() {
+        let t0 = Instant::now();
+        let children = vec![
+            timed_card(t0, 3_450, Some(1_234)),
+            timed_card(t0 + Duration::from_millis(1_000), 1_000, None),
+        ];
+        let mut out = Vec::new();
+        layout_run(&mut out, 3, &children);
+        let flat: String = out[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(flat.contains("1.2k tok"), "{flat}");
+        assert!(flat.contains("3.4s"), "{flat}");
+    }
+
+    #[test]
+    fn card_header_shows_duration_always_and_tokens_when_open() {
+        let row_text = |open: bool| -> String {
+            let mut card = ToolCard {
+                name: "run_tests".into(),
+                author: Some("model".into()),
+                args: "{}".into(),
+                justification: None,
+                risk: None,
+                result: Some("3 passed".into()),
+                ok: true,
+                open,
+                started: Some(Instant::now()),
+                taken_ms: Some(3_450),
+                tokens: Some(1_234),
+            };
+            card.open = open;
+            let mut out = Vec::new();
+            layout_tool(&mut out, 1, &card, 60);
+            out[0].spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        // Collapsed: duration visible, tokens hidden.
+        let closed = row_text(false);
+        assert!(closed.contains("3.4s"), "{closed}");
+        assert!(!closed.contains("tok"), "{closed}");
+        // Open: both visible.
+        let open = row_text(true);
+        assert!(open.contains("3.4s"), "{open}");
+        assert!(open.contains("1.2k tok"), "{open}");
+    }
+
+    #[test]
+    fn reasoning_is_open_by_default_and_survives_folding() {
+        let m = Msg::reasoning("model", "let me check the layout code");
+        assert_eq!(m.kind, MsgKind::Reasoning);
+        assert!(m.open);
+        // Folding a stretch keeps reasoning expanded (only tool/failure cards
+        // are force-collapsed).
+        let mut chat = vec![
+            Msg::reasoning("model", "think"),
+            tool_card("apply_patch", "{}", true, true),
+        ];
+        fold_completed_runs(&mut chat);
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].kind, MsgKind::Run);
+        let children = &chat[0].children;
+        assert!(children[0].open, "reasoning must stay expanded after folding");
+        assert!(
+            !children[1].tool.as_ref().unwrap().open,
+            "tool cards are still force-collapsed"
+        );
     }
 
     #[test]
@@ -4664,6 +4906,9 @@ mod search_tests {
             result: Some("3 passed".into()),
             ok: true,
             open: true,
+            started: None,
+            taken_ms: None,
+            tokens: None,
         });
         assert!(msg_matches(&card, "run_task"));
         assert!(msg_matches(&card, "verify"));

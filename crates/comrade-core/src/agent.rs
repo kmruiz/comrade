@@ -8,9 +8,20 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::context::ContextManager;
-use crate::llm::{ChatMessage, LlmClient, Role};
+use crate::llm::{ChatMessage, LlmClient, Role, Usage};
 use crate::react::{build_system_prompt, parse_turn, render_observation};
 use crate::session::AgentEvent;
+
+/// Total real tokens a request cost, when the endpoint reported any usage.
+fn usage_total(u: &Usage) -> Option<usize> {
+    if u.total_tokens > 0 {
+        Some(u.total_tokens)
+    } else if u.prompt_tokens + u.completion_tokens > 0 {
+        Some(u.prompt_tokens + u.completion_tokens)
+    } else {
+        None
+    }
+}
 
 /// Tools whose side effects require human approval (and thus mandatory
 /// Justification/Risk). Keep in sync with the tool crates.
@@ -752,6 +763,7 @@ async fn run_agent_loop(
                 args: args_pretty.clone(),
                 justification: turn_p.justification.clone(),
                 risk: turn_p.risk.clone(),
+                tokens: turn.usage.as_ref().and_then(usage_total),
             })
             .await;
         let _ = tx
@@ -862,6 +874,9 @@ async fn run_native_calls(
             .iter()
             .all(|p| p.name == crate::delegate::TOOL_NAME);
     let mut deferred: Vec<Prepared> = Vec::new();
+    // Real usage of the request behind this batch; handed to the first tool
+    // call that actually dispatches so per-run sums count each request once.
+    let mut turn_tokens = turn.usage.as_ref().and_then(usage_total);
 
     'calls: for p in prepared {
         let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
@@ -899,6 +914,7 @@ async fn run_native_calls(
                 args: args_pretty.clone(),
                 justification: p.justification.clone(),
                 risk: p.risk.clone(),
+                tokens: turn_tokens.take(),
             })
             .await;
         if is_approval_gated(&p.name) && !ctx.auto_approve {
@@ -2109,5 +2125,35 @@ mod monitors_tests {
         let m = verify_guard_message();
         assert!(m.contains("run_tests"));
         assert!(m.contains("git_commit"));
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::usage_total;
+    use crate::llm::Usage;
+
+    #[test]
+    fn usage_total_prefers_total_then_falls_back_to_the_sum() {
+        // Endpoint reports total_tokens directly.
+        assert_eq!(
+            usage_total(&Usage {
+                total_tokens: 150,
+                prompt_tokens: 100,
+                completion_tokens: 50,
+            }),
+            Some(150)
+        );
+        // Only the parts are present: sum them.
+        assert_eq!(
+            usage_total(&Usage {
+                total_tokens: 0,
+                prompt_tokens: 90,
+                completion_tokens: 10,
+            }),
+            Some(100)
+        );
+        // No usage at all: the UI falls back to "no tokens reported".
+        assert_eq!(usage_total(&Usage::default()), None);
     }
 }
