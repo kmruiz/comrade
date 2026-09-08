@@ -232,7 +232,7 @@ struct RenderRow {
     tool_header: Option<usize>,
 }
 
-/// Active incremental search over the chat history (Ctrl-F).
+/// Active incremental search over the chat history (Ctrl-S).
 struct Search {
     /// Raw query as typed by the user (matched case-insensitively).
     query: String,
@@ -379,7 +379,7 @@ impl MxCommand {
             MxCommand::MoveUserDown => Some("C-S-n"),
             MxCommand::MoveUserUp => Some("C-S-p"),
             MxCommand::Quit => Some("C-c"),
-            MxCommand::SearchChat => Some("C-f"),
+            MxCommand::SearchChat => Some("C-s"),
             MxCommand::SubmitPrompt => Some("<return>"),
             MxCommand::ToggleAutoAccept => Some("C-SPC"),
             MxCommand::ToggleToolCard => Some("tab"),
@@ -519,7 +519,7 @@ struct App {
     /// Raw current model output (not yet committed to a message).
     stream: String,
     input: Editor,
-    /// Active Ctrl-F search over chat history (None when closed).
+    /// Active Ctrl-S search over chat history (None when closed).
     search: Option<Search>,
     dialogs: Vec<Dialog>,
     /// True while the open dialog buffers a follow-up question to the model.
@@ -764,7 +764,7 @@ impl App {
         }
     }
 
-    // --- Ctrl-F search over chat history ----------------------------------
+    // --- Ctrl-S search over chat history ----------------------------------
 
     /// All chat indices whose message matches the current query (folded run
     /// digests match through their children).
@@ -1639,7 +1639,7 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                     MxKeyOutcome::Handled => return false,
                     MxKeyOutcome::Quit => return true,
                     // Closed without consuming the key: fall through so e.g.
-                    // Ctrl-F pressed while the palette is open still searches.
+                    // Ctrl-S pressed while the palette is open still searches.
                     MxKeyOutcome::Closed => {}
                 }
             }
@@ -1648,8 +1648,8 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                 app.open_model_pick();
                 return false;
             }
-            // Ctrl-F opens the chat-history search.
-            if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            // Ctrl-S opens the chat-history search.
+            if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.search = Some(Search::new());
                 return false;
             }
@@ -1752,15 +1752,15 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
     }
 }
 
-/// Keys while the Ctrl-F search bar is active. Returns true when the app should quit.
+/// Keys while the Ctrl-S search bar is active. Returns true when the app should quit.
 fn handle_search_key(app: &mut App, key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
-        // Close the search bar (Esc or Ctrl-F).
+        // Close the search bar (Esc or Ctrl-S).
         KeyCode::Esc => app.search = None,
-        KeyCode::Char('f') if ctrl => app.search = None,
+        KeyCode::Char('s') if ctrl => app.search = None,
         // Cycle through matches: enter/↓ next, shift-enter/↑ previous.
         KeyCode::Enter | KeyCode::Down | KeyCode::PageDown if !shift => app.step_search(1),
         KeyCode::Enter | KeyCode::Up | KeyCode::PageUp if shift => app.step_search(-1),
@@ -1790,7 +1790,7 @@ enum MxKeyOutcome {
     /// The palette ran `quit`; the whole app should exit.
     Quit,
     /// The palette dismissed itself without consuming the key, so the caller
-    /// should dispatch the key normally (e.g. Ctrl-F pressed mid-typing).
+    /// should dispatch the key normally (e.g. Ctrl-S pressed mid-typing).
     Closed,
 }
 
@@ -2055,7 +2055,7 @@ fn search_step(state: Option<(usize, usize)>, dir: isize) -> Option<usize> {
 }
 
 /// Lowercased, searchable text of a message (chat body + tool/failure cards).
-/// A folded [`MsgKind::Run`] digest exposes every child, so Ctrl-F still finds
+/// A folded [`MsgKind::Run`] digest exposes every child, so search still finds
 /// text inside a collapsed run and copy_selected copies the whole stretch.
 fn msg_searchable(msg: &Msg) -> String {
     let mut s = msg.text.clone();
@@ -2391,7 +2391,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
         frame.render_widget(Paragraph::new(mx_line), rows[1]);
         draw_mx_list(mx, frame, rows[1]);
     } else if let Some(s) = &app.search {
-        // Search bar replaces the prompt line while Ctrl-F is active.
+        // Search bar replaces the prompt line while Ctrl-S is active.
         let total = s.matches.len();
         let counter = if s.query.is_empty() {
             "type to search".to_string()
