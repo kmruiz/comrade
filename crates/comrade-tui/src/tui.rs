@@ -13,7 +13,10 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use arboard::Clipboard;
 use async_trait::async_trait;
-use comrade_core::{AgentEvent, AgentSession, ChatMessage, MemoryUndo, Role, run_agent};
+use comrade_core::{
+    AgentEvent, AgentSession, ChatMessage, ContextManager, MemoryUndo, Role, build_session_context,
+    run_agent_with_history,
+};
 use comrade_tool::{PlanStatus, SessionControl, ToolContext, UserIo, UserPrompt, UserReply};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -216,6 +219,10 @@ struct App {
     session: Arc<AgentSession>,
     undo: Arc<MemoryUndo>,
     ctx_base: ToolContext,
+    /// Rolling conversation history shared across task runs in this session:
+    /// kept between prompts (never wiped at task end) and compacted
+    /// automatically as it approaches the token budget.
+    history: Arc<tokio::sync::Mutex<ContextManager>>,
 
     events_tx: mpsc::Sender<AgentEvent>,
     events_rx: mpsc::Receiver<AgentEvent>,
@@ -447,6 +454,9 @@ impl App {
         let client = self.client.clone();
         let tools = self.tools.clone();
         let ctx = self.ctx_base.clone();
+        // One conversation per session: every task appends to the same history,
+        // which the agent compacts itself as it approaches the token budget.
+        let history = self.history.clone();
         let tx = self.events_tx.clone();
         let balance_tx = self.events_tx.clone();
         let stop = CancellationToken::new();
@@ -455,7 +465,22 @@ impl App {
         self.follow = true;
         self.sel = None;
         tokio::spawn(async move {
-            let _ = run_agent(&cfg, &client, ctx, &tools, prompt, tx, stop).await;
+            {
+                // Runs are serialized (self.running), so the guard is
+                // uncontended; it only exists to give the task owned access.
+                let mut history = history.lock().await;
+                let _ = run_agent_with_history(
+                    &cfg,
+                    &client,
+                    ctx,
+                    &tools,
+                    prompt,
+                    &mut history,
+                    tx,
+                    stop,
+                )
+                .await;
+            }
             // Refresh the provider account balance after the run finishes.
             if let Some(balance) = client.fetch_account_balance().await {
                 let _ = balance_tx.send(AgentEvent::AccountBalance(balance)).await;
@@ -769,6 +794,11 @@ pub async fn run(deps: &Deps) -> Result<()> {
         session: bundle.session.clone(),
         undo: bundle.undo.clone(),
         ctx_base: bundle.ctx_base.clone(),
+        history: Arc::new(tokio::sync::Mutex::new(build_session_context(
+            &deps.cfg,
+            &deps.root.to_string_lossy(),
+            &deps.tools,
+        ))),
         events_tx,
         events_rx,
         asks_rx,

@@ -15,7 +15,7 @@ pub mod react;
 pub mod session;
 pub mod undo;
 
-pub use agent::run_agent;
+pub use agent::{build_session_context, run_agent, run_agent_with_history};
 pub use config::{Autonomy, Config, DelegateCfg, LoadedConfig};
 pub use context::{ContextManager, estimate_tokens};
 pub use delegate::{DelegateLimits, DelegateTool};

@@ -20,8 +20,18 @@ pub fn estimate_tokens(text: &str) -> usize {
 ///    lines into a compact "Earlier context" rollup, so long sessions degrade
 ///    to summaries instead of silently losing history.
 ///
+/// History is trimmed once it *approaches* the budget (the `trim_target`),
+/// not only after crossing it: the reserved headroom keeps the next model
+/// request (plus its tool output and answer) comfortably inside the window.
+///
 /// The last [`KEEP_RECENT`] messages and the current step are always preserved.
 const KEEP_RECENT: usize = 2;
+/// One message out of every this many budget tokens is reserved as headroom
+/// while trimming (a tenth of the budget).
+const HEADROOM_FRACTION: usize = 10;
+/// Budgets below this keep the plain cap: a fraction of a tiny budget would be
+/// meaningless and would evict history the moment a single message arrives.
+const HEADROOM_MIN_BUDGET: usize = 4000;
 /// Observations larger than this many chars are stubbing candidates.
 const STUB_MIN_CHARS: usize = 600;
 /// Characters of the observation head kept when stubbing.
@@ -124,10 +134,10 @@ impl ContextManager {
         let _ = idx;
     }
 
-    /// Fit history under the token budget: stub large old observations, then
-    /// evict the oldest messages (folding thoughts into an "Earlier context"
-    /// rollup). Never drops index 0 (system) or the last [`KEEP_RECENT`]
-    /// messages.
+    /// Fit history under the budget, compacting as it *approaches* the cap:
+    /// stub large old observations, then evict the oldest messages (folding
+    /// thoughts into an "Earlier context" rollup). Never drops index 0
+    /// (system) or the last [`KEEP_RECENT`] messages.
     pub fn enforce_budget(&mut self) {
         // 1. Stub oversized observations from the past (not the recent window).
         loop {
@@ -170,8 +180,19 @@ impl ContextManager {
         }
     }
 
+    /// Token level history is compacted down to: the hard budget minus a
+    /// headroom fraction, so a request is never sent at the very edge of the
+    /// window. Small budgets fall back to the plain cap.
+    fn trim_target(&self) -> usize {
+        if self.budget_tokens >= HEADROOM_MIN_BUDGET {
+            self.budget_tokens - self.budget_tokens / HEADROOM_FRACTION
+        } else {
+            self.budget_tokens
+        }
+    }
+
     fn over_budget(&self) -> bool {
-        self.total_tokens() > self.budget_tokens
+        self.total_tokens() > self.trim_target()
     }
 
     /// Index of the oldest large tool observation that is outside the protected
@@ -371,6 +392,55 @@ mod tests {
             "oversized observation should be gone/stubbed"
         );
         assert!(cm.total_tokens() <= 40);
+    }
+
+    #[test]
+    fn compaction_starts_below_the_hard_budget_keeping_headroom() {
+        // budget 10_000 >= HEADROOM_MIN_BUDGET: history is trimmed down to the
+        // trim target (90% = 9_000) once it approaches the cap, leaving
+        // headroom, instead of waiting until it overflows the hard budget.
+        let mut cm = ContextManager::new(10_000, 100_000);
+        cm.push(ChatMessage::new(Role::System, "sys"));
+        // each message is ~2.25k estimated tokens
+        for i in 0..4u32 {
+            cm.push(ChatMessage::new(
+                Role::User,
+                format!("task {i}: {}", "x".repeat(9_000)),
+            ));
+        }
+        // ~9k tokens: over the 9_000 trim target yet under the 10_000 cap.
+        assert!(
+            cm.total_tokens() > 9_000,
+            "precondition: history approaches the budget"
+        );
+        assert!(
+            cm.total_tokens() <= 10_000,
+            "precondition: still under the hard cap"
+        );
+        cm.enforce_budget();
+        assert!(
+            cm.total_tokens() <= 9_000,
+            "compacted to the trim target, not the hard cap"
+        );
+        assert!(cm.evicted >= 1);
+        // evicted history is summarized, not silently dropped
+        assert!(
+            cm.messages()
+                .iter()
+                .any(|m| m.content.starts_with("Earlier context (compacted)"))
+        );
+    }
+
+    #[test]
+    fn no_compaction_below_the_trim_target() {
+        let mut cm = ContextManager::new(10_000, 100_000);
+        cm.push(ChatMessage::new(Role::System, "sys"));
+        cm.push(ChatMessage::new(
+            Role::User,
+            "short task that stays under the trim target",
+        ));
+        cm.enforce_budget();
+        assert_eq!(cm.evicted, 0);
     }
 }
 

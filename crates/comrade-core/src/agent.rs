@@ -319,6 +319,23 @@ pub struct AgentOutcome {
     pub iterations: usize,
 }
 
+/// Build the rolling message history (system prompt + budget manager) for one
+/// session. Sessions that run many tasks keep the returned manager and hand it
+/// to [`run_agent_with_history`] each time, so context survives task
+/// boundaries instead of being wiped on every final answer.
+pub fn build_session_context(
+    cfg: &Config,
+    project_root: &str,
+    tools: &ToolRegistry,
+) -> ContextManager {
+    let budget = cfg.effective_budget();
+    ContextManager::with_system(
+        build_system_prompt(project_root, tools, budget),
+        budget,
+        cfg.context.max_tool_output_chars,
+    )
+}
+
 /// Drive one agent session to completion against the given model.
 ///
 /// `ctx` carries the session state, human channel, and undo log; `tx` streams
@@ -329,6 +346,26 @@ pub async fn run_agent(
     ctx: ToolContext,
     tools: &ToolRegistry,
     user_input: String,
+    tx: mpsc::Sender<AgentEvent>,
+    stop: CancellationToken,
+) -> Result<AgentOutcome> {
+    let root = ctx.project_root.to_string_lossy().to_string();
+    let mut history = build_session_context(cfg, &root, tools);
+    run_agent_with_history(cfg, client, ctx, tools, user_input, &mut history, tx, stop).await
+}
+
+/// Run an agent task against a caller-owned history (see
+/// [`build_session_context`]). The history is kept across calls, so a session
+/// that processes many tasks retains the earlier conversation; the manager
+/// compacts it automatically as it approaches the budget. Exactly one task
+/// runs at a time against the manager.
+pub async fn run_agent_with_history(
+    cfg: &Config,
+    client: &LlmClient,
+    ctx: ToolContext,
+    tools: &ToolRegistry,
+    user_input: String,
+    history: &mut ContextManager,
     tx: mpsc::Sender<AgentEvent>,
     stop: CancellationToken,
 ) -> Result<AgentOutcome> {
@@ -343,15 +380,10 @@ pub async fn run_agent(
     }
     let _ = tx.send(AgentEvent::User(user_input.clone())).await;
 
-    let budget = cfg.effective_budget();
-    let mut ctxm = ContextManager::with_system(
-        build_system_prompt(ctx.project_root.to_string_lossy().as_ref(), tools, budget),
-        budget,
-        cfg.context.max_tool_output_chars,
-    );
-    ctxm.push(ChatMessage::new(Role::User, user_input));
+    history.push(ChatMessage::new(Role::User, user_input));
+    history.enforce_budget();
 
-    let result = run_agent_loop(cfg, client, tools, ctx, ctxm, tx.clone(), &stop).await;
+    let result = run_agent_loop(cfg, client, tools, ctx, history, tx.clone(), &stop).await;
 
     // Guarantee the UI always sees an error (if any) and a terminal event, on
     // every exit path.
@@ -367,7 +399,7 @@ async fn run_agent_loop(
     client: &LlmClient,
     tools: &ToolRegistry,
     ctx: ToolContext,
-    mut ctxm: ContextManager,
+    ctxm: &mut ContextManager,
     tx: mpsc::Sender<AgentEvent>,
     stop: &CancellationToken,
 ) -> Result<AgentOutcome> {
@@ -490,7 +522,7 @@ async fn run_agent_loop(
                 }
             }
             run_native_calls(
-                &mut ctxm,
+                ctxm,
                 &tx,
                 tools,
                 &ctx,
