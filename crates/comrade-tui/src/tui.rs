@@ -283,6 +283,181 @@ struct ModelPick {
     model_sel: Option<usize>,
 }
 
+// ---------------------------------------------------------------------------
+// M-x command palette (Alt+X)
+// ---------------------------------------------------------------------------
+
+/// Every cockpit command invocable from the M-x palette. The `name` is the
+/// descriptive, Emacs-style identifier typed into the palette; `keys` is the
+/// keybinding hint shown after a command runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MxCommand {
+    AssignModel,
+    BackwardKillWord,
+    BackwardWord,
+    BeginningOfLine,
+    CancelRun,
+    Copy,
+    EndOfLine,
+    ForwardWord,
+    InsertNewline,
+    KillWord,
+    MoveBlockDown,
+    MoveBlockUp,
+    MoveUserDown,
+    MoveUserUp,
+    Quit,
+    SearchChat,
+    SubmitPrompt,
+    ToggleAutoAccept,
+    ToggleToolCard,
+}
+
+impl MxCommand {
+    /// Palette order (alphabetical by descriptive name).
+    const ALL: &'static [MxCommand] = &[
+        MxCommand::AssignModel,
+        MxCommand::BackwardKillWord,
+        MxCommand::BackwardWord,
+        MxCommand::BeginningOfLine,
+        MxCommand::CancelRun,
+        MxCommand::Copy,
+        MxCommand::EndOfLine,
+        MxCommand::ForwardWord,
+        MxCommand::InsertNewline,
+        MxCommand::KillWord,
+        MxCommand::MoveBlockDown,
+        MxCommand::MoveBlockUp,
+        MxCommand::MoveUserDown,
+        MxCommand::MoveUserUp,
+        MxCommand::Quit,
+        MxCommand::SearchChat,
+        MxCommand::SubmitPrompt,
+        MxCommand::ToggleAutoAccept,
+        MxCommand::ToggleToolCard,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            MxCommand::AssignModel => "assign-model-to-step",
+            MxCommand::BackwardKillWord => "backward-kill-word",
+            MxCommand::BackwardWord => "backward-word",
+            MxCommand::BeginningOfLine => "beginning-of-line",
+            MxCommand::CancelRun => "cancel-run",
+            MxCommand::Copy => "copy",
+            MxCommand::EndOfLine => "end-of-line",
+            MxCommand::ForwardWord => "forward-word",
+            MxCommand::InsertNewline => "insert-newline",
+            MxCommand::KillWord => "kill-word",
+            MxCommand::MoveBlockDown => "move-block-down",
+            MxCommand::MoveBlockUp => "move-block-up",
+            MxCommand::MoveUserDown => "move-user-down",
+            MxCommand::MoveUserUp => "move-user-up",
+            MxCommand::Quit => "quit",
+            MxCommand::SearchChat => "search-chat-history",
+            MxCommand::SubmitPrompt => "submit-prompt",
+            MxCommand::ToggleAutoAccept => "toggle-auto-accept",
+            MxCommand::ToggleToolCard => "toggle-tool-card",
+        }
+    }
+
+    /// Emacs-style keybinding hint; `None` when the command is unbound.
+    fn keys(self) -> Option<&'static str> {
+        match self {
+            MxCommand::AssignModel => Some("C-a"),
+            MxCommand::BackwardKillWord => Some("M-<backspace>"),
+            MxCommand::BackwardWord => Some("M-<left>"),
+            MxCommand::BeginningOfLine => Some("<home>"),
+            MxCommand::CancelRun => Some("esc"),
+            MxCommand::Copy => Some("C-S-c"),
+            MxCommand::EndOfLine => Some("<end>"),
+            MxCommand::ForwardWord => Some("M-<right>"),
+            MxCommand::InsertNewline => Some("S-<return>"),
+            MxCommand::KillWord => Some("M-<delete>"),
+            MxCommand::MoveBlockDown => Some("C-n"),
+            MxCommand::MoveBlockUp => Some("C-p"),
+            MxCommand::MoveUserDown => Some("C-S-n"),
+            MxCommand::MoveUserUp => Some("C-S-p"),
+            MxCommand::Quit => Some("C-c"),
+            MxCommand::SearchChat => Some("C-f"),
+            MxCommand::SubmitPrompt => Some("<return>"),
+            MxCommand::ToggleAutoAccept => Some("C-SPC"),
+            MxCommand::ToggleToolCard => Some("tab"),
+        }
+    }
+
+    fn desc(self) -> &'static str {
+        match self {
+            MxCommand::AssignModel => "assign a delegate model to a plan step",
+            MxCommand::BackwardKillWord => "delete the word before the prompt cursor",
+            MxCommand::BackwardWord => "move the prompt cursor back one word",
+            MxCommand::BeginningOfLine => "move the prompt cursor to the start of the line",
+            MxCommand::CancelRun => "stop the running agent",
+            MxCommand::Copy => "copy the prompt selection or the chat block under the cursor",
+            MxCommand::EndOfLine => "move the prompt cursor to the end of the line",
+            MxCommand::ForwardWord => "move the prompt cursor forward one word",
+            MxCommand::InsertNewline => "insert a newline in the prompt",
+            MxCommand::KillWord => "delete the word after the prompt cursor",
+            MxCommand::MoveBlockDown => "move to the next chat block",
+            MxCommand::MoveBlockUp => "move to the previous chat block",
+            MxCommand::MoveUserDown => "jump to the next message you sent",
+            MxCommand::MoveUserUp => "jump to the previous message you sent",
+            MxCommand::Quit => "quit the cockpit",
+            MxCommand::SearchChat => "search the chat history",
+            MxCommand::SubmitPrompt => "send the prompt to the agent",
+            MxCommand::ToggleAutoAccept => "toggle auto-accept of approvals",
+            MxCommand::ToggleToolCard => "expand or collapse the selected tool card",
+        }
+    }
+}
+
+/// The Alt+X command palette: type to narrow, enter runs the highlighted
+/// command. After a command with a keybinding runs, `done` holds the "you can
+/// run this command with <keys>" hint shown in the palette row.
+struct Mx {
+    query: String,
+    /// Commands matching `query`, in [`MxCommand::ALL`] order.
+    matches: Vec<MxCommand>,
+    sel: usize,
+    /// Some(hint) after a command ran: the palette stays open showing the hint
+    /// until the next key dismisses it.
+    done: Option<String>,
+}
+
+impl Mx {
+    fn open() -> Self {
+        let mut mx = Mx {
+            query: String::new(),
+            matches: Vec::new(),
+            sel: 0,
+            done: None,
+        };
+        mx.refresh();
+        mx
+    }
+
+    /// Recompute the match list from the typed query and keep the cursor valid.
+    fn refresh(&mut self) {
+        let q = self.query.to_lowercase();
+        self.matches = MxCommand::ALL
+            .iter()
+            .filter(|c| c.name().contains(&q))
+            .copied()
+            .collect();
+        if self.sel >= self.matches.len() {
+            self.sel = 0;
+        }
+    }
+
+    fn step(&mut self, dir: isize) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let len = self.matches.len() as isize;
+        self.sel = (((self.sel as isize + dir) % len) + len) as usize % len as usize;
+    }
+}
+
 struct App {
     cfg: Arc<comrade_core::Config>,
     client: Arc<comrade_core::LlmClient>,
@@ -324,6 +499,8 @@ struct App {
     dialog_ask: bool,
     /// Human-driven "assign a model to a plan step" overlay (Ctrl-A), when open.
     pick: Option<ModelPick>,
+    /// The Alt+X (M-x) command palette, when open.
+    mx: Option<Mx>,
     /// Sends a follow-up question's answer back from the ask-the-model task.
     dialog_ask_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Follow-up Q/A shown inside the confirm dialog.
@@ -925,6 +1102,69 @@ impl App {
         }
     }
 
+    /// Toggle auto-approve mode (Ctrl-Space): flips the flag, reports the new
+    /// state in the chat, and accepts an already-waiting approval when turning
+    /// on.
+    fn toggle_auto_accept(&mut self) {
+        self.auto_accept = !self.auto_accept;
+        self.push_msg(Msg::text(
+            MsgKind::Meta,
+            if self.auto_accept {
+                "auto-accept ON: approvals will be accepted automatically (ctrl-space to disable)"
+                    .to_string()
+            } else {
+                "auto-accept off".to_string()
+            },
+        ));
+        if self.auto_accept {
+            self.accept_top_confirm();
+        }
+    }
+
+    /// Execute an M-x command. Returns true when the app should quit.
+    fn run_command(&mut self, cmd: MxCommand) -> bool {
+        match cmd {
+            MxCommand::AssignModel => self.open_model_pick(),
+            MxCommand::BackwardKillWord => self.input.backspace_word(),
+            MxCommand::BackwardWord => self.input.move_word_left(false),
+            MxCommand::BeginningOfLine => self.input.move_home(false),
+            MxCommand::CancelRun => self.cancel_run(),
+            MxCommand::Copy => {
+                // Mirrors Ctrl+Shift+C: copy the prompt's selection when there
+                // is one, otherwise the chat message under the cursor.
+                if let Some(sel) = self.input.selected_text() {
+                    let sel = sel.to_string();
+                    self.copy_text(&sel);
+                } else {
+                    self.copy_selected();
+                }
+            }
+            MxCommand::EndOfLine => self.input.move_end(false),
+            MxCommand::ForwardWord => self.input.move_word_right(false),
+            MxCommand::InsertNewline => self.input.insert('\n'),
+            MxCommand::KillWord => self.input.delete_word(),
+            MxCommand::MoveBlockDown => self.move_block(1),
+            MxCommand::MoveBlockUp => self.move_block(-1),
+            MxCommand::MoveUserDown => self.move_user(1),
+            MxCommand::MoveUserUp => self.move_user(-1),
+            MxCommand::Quit => return true,
+            MxCommand::SearchChat => self.search = Some(Search::new()),
+            MxCommand::SubmitPrompt => {
+                if !self.running {
+                    let prompt = self.input.take_text();
+                    self.start_run(prompt);
+                }
+            }
+            MxCommand::ToggleAutoAccept => self.toggle_auto_accept(),
+            MxCommand::ToggleToolCard => {
+                if let Some(idx) = self.sel {
+                    self.toggle_tool(idx);
+                }
+            }
+        }
+        false
+    }
+
     /// Auto-accept the confirmation currently on top of the dialog stack
     /// (used when the mode is turned on while an approval is waiting).
     fn accept_top_confirm(&mut self) {
@@ -1218,6 +1458,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         dialog_ask_tx: None,
         dialog_conv: Vec::new(),
         pick: None,
+        mx: None,
         chat_rect: Rect::default(),
         row_targets: Vec::new(),
         row_msg: Vec::new(),
@@ -1333,20 +1574,7 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
             let ctrl_space = key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('\0'));
             if ctrl_space {
-                app.auto_accept = !app.auto_accept;
-                app.push_msg(Msg::text(
-                    MsgKind::Meta,
-                    if app.auto_accept {
-                        "auto-accept ON: approvals will be accepted automatically (ctrl-space to disable)"
-                            .to_string()
-                    } else {
-                        "auto-accept off".to_string()
-                    },
-                ));
-                if app.auto_accept {
-                    // Accept any approval already waiting, then run with it.
-                    app.accept_top_confirm();
-                }
+                app.toggle_auto_accept();
                 return false;
             }
             if let KeyCode::Char(ch) = key.code {
@@ -1377,6 +1605,16 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
             }
             if !app.dialogs.is_empty() {
                 return handle_dialog_key(app, key.code);
+            }
+            // The M-x command palette, when open.
+            if app.mx.is_some() {
+                match handle_mx_key(app, key) {
+                    MxKeyOutcome::Handled => return false,
+                    MxKeyOutcome::Quit => return true,
+                    // Closed without consuming the key: fall through so e.g.
+                    // Ctrl-F pressed while the palette is open still searches.
+                    MxKeyOutcome::Closed => {}
+                }
             }
             // Ctrl-A opens the "assign a model to a plan step" overlay.
             if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1415,6 +1653,11 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
             }
             if key.modifiers.contains(KeyModifiers::ALT) {
                 if let KeyCode::Char(ch) = key.code {
+                    if ch.eq_ignore_ascii_case(&'x') {
+                        // M-x: open the command palette.
+                        app.mx = Some(Mx::open());
+                        return false;
+                    }
                     if ch.eq_ignore_ascii_case(&'p') {
                         app.move_user(-1);
                         return false;
@@ -1511,6 +1754,132 @@ fn handle_search_key(app: &mut App, key: KeyEvent) -> bool {
         _ => {}
     }
     false
+}
+
+/// Result of feeding one key to the M-x palette.
+enum MxKeyOutcome {
+    /// The palette consumed the key (it stays open or dismissed itself).
+    Handled,
+    /// The palette ran `quit`; the whole app should exit.
+    Quit,
+    /// The palette dismissed itself without consuming the key, so the caller
+    /// should dispatch the key normally (e.g. Ctrl-F pressed mid-typing).
+    Closed,
+}
+
+/// Keys while the M-x command palette is open.
+fn handle_mx_key(app: &mut App, key: KeyEvent) -> MxKeyOutcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // After a command ran, the row shows the "you can run this command with
+    // <keys>" hint; the next key dismisses it (Esc/C-g also close).
+    if app.mx.as_ref().is_some_and(|m| m.done.is_some()) {
+        app.mx = None;
+        return MxKeyOutcome::Handled;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.mx = None;
+            MxKeyOutcome::Handled
+        }
+        // C-g cancels the minibuffer (Emacs), as does M-x itself.
+        KeyCode::Char('g') if ctrl => {
+            app.mx = None;
+            MxKeyOutcome::Handled
+        }
+        KeyCode::Char('x') if alt => {
+            app.mx = None;
+            MxKeyOutcome::Handled
+        }
+        KeyCode::Enter => {
+            let cmd = app.mx.as_ref().and_then(|m| m.matches.get(m.sel)).copied();
+            app.mx = None;
+            match cmd {
+                Some(cmd) => {
+                    if app.run_command(cmd) {
+                        return MxKeyOutcome::Quit;
+                    }
+                    // Commands that opened their own overlay (search, model
+                    // pick) take over the screen; the hint would just sit in
+                    // front of them, so close the palette instead.
+                    let overlay_open = app.search.is_some() || app.pick.is_some();
+                    match (overlay_open, cmd.keys()) {
+                        (false, Some(keys)) => {
+                            // Stay open in hint mode: the row tells the user
+                            // how to run the command directly next time.
+                            app.mx = Some(Mx {
+                                query: String::new(),
+                                matches: Vec::new(),
+                                sel: 0,
+                                done: Some(format!("you can run this command with {keys}")),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                // Nothing matched: stay in the palette so the user can edit.
+                None => app.mx = Some(Mx::open()),
+            }
+            MxKeyOutcome::Handled
+        }
+        KeyCode::Up => {
+            if let Some(m) = &mut app.mx {
+                m.step(-1);
+            }
+            MxKeyOutcome::Handled
+        }
+        KeyCode::Down => {
+            if let Some(m) = &mut app.mx {
+                m.step(1);
+            }
+            MxKeyOutcome::Handled
+        }
+        KeyCode::Char('p') if ctrl && !alt => {
+            if let Some(m) = &mut app.mx {
+                m.step(-1);
+            }
+            MxKeyOutcome::Handled
+        }
+        KeyCode::Char('n') if ctrl && !alt => {
+            if let Some(m) = &mut app.mx {
+                m.step(1);
+            }
+            MxKeyOutcome::Handled
+        }
+        // Tab completes the query with the highlighted command's name.
+        KeyCode::Tab => {
+            if let Some(name) = app
+                .mx
+                .as_ref()
+                .and_then(|m| m.matches.get(m.sel))
+                .map(|c| c.name().to_string())
+            {
+                app.mx.as_mut().unwrap().query = name;
+                app.mx.as_mut().unwrap().refresh();
+            }
+            MxKeyOutcome::Handled
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            if let Some(m) = &mut app.mx {
+                m.query.push(c);
+                m.refresh();
+            }
+            MxKeyOutcome::Handled
+        }
+        KeyCode::Backspace if !ctrl => {
+            if let Some(m) = &mut app.mx {
+                m.query.pop();
+                m.refresh();
+            }
+            MxKeyOutcome::Handled
+        }
+        // Anything else (other Ctrl/Alt chords) dismisses the palette and lets
+        // the key do its normal job.
+        _ => {
+            app.mx = None;
+            MxKeyOutcome::Closed
+        }
+    }
 }
 
 fn handle_dialog_key(app: &mut App, code: KeyCode) -> bool {
@@ -1792,7 +2161,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
     // Pre-wrap the prompt text so the row reserved for it can grow with the
     // content (search mode replaces the prompt with a fixed single row).
     let (prompt_rows, prompt_win, prompt_cur) = prompt_view(app, area.width);
-    let prompt_h = if app.search.is_some() {
+    let prompt_h = if app.search.is_some() || app.mx.is_some() {
         1
     } else {
         prompt_rows.len().clamp(1, PROMPT_MAX_ROWS)
@@ -1953,7 +2322,52 @@ fn draw(app: &mut App, frame: &mut Frame) {
     draw_stats(app, frame, right[0]);
     draw_plan(app, frame, right[1]);
 
-    if let Some(s) = &app.search {
+    // The M-x palette or the search bar replace the prompt line while open.
+    if let Some(mx) = &app.mx {
+        let (label, body) = match &mx.done {
+            Some(hint) => ("M-x", hint.clone()),
+            None => ("M-x ", mx.query.clone()),
+        };
+        let mx_line = Line::from(vec![
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(if mx.done.is_some() { " " } else { "" }),
+            Span::styled(body, Style::default().fg(Color::White)),
+            if mx.done.is_none() {
+                Span::styled("_", Style::default().fg(Color::Magenta))
+            } else {
+                Span::raw("")
+            },
+            if mx.done.is_some() {
+                Span::styled(
+                    "  press any key to close",
+                    Style::default().fg(Color::DarkGray),
+                )
+            } else {
+                Span::styled(
+                    format!(
+                        "  {}",
+                        if mx.matches.is_empty() {
+                            "no match"
+                        } else {
+                            "enter:run  tab:complete  esc:close"
+                        }
+                    ),
+                    Style::default().fg(if mx.matches.is_empty() {
+                        Color::Red
+                    } else {
+                        Color::DarkGray
+                    }),
+                )
+            },
+        ]);
+        frame.render_widget(Paragraph::new(mx_line), rows[1]);
+        draw_mx_list(mx, frame, rows[1]);
+    } else if let Some(s) = &app.search {
         // Search bar replaces the prompt line while Ctrl-F is active.
         let total = s.matches.len();
         let counter = if s.query.is_empty() {
@@ -1997,6 +2411,93 @@ fn draw(app: &mut App, frame: &mut Frame) {
     if let Some(p) = &app.pick {
         draw_model_pick(p, frame);
     }
+}
+
+/// The completion popup listing the commands matching the M-x query, drawn
+/// above the palette row. Hidden once a command ran (hint mode) or when
+/// nothing matches.
+fn draw_mx_list(mx: &Mx, frame: &mut Frame, prompt_area: Rect) {
+    if mx.done.is_some() || mx.matches.is_empty() {
+        return;
+    }
+    let area = frame.area();
+    let w = area.width.saturating_sub(2).min(96);
+    let shown = mx.matches.len().min(8);
+    let h = shown as u16 + 3; // two border rows + one hint row
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = prompt_area.y.saturating_sub(h).max(area.y);
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" M-x ")
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let text_w = usize::from(inner.width.saturating_sub(2)).max(8);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut sel_line = 0usize;
+    for (i, cmd) in mx.matches.iter().enumerate().take(8) {
+        let selected = i == mx.sel;
+        let keys = cmd.keys().unwrap_or("");
+        let name = cmd.name();
+        let desc_w = text_w.saturating_sub(4 + name.chars().count() + keys.chars().count());
+        let desc: String = cmd.desc().chars().take(desc_w).collect();
+        let pad = desc_w.saturating_sub(desc.chars().count());
+        if selected {
+            sel_line = lines.len();
+        }
+        push_tok_line(
+            &mut lines,
+            &[
+                tok(
+                    if selected { "> " } else { "  " },
+                    Style::default().fg(if selected {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                tok(
+                    name,
+                    if selected {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    },
+                ),
+                tok("  ", Style::default()),
+                tok(
+                    format!("{desc}{}", " ".repeat(pad)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                tok(keys.to_string(), Style::default().fg(Color::Yellow)),
+            ],
+        );
+    }
+    let view = usize::from(rows[0].height).max(1);
+    let scroll = sel_line.saturating_sub(view.saturating_sub(1)) as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), rows[0]);
+    let hint = format!(
+        "type to filter · {} of {} shown · ctrl-p/n or ↑/↓ move · enter runs · tab completes",
+        shown,
+        mx.matches.len()
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2163,7 +2664,10 @@ fn chat_title(title: &str, width: u16) -> String {
     }
     // cap() appends "…" on top of max, so width - 3 leaves room for it while
     // keeping the whole title inside width - 2 cells (off the right border).
-    cap(&format!(" {trimmed} "), usize::from(width.saturating_sub(3)))
+    cap(
+        &format!(" {trimmed} "),
+        usize::from(width.saturating_sub(3)),
+    )
 }
 
 fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -4434,7 +4938,10 @@ mod tests {
         assert_eq!(chat.len(), 1);
         assert_eq!(chat[0].kind, MsgKind::Run);
         let children = &chat[0].children;
-        assert!(children[0].open, "reasoning must stay expanded after folding");
+        assert!(
+            children[0].open,
+            "reasoning must stay expanded after folding"
+        );
         assert!(
             !children[1].tool.as_ref().unwrap().open,
             "tool cards are still force-collapsed"
