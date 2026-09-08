@@ -896,8 +896,11 @@ impl App {
         match key.code {
             KeyCode::Esc => self.pick = None,
             KeyCode::Char('a') if ctrl => self.pick = None,
-            KeyCode::Up | KeyCode::Char('k') if !ctrl => self.pick_nav(-1),
-            KeyCode::Down | KeyCode::Char('j') if !ctrl => self.pick_nav(1),
+            // Emacs-style movement: ctrl-p previous, ctrl-n next (arrows work too).
+            KeyCode::Up => self.pick_nav(-1),
+            KeyCode::Down => self.pick_nav(1),
+            KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&'p') => self.pick_nav(-1),
+            KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&'n') => self.pick_nav(1),
             KeyCode::Right | KeyCode::Enter => {
                 // Open the model column on the currently selected step.
                 if self
@@ -2674,9 +2677,9 @@ fn draw_model_pick(pick: &ModelPick, frame: &mut Frame) {
     }
 
     let hint = if picking_model {
-        "↑/↓ or j/k move · 1..N assigns · enter confirms · esc/← back to steps"
+        "ctrl-p/n or ↑/↓ move · 1..N assigns · enter confirms · esc/← back to steps"
     } else {
-        "↑/↓ or j/k move · →/enter picks a model · ctrl-a/esc closes"
+        "ctrl-p/n or ↑/↓ move · →/enter picks a model · ctrl-a/esc closes"
     };
 
     let content_h = lines.len() as u16;

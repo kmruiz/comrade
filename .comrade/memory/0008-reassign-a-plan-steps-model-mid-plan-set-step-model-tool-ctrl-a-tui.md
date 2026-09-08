@@ -12,3 +12,6 @@ New SessionControl method (crates/comrade-tool/src/plan.rs): fn reassign_step_mo
 ## Consequences
 Terminal note: do not bind TUI keys to Ctrl+M (indistinguishable from Enter). TUI ModelPick keeps only pending/blocked steps; a step that turns in_progress while the overlay is open fails the session guard and reports via Meta. Empty-model steps written by direct session calls are treated as self. Tests: comrade-core session tests reassign_changes_model_and_clears_delegation_record; comrade-tool-session 7 new set_step_model_* tests; delegate deny_list test asserts set_step_model denied.
 
+
+## Note
+TUI ModelPick overlay movement changed (user request): j/k bindings removed; movement is now ctrl-p (previous) / ctrl-n (next), matching the Emacs-style chat navigation, with arrow keys kept as alternates. Hints updated accordingly.
