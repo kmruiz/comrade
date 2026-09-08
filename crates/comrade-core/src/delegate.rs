@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use comrade_tool::{PlanStatus, PlanTarget, Tool, ToolContext, ToolRegistry, ToolSpec};
 use serde_json::{Value, json};
 
-use crate::agent::{LoopTracker, MAX_LOOP_REFUSALS, loop_refusal};
+use crate::agent::{LoopTracker, MAX_LOOP_REFUSALS, allow_read_step, loop_refusal};
 use crate::config::DelegateCfg;
 use crate::context::ContextManager;
 use crate::llm::{ChatMessage, LlmClient, Role, ToolCallMsg};
@@ -561,6 +561,27 @@ fn refuse_repeat(tracker: &mut LoopTracker, sig: &str) -> Result<Option<String>>
     }
 }
 
+/// Read guard for the delegate sub-agent loop, mirroring the main loop's
+/// `allow_read_step` (agent.rs): once the delegate has done twenty consecutive
+/// read-only calls with no state change in between, the next read is refused
+/// and the delegate is nudged to implement instead of keep reading. Any
+/// non-read action resets the counter. Returns the refusal message when the
+/// read must not run, `None` when it may.
+fn refuse_reading(name: &str, consecutive_reads: &mut usize) -> Option<String> {
+    if allow_read_step(name, consecutive_reads) {
+        return None;
+    }
+    // Delegate wording: unlike the main loop there is no `update_plan` tool for
+    // the delegate to call (session/plan tools are denied), so the nudge points
+    // at implementing and answering instead.
+    Some(format!(
+        "You have performed {} reads in a row with no changes. You have enough context - \
+         implement now (write or edit a file) and verify your work, then reply with your final \
+         answer. Do not keep reading.",
+        *consecutive_reads
+    ))
+}
+
 /// Run one delegate as a tool-using sub-agent until it produces a final answer.
 /// Mirrors the main agent loop but for the delegate's own client, scoped tool
 /// registry and limits: native tool calling when the delegate protocol allows
@@ -592,6 +613,9 @@ async fn run_delegate_subagent(
     // in between is refused, and the run aborts after a few such refusals so a
     // stuck delegate cannot loop forever on the same argument.
     let mut tracker = LoopTracker::default();
+    // Read guard: consecutive read-only calls since the last state change; the
+    // delegate is nudged to implement once it has read too long without acting.
+    let mut consecutive_reads = 0usize;
     // The run's cancel token, set by the main agent loop (agent.rs). When the
     // human interrupts the parent, a delegate stuck waiting on its model
     // request must abort instead of holding the whole run at "working".
@@ -643,6 +667,13 @@ async fn run_delegate_subagent(
                 let args = serde_json::from_str(&tc.arguments).unwrap_or_default();
                 let args_pretty = serde_json::to_string(&args).unwrap_or_default();
                 let sig = format!("{} {}", tc.name, args_pretty);
+                if let Some(msg) = refuse_reading(&tc.name, &mut consecutive_reads) {
+                    // Too many reads in a row: nudge to implement. Still answer
+                    // the call with a tool result so history stays API-valid.
+                    let clamped = ctxm.truncate_observation(&msg);
+                    ctxm.push(ChatMessage::tool_result(tc.id, clamped));
+                    continue;
+                }
                 if let Some(msg) = refuse_repeat(&mut tracker, &sig)? {
                     // Refused as a no-progress repeat: still answer the call
                     // with a tool result so the history stays API-valid.
@@ -696,6 +727,14 @@ async fn run_delegate_subagent(
         };
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
         let sig = format!("{} {}", tool_call.name, args_pretty);
+        if let Some(msg) = refuse_reading(&tool_call.name, &mut consecutive_reads) {
+            let obs = ctxm.truncate_observation(&msg);
+            ctxm.push(ChatMessage::new(
+                Role::User,
+                render_observation(&tool_call.name, &obs),
+            ));
+            continue;
+        }
         if let Some(msg) = refuse_repeat(&mut tracker, &sig)? {
             let obs = ctxm.truncate_observation(&msg);
             ctxm.push(ChatMessage::new(
@@ -1429,6 +1468,34 @@ mod tests {
         }),
     });
 
+    /// A recording stub that stands in for the read-only `read_file` tool (a
+    /// read is never a state change, so it feeds the delegate read guard).
+    struct ReadStubTool {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for ReadStubTool {
+        fn spec(&self) -> &ToolSpec {
+            &STUB_READ_SPEC
+        }
+
+        async fn invoke(&self, _ctx: &ToolContext, _args: Value) -> Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("stub read_file executed".to_string())
+        }
+    }
+
+    static STUB_READ_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| ToolSpec {
+        name: "read_file".into(),
+        description: "stub read_file".into(),
+        json_schema: json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"]
+        }),
+    });
+
     /// A fake chat server that answers N sequential requests with N distinct
     /// raw JSON bodies. The delegate sub-agent loop makes one request per turn,
     /// so this models a tool round (turn 1: model asks for a tool) followed by
@@ -1786,5 +1853,139 @@ mod tests {
         // The sub-agent loop must not have crashed: unknown tool became an
         // observation and the model recovered with a final answer.
         assert!(out.contains("no commit available, done"), "{out}");
+    }
+
+    /// The read guard itself (mirror of the main loop's `allow_read_step`, but
+    /// with delegate wording): the 21st consecutive read-only call is refused,
+    /// the nudge says implement instead of reading, and it never mentions
+    /// `update_plan` (delegates have no plan tool).
+    #[test]
+    fn delegate_read_guard_nudges_after_20_consecutive_reads() {
+        let mut reads = 0usize;
+        for i in 0..20 {
+            assert!(
+                refuse_reading("read_file", &mut reads).is_none(),
+                "read #{i} should be allowed before the threshold"
+            );
+        }
+        assert_eq!(reads, 20);
+        let msg = refuse_reading("read_file", &mut reads).expect("the 21st read is refused");
+        assert!(msg.contains("20 reads"), "{msg}");
+        assert!(msg.contains("implement now"), "{msg}");
+        assert!(!msg.contains("update_plan"), "delegates cannot plan: {msg}");
+        // The counter never grows past the threshold: further reads stay refused.
+        assert!(refuse_reading("read_file", &mut reads).is_some());
+        assert_eq!(reads, 20);
+    }
+
+    /// Any non-read action resets the delegate's read counter, so a delegate
+    /// that edits between reads never trips the guard.
+    #[test]
+    fn delegate_read_guard_resets_after_an_action() {
+        let mut reads = 19usize; // one short of the threshold
+        assert!(refuse_reading("write_file", &mut reads).is_none());
+        assert_eq!(reads, 0, "a mutating call resets the read counter");
+        assert!(refuse_reading("read_ranges", &mut reads).is_none());
+        assert_eq!(reads, 1);
+    }
+
+    /// A native-mode delegate that does nothing but read different files for 21
+    /// consecutive turns has its 21st read refused: the tool is only ever
+    /// reached 20 times, and the run still ends with a normal final answer.
+    #[tokio::test]
+    async fn native_delegate_read_guard_stops_a_read_only_run() {
+        let read_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ReadStubTool {
+            calls: read_calls.clone(),
+        }));
+
+        let mut turns = Vec::new();
+        for i in 0..21 {
+            turns.push(
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": "",
+                            "tool_calls": [{
+                                "id": format!("call_{i}"),
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": json!({"path": format!("src/f{i}.rs")}).to_string()
+                                }
+                            }]
+                        }
+                    }]
+                })
+                .to_string(),
+            );
+        }
+        let final_turn = json!({"choices": [{"message": {"content": "done reading"}}]}).to_string();
+        turns.push(final_turn);
+        let base = scripted_server(turns);
+
+        let cfg = Config {
+            delegates: vec![delegate("cheap", &base)],
+            ..Config::default()
+        };
+        let tool = DelegateTool::new(&cfg.delegates, registry, DelegateLimits::default())
+            .unwrap()
+            .unwrap();
+        let ctx = test_ctx();
+        let out = tool
+            .invoke(&ctx, json!({"model": "cheap", "task": "read src/f0.rs"}))
+            .await
+            .unwrap();
+        assert!(out.contains("done reading"), "{out}");
+        assert_eq!(
+            read_calls.load(std::sync::atomic::Ordering::SeqCst),
+            20,
+            "the 21st read must be refused before it reaches the tool"
+        );
+    }
+
+    /// The same read guard applies to ReAct-text delegates: 21 read-only
+    /// Tool:/Args: turns, the 21st refused, then a normal final answer.
+    #[tokio::test]
+    async fn react_delegate_read_guard_stops_a_read_only_run() {
+        let read_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ReadStubTool {
+            calls: read_calls.clone(),
+        }));
+
+        let mut turns = Vec::new();
+        for i in 0..21 {
+            turns.push(
+                json!({"choices": [{"message": {"content": format!(
+                    "Thought: still exploring\nTool: read_file\nArgs: {{\"path\":\"src/f{i}.rs\"}}"
+                )}}]})
+                .to_string(),
+            );
+        }
+        let final_turn = json!({"choices": [{"message": {"content": "done reading"}}]}).to_string();
+        turns.push(final_turn);
+        let base = scripted_server(turns);
+
+        let mut d = delegate("cheap", &base);
+        d.llm.protocol = Protocol::React;
+        let cfg = Config {
+            delegates: vec![d],
+            ..Config::default()
+        };
+        let tool = DelegateTool::new(&cfg.delegates, registry, DelegateLimits::default())
+            .unwrap()
+            .unwrap();
+        let ctx = test_ctx();
+        let out = tool
+            .invoke(&ctx, json!({"model": "cheap", "task": "read src/f0.rs"}))
+            .await
+            .unwrap();
+        assert!(out.contains("done reading"), "{out}");
+        assert_eq!(
+            read_calls.load(std::sync::atomic::Ordering::SeqCst),
+            20,
+            "the 21st read must be refused before it reaches the tool"
+        );
     }
 }

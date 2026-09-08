@@ -99,7 +99,8 @@ const READ_GUARD_THRESHOLD: usize = 20;
 /// Process monitor: if the model keeps reading without doing anything, stop it.
 /// Returns `true` when the tool may run (and updates the counter); `false` when
 /// the read should be refused as "enough context".
-fn allow_read_step(name: &str, consecutive_reads: &mut usize) -> bool {
+/// Shared with the delegate sub-agent loop (delegate.rs).
+pub(crate) fn allow_read_step(name: &str, consecutive_reads: &mut usize) -> bool {
     if is_read_only(name) {
         if *consecutive_reads >= READ_GUARD_THRESHOLD {
             return false;
