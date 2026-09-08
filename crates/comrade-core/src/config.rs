@@ -179,6 +179,101 @@ pub struct Config {
     /// Extra developer models the tech lead can delegate sub-tasks to (see the
     /// `delegate` tool).
     pub delegates: Vec<DelegateCfg>,
+    /// External MCP servers whose tools are bridged into the agent.
+    pub mcp: McpConfig,
+}
+
+/// Configuration for the built-in MCP (Model Context Protocol) client.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct McpConfig {
+    pub servers: Vec<McpServerCfg>,
+}
+
+/// One external MCP server the agent can call tools on.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct McpServerCfg {
+    /// Unique name; namespaces this server's tools as `mcp_<name>_<tool>`.
+    pub name: String,
+    /// How to reach the server (stdio child process or streamable HTTP).
+    pub transport: McpTransport,
+    /// Optional authentication for HTTP servers.
+    #[serde(default)]
+    pub auth: Option<McpAuth>,
+}
+
+/// Transport for an MCP server connection.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Spawn a local process and speak JSON-RPC 2.0 over its stdin/stdout.
+    Stdio {
+        /// Executable to run (e.g. `npx`, `uvx`, a local binary).
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// Extra environment for the child. Values starting with `$` read the
+        /// named variable from Comrade's own environment at connect time.
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+    },
+    /// Remote MCP server speaking the streamable HTTP transport.
+    Http {
+        /// Base URL of the MCP endpoint (e.g. `https://mcp.example.com/mcp`).
+        url: String,
+    },
+}
+
+/// Authentication applied to MCP HTTP requests.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum McpAuth {
+    /// Static API key sent with every request.
+    #[serde(rename = "api_key")]
+    ApiKey {
+        /// Literal key, or `$NAME` to read the key from Comrade's environment.
+        key: String,
+        /// Header to carry the key in. Defaults to `Authorization`, in which
+        /// case the value is `Bearer <key>`; any other header gets the raw key.
+        #[serde(default)]
+        header: Option<String>,
+    },
+    /// OpenID Connect: OAuth 2.0 authorization-code flow with PKCE.
+    #[serde(rename = "oidc")]
+    Oidc {
+        /// OAuth client id this Comrade install identifies as.
+        client_id: String,
+        /// Authorization server metadata URL. When unset, discovered from the
+        /// transport URL's origin per RFC 8414 (`/.well-known/oauth-authorization-server`).
+        #[serde(default)]
+        issuer: Option<String>,
+        #[serde(default = "default_oidc_scopes")]
+        scopes: Vec<String>,
+        /// Fixed loopback redirect port; when unset an ephemeral port is used.
+        #[serde(default)]
+        redirect_port: Option<u16>,
+        /// Optional OAuth audience/resource indicator.
+        #[serde(default)]
+        audience: Option<String>,
+    },
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    ["openid", "profile", "email"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// Expand a `$NAME`-prefixed config value against a lookup (normally
+/// `std::env::var`). Literal values pass through untouched; a `$`-reference
+/// whose variable is unset keeps its literal text so the misconfiguration is
+/// visible rather than silently empty.
+pub fn expand_env_value(value: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
+    match value.strip_prefix('$').filter(|n| !n.is_empty()) {
+        Some(name) => lookup(name).unwrap_or_else(|| value.to_string()),
+        None => value.to_string(),
+    }
 }
 
 /// Config loaded from disk with defaults layered underneath.
@@ -440,5 +535,130 @@ mod tests {
             provider_base_url("DeepSeek"),
             Some("https://api.deepseek.com/v1")
         );
+    }
+
+    #[test]
+    fn mcp_defaults_to_no_servers() {
+        let c = Config::default();
+        assert!(c.mcp.servers.is_empty());
+        let p = write_tmp("[llm]\nprovider = \"ollama\"\nmodel = \"x\"\n");
+        let c = Config::load(Some(&p)).unwrap().config;
+        let _ = std::fs::remove_file(&p);
+        assert!(c.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_parses_stdio_and_http_with_api_key() {
+        let p = write_tmp(
+            r#"
+            [llm]
+            provider = "ollama"
+            model = "x"
+
+            [[mcp.servers]]
+            name = "fs"
+            [mcp.servers.transport]
+            type = "stdio"
+            command = "npx"
+            args = ["-y", "@modelcontextprotocol/server-filesystem"]
+            [mcp.servers.transport.env]
+            TOKEN = "$FS_TOKEN"
+
+            [[mcp.servers]]
+            name = "remote"
+            [mcp.servers.transport]
+            type = "http"
+            url = "https://mcp.example.com/mcp"
+            [mcp.servers.auth]
+            type = "api_key"
+            key = "$REMOTE_KEY"
+            "#,
+        );
+        let c = Config::load(Some(&p)).unwrap().config;
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(c.mcp.servers.len(), 2);
+
+        let fs = &c.mcp.servers[0];
+        assert_eq!(fs.name, "fs");
+        assert_eq!(fs.auth, None);
+        let McpTransport::Stdio {
+            command,
+            args,
+            env,
+        } = &fs.transport
+        else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(command, "npx");
+        assert_eq!(args, &vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()]);
+        assert_eq!(env.get("TOKEN").map(String::as_str), Some("$FS_TOKEN"));
+
+        let remote = &c.mcp.servers[1];
+        let McpTransport::Http { url } = &remote.transport else {
+            panic!("expected http transport");
+        };
+        assert_eq!(url, "https://mcp.example.com/mcp");
+        assert_eq!(
+            remote.auth,
+            Some(McpAuth::ApiKey {
+                key: "$REMOTE_KEY".into(),
+                header: None
+            })
+        );
+    }
+
+    #[test]
+    fn mcp_oidc_auth_parses_full_and_defaults_scopes() {
+        let p = write_tmp(
+            r#"
+            [llm]
+            provider = "ollama"
+            model = "x"
+
+            [[mcp.servers]]
+            name = "secure"
+            [mcp.servers.transport]
+            type = "http"
+            url = "https://secure.example/mcp"
+            [mcp.servers.auth]
+            type = "oidc"
+            client_id = "comrade"
+            audience = "https://secure.example/api"
+            "#,
+        );
+        let c = Config::load(Some(&p)).unwrap().config;
+        let _ = std::fs::remove_file(&p);
+        let s = &c.mcp.servers[0];
+        match &s.auth {
+            Some(McpAuth::Oidc {
+                client_id,
+                scopes,
+                issuer: None,
+                redirect_port: None,
+                audience: Some(aud),
+            }) => {
+                assert_eq!(client_id, "comrade");
+                assert_eq!(scopes, &["openid", "profile", "email"]);
+                assert_eq!(aud, "https://secure.example/api");
+            }
+            other => panic!("unexpected auth: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_env_value_resolves_only_dollar_names() {
+        let env = |name: &str| -> Option<String> {
+            match name {
+                "HOME" => Some("/home/me".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(expand_env_value("$HOME", &env), "/home/me");
+        assert_eq!(expand_env_value("plain", &env), "plain");
+        assert_eq!(expand_env_value("$", &env), "$");
+        // An unset variable keeps its literal text so the mistake is visible.
+        assert_eq!(expand_env_value("$MISSING", &env), "$MISSING");
+        // Nested lookups are not expanded (single pass).
+        assert_eq!(expand_env_value("$HO$ME", &env), "$HO$ME");
     }
 }

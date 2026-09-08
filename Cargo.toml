@@ -10,6 +10,7 @@ members = [
     "crates/comrade-tool-memory",
     "crates/comrade-tool-web",
     "crates/comrade-core",
+    "crates/comrade-tool-mcp",
     "crates/comrade-tui",
 ]
 

@@ -1,0 +1,26 @@
+[package]
+name = "comrade-tool-mcp"
+description = "MCP (Model Context Protocol) client: connects to external MCP servers over stdio or streamable HTTP and exposes their tools to the agent, with API-key and OIDC (OAuth code + PKCE) auth."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+comrade-tool = { path = "../comrade-tool" }
+comrade-core = { path = "../comrade-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "io-std", "process", "net"] }
+rmcp = { version = "3.2.0", features = [
+    "client",
+    "transport-child-process",
+    "transport-io",
+    "transport-streamable-http-client-reqwest",
+    "auth",
+    "reqwest",
+] }
+
+[dev-dependencies]
+tokio-util.workspace = true
