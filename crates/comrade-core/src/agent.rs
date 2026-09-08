@@ -1,5 +1,8 @@
 use anyhow::{Context as _, Result, bail};
 use comrade_tool::{ToolContext, ToolRegistry};
+use futures_util::future::join_all;
+use std::future::Future;
+use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -808,6 +811,16 @@ async fn run_native_calls(
 
     ctxm.push(ChatMessage::assistant_with_calls(turn.content, calls));
 
+    // A native batch may hold several calls. `delegate` calls are independent
+    // (pure LLM work, no repository access) and slow, so when the whole batch
+    // is delegates they run concurrently below instead of one after the other.
+    // Mixed batches keep the historical strictly-sequential behaviour.
+    let parallel_delegates = prepared.len() > 1
+        && prepared
+            .iter()
+            .all(|p| p.name == crate::delegate::TOOL_NAME);
+    let mut deferred: Vec<Prepared> = Vec::new();
+
     'calls: for p in prepared {
         let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
         let sig = format!("{} {args_pretty}", p.name);
@@ -872,8 +885,8 @@ async fn run_native_calls(
                 continue;
             }
             ctx.set_approval(comrade_tool::ApprovalNotes {
-                justification: p.justification.unwrap_or_default(),
-                risk: p.risk,
+                justification: p.justification.clone().unwrap_or_default(),
+                risk: p.risk.clone(),
             });
         }
 
@@ -918,6 +931,14 @@ async fn run_native_calls(
             continue;
         };
 
+        // Pre-flight checks all passed. In a pure-delegate batch the invocation
+        // is deferred so every call runs concurrently after the loop; otherwise
+        // keep invoking inline, exactly as before.
+        if parallel_delegates {
+            deferred.push(p);
+            continue;
+        }
+
         let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
         let _ = tx
             .send(AgentEvent::ToolStart {
@@ -951,6 +972,66 @@ async fn run_native_calls(
         };
         ctxm.push(ChatMessage::tool_result(p.id, content));
         tracker.record(&p.name, sig);
+    }
+
+    // Run the deferred delegates concurrently. They are all `delegate` calls,
+    // so they cannot mutate the workspace or depend on each other; results are
+    // streamed back and recorded in the original call order.
+    if !deferred.is_empty() {
+        for p in &deferred {
+            let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
+            let _ = tx
+                .send(AgentEvent::ToolStart {
+                    name: p.name.clone(),
+                    args: args_pretty,
+                })
+                .await;
+        }
+        let futures: Vec<Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>> = deferred
+            .iter()
+            .map(|p| {
+                let ctx = ctx.clone();
+                let args = p.args.clone();
+                let tool = tools.get(&p.name).expect("delegate tool checked above");
+                let fut: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
+                    Box::pin(async move { tool.invoke(&ctx, args).await });
+                fut
+            })
+            .collect();
+        let results = join_all(futures).await;
+        for (p, res) in deferred.into_iter().zip(results) {
+            let output = match res {
+                Ok(out) => out,
+                Err(err) => format!("ERROR: {err:#}"),
+            };
+            let ok = !output.starts_with("ERROR:");
+            let clamped = ctxm.truncate_observation(&output);
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: p.name.clone(),
+                    output: clamped.clone(),
+                    ok,
+                })
+                .await;
+            update_verify_state(&p.name, ok, &clamped, verified_after_change);
+            let content = if ok {
+                clamped.clone()
+            } else {
+                let hint = failure_hint(&p.name, &clamped);
+                if hint.is_empty() {
+                    clamped.clone()
+                } else {
+                    format!("{clamped}\n\nHINT: {hint}")
+                }
+            };
+            ctxm.push(ChatMessage::tool_result(p.id, content));
+            let sig = format!(
+                "{} {}",
+                p.name,
+                serde_json::to_string(&p.args).unwrap_or_default()
+            );
+            tracker.record(&p.name, sig);
+        }
     }
     ctxm.note_turn_done();
     Ok(())
@@ -1429,6 +1510,200 @@ mod tests {
             }
         }
         assert!(saw_final);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Main model that answers the first request with TWO native `delegate`
+    /// tool calls in a single batch, then finishes with "All done.".
+    fn spawn_two_delegate_main_model() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let calls = AtomicUsize::new(0);
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let mut used = 0usize;
+                loop {
+                    match stream.read(&mut buf[used..]) {
+                        Ok(0) => break,
+                        Ok(r) => {
+                            used += r;
+                            if buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let body = if n == 0 {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Delegating two tasks.\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"delegate\",\"arguments\":\"{\\\"model\\\": \\\"a\\\", \\\"task\\\": \\\"alpha work\\\"}\"}}]}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"delegate\",\"arguments\":\"{\\\"model\\\": \\\"b\\\", \\\"task\\\": \\\"beta work\\\"}\"}}]}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                } else {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"All done.\"}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    /// Fake delegate endpoint that answers only once BOTH delegate requests
+    /// have arrived. A sequential dispatcher sends one request and then blocks
+    /// waiting for its reply, so it deadlocks here and the enclosing test times
+    /// out; parallel dispatch gets both requests in and both replies out.
+    fn spawn_barrier_delegate_server() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let read_header = |mut stream: std::net::TcpStream| -> std::net::TcpStream {
+                let mut buf = [0u8; 2048];
+                let mut used = 0usize;
+                loop {
+                    match stream.read(&mut buf[used..]) {
+                        Ok(0) => break,
+                        Ok(r) => {
+                            used += r;
+                            if buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                stream
+            };
+            let (s1, _) = listener.accept().unwrap();
+            let s1 = read_header(s1);
+            let (s2, _) = listener.accept().unwrap();
+            let s2 = read_header(s2);
+            for (mut s, content) in [(s1, "RESULT-A"), (s2, "RESULT-B")] {
+                let body =
+                    format!("{{\"choices\":[{{\"message\":{{\"content\":\"{content}\"}}}}]}}");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn parallel_delegate_calls_in_one_turn_run_concurrently() {
+        let main_port = spawn_two_delegate_main_model();
+        let delegate_port = spawn_barrier_delegate_server();
+        let delegate_url = format!("http://127.0.0.1:{delegate_port}/v1");
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{main_port}/v1");
+        cfg.llm.model = "fake".into();
+        cfg.delegates = vec![
+            crate::config::DelegateCfg {
+                name: "a".into(),
+                description: "delegate a".into(),
+                llm: crate::config::LlmCfg {
+                    base_url: delegate_url.clone(),
+                    model: "alpha".into(),
+                    ..Default::default()
+                },
+            },
+            crate::config::DelegateCfg {
+                name: "b".into(),
+                description: "delegate b".into(),
+                llm: crate::config::LlmCfg {
+                    base_url: delegate_url,
+                    model: "beta".into(),
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let (tx, mut events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        comrade_tool::SessionControl::set_plan(
+            &*session,
+            vec![comrade_tool::PlanStepDraft {
+                goal: "split the work into two independent sub-tasks and delegate both".into(),
+                verification: "verifies".into(),
+                model: "".into(),
+                context: "".into(),
+            }],
+        );
+        let root =
+            std::env::temp_dir().join(format!("comrade-parallel-delegate-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let undo = Arc::new(MemoryUndo::new(root.clone()));
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: undo.clone(),
+            auto_approve: true,
+            approval: Default::default(),
+        };
+        let delegate_tool = crate::delegate::DelegateTool::new(&cfg.delegates)
+            .unwrap()
+            .unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.extend(vec![Box::new(delegate_tool) as Box<dyn comrade_tool::Tool>]);
+        let client = LlmClient::new(&cfg.llm).unwrap();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_agent(
+                &cfg,
+                &client,
+                ctx,
+                &tools,
+                "delegate both sub-tasks in parallel".to_string(),
+                tx,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("agent stalled: the two delegate calls did not run in parallel")
+        .unwrap();
+        assert_eq!(outcome.final_answer, "All done.");
+
+        let mut delegate_results = 0usize;
+        let mut saw_result_a = false;
+        let mut saw_result_b = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
+        {
+            match ev {
+                AgentEvent::ToolResult {
+                    name, output, ok, ..
+                } if name == "delegate" => {
+                    delegate_results += 1;
+                    assert!(ok, "delegate call failed: {output}");
+                    saw_result_a |= output.contains("RESULT-A");
+                    saw_result_b |= output.contains("RESULT-B");
+                }
+                AgentEvent::RunEnd => break,
+                _ => {}
+            }
+        }
+        assert_eq!(delegate_results, 2);
+        assert!(
+            saw_result_a && saw_result_b,
+            "both delegate replies must reach the model"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

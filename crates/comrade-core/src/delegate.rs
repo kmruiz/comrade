@@ -123,6 +123,12 @@ the delegate replies, run the step's verification yourself with your tools \
 to the failure output so the delegate fixes it — up to 5 fix rounds per step. \
 After 5 the tool refuses further fix requests and you must do the step yourself.
 
+Several delegate calls issued in one message run in PARALLEL: split \
+independent sub-tasks into separate calls and batch them together instead of \
+delegating one at a time and waiting. Every call must be fully self-contained: \
+delegates cannot see each other's work, so never make one depend on another's \
+result, and never delegate the same plan step twice in one batch.
+
 Configured delegates:
 {name_list}"
         );
