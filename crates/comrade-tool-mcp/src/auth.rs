@@ -2,7 +2,7 @@
 //! authorization-code + PKCE with loopback redirect) resolution into a
 //! request header consumed by the rmcp streamable-HTTP transport.
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail};
 use comrade_core::McpAuth;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde::Deserialize;
@@ -45,7 +45,10 @@ pub async fn resolve_auth_header(
                 Some(h) if !h.is_empty() && !h.eq_ignore_ascii_case("authorization") => {
                     Ok(Some((h.clone(), value)))
                 }
-                _ => Ok(Some(("Authorization".to_string(), format!("Bearer {value}")))),
+                _ => Ok(Some((
+                    "Authorization".to_string(),
+                    format!("Bearer {value}"),
+                ))),
             }
         }
         Some(cfg @ McpAuth::Oidc { .. }) => {
@@ -153,8 +156,7 @@ fn random_bytes(bytes: usize) -> Vec<u8> {
 
 /// Base64url (RFC 4648 §5) without padding.
 fn base64url(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b = [
@@ -192,18 +194,15 @@ async fn capture_redirect_code(
     loop {
         let (mut socket, _) = listener.accept().await?;
         let mut buf = [0u8; 8192];
-        let n = match tokio::time::timeout(std::time::Duration::from_secs(10), socket.read(&mut buf))
-            .await
-        {
-            Ok(Ok(n)) if n > 0 => n,
-            _ => continue,
-        };
+        let n =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), socket.read(&mut buf))
+                .await
+            {
+                Ok(Ok(n)) if n > 0 => n,
+                _ => continue,
+            };
         let request = String::from_utf8_lossy(&buf[..n]).to_string();
-        let path = request
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("/")
-            .to_string();
+        let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
         let Some((_, query)) = path.split_once('?') else {
             respond_http(socket, "<html><body>ok</body></html>").await;
             continue;
@@ -297,8 +296,12 @@ async fn oidc_access_token_with(
     let actual_port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{actual_port}/callback");
 
-    let mut authz = reqwest::Url::parse(&meta.authorization_endpoint)
-        .with_context(|| format!("bad authorization_endpoint {:?}", meta.authorization_endpoint))?;
+    let mut authz = reqwest::Url::parse(&meta.authorization_endpoint).with_context(|| {
+        format!(
+            "bad authorization_endpoint {:?}",
+            meta.authorization_endpoint
+        )
+    })?;
     {
         let mut q = authz.query_pairs_mut();
         q.append_pair("response_type", "code");
@@ -366,7 +369,10 @@ mod tests {
             header: None,
         };
         assert_eq!(
-            resolve_auth_header(Some(&auth), "https://x.example/mcp").await.unwrap().unwrap(),
+            resolve_auth_header(Some(&auth), "https://x.example/mcp")
+                .await
+                .unwrap()
+                .unwrap(),
             ("Authorization".to_string(), "Bearer sekrit".to_string())
         );
     }
@@ -378,7 +384,10 @@ mod tests {
             header: Some("x-api-key".into()),
         };
         assert_eq!(
-            resolve_auth_header(Some(&auth), "https://x.example/mcp").await.unwrap().unwrap(),
+            resolve_auth_header(Some(&auth), "https://x.example/mcp")
+                .await
+                .unwrap()
+                .unwrap(),
             ("x-api-key".to_string(), "k123".to_string())
         );
     }
@@ -390,7 +399,10 @@ mod tests {
             header: None,
         };
         // Unresolvable env var keeps its literal text (config contract).
-        let v = resolve_auth_header(Some(&auth), "https://x.example/mcp").await.unwrap().unwrap();
+        let v = resolve_auth_header(Some(&auth), "https://x.example/mcp")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(v.1, "Bearer $MISSING_KEY");
     }
 
@@ -398,7 +410,9 @@ mod tests {
     /// metadata, an authorize endpoint that 302s to the client's loopback
     /// redirect URI with a code, and a token endpoint that mints tokens.
     async fn spawn_mock_as() -> (u16, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = tokio::spawn(async move {
             loop {
@@ -442,7 +456,8 @@ mod tests {
                                     params.insert(k.to_string(), decoded);
                                 }
                             }
-                            let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
+                            let redirect_uri =
+                                params.get("redirect_uri").cloned().unwrap_or_default();
                             let state = params.get("state").cloned().unwrap_or_default();
                             // Immediate "consent": bounce straight to the loopback.
                             let _ = socket
@@ -458,7 +473,9 @@ mod tests {
                         }
                         ("POST", "/token") => {
                             let payload = req.split("\r\n\r\n").nth(1).unwrap_or("");
-                            if payload.contains("code_verifier=") && payload.contains("code=auth-code-1") {
+                            if payload.contains("code_verifier=")
+                                && payload.contains("code=auth-code-1")
+                            {
                                 body = format!(
                                     r#"{{"access_token":"access-123","token_type":"Bearer","expires_in":3600,"refresh_token":"refresh-456"}}"#
                                 );
@@ -515,4 +532,3 @@ mod tests {
         Ok(())
     }
 }
-

@@ -10,3 +10,5 @@
 pub mod auth;
 pub mod connect;
 pub mod tool;
+
+pub use connect::{connect_all, connect_one};

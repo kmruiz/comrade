@@ -4,7 +4,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use comrade_tool::{Tool, ToolContext, ToolSpec};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// What the MCP connection executes when the agent invokes one remote tool.
 ///
@@ -145,7 +145,13 @@ mod tests {
             json!({ "type": "object", "properties": { "q": { "type": "string" } } }),
             Box::new(Stub),
         );
-        assert!(t.spec().json_schema.as_object().unwrap().contains_key("properties"));
+        assert!(
+            t.spec()
+                .json_schema
+                .as_object()
+                .unwrap()
+                .contains_key("properties")
+        );
     }
 
     struct Stub;

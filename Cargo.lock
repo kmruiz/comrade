@@ -527,6 +527,7 @@ dependencies = [
  "comrade-tool",
  "comrade-tool-fs",
  "comrade-tool-git",
+ "comrade-tool-mcp",
  "comrade-tool-memory",
  "comrade-tool-project",
  "comrade-tool-session",

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
 use comrade_core::{McpServerCfg, McpTransport};
 use comrade_tool::Tool;
@@ -60,11 +60,7 @@ impl ServerSession {
     async fn connect(cfg: &McpServerCfg) -> Result<Self> {
         let name = cfg.name.clone();
         let (running, peer) = match &cfg.transport {
-            McpTransport::Stdio {
-                command,
-                args,
-                env,
-            } => {
+            McpTransport::Stdio { command, args, env } => {
                 let mut cmd = Command::new(command);
                 cmd.args(args);
                 for (k, v) in env {
@@ -75,14 +71,11 @@ impl ServerSession {
                 cmd.stdout(std::process::Stdio::piped());
                 cmd.stderr(std::process::Stdio::piped());
                 cmd.kill_on_drop(true);
-                let transport =
-                    rmcp::transport::child_process::TokioChildProcess::new(cmd).with_context(
-                        || format!("failed to spawn MCP server command {command:?}"),
-                    )?;
-                let running =
-                    rmcp::service::serve_client((), transport).await.context(
-                        format!("MCP handshake with {name} failed"),
-                    )?;
+                let transport = rmcp::transport::child_process::TokioChildProcess::new(cmd)
+                    .with_context(|| format!("failed to spawn MCP server command {command:?}"))?;
+                let running = rmcp::service::serve_client((), transport)
+                    .await
+                    .context(format!("MCP handshake with {name} failed"))?;
                 let peer: Peer<RoleClient> = running.clone();
                 (running, peer)
             }
@@ -90,10 +83,9 @@ impl ServerSession {
                 let config = crate::auth::http_transport_config(url, cfg.auth.as_ref()).await?;
                 let transport =
                     rmcp::transport::streamable_http_client::StreamableHttpClientTransport::from_config(config);
-                let running =
-                    rmcp::service::serve_client((), transport).await.context(
-                        format!("MCP HTTP handshake with {name} failed"),
-                    )?;
+                let running = rmcp::service::serve_client((), transport)
+                    .await
+                    .context(format!("MCP HTTP handshake with {name} failed"))?;
                 let peer: Peer<RoleClient> = running.clone();
                 (running, peer)
             }
@@ -146,8 +138,8 @@ struct PeerCall {
 impl RemoteCall for PeerCall {
     async fn call(&self, args: Value) -> Result<String> {
         let arguments = args.as_object().cloned().unwrap_or_default();
-        let req = rmcp::model::CallToolRequestParams::new(self.tool.clone())
-            .with_arguments(arguments);
+        let req =
+            rmcp::model::CallToolRequestParams::new(self.tool.clone()).with_arguments(arguments);
         let resp = self.peer.call_tool(req).await?;
         render_call_tool_result(resp)
     }
@@ -253,8 +245,10 @@ mod tests {
                 })),
                 "tools/call" => {
                     let name = params["name"].as_str().unwrap_or_default();
-                    let args =
-                        params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    let args = params
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
                     match name {
                         "echo" => Some(json!({
                             "jsonrpc": "2.0", "id": id,
@@ -322,15 +316,25 @@ mod tests {
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["mcp_fixture_echo", "mcp_fixture_add", "mcp_fixture_always_error"]
+            vec![
+                "mcp_fixture_echo",
+                "mcp_fixture_add",
+                "mcp_fixture_always_error"
+            ]
         );
         assert!(specs[0].description.contains("MCP server `fixture`"));
         assert!(specs[0].json_schema["properties"]["message"].is_object());
 
-        let call = PeerCall { peer: session.peer.clone(), tool: "echo".into() };
+        let call = PeerCall {
+            peer: session.peer.clone(),
+            tool: "echo".into(),
+        };
         assert_eq!(call.call(json!({ "message": "hi" })).await?, "echo: hi");
 
-        let call = PeerCall { peer: session.peer.clone(), tool: "add".into() };
+        let call = PeerCall {
+            peer: session.peer.clone(),
+            tool: "add".into(),
+        };
         assert_eq!(call.call(json!({ "a": 2, "b": 40 })).await?, "42");
         Ok(())
     }
@@ -338,7 +342,10 @@ mod tests {
     #[tokio::test]
     async fn tool_errors_surface_as_errors() -> Result<()> {
         let session = connect_fixture().await?;
-        let call = PeerCall { peer: session.peer.clone(), tool: "always_error".into() };
+        let call = PeerCall {
+            peer: session.peer.clone(),
+            tool: "always_error".into(),
+        };
         let err = call.call(json!({})).await.unwrap_err();
         assert!(err.to_string().contains("MCP tool error"), "got: {err}");
         assert!(err.to_string().contains("boom"));
@@ -348,7 +355,10 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_fails() -> Result<()> {
         let session = connect_fixture().await?;
-        let call = PeerCall { peer: session.peer.clone(), tool: "nope".into() };
+        let call = PeerCall {
+            peer: session.peer.clone(),
+            tool: "nope".into(),
+        };
         assert!(call.call(json!({})).await.is_err());
         Ok(())
     }

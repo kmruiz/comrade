@@ -581,16 +581,17 @@ mod tests {
         let fs = &c.mcp.servers[0];
         assert_eq!(fs.name, "fs");
         assert_eq!(fs.auth, None);
-        let McpTransport::Stdio {
-            command,
-            args,
-            env,
-        } = &fs.transport
-        else {
+        let McpTransport::Stdio { command, args, env } = &fs.transport else {
             panic!("expected stdio transport");
         };
         assert_eq!(command, "npx");
-        assert_eq!(args, &vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()]);
+        assert_eq!(
+            args,
+            &vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string()
+            ]
+        );
         assert_eq!(env.get("TOKEN").map(String::as_str), Some("$FS_TOKEN"));
 
         let remote = &c.mcp.servers[1];

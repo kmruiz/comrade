@@ -87,7 +87,12 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
     }
     let cfg = Arc::new(cfg);
 
-    let tools = Arc::new(build_tools(&cfg)?);
+    // Connect configured MCP servers and register their tools alongside the
+    // built-ins. A dead/unreachable server is skipped with a warning instead
+    // of aborting startup (see connect_all).
+    let mut reg = build_tools(&cfg)?;
+    reg.extend(comrade_tool_mcp::connect_all(&cfg.mcp.servers).await);
+    let tools = Arc::new(reg);
     Ok(Deps {
         cfg,
         client,
