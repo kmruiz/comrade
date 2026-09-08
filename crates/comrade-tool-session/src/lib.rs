@@ -94,12 +94,12 @@ static SET_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "goal": { "type": "string", "description": "What this step aims to accomplish." },
+                        "goal": { "type": "string", "description": "What this step aims to accomplish, summarised, for a human to read." },
                         "verification": { "type": "string", "description": "How to verify the step succeeded, e.g. \"cargo test passes\" or \"rgrep finds the new call sites\"." },
                         "model": { "type": "string", "description": "REQUIRED. The model that will execute this step: write \"self\" when you (the main agent model) will run it yourself, or one of the configured delegate names (see the delegate tool's model listing). Every step must name who runs it." },
-                        "context": { "type": "string", "description": "Summarised context the executing model needs for this step (optional; never shown in the UI)." }
+                        "context": { "type": "string", "description": "Summarised context the executing model needs for this step (mandatory; never shown in the UI)." }
                     },
-                    "required": ["goal", "model"],
+                    "required": ["goal", "model", "verification", "context"],
                     "additionalProperties": false
                 },
                 "minItems": 1,
@@ -480,7 +480,7 @@ struct AskQuestion;
 static ASK_QUESTION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "ask_question".into(),
-    description: "Ask the human a question and wait for their answer. Use to resolve ambiguity, request confirmation, or let the human pick between options. Prefer this over guessing when a choice materially affects the outcome.".into(),
+    description: "Ask the human a question and wait for their answer. Use to resolve ambiguity, request confirmation, or let the human pick between options. Prefer this over guessing when a choice materially affects the outcome. If you recommend one specific answer or approach, be explicit about it.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {

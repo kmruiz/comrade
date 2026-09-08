@@ -43,8 +43,9 @@ const PROMPT_MAX_ROWS: usize = 5;
 /// Mode-line background while auto-approve is active: a warm orange so the
 /// bar reads as "warning: changes are applied without asking".
 const AUTO_BAR_BG: Color = Color::Rgb(203, 106, 15);
-/// Keybinding hints shown right-aligned on the mode line when wide enough.
-const LEGEND: &str = "enter:run shift-enter:newline alt-backspace:word esc:cancel ctrl-space:auto ctrl-c:quit ctrl-f:search ctrl-p/n:block alt-p/n:user ctrl-a:assign tab:toggle";
+/// App name shown right-aligned on the mode line (Emacs-style), where the
+/// keybinding legend used to live.
+const APP_TAG: &str = " comrade ";
 
 // ---------------------------------------------------------------------------
 // UserIo bridging into the UI event loop
@@ -1628,7 +1629,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
 
     let header = Line::from(vec![
         Span::styled(
-            format!(" comrade | {} ", app.session.title()),
+            format!(" {} ", app.session.title()),
             Style::default()
                 .bg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
@@ -1660,8 +1661,8 @@ fn draw(app: &mut App, frame: &mut Frame) {
     // Left: repo (branch + inserted/removed lines, added/deleted files),
     // agent state (IDLE/RUNNING) and mode (auto/ask). The whole bar turns a
     // warm orange while auto-approve is active so the "changes land without
-    // asking" mode reads as a warning. The key legend survives on the far
-    // right when the terminal is wide enough.
+    // asking" mode reads as a warning. The app name sits on the far right
+    // when the terminal is wide enough.
     let auto = app.auto_mode_on();
     let on_auto = |fg: Color| -> Color { if auto { Color::Black } else { fg } };
     let bar_style = Style::default()
@@ -1736,21 +1737,21 @@ fn draw(app: &mut App, frame: &mut Frame) {
 
     frame.render_widget(Paragraph::new(header), rows[0]);
 
-    // The bar spans the whole row; the key legend is right-aligned in the
-    // leftover width and drops first on narrow terminals.
-    let legend_w = (LEGEND.chars().count() as u16).min(rows[3].width.saturating_sub(60));
+    // The bar spans the whole row; the app name is right-aligned in its own
+    // segment and drops first on narrow terminals.
+    let tag_w = (APP_TAG.chars().count() as u16).min(rows[3].width.saturating_sub(60));
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(legend_w)])
+        .constraints([Constraint::Min(0), Constraint::Length(tag_w)])
         .split(rows[3]);
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(bar_style),
         bottom[0],
     );
-    if legend_w > 0 {
+    if tag_w > 0 {
         frame.render_widget(
-            Paragraph::new(Line::from(LEGEND))
-                .style(bar_style)
+            Paragraph::new(Line::from(APP_TAG))
+                .style(bar_style.add_modifier(Modifier::BOLD))
                 .alignment(Alignment::Right),
             bottom[1],
         );

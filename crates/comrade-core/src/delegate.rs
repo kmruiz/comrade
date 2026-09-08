@@ -245,7 +245,7 @@ Configured delegates — pick the one whose description best fits the task:
                 },
                 "feedback": {
                     "type": "string",
-                    "description": "Verification failure output from the parent for a delegate that previously attempted `step`: the delegate must fix its deliverable until it passes. Counts as one fix round (max 5 per step, tracked on the step's note). Only valid with `step`."
+                    "description": "Verification failure output from the parent for a delegate that previously attempted `step`: the delegate must fix its deliverable until it passes. Counts as one fix round (max 5 per step, tracked on the step's note). The feedback must contain an actionable plan so the delegate model knows what is wrong and what do to to fix it."
                 }
             },
             "oneOf": [
