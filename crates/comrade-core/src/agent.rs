@@ -53,7 +53,6 @@ const APPROVAL_GATED_TOOLS: &[&str] = &[
     "delegate",
     "remember",
     "amend_decision",
-    "format_code",
     "shell",
 ];
 

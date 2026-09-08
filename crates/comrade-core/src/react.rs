@@ -200,7 +200,7 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          Args MUST be valid strict JSON: quote every key and every string value, e.g. {\"path\": \"src/main.rs\"}.\n\
          \n\
          Before running an approval-gated tool — write_file, rename, \
-         format_code, shell, remember, amend_decision — you MUST also write, between Thought and Tool:\n\
+         shell, remember, amend_decision — you MUST also write, between Thought and Tool:\n\
          \n\
          Justification: <why this action should run, one or two short lines>\n\
          Risk: <what could go wrong or how invasive it is; write \"Risk: none\" if safe>\n\

@@ -126,7 +126,7 @@ struct FormatCode;
 static FORMAT_CODE_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "format_code".into(),
-    description: "Run the project formatter (cargo fmt --all) so code is formatted deterministically instead of hand-formatting tokens. Approval-gated.".into(),
+    description: "Run the project formatter (cargo fmt --all) so code is formatted deterministically instead of hand-formatting tokens. Runs directly without approval (rustfmt only rewrites whitespace).".into(),
     json_schema: json!({
         "type": "object",
         "properties": {},
@@ -142,16 +142,16 @@ impl Tool for FormatCode {
     }
 
     async fn invoke(&self, ctx: &ToolContext, _args: Value) -> Result<String> {
-        run_approved_line(
-            ctx,
-            ctx.project_root.clone(),
-            "cargo fmt --all",
-            tasks::CommandLine::Cargo {
+        // Rustfmt is a deterministic, whitespace-only rewrite, so it runs
+        // directly (no human approval) like run_tests/run_task.
+        let resolved = tasks::Resolved {
+            cwd: ctx.project_root.clone(),
+            line: tasks::CommandLine::Cargo {
                 args: vec!["fmt".into(), "--all".into()],
             },
-            300,
-        )
-        .await
+            describe: "cargo fmt --all".to_string(),
+        };
+        tasks::run(&resolved, 300).await
     }
 }
 
