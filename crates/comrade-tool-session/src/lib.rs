@@ -157,7 +157,7 @@ struct UpdatePlan;
 static UPDATE_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "update_plan".into(),
-    description: "Update the status of one plan step (mark in_progress/done/blocked). Identify a step by its 1-based `index` (preferred) or by `text` that appears in its goal.".into(),
+    description: "Update the status of one plan step (mark in_progress/done/blocked). Identify a step by its 1-based `index` (preferred) or by `text` that appears in its goal. A step assigned a delegate `model` can only be marked done after the `delegate` tool has run it.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -203,6 +203,31 @@ impl Tool for UpdatePlan {
             _ => anyhow::bail!("update_plan requires either a 1-based `index` or non-empty `text`"),
         };
 
+        // A step assigned a delegate model can only be completed once the
+        // `delegate` tool has actually run it: the root model must not do a
+        // delegated step's work itself and then mark it done.
+        if status == PlanStatus::Done {
+            let steps = ctx.session.plan();
+            let matched = steps.iter().find(|s| match &target {
+                PlanTarget::Id(id) => s.id == *id,
+                PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+            });
+            if let Some(step) = matched {
+                let model = step.model.trim();
+                if !model.is_empty() && !ctx.session.step_was_delegated(step.id) {
+                    anyhow::bail!(
+                        "plan step {} is assigned to delegate {model:?}, but the `delegate` tool \
+                         has never run it — the root model cannot complete a delegated step \
+                         itself. Run the step with the delegate tool (pass `step` = {}), verify \
+                         the result, then mark it done. If no delegate is available, replace the \
+                         plan with `set_plan` leaving `model` empty.",
+                        step.id,
+                        step.id
+                    );
+                }
+            }
+        }
+
         if ctx.session.update_plan(target, status, args.note) {
             let open = ctx
                 .session
@@ -226,7 +251,7 @@ struct FinishPlan;
 static FINISH_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "finish_plan".into(),
-    description: "Mark the whole plan as finished, optionally with a closing summary. Use when the task is complete.".into(),
+    description: "Mark the whole plan as finished, optionally with a closing summary. Use when the task is complete. Refuses while any step assigned a delegate model has never been run by the `delegate` tool.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -250,6 +275,30 @@ impl Tool for FinishPlan {
             summary: Option<String>,
         }
         let args: Args = serde_json::from_value(args)?;
+
+        // Refuse to auto-close any step that is assigned a delegate model but
+        // has never been run by the `delegate` tool.
+        let stuck: Vec<String> = ctx
+            .session
+            .plan()
+            .iter()
+            .filter(|s| {
+                !s.model.trim().is_empty()
+                    && matches!(s.status, PlanStatus::Pending | PlanStatus::InProgress)
+                    && !ctx.session.step_was_delegated(s.id)
+            })
+            .map(|s| format!("step {} (delegate {:?})", s.id, s.model))
+            .collect();
+        if !stuck.is_empty() {
+            anyhow::bail!(
+                "cannot finish the plan: {} still assigned to a delegate but never run by the \
+                 `delegate` tool: {}. Delegate each step (delegate tool with `step` = <id>), \
+                 verify the result, or replace the plan with `set_plan` leaving `model` empty.",
+                stuck.len(),
+                stuck.join(", ")
+            );
+        }
+
         ctx.session.finish_plan(args.summary);
         Ok("Plan finished.".to_string())
     }
@@ -342,5 +391,206 @@ impl Tool for AskQuestion {
             UserReply::Answer(answer) => answer,
             UserReply::Denied => "(user dismissed the question)".to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use comrade_tool::{
+        PlanStatus, PlanStep, PlanStepDraft, PlanTarget, SessionControl, Tool, ToolContext,
+        UndoLog, UserIo, UserPrompt, UserReply,
+    };
+    use serde_json::json;
+
+    use super::{FinishPlan, UpdatePlan};
+
+    /// A real-enough session: stores the plan and which steps the `delegate`
+    /// tool has run, exactly like `AgentSession` does.
+    struct StubSession {
+        plan: Mutex<Vec<PlanStep>>,
+        delegated: Mutex<HashSet<u64>>,
+    }
+
+    impl StubSession {
+        fn with_plan(steps: Vec<PlanStepDraft>) -> Self {
+            let plan = steps
+                .into_iter()
+                .enumerate()
+                .map(|(i, d)| PlanStep {
+                    id: (i + 1) as u64,
+                    goal: d.goal,
+                    verification: d.verification,
+                    model: d.model,
+                    context: d.context,
+                    status: PlanStatus::Pending,
+                    note: None,
+                })
+                .collect();
+            StubSession {
+                plan: Mutex::new(plan),
+                delegated: Mutex::new(HashSet::new()),
+            }
+        }
+    }
+
+    impl SessionControl for StubSession {
+        fn set_title(&self, _t: &str) {}
+        fn title(&self) -> String {
+            "test".into()
+        }
+        fn set_plan(&self, _s: Vec<PlanStepDraft>) {}
+        fn plan(&self) -> Vec<PlanStep> {
+            self.plan.lock().unwrap().clone()
+        }
+        fn update_plan(
+            &self,
+            target: PlanTarget,
+            status: PlanStatus,
+            note: Option<String>,
+        ) -> bool {
+            let mut plan = self.plan.lock().unwrap();
+            let Some(step) = plan.iter_mut().find(|s| match &target {
+                PlanTarget::Id(id) => s.id == *id,
+                PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+            }) else {
+                return false;
+            };
+            step.status = status;
+            if let Some(n) = note {
+                if !n.trim().is_empty() {
+                    step.note = Some(n.trim().to_string());
+                }
+            }
+            true
+        }
+        fn finish_plan(&self, _summary: Option<String>) {
+            let mut plan = self.plan.lock().unwrap();
+            for step in plan.iter_mut() {
+                if !matches!(step.status, PlanStatus::Done | PlanStatus::Blocked) {
+                    step.status = PlanStatus::Done;
+                }
+            }
+        }
+        fn mark_step_delegated(&self, id: u64) {
+            self.delegated.lock().unwrap().insert(id);
+        }
+        fn step_was_delegated(&self, id: u64) -> bool {
+            self.delegated.lock().unwrap().contains(&id)
+        }
+        fn set_status(&self, _s: &str) {}
+        fn status(&self) -> String {
+            String::new()
+        }
+    }
+
+    struct NoopIo;
+    #[async_trait]
+    impl UserIo for NoopIo {
+        async fn ask(&self, _p: UserPrompt) -> Result<UserReply> {
+            Ok(UserReply::Answer("yes".into()))
+        }
+    }
+
+    struct NoopUndo;
+    #[async_trait]
+    impl UndoLog for NoopUndo {
+        async fn capture(&self, _p: &str, _b: String) -> Result<()> {
+            Ok(())
+        }
+        async fn undo_last(&self) -> Result<usize> {
+            Ok(0)
+        }
+        async fn is_empty(&self) -> bool {
+            true
+        }
+        async fn len(&self) -> usize {
+            0
+        }
+    }
+
+    fn ctx(session: StubSession) -> ToolContext {
+        ToolContext {
+            project_root: PathBuf::from("/tmp/x"),
+            cwd: PathBuf::from("/tmp/x"),
+            session: Arc::new(session),
+            user: Arc::new(NoopIo),
+            undo: Arc::new(NoopUndo),
+            auto_approve: true,
+            approval: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn delegated_step() -> PlanStepDraft {
+        PlanStepDraft {
+            goal: "write the helper fn".into(),
+            verification: "cargo test passes".into(),
+            model: "cheap".into(),
+            context: String::new(),
+        }
+    }
+
+    fn plain_step() -> PlanStepDraft {
+        PlanStepDraft {
+            goal: "plain step".into(),
+            verification: String::new(),
+            model: String::new(),
+            context: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cannot_mark_delegated_step_done_before_delegate_ran() {
+        let c = ctx(StubSession::with_plan(vec![delegated_step()]));
+        let err = UpdatePlan
+            .invoke(&c, json!({"index": 1, "status": "done"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("delegate"), "{err}");
+        assert_eq!(c.session.plan()[0].status, PlanStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn can_mark_delegated_step_done_after_delegate_ran() {
+        let c = ctx(StubSession::with_plan(vec![delegated_step()]));
+        c.session.mark_step_delegated(1);
+        let out = UpdatePlan
+            .invoke(&c, json!({"index": 1, "status": "done"}))
+            .await
+            .unwrap();
+        assert!(out.contains("Step marked done"), "{out}");
+        assert_eq!(c.session.plan()[0].status, PlanStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn can_still_mark_a_plain_step_done() {
+        let c = ctx(StubSession::with_plan(vec![plain_step()]));
+        UpdatePlan
+            .invoke(&c, json!({"index": 1, "status": "done"}))
+            .await
+            .unwrap();
+        assert_eq!(c.session.plan()[0].status, PlanStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn finish_plan_refuses_open_never_delegated_steps() {
+        let c = ctx(StubSession::with_plan(vec![delegated_step(), plain_step()]));
+        let err = FinishPlan.invoke(&c, json!({})).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("step 1"), "{msg}");
+        assert_eq!(c.session.plan()[0].status, PlanStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn finish_plan_allows_delegated_steps_that_ran() {
+        let c = ctx(StubSession::with_plan(vec![delegated_step()]));
+        c.session.mark_step_delegated(1);
+        FinishPlan.invoke(&c, json!({})).await.unwrap();
+        assert_eq!(c.session.plan()[0].status, PlanStatus::Done);
     }
 }

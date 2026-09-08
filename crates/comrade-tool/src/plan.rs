@@ -118,6 +118,18 @@ pub trait SessionControl: Send + Sync {
     /// Mark the whole plan finished with an optional closing summary.
     fn finish_plan(&self, summary: Option<String>);
 
+    /// Record that the `delegate` tool ran the given plan step (a delegate
+    /// reply was received). Used to enforce that steps assigned a delegate
+    /// model are executed on that delegate and cannot be silently completed by
+    /// the root model itself.
+    fn mark_step_delegated(&self, _step_id: u64) {}
+
+    /// True when the `delegate` tool has run this plan step at least once.
+    /// Defaults to false for implementations that do not track delegation.
+    fn step_was_delegated(&self, _step_id: u64) -> bool {
+        false
+    }
+
     fn set_status(&self, status: &str);
     fn status(&self) -> String;
 }

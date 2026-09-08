@@ -379,6 +379,7 @@ dependencies = [
  "comrade-tool",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

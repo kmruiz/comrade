@@ -121,7 +121,11 @@ the delegate verify. The delegate is asked to self-check and close with a \
 the delegate replies, run the step's verification yourself with your tools \
 (e.g. run_tests); if it fails, re-delegate the SAME step with `feedback` set \
 to the failure output so the delegate fixes it — up to 5 fix rounds per step. \
-After 5 the tool refuses further fix requests and you must do the step yourself.
+After 5 the tool refuses further fix requests and you must do the step yourself. \
+Running a plan step through this tool is what entitles it to be marked done: \
+update_plan and finish_plan refuse to close a step assigned a delegate model \
+until the delegate tool has run it, so you cannot complete delegated work \
+yourself.
 
 Several delegate calls issued in one message run in PARALLEL: split \
 independent sub-tasks into separate calls and batch them together instead of \
@@ -356,6 +360,13 @@ impl Tool for DelegateTool {
                 return Err(err);
             }
         };
+
+        // The delegate produced a reply: record that this plan step really ran
+        // on a delegate, so the root cannot later complete it "itself" without
+        // delegating (enforced by update_plan/finish_plan).
+        if let Some((id, _)) = delegated_step {
+            ctx.session.mark_step_delegated(id);
+        }
 
         Ok(format!("delegate {model} ({display}) replied:\n{reply}"))
     }

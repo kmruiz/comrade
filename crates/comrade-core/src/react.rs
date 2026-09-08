@@ -94,7 +94,11 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
              `feedback` so the delegate fixes it, and repeat — up to 5 fix rounds per step. The \
              delegate tool counts the rounds and refuses further fix requests after 5; at that \
              point stop delegating, do the step yourself with your tools, and only then mark it \
-             done (or blocked).\n\n",
+             done (or blocked). \
+             Delegation is enforced, not optional: once you assign a delegate `model` to a step, \
+             update_plan and finish_plan refuse to mark that step done until the delegate tool \
+             has run it (its plan note shows `working: <model>`), so do not do delegated work \
+             yourself.\n\n",
         );
     }
     prompt.push_str(

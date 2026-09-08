@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use comrade_tool::{PlanStatus, PlanStep, PlanTarget, SessionControl};
@@ -67,6 +68,9 @@ pub struct AgentSession {
     plan: RwLock<Vec<PlanStep>>,
     finished: RwLock<Option<String>>,
     next_id: RwLock<u64>,
+    /// Plan step ids the `delegate` tool has run at least once (so steps
+    /// assigned a delegate model cannot be completed by the root itself).
+    delegated: RwLock<HashSet<u64>>,
 }
 
 impl AgentSession {
@@ -78,6 +82,7 @@ impl AgentSession {
             plan: RwLock::new(Vec::new()),
             finished: RwLock::new(None),
             next_id: RwLock::new(1),
+            delegated: RwLock::new(HashSet::new()),
         }
     }
 
@@ -127,6 +132,7 @@ impl SessionControl for AgentSession {
             }
         }
         *self.plan.write().unwrap() = plan;
+        *self.delegated.write().unwrap() = HashSet::new();
         *self.finished.write().unwrap() = None;
         self.emit(AgentEvent::PlanChanged);
     }
@@ -170,6 +176,14 @@ impl SessionControl for AgentSession {
         self.emit(AgentEvent::PlanFinished(summary));
     }
 
+    fn mark_step_delegated(&self, step_id: u64) {
+        self.delegated.write().unwrap().insert(step_id);
+    }
+
+    fn step_was_delegated(&self, step_id: u64) -> bool {
+        self.delegated.read().unwrap().contains(&step_id)
+    }
+
     fn set_status(&self, status: &str) {
         *self.status.write().unwrap() = status.to_string();
         self.emit(AgentEvent::StatusChanged);
@@ -192,6 +206,25 @@ mod tests {
             model: String::new(),
             context: String::new(),
         }
+    }
+
+    #[test]
+    fn delegated_steps_are_tracked_and_cleared_when_plan_is_reset() {
+        let (tx, _rx) = mpsc::channel(16);
+        let s = AgentSession::new(tx);
+        s.set_plan(vec![PlanStepDraft {
+            goal: "delegate me".into(),
+            verification: String::new(),
+            model: "cheap".into(),
+            context: String::new(),
+        }]);
+        assert!(!s.step_was_delegated(1));
+        s.mark_step_delegated(1);
+        assert!(s.step_was_delegated(1));
+
+        // a brand-new plan restarts the delegation record with the ids
+        s.set_plan(vec![draft("only", "")]);
+        assert!(!s.step_was_delegated(1));
     }
 
     #[test]
