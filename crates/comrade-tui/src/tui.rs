@@ -2115,8 +2115,23 @@ fn render_row_line(
     Line::from(spans)
 }
 
+/// Border title for the chat panel: the session's display name, padded like
+/// the other panel titles (" plan ", " model ") and truncated to keep the
+/// block's right border intact on narrow terminals.
+fn chat_title(title: &str, width: u16) -> String {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return " chat ".to_string();
+    }
+    // cap() appends "…" on top of max, so width - 3 leaves room for it while
+    // keeping the whole title inside width - 2 cells (off the right border).
+    cap(&format!(" {trimmed} "), usize::from(width.saturating_sub(3)))
+}
+
 fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" chat ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(chat_title(&app.session.title(), area.width));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -3870,6 +3885,25 @@ mod tests {
         assert!(flat.contains("Title"), "{flat}");
         assert!(flat.contains("fn main() {}"), "{flat}");
         assert!(flat.contains("plain"), "{flat}");
+    }
+
+    #[test]
+    fn chat_title_shows_the_session_name() {
+        // The panel reads the session name, padded like the other titles.
+        assert_eq!(chat_title("my task", 40), " my task ");
+        // The default session name is shown until the first prompt names it.
+        assert_eq!(chat_title("New session", 40), " New session ");
+    }
+
+    #[test]
+    fn chat_title_is_truncated_to_fit_the_panel() {
+        // A long name must never eat the block's right border: at most
+        // width - 2 cells, with the cap's ellipsis.
+        let title = chat_title(&"x".repeat(80), 20);
+        assert!(title.chars().count() <= 18, "{title}");
+        assert!(title.ends_with('…'), "{title}");
+        // Empty title falls back to the old placeholder.
+        assert_eq!(chat_title("   ", 40), " chat ");
     }
 
     #[test]
