@@ -35,6 +35,27 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
     prompt.push_str(&format!(
         "Context budget is about {budget} tokens. Be terse.\n\n"
     ));
+    // Lead with delegation when it is possible: models weight the start of the
+    // prompt, so the delegate-first default must come before the self-first
+    // working style below (which says "you write real code yourself") or the
+    // root model quietly does every step itself and never calls `delegate`.
+    if tools.iter().any(|t| t.spec().name == "delegate") {
+        prompt.push_str(
+            "## Delegate by default\n\
+             You lead a team of developer delegate models — the `delegate` tool lists who is \
+             available. For every task, PREFER delegating the well-bounded steps to a delegate \
+             over doing them yourself: give each such step a delegate `model` in set_plan, then \
+             run it with the delegate tool (delegate step=<id>). A step counts as well-bounded \
+             when one developer can finish it end-to-end on its own — a single file or function, \
+             a bugfix, a refactor, a data transform, a translation, a test. Keep for yourself \
+             only what needs your judgement or commit rights: planning, orienting, integrating, \
+             verifying what a delegate changed, committing.\n\
+             \n\
+             Delegation is enforced, not a suggestion: a step you assign a delegate `model` cannot \
+             be marked done until the delegate tool has actually run it, so assign `model` only to \
+             steps you intend to delegate — then delegate them.\n\n",
+        );
+    }
     prompt.push_str(
         "## Working style\n\
          You are a tech lead - you write real code and tests yourself when the work needs you, and \
@@ -882,6 +903,18 @@ mod dev_prompt_tests {
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(NamedTool::with_name("delegate")));
         let prompt = build_system_prompt("/x", &reg, 6000);
+        // The delegate-first default must lead the prompt, before the
+        // self-first "## Working style", so root models see it first.
+        let delegate_lead = prompt
+            .find("## Delegate by default")
+            .expect("delegation must lead the prompt");
+        let working_style = prompt
+            .find("## Working style")
+            .expect("working style section must exist");
+        assert!(
+            delegate_lead < working_style,
+            "delegate-first section must come before ## Working style:\n{prompt}"
+        );
         assert!(
             prompt.contains("tech lead with a team of developer models"),
             "{prompt}"
@@ -906,6 +939,7 @@ mod dev_prompt_tests {
     fn prompt_stays_silent_about_delegation_without_delegates() {
         let reg = ToolRegistry::new();
         let prompt = build_system_prompt("/x", &reg, 6000);
+        assert!(!prompt.contains("## Delegate by default"), "{prompt}");
         assert!(
             !prompt.contains("tech lead with a team of developer models"),
             "{prompt}"
