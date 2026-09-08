@@ -463,14 +463,48 @@ async fn run_agent_loop(
             None
         };
 
-        // Stream the model's reply: each content chunk is forwarded to the UI as
-        // `Delta`; the accumulated turn (text + native tool calls) is returned.
+        // Stream the model's reply to the UI as `Delta` events; the accumulated
+        // turn (text + native tool calls) is returned separately. A fast local
+        // model emits tokens far faster than the TUI can redraw them (freeze
+        // notes #25/#29), so the raw per-token chunks are COALESCED here: the
+        // forwarder ships at most one `Delta` per DELTA_FLUSH_MS (or per
+        // DELTA_FLUSH_CHARS of buffered text), and uses `try_send` so a UI
+        // that has fallen behind can never wedge the run task on a full event
+        // channel. Deltas are purely cosmetic streaming text -- the full turn
+        // is committed by its own ToolCall/FinalAnswer event, so dropping an
+        // intermediate batch only skips on-screen animation, never content.
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let events_tx = tx.clone();
+        const DELTA_FLUSH_MS: u64 = 33; // ~30 fps ceiling of on-screen token animation
+        const DELTA_FLUSH_CHARS: usize = 1024; // ...and never batch more than this
         let forwarder = tokio::spawn(async move {
-            while let Some(delta) = delta_rx.recv().await {
-                if events_tx.send(AgentEvent::Delta(delta)).await.is_err() {
-                    break;
+            let mut flush = tokio::time::interval(std::time::Duration::from_millis(DELTA_FLUSH_MS));
+            flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut buf = String::new();
+            let ship = |buf: &mut String| {
+                if buf.is_empty() {
+                    return;
+                }
+                let batch = std::mem::take(buf);
+                let _ = events_tx.try_send(AgentEvent::Delta(batch));
+            };
+            loop {
+                tokio::select! {
+                    delta = delta_rx.recv() => match delta {
+                        Some(d) => {
+                            buf.push_str(&d);
+                            // `buf` never grows past DELTA_FLUSH_CHARS, so the
+                            // char count below stays cheap.
+                            if buf.chars().count() >= DELTA_FLUSH_CHARS {
+                                ship(&mut buf);
+                            }
+                        }
+                        None => {
+                            ship(&mut buf);
+                            break;
+                        }
+                    },
+                    _ = flush.tick() => ship(&mut buf),
                 }
             }
         });
@@ -488,17 +522,17 @@ async fn run_agent_loop(
             Ok(turn) => turn,
             Err(e) => {
                 // Interrupted (usually user cancel): return immediately,
-                // WITHOUT draining the delta forwarder. The forwarder can be
-                // parked awaiting a full UI event channel; draining it here
-                // would wedge the run in an await that never sees the cancel
-                // token, making Esc unable to end it. Once delta_tx is dropped
-                // (on return) the forwarder's channel closes and it exits.
+                // WITHOUT draining the delta forwarder. Once delta_tx is
+                // dropped (on return) the forwarder's channel closes and it
+                // exits; the forwarder never blocks on the UI (try_send), so
+                // it cannot hold up the run anyway.
                 return Err(e);
             }
         };
         drop(delta_tx);
-        // Drain the delta queue so the UI sees every token, not just those the
-        // forwarder got to before we moved on.
+        // Drain the delta forwarder so any buffered text is flushed to the UI
+        // before the turn's own ToolCall/FinalAnswer event commits the full
+        // text. With the try_send path above this cannot block on a slow UI.
         let _ = forwarder.await;
 
         // Real usage from the API when reported (prompt_tokens = context the

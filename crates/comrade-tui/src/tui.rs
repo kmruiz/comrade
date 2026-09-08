@@ -568,6 +568,10 @@ struct App {
     /// abort a run that ignores the cancel token (see [`App::cancel_run`]).
     run_handle: Option<tokio::task::JoinHandle<()>>,
     running: bool,
+    /// Instant of the last terminal repaint, used to cap event-driven redraws
+    /// to ~30 fps while a run is streaming (a fast local model can otherwise
+    /// flood the repaint path; see freeze notes #25/#29).
+    last_draw: std::time::Instant,
     /// Auto-accept mode: approvals are answered "yes" without prompting.
     auto_accept: bool,
     /// Latest repo snapshot for the mode line.
@@ -1804,6 +1808,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         stop: None,
         run_handle: None,
         running: false,
+        last_draw: std::time::Instant::now(),
         auto_accept: false,
         git: GitBarInfo::default(),
         git_rx,
@@ -1934,7 +1939,20 @@ pub async fn run(deps: &Deps) -> Result<()> {
             }
         }
         app.refresh_git();
-        let _ = terminal.draw(|f| draw(&mut app, f));
+        // Coalesce repaints: while a run is streaming, bursts of agent events
+        // (a fast local model feeds a `Delta` every ~33 ms plus tool activity)
+        // can arrive faster than the terminal can usefully repaint, and each
+        // repaint costs more as the conversation grows. Cap event-driven
+        // repaints at ~30 fps while running; idle frames are never throttled
+        // (nothing floods when no run is in flight), and the plan spinner's
+        // 100 ms tick clears the cap every time, so animation is unaffected.
+        let now = std::time::Instant::now();
+        let capped =
+            app.running && now.duration_since(app.last_draw) < std::time::Duration::from_millis(33);
+        if !capped {
+            app.last_draw = now;
+            let _ = terminal.draw(|f| draw(&mut app, f));
+        }
     };
 
     let _ = execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
