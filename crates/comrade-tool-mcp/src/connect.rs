@@ -111,25 +111,38 @@ impl ServerSession {
                 );
                 continue;
             }
-            let call = PeerCall {
-                peer: self.peer.clone(),
-                tool: t.name.to_string(),
-            };
             out.push(Box::new(McpToolAdapter::new(
                 &self.name,
                 &t.name,
                 t.description.as_deref(),
                 t.schema_as_json_value(),
-                Box::new(call),
+                Box::new(self.call(&t.name)),
             )));
         }
         Ok(out)
+    }
+
+    /// A call handle for one tool that keeps the whole session alive: the
+    /// [`RunningService`] clone inside [`PeerCall`] holds the transport (and
+    /// the stdio child) open for as long as any adapter built from it lives.
+    /// Sessions themselves are short-lived (see `connect_one`), so every tool
+    /// must carry its own keep-alive or the connection drops right after
+    /// `tools/list` and later calls fail with "Transport closed".
+    fn call(&self, tool: &str) -> PeerCall {
+        PeerCall {
+            _keepalive: self._running.clone(),
+            peer: self.peer.clone(),
+            tool: tool.to_string(),
+        }
     }
 }
 
 /// Calls `tools/call` on a shared peer for one remote tool and renders the
 /// returned content blocks into the text the agent sees.
 struct PeerCall {
+    /// Keep-alive: the running MCP service (transport tasks + spawned child).
+    /// Dropped only when the last tool adapter holding this call drops.
+    _keepalive: Arc<RunningService<RoleClient, ()>>,
     peer: Peer<RoleClient>,
     tool: String,
 }
@@ -325,27 +338,33 @@ mod tests {
         assert!(specs[0].description.contains("MCP server `fixture`"));
         assert!(specs[0].json_schema["properties"]["message"].is_object());
 
-        let call = PeerCall {
-            peer: session.peer.clone(),
-            tool: "echo".into(),
-        };
+        let call = session.call("echo");
         assert_eq!(call.call(json!({ "message": "hi" })).await?, "echo: hi");
 
-        let call = PeerCall {
-            peer: session.peer.clone(),
-            tool: "add".into(),
-        };
+        let call = session.call("add");
         assert_eq!(call.call(json!({ "a": 2, "b": 40 })).await?, "42");
+        Ok(())
+    }
+
+    /// Regression: a tool handed out by a session stays callable after the
+    /// ServerSession (the only holder of the Arc<RunningService> keep-alive)
+    /// is dropped. connect_one() drops exactly that session while returning the
+    /// tools, so a lost keep-alive used to close the transport and make every
+    /// later tools/call fail with "Transport closed".
+    #[tokio::test]
+    async fn tool_outlives_the_dropped_session() -> Result<()> {
+        let session = connect_fixture().await?;
+        let call = session.call("echo");
+        // connect_one() drops its ServerSession here while the tool lives on.
+        drop(session);
+        assert_eq!(call.call(json!({ "message": "hi" })).await?, "echo: hi");
         Ok(())
     }
 
     #[tokio::test]
     async fn tool_errors_surface_as_errors() -> Result<()> {
         let session = connect_fixture().await?;
-        let call = PeerCall {
-            peer: session.peer.clone(),
-            tool: "always_error".into(),
-        };
+        let call = session.call("always_error");
         let err = call.call(json!({})).await.unwrap_err();
         assert!(err.to_string().contains("MCP tool error"), "got: {err}");
         assert!(err.to_string().contains("boom"));
@@ -355,10 +374,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_fails() -> Result<()> {
         let session = connect_fixture().await?;
-        let call = PeerCall {
-            peer: session.peer.clone(),
-            tool: "nope".into(),
-        };
+        let call = session.call("nope");
         assert!(call.call(json!({})).await.is_err());
         Ok(())
     }
