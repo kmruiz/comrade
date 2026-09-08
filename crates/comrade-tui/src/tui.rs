@@ -350,6 +350,7 @@ enum MxCommand {
     MoveBlockUp,
     MoveUserDown,
     MoveUserUp,
+    NewSession,
     Quit,
     ReloadConfig,
     SearchChat,
@@ -375,6 +376,7 @@ impl MxCommand {
         MxCommand::MoveBlockUp,
         MxCommand::MoveUserDown,
         MxCommand::MoveUserUp,
+        MxCommand::NewSession,
         MxCommand::Quit,
         MxCommand::ReloadConfig,
         MxCommand::SearchChat,
@@ -399,6 +401,7 @@ impl MxCommand {
             MxCommand::MoveBlockUp => "move-block-up",
             MxCommand::MoveUserDown => "move-user-down",
             MxCommand::MoveUserUp => "move-user-up",
+            MxCommand::NewSession => "new-session",
             MxCommand::Quit => "quit",
             MxCommand::ReloadConfig => "reload-config",
             MxCommand::SearchChat => "search-chat-history",
@@ -425,6 +428,8 @@ impl MxCommand {
             MxCommand::MoveBlockUp => Some("C-p"),
             MxCommand::MoveUserDown => Some("C-S-n"),
             MxCommand::MoveUserUp => Some("C-S-p"),
+            // Starts a fresh session: unbound, run it from the M-x palette.
+            MxCommand::NewSession => None,
             MxCommand::Quit => Some("C-c"),
             MxCommand::ReloadConfig => Some("C-r"),
             MxCommand::SearchChat => Some("C-s"),
@@ -450,6 +455,7 @@ impl MxCommand {
             MxCommand::MoveBlockUp => "move to the previous chat block",
             MxCommand::MoveUserDown => "jump to the next message you sent",
             MxCommand::MoveUserUp => "jump to the previous message you sent",
+            MxCommand::NewSession => "start a fresh session (clears the chat, plan and context)",
             MxCommand::Quit => "quit the cockpit",
             MxCommand::ReloadConfig => "reload the config file without restarting",
             MxCommand::SearchChat => "search the chat history",
@@ -1059,6 +1065,52 @@ impl App {
         self.tools = Arc::new(tools);
     }
 
+    /// Start a fresh session in place, replacing the current one: a brand-new
+    /// [`AgentSession`] (plan/status/title reset), a new undo log and tool
+    /// context, a clean rolling conversation history, and an empty chat
+    /// transcript. The human channel (ask dialogs) and the agent-event channel
+    /// are reused, so the UI event loop keeps working untouched. Only applies
+    /// while idle: a run in flight keeps the session it started with.
+    fn new_session(&mut self) {
+        if self.running {
+            self.push_meta("cannot start a fresh session while a run is in flight");
+            return;
+        }
+        let user = self.ctx_base.user.clone();
+        let undo = Arc::new(comrade_core::MemoryUndo::new(self.root.clone()));
+        let session = Arc::new(AgentSession::new(self.events_tx.clone()));
+        let ctx_base = ToolContext {
+            project_root: self.root.clone(),
+            cwd: self.root.clone(),
+            session: session.clone().as_control(),
+            user,
+            undo,
+            auto_approve: self.cfg.auto_approve(),
+            approval: Default::default(),
+        };
+        self.session = session;
+        self.ctx_base = ctx_base;
+        self.history = Arc::new(tokio::sync::Mutex::new(build_session_context(
+            &self.cfg,
+            &self.root.to_string_lossy(),
+            &self.tools,
+        )));
+        // Clear the transcript and everything derived from it; push_meta below
+        // bumps chat_epoch so the row-layout cache is invalidated.
+        self.chat.clear();
+        self.section_collapsed.clear();
+        self.chat_rows_cache = None;
+        self.stream.clear();
+        self.search = None;
+        self.sel = None;
+        self.scroll_top = 0;
+        self.follow = true;
+        self.was_at_bottom = true;
+        self.ctx_tokens = 0;
+        self.ctx_estimated = true;
+        self.push_meta("started a fresh session");
+    }
+
     /// True when approvals run without prompting: either the config autonomy
     /// is `auto` (`ctx_base.auto_approve`) or the user toggled ctrl-space.
     fn auto_mode_on(&self) -> bool {
@@ -1334,6 +1386,7 @@ impl App {
             MxCommand::MoveBlockUp => self.move_block(-1),
             MxCommand::MoveUserDown => self.move_user(1),
             MxCommand::MoveUserUp => self.move_user(-1),
+            MxCommand::NewSession => self.new_session(),
             MxCommand::Quit => return true,
             MxCommand::ReloadConfig => self.reload_config(),
             MxCommand::SearchChat => self.search = Some(Search::new()),
