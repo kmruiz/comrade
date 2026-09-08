@@ -505,7 +505,8 @@ async fn run_agent_loop(
                 if !is_plan_tool {
                     plan_nudged = true;
                     let msg = "Every task starts with a plan. Call set_plan first with your steps - \
-                               each step needs a goal and a verification - before taking any other action.";
+                               each step needs a goal, a verification and the `model` that will run it \
+                               (\"self\" or a delegate name) - before taking any other action.";
                     ctxm.push(ChatMessage::new(Role::Assistant, turn.content.clone()));
                     let _ = tx
                         .send(AgentEvent::ToolResult {
@@ -659,7 +660,8 @@ async fn run_agent_loop(
             if !is_plan_tool {
                 plan_nudged = true;
                 let msg = "Every task starts with a plan. Call set_plan first with your steps - each step \
-                     needs a goal and a verification - before taking any other action.";
+                     needs a goal, a verification and the `model` that will run it (\"self\" or a delegate \
+                     name) - before taking any other action.";
                 let _ = tx
                     .send(AgentEvent::ToolResult {
                         name: tool_call.name.clone(),

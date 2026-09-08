@@ -1,5 +1,14 @@
 use std::fmt;
 
+/// Reserved `PlanStepDraft::model` value naming the main agent model itself.
+///
+/// Plan steps must always state who runs them. Writing `AGENT_MODEL` ("self")
+/// means the main tech-lead model executes the step; any other non-empty model
+/// must be the name of a configured delegate (see the `delegate` tool's model
+/// listing). Delegation enforcement relies on this: steps whose `model` is not
+/// `AGENT_MODEL` are delegated steps and cannot be completed by the lead alone.
+pub const AGENT_MODEL: &str = "self";
+
 /// Status of a single plan step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,8 +60,9 @@ pub struct PlanStepDraft {
     /// outcome). Optional but strongly encouraged for isolatable steps.
     #[serde(default)]
     pub verification: String,
-    /// Which model will execute this step. Empty means the main (tech lead)
-    /// model itself; otherwise a configured developer model name. Shown in the UI.
+    /// Which model will execute this step. Mandatory: the reserved value
+    /// [`AGENT_MODEL`] ("self") when the main model runs it, or a configured
+    /// delegate's name. Shown in the UI.
     #[serde(default)]
     pub model: String,
     /// Summarised context the executing model needs for this step. Fed to the
@@ -70,7 +80,8 @@ pub struct PlanStep {
     pub goal: String,
     /// How to verify the step succeeded (may be empty).
     pub verification: String,
-    /// Which model will execute this step (empty = the main model).
+    /// Which model will execute this step. [`AGENT_MODEL`] ("self") means the
+    /// main model; anything else is a delegate's name.
     pub model: String,
     /// Summarised context for the executing model (never shown in the UI).
     pub context: String,

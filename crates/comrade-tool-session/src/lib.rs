@@ -10,9 +10,20 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use comrade_tool::{PlanStatus, PlanTarget, Tool, ToolContext, ToolSpec, UserPrompt, UserReply};
+use comrade_tool::{
+    AGENT_MODEL, PlanStatus, PlanTarget, Tool, ToolContext, ToolSpec, UserPrompt, UserReply,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+/// Whether a plan step's `model` names a delegate rather than the main agent.
+/// The main model is [`AGENT_MODEL`] ("self"); any other non-empty model is a
+/// configured delegate, so its step can only be completed via the `delegate`
+/// tool (an empty model, from direct session writes, also counts as self).
+fn is_delegate_model(model: &str) -> bool {
+    let m = model.trim();
+    !m.is_empty() && m != AGENT_MODEL
+}
 
 /// All session-control tools.
 pub fn all() -> Vec<Box<dyn Tool>> {
@@ -73,7 +84,7 @@ struct SetPlan;
 static SET_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "set_plan".into(),
-    description: "Lay out the plan before doing work. Each step is an isolated unit with a goal, a verification (how to prove it succeeded) and optionally the model that will run it plus the summarised context that model needs, so steps can later be run independently or delegated. Replaces any existing plan; advance steps with update_plan.".into(),
+    description: "Lay out the plan before doing work. Each step is an isolated unit with a goal, a verification (how to prove it succeeded) and the model that will run it, so steps can later be run independently or delegated. Replaces any existing plan; advance steps with update_plan.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -84,10 +95,10 @@ static SET_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
                     "properties": {
                         "goal": { "type": "string", "description": "What this step aims to accomplish." },
                         "verification": { "type": "string", "description": "How to verify the step succeeded, e.g. \"cargo test passes\" or \"rgrep finds the new call sites\"." },
-                        "model": { "type": "string", "description": "Which delegate model runs this step (optional; empty means you run it yourself). Shown in the UI." },
+                        "model": { "type": "string", "description": "REQUIRED. The model that will execute this step: write \"self\" when you (the main agent model) will run it yourself, or one of the configured delegate names (see the delegate tool's model listing). Every step must name who runs it." },
                         "context": { "type": "string", "description": "Summarised context the executing model needs for this step (optional; never shown in the UI)." }
                     },
-                    "required": ["goal"],
+                    "required": ["goal", "model"],
                     "additionalProperties": false
                 },
                 "minItems": 1,
@@ -128,6 +139,13 @@ impl Tool for SetPlan {
         for step in &args.steps {
             if step.goal.trim().is_empty() {
                 anyhow::bail!("each step needs a non-empty `goal`");
+            }
+            if step.model.trim().is_empty() {
+                anyhow::bail!(
+                    "each step must name the `model` that will run it: {AGENT_MODEL:?} \
+                     (\"self\") when you will run it yourself, or one of the delegate names \
+                     listed by the `delegate` tool"
+                );
             }
         }
         let drafts: Vec<comrade_tool::PlanStepDraft> = args
@@ -203,9 +221,10 @@ impl Tool for UpdatePlan {
             _ => anyhow::bail!("update_plan requires either a 1-based `index` or non-empty `text`"),
         };
 
-        // A step assigned a delegate model can only be completed once the
+        // A step assigned to a delegate model can only be completed once the
         // `delegate` tool has actually run it: the tech lead must not do a
-        // delegated step's work itself and then mark it done.
+        // delegated step's work itself and then mark it done. Steps assigned
+        // to the main model ("self") are the lead's own work and need no run.
         if status == PlanStatus::Done {
             let steps = ctx.session.plan();
             let matched = steps.iter().find(|s| match &target {
@@ -213,15 +232,15 @@ impl Tool for UpdatePlan {
                 PlanTarget::Text(text) => s.goal.contains(text.as_str()),
             });
             if let Some(step) = matched {
-                let model = step.model.trim();
-                if !model.is_empty() && !ctx.session.step_was_delegated(step.id) {
+                if is_delegate_model(&step.model) && !ctx.session.step_was_delegated(step.id) {
                     anyhow::bail!(
-                        "plan step {} is assigned to delegate {model:?}, but the `delegate` tool \
+                        "plan step {} is assigned to delegate {:?}, but the `delegate` tool \
                          has never run it — the tech lead cannot complete a delegated step \
                          itself. Run the step with the delegate tool (pass `step` = {}), verify \
-                         the result, then mark it done. If no delegate is available, replace the \
-                         plan with `set_plan` leaving `model` empty.",
+                         the result, then mark it done. To do the step yourself instead, replace \
+                         the plan with `set_plan` naming your own model ({AGENT_MODEL:?}).",
                         step.id,
+                        step.model.trim(),
                         step.id
                     );
                 }
@@ -277,23 +296,25 @@ impl Tool for FinishPlan {
         let args: Args = serde_json::from_value(args)?;
 
         // Refuse to auto-close any step that is assigned a delegate model but
-        // has never been run by the `delegate` tool.
+        // has never been run by the `delegate` tool. Steps assigned to the main
+        // model ("self") are the lead's own work and may be auto-finished.
         let stuck: Vec<String> = ctx
             .session
             .plan()
             .iter()
             .filter(|s| {
-                !s.model.trim().is_empty()
+                is_delegate_model(&s.model)
                     && matches!(s.status, PlanStatus::Pending | PlanStatus::InProgress)
                     && !ctx.session.step_was_delegated(s.id)
             })
-            .map(|s| format!("step {} (delegate {:?})", s.id, s.model))
+            .map(|s| format!("step {} (delegate {:?})", s.id, s.model.trim()))
             .collect();
         if !stuck.is_empty() {
             anyhow::bail!(
                 "cannot finish the plan: {} still assigned to a delegate but never run by the \
                  `delegate` tool: {}. Delegate each step (delegate tool with `step` = <id>), \
-                 verify the result, or replace the plan with `set_plan` leaving `model` empty.",
+                 verify the result, or replace the plan with `set_plan` naming your own model \
+                 ({AGENT_MODEL:?}) and do those steps yourself.",
                 stuck.len(),
                 stuck.join(", ")
             );
@@ -403,12 +424,12 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use comrade_tool::{
-        PlanStatus, PlanStep, PlanStepDraft, PlanTarget, SessionControl, Tool, ToolContext,
-        UndoLog, UserIo, UserPrompt, UserReply,
+        AGENT_MODEL, PlanStatus, PlanStep, PlanStepDraft, PlanTarget, SessionControl, Tool,
+        ToolContext, UndoLog, UserIo, UserPrompt, UserReply,
     };
     use serde_json::json;
 
-    use super::{FinishPlan, UpdatePlan};
+    use super::{FinishPlan, SetPlan, UpdatePlan};
 
     /// A real-enough session: stores the plan and which steps the `delegate`
     /// tool has run, exactly like `AgentSession` does.
@@ -539,7 +560,7 @@ mod tests {
         PlanStepDraft {
             goal: "plain step".into(),
             verification: String::new(),
-            model: String::new(),
+            model: AGENT_MODEL.into(),
             context: String::new(),
         }
     }
@@ -569,12 +590,51 @@ mod tests {
 
     #[tokio::test]
     async fn can_still_mark_a_plain_step_done() {
+        // A step the main model runs itself ("self") is the lead's own work:
+        // it can be marked done without any `delegate` run.
         let c = ctx(StubSession::with_plan(vec![plain_step()]));
         UpdatePlan
             .invoke(&c, json!({"index": 1, "status": "done"}))
             .await
             .unwrap();
         assert_eq!(c.session.plan()[0].status, PlanStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn finish_plan_allows_open_self_steps() {
+        let c = ctx(StubSession::with_plan(vec![plain_step()]));
+        FinishPlan.invoke(&c, json!({})).await.unwrap();
+        assert_eq!(c.session.plan()[0].status, PlanStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn set_plan_requires_a_model_per_step() {
+        let c = ctx(StubSession::with_plan(vec![]));
+        let err = SetPlan
+            .invoke(
+                &c,
+                json!({ "steps": [{ "goal": "do a thing", "verification": "x", "model": "  " }] }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("`model`"), "{err}");
+        assert!(err.to_string().contains("self"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn set_plan_accepts_self_and_delegate_models() {
+        let c = ctx(StubSession::with_plan(vec![]));
+        let out = SetPlan
+            .invoke(
+                &c,
+                json!({ "steps": [
+                    { "goal": "I do this", "model": "self" },
+                    { "goal": "delegate does this", "model": "cheap" }
+                ] }),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("2 step(s)"), "{out}");
     }
 
     #[tokio::test]

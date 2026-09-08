@@ -63,9 +63,10 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          targeted read of the code you will touch is enough, then act.\n\
          \n\
          Default loop for EVERY task:\n\
-         1. Plan first: call set_plan even for a single step. Every step needs a goal and a \
-         verification (how you will prove it works). Break big work into the smallest steps that \
-         one agent can do end-to-end on its own: keep every step small, self-contained and \
+         1. Plan first: call set_plan even for a single step. Every step needs a goal, a \
+         verification (how you will prove it works) and the `model` that will run it — \"self\" \
+         when you do it yourself, or a delegate's name. Break big work into the smallest steps \
+         that one agent can do end-to-end on its own: keep every step small, self-contained and \
          independently verifiable, so it can be re-ordered or handed to another model. Advance \
          steps with update_plan as you go.\n\
          2. Read the run books before you orient or choose: durable project memory lives in \

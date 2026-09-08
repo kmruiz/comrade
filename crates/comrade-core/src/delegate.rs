@@ -29,6 +29,7 @@ use crate::config::DelegateCfg;
 use crate::context::ContextManager;
 use crate::llm::{ChatMessage, LlmClient, Role, ToolCallMsg};
 use crate::react::{parse_turn, render_observation};
+use comrade_tool::AGENT_MODEL;
 
 /// Name of the tool advertised to the tech lead model.
 pub const TOOL_NAME: &str = "delegate";
@@ -141,6 +142,12 @@ impl DelegateTool {
             if cfg.name.trim().is_empty() {
                 bail!("delegates[{i}]: every delegate needs a `name`");
             }
+            if cfg.name.trim() == AGENT_MODEL {
+                bail!(
+                    "delegates[{i}]: {AGENT_MODEL:?} is reserved for the main agent model in plan \
+                     steps; pick a different delegate name"
+                );
+            }
             if cfg.llm.model.trim().is_empty() {
                 bail!(
                     "delegates[{i}] ({}): every delegate needs a `model`",
@@ -180,7 +187,9 @@ the repo with its own tools.
 
 To execute one of your plan steps, pass `step` (the plan step id): the task and \
 context then come from that step and `model` must match the step's model. \
-Otherwise delegate ad-hoc work with `model` + `task` (+ optional `context`).
+Otherwise delegate ad-hoc work with `model` + `task` (+ optional `context`). \
+Plan steps you will run yourself carry the reserved model \"self\" and cannot be \
+delegated via `step`.
 
 The plan shows who is working: delegating a step marks it in_progress with a \
 `working: <model>` note, and fix rounds show up as `(fix N/5)`. Verification is \
@@ -318,6 +327,12 @@ impl Tool for DelegateTool {
                 if found.model.trim().is_empty() {
                     bail!(
                         "plan step {id} has no delegate model assigned; it runs on the main model"
+                    );
+                }
+                if found.model.trim() == AGENT_MODEL {
+                    bail!(
+                        "plan step {id} is assigned to the main agent model ({AGENT_MODEL:?}), not \
+                         a delegate — do the step yourself instead of delegating it"
                     );
                 }
                 let goal = found.goal.trim();
@@ -985,6 +1000,25 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("Pure Rust, no dependencies."), "{body}");
+    }
+
+    #[tokio::test]
+    async fn self_assigned_plan_steps_cannot_be_delegated() {
+        let (base, _spy) = request_spy();
+        let cfg = Config {
+            delegates: vec![delegate("cheap", &base)],
+            ..Config::default()
+        };
+        let tool = mk_delegate(&cfg.delegates).unwrap().unwrap();
+        let ctx = test_ctx();
+        ctx.session.set_plan(vec![PlanStepDraft {
+            goal: "do it myself".into(),
+            verification: "".into(),
+            model: comrade_tool::AGENT_MODEL.into(),
+            context: "".into(),
+        }]);
+        let err = tool.invoke(&ctx, json!({"step": 1})).await.unwrap_err();
+        assert!(err.to_string().contains("main agent model"), "{err}");
     }
 
     #[tokio::test]
