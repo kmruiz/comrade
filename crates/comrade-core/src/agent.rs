@@ -62,7 +62,7 @@ fn is_approval_gated(name: &str) -> bool {
 
 /// Whether a tool call mutates the workspace (used to tell "repeat but state
 /// changed" apart from "repeat doing nothing").
-fn is_mutating(name: &str) -> bool {
+pub(crate) fn is_mutating(name: &str) -> bool {
     MUTATING_TOOLS.contains(&name)
 }
 
@@ -236,14 +236,14 @@ fn augmented_spec(mut spec: comrade_tool::ToolSpec) -> comrade_tool::ToolSpec {
     spec
 }
 
-const LOOP_WINDOW: usize = 8;
-const MAX_LOOP_REFUSALS: usize = 3;
+pub(crate) const LOOP_WINDOW: usize = 8;
+pub(crate) const MAX_LOOP_REFUSALS: usize = 3;
 
 /// Detects no-progress loops: the same exact tool call repeated while nothing
 /// changed in between. Each detected repeat is refused; after several refusals
 /// the run aborts instead of burning the whole budget.
 #[derive(Default)]
-struct LoopTracker {
+pub(crate) struct LoopTracker {
     /// (canonical call signature, mutation counter at the time it ran).
     recent: std::collections::VecDeque<(String, u64)>,
     /// How many mutating calls have executed; identical calls on either side of
@@ -259,7 +259,7 @@ struct LoopTracker {
 impl LoopTracker {
     /// Returns the refusal count when this exact call was already made with no
     /// state change since (i.e. a no-progress repeat), else `None`.
-    fn check(&mut self, sig: &str) -> Option<usize> {
+    pub(crate) fn check(&mut self, sig: &str) -> Option<usize> {
         let repeats_without_change = self
             .recent
             .iter()
@@ -274,7 +274,7 @@ impl LoopTracker {
 
     /// The model made progress (a real tool execution): clear the refusal
     /// counter so a fresh mistake does not accumulate onto an old one.
-    fn record(&mut self, name: &str, sig: String) {
+    pub(crate) fn record(&mut self, name: &str, sig: String) {
         if is_mutating(name) {
             self.mutation_seq += 1;
             // A state change means repeats were legitimate; start counting again.
@@ -300,7 +300,7 @@ impl LoopTracker {
     }
 
     /// Stop the run gracefully (not an error) because the model kept repeating.
-    fn mark_stuck(&mut self, sig: &str) {
+    pub(crate) fn mark_stuck(&mut self, sig: &str) {
         if self.stuck.is_none() {
             self.stuck = Some(format!(
                 "Stopped: repeated identical action `{sig}` without making progress"
@@ -308,13 +308,13 @@ impl LoopTracker {
         }
     }
 
-    fn stuck_reason(&self) -> Option<String> {
+    pub(crate) fn stuck_reason(&self) -> Option<String> {
         self.stuck.clone()
     }
 }
 
 /// Message fed back when a tool call is refused as a no-progress repeat.
-fn loop_refusal(tool: &str) -> String {
+pub(crate) fn loop_refusal(tool: &str) -> String {
     format!(
         "tool `{tool}` was already called with exactly these arguments and nothing changed since. \
          Repeating it will not make progress. Change something first (edit a file, run a different \

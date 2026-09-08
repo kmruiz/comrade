@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use comrade_tool::{PlanStatus, PlanTarget, Tool, ToolContext, ToolRegistry, ToolSpec};
 use serde_json::{Value, json};
 
+use crate::agent::{LoopTracker, MAX_LOOP_REFUSALS, loop_refusal};
 use crate::config::DelegateCfg;
 use crate::context::ContextManager;
 use crate::llm::{ChatMessage, LlmClient, Role, ToolCallMsg};
@@ -539,6 +540,26 @@ stating what you checked and whether it passes."
     )
 }
 
+/// No-progress guard for the delegate sub-agent loop, mirroring the main agent
+/// loop's `LoopTracker` semantics. `tracker.check(sig)` returns a count only
+/// when the exact same call ran before with no state change since; such repeats
+/// are refused (the returned message tells the model to change tack). After
+/// [`MAX_LOOP_REFUSALS`] identical repeats the whole run aborts with an error
+/// instead of burning the delegate's iteration budget on the same argument.
+fn refuse_repeat(tracker: &mut LoopTracker, sig: &str) -> Result<Option<String>> {
+    match tracker.check(sig) {
+        None => Ok(None),
+        Some(count) if count >= MAX_LOOP_REFUSALS => bail!(
+            "delegate repeated identical action `{sig}` {count}x without any state change; \
+             aborting the sub-agent loop to avoid repeating forever"
+        ),
+        Some(_) => {
+            let tool = sig.split_whitespace().next().unwrap_or(sig);
+            Ok(Some(loop_refusal(tool)))
+        }
+    }
+}
+
 /// Run one delegate as a tool-using sub-agent until it produces a final answer.
 /// Mirrors the main agent loop but for the delegate's own client, scoped tool
 /// registry and limits: native tool calling when the delegate protocol allows
@@ -564,6 +585,11 @@ async fn run_delegate_subagent(
     let mut ctxm =
         ContextManager::with_system(system, limits.budget_tokens, limits.max_tool_output_chars);
     ctxm.push(ChatMessage::new(Role::User, user_prompt));
+
+    // No-progress guard: the identical tool call repeated with no state change
+    // in between is refused, and the run aborts after a few such refusals so a
+    // stuck delegate cannot loop forever on the same argument.
+    let mut tracker = LoopTracker::default();
 
     for _ in 0..limits.max_iterations {
         ctxm.enforce_budget();
@@ -592,6 +618,15 @@ async fn run_delegate_subagent(
             ctxm.push(ChatMessage::assistant_with_calls(turn.content, calls));
             for tc in turn.tool_calls {
                 let args = serde_json::from_str(&tc.arguments).unwrap_or_default();
+                let args_pretty = serde_json::to_string(&args).unwrap_or_default();
+                let sig = format!("{} {}", tc.name, args_pretty);
+                if let Some(msg) = refuse_repeat(&mut tracker, &sig)? {
+                    // Refused as a no-progress repeat: still answer the call
+                    // with a tool result so the history stays API-valid.
+                    let clamped = ctxm.truncate_observation(&msg);
+                    ctxm.push(ChatMessage::tool_result(tc.id, clamped));
+                    continue;
+                }
                 let output = match tools.get(&tc.name) {
                     Some(tool) => match tool.invoke(&dctx, args).await {
                         Ok(out) => out,
@@ -601,6 +636,7 @@ async fn run_delegate_subagent(
                 };
                 let clamped = ctxm.truncate_observation(&output);
                 ctxm.push(ChatMessage::tool_result(tc.id, clamped));
+                tracker.record(&tc.name, sig);
             }
             continue;
         }
@@ -630,6 +666,16 @@ async fn run_delegate_subagent(
         let Some(tool_call) = turn_p.tool_call else {
             return Ok(turn_p.final_text);
         };
+        let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
+        let sig = format!("{} {}", tool_call.name, args_pretty);
+        if let Some(msg) = refuse_repeat(&mut tracker, &sig)? {
+            let obs = ctxm.truncate_observation(&msg);
+            ctxm.push(ChatMessage::new(
+                Role::User,
+                render_observation(&tool_call.name, &obs),
+            ));
+            continue;
+        }
         let Some(tool) = tools.get(&tool_call.name) else {
             let msg = format!(
                 "unknown tool {:?}; choose from the listed tools",
@@ -651,6 +697,7 @@ async fn run_delegate_subagent(
             Role::User,
             render_observation(&tool_call.name, &clamped),
         ));
+        tracker.record(&tool_call.name, sig);
         ctxm.note_tool_done(&tool_call.name, turn_p.thought.as_deref());
     }
 
@@ -692,7 +739,7 @@ mod tests {
 
     use super::*;
     use crate::MemoryUndo;
-    use crate::config::{Config, DelegateCfg, LlmCfg};
+    use crate::config::{Config, DelegateCfg, LlmCfg, Protocol};
     use crate::session::AgentSession;
 
     /// The delegate tool never touches the session/user, so a no-op IO double
@@ -1356,6 +1403,161 @@ mod tests {
             write_calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "delegate must have run its write_file tool once"
+        );
+    }
+
+    /// A registry that contains exactly one recording stub `write_file` tool.
+    fn write_stub_registry(calls: Arc<std::sync::atomic::AtomicUsize>) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(StubTool { calls }));
+        registry
+    }
+
+    /// A native-mode delegate that repeats the SAME tool call with the SAME
+    /// arguments gets it refused and then aborts instead of looping forever.
+    /// Sequence: turn 1 executes the call, turns 2-3 are refused as
+    /// no-progress repeats, turn 4 hits MAX_LOOP_REFUSALS and bails.
+    #[tokio::test]
+    async fn repeated_native_tool_call_is_refused_then_aborts() {
+        let write_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = write_stub_registry(write_calls.clone());
+
+        let call = json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let base = scripted_server(vec![call.clone(), call.clone(), call.clone(), call]);
+
+        let cfg = Config {
+            delegates: vec![delegate("cheap", &base)],
+            ..Config::default()
+        };
+        let tool = DelegateTool::new(&cfg.delegates, registry, DelegateLimits::default())
+            .unwrap()
+            .unwrap();
+        let ctx = test_ctx();
+        let err = tool
+            .invoke(&ctx, json!({"model": "cheap", "task": "write src/a.rs"}))
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("repeated identical action"), "{text}");
+        assert!(text.contains("write_file"), "{text}");
+        assert_eq!(
+            write_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the repeat must never reach the tool: only the first call runs"
+        );
+    }
+
+    /// The same guard works for ReAct-text delegates: an identical
+    /// Tool:/Args: call repeated with nothing changing in between is refused
+    /// and the run aborts after MAX_LOOP_REFUSALS repeats.
+    #[tokio::test]
+    async fn repeated_react_tool_call_is_refused_then_aborts() {
+        let write_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = write_stub_registry(write_calls.clone());
+
+        let call =
+            json!({"choices": [{"message": {"content": "Thought: retry the write\nTool: write_file\nArgs: {\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"}}]})
+                .to_string();
+        let base = scripted_server(vec![call.clone(), call.clone(), call.clone(), call]);
+
+        let mut d = delegate("cheap", &base);
+        d.llm.protocol = Protocol::React;
+        let cfg = Config {
+            delegates: vec![d],
+            ..Config::default()
+        };
+        let tool = DelegateTool::new(&cfg.delegates, registry, DelegateLimits::default())
+            .unwrap()
+            .unwrap();
+        let ctx = test_ctx();
+        let err = tool
+            .invoke(&ctx, json!({"model": "cheap", "task": "write src/a.rs"}))
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("repeated identical action"), "{text}");
+        assert_eq!(
+            write_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the repeat must never reach the tool: only the first call runs"
+        );
+    }
+
+    /// A mutation between two identical calls is real progress, so the second
+    /// identical call must NOT be refused (no false positive on a legit
+    /// re-check after an edit).
+    #[tokio::test]
+    async fn identical_call_after_a_mutation_is_not_a_loop() {
+        let write_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = write_stub_registry(write_calls.clone());
+
+        let call_a = json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let call_b = json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_2",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"src/b.rs\",\"content\":\"pub fn b(){}\"}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let final_turn =
+            json!({"choices": [{"message": {"content": "done, both files written"}}]}).to_string();
+        // a executes, b executes (a mutation -> clears refusals), a again is a
+        // legitimate re-check after state changed, then a final answer.
+        let base = scripted_server(vec![call_a.clone(), call_b, call_a, final_turn]);
+
+        let cfg = Config {
+            delegates: vec![delegate("cheap", &base)],
+            ..Config::default()
+        };
+        let tool = DelegateTool::new(&cfg.delegates, registry, DelegateLimits::default())
+            .unwrap()
+            .unwrap();
+        let ctx = test_ctx();
+        let out = tool
+            .invoke(&ctx, json!({"model": "cheap", "task": "write two files"}))
+            .await
+            .unwrap();
+        assert!(out.contains("done, both files written"), "{out}");
+        assert_eq!(
+            write_calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "all three write_file calls were legitimate"
         );
     }
 
