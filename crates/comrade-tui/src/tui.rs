@@ -411,7 +411,9 @@ impl MxCommand {
             MxCommand::SearchChat => "search the chat history",
             MxCommand::SubmitPrompt => "send the prompt to the agent",
             MxCommand::ToggleAutoAccept => "toggle auto-accept of approvals",
-            MxCommand::ToggleToolCard => "expand or collapse the selected tool card",
+            MxCommand::ToggleToolCard => {
+                "expand or collapse the selected tool card (or a whole user-turn section)"
+            }
         }
     }
 }
@@ -526,6 +528,11 @@ struct App {
     /// 10 s when the cwd is not a repo so we don't spawn failing `git`s).
     git_gate: Option<Instant>,
     chat: Vec<Msg>,
+    /// Org-style section (one exchange per user turn) collapse state, indexed
+    /// by section ordinal = the turn's rank among `MsgKind::User` messages.
+    /// User messages are only ever appended (run-digest folds splice only
+    /// Tool/Reasoning/Failure/Meta), so ordinals never shift or get reused.
+    section_collapsed: Vec<bool>,
     /// Raw current model output (not yet committed to a message).
     stream: String,
     input: Editor,
@@ -638,7 +645,30 @@ impl App {
         }
     }
 
+    // --- org-mode style exchange sections ---------------------------------
+
+    /// Expand the section a chat message belongs to (no-op when not collapsed).
+    fn expand_section_at(&mut self, msg_idx: usize) {
+        expand_section(&mut self.section_collapsed, &self.chat, msg_idx);
+    }
+
+    /// Toggle the section a chat message belongs to (no-op outside a section).
+    fn toggle_section_at(&mut self, msg_idx: usize) {
+        toggle_section(
+            &mut self.section_collapsed,
+            &self.chat,
+            self.running,
+            msg_idx,
+        );
+    }
+
     fn toggle_tool(&mut self, idx: usize) {
+        // A user-turn heading is an org-style section header: toggling it
+        // folds/unfolds the whole exchange, not a single card.
+        if matches!(self.chat.get(idx).map(|m| m.kind), Some(MsgKind::User)) {
+            self.toggle_section_at(idx);
+            return;
+        }
         let is_run = match self.chat.get(idx).map(|m| m.kind) {
             Some(MsgKind::Run) => true,
             _ => false,
@@ -740,9 +770,10 @@ impl App {
         self.push_msg(Msg::failure(name, detail));
     }
 
-    /// Move to the next (`+1`) or previous (`-1`) chat block.
+    /// Move to the next (`+1`) or previous (`-1`) visible chat block, stepping
+    /// over the messages hidden inside a collapsed section.
     fn move_block(&mut self, dir: isize) {
-        if let Some(next) = step_block(self.sel, self.chat.len(), dir) {
+        if let Some(next) = step_visible(&self.chat, &self.section_collapsed, self.sel, dir) {
             self.select_block(next);
         }
     }
@@ -813,6 +844,9 @@ impl App {
             return;
         };
         let mut idx = idx;
+        // A match hiding inside a collapsed exchange must unfold its section
+        // first, or the jump would land on an invisible row.
+        self.expand_section_at(idx);
         let folded = match self.chat.get(idx).map(|m| m.kind) {
             Some(MsgKind::Run) => true,
             _ => false,
@@ -1546,6 +1580,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         git_inflight: false,
         git_gate: None,
         chat: Vec::new(),
+        section_collapsed: Vec::new(),
         stream: String::new(),
         input: Editor::new(),
         search: None,
@@ -2077,21 +2112,100 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 // navigation math (pure)
 // ---------------------------------------------------------------------------
 
-/// Next/previous chat block index given the current selection.
-fn step_block(sel: Option<usize>, len: usize, dir: isize) -> Option<usize> {
-    if len == 0 {
+/// Total number of org-style sections = the number of user turns.
+fn section_count(chat: &[Msg]) -> usize {
+    chat.iter().filter(|m| m.kind == MsgKind::User).count()
+}
+
+/// The section any chat message belongs to: `(ordinal, its user-turn index)`.
+/// Every message after a user turn up to (not including) the next belongs to
+/// that turn's section. Messages before the first user turn have no section.
+fn section_of_msg(chat: &[Msg], idx: usize) -> Option<(usize, usize)> {
+    if idx >= chat.len() {
         return None;
     }
-    Some(match sel {
-        Some(i) => (i as isize + dir).clamp(0, len as isize - 1) as usize,
-        None => {
-            if dir < 0 {
-                len - 1
-            } else {
-                0
-            }
+    let mut n_users = 0;
+    let mut last: Option<(usize, usize)> = None;
+    for (i, m) in chat[..=idx].iter().enumerate() {
+        if m.kind == MsgKind::User {
+            last = Some((n_users, i));
+            n_users += 1;
         }
-    })
+    }
+    last
+}
+
+/// Whether a section may be collapsed right now. The last (live) section of a
+/// run that is still in flight must stay visible, so it is exempt.
+fn section_collapsible(running: bool, ord: usize, count: usize) -> bool {
+    !running || ord + 1 < count
+}
+
+/// Collapse state of the section with the given ordinal.
+fn collapsed_at(collapsed: &[bool], ord: usize) -> bool {
+    collapsed.get(ord).copied().unwrap_or(false)
+}
+
+fn set_collapsed_at(collapsed: &mut Vec<bool>, ord: usize, val: bool) {
+    if ord >= collapsed.len() {
+        collapsed.resize(ord + 1, false);
+    }
+    collapsed[ord] = val;
+}
+
+/// Expand the section a chat message belongs to (no-op when not collapsed).
+fn expand_section(collapsed: &mut Vec<bool>, chat: &[Msg], msg_idx: usize) {
+    if let Some((ord, _)) = section_of_msg(chat, msg_idx) {
+        set_collapsed_at(collapsed, ord, false);
+    }
+}
+
+/// Toggle the section a chat message belongs to (no-op outside a section).
+/// The live last section of an in-flight run cannot be collapsed.
+fn toggle_section(collapsed: &mut Vec<bool>, chat: &[Msg], running: bool, msg_idx: usize) {
+    let Some((ord, _)) = section_of_msg(chat, msg_idx) else {
+        return;
+    };
+    if collapsed_at(collapsed, ord) {
+        set_collapsed_at(collapsed, ord, false);
+    } else if section_collapsible(running, ord, section_count(chat)) {
+        set_collapsed_at(collapsed, ord, true);
+    }
+}
+
+/// Whether a chat message is currently exposed: a user-turn heading always is
+/// (it is its own section's header); every other message shows only while its
+/// section is expanded. Content before the first user turn is exposed.
+fn chat_visible(chat: &[Msg], collapsed: &[bool], idx: usize) -> bool {
+    match chat.get(idx).map(|m| m.kind) {
+        Some(MsgKind::User) => true,
+        Some(_) => section_of_msg(chat, idx).is_none_or(|(o, _)| !collapsed_at(collapsed, o)),
+        None => false,
+    }
+}
+
+/// Next/previous visible chat block from the current selection, skipping the
+/// messages hidden inside a collapsed section. Returns None at the ends.
+fn step_visible(chat: &[Msg], collapsed: &[bool], sel: Option<usize>, dir: isize) -> Option<usize> {
+    if chat.is_empty() {
+        return None;
+    }
+    let len = chat.len() as isize;
+    let mut cur: isize = match sel {
+        Some(s) => s as isize,
+        // No selection: start just past the edge the step moves toward.
+        None if dir < 0 => len,
+        None => -1,
+    };
+    loop {
+        cur += dir;
+        if cur < 0 || cur >= len {
+            return None;
+        }
+        if chat_visible(chat, collapsed, cur as usize) {
+            return Some(cur as usize);
+        }
+    }
 }
 
 /// Next/previous user-message index given the user positions and selection.
@@ -2632,15 +2746,39 @@ fn draw_prompt(
 ) {
     let sel = app.input.selection();
     let text = app.input.text().to_string();
+    // The prompt bar is a distinct green-tinted band (like a REPL prompt), with
+    // wrapped continuation rows dimmed below the active line.
+    let band = prompt_bg();
     let mut lines = Vec::with_capacity(rows.len().min(PROMPT_MAX_ROWS));
     for (i, r) in rows.iter().enumerate().skip(win).take(PROMPT_MAX_ROWS) {
-        let prefix = if i == 0 {
-            Span::styled("> ", Style::default().fg(Color::Green))
+        let first = i == 0;
+        let prefix_style = if first {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+                .bg(band)
         } else {
-            Span::styled("  ", Style::default().fg(Color::DarkGray))
+            Style::default().fg(Color::DarkGray).bg(band)
         };
-        let mut spans = vec![prefix];
-        spans.extend(selection_spans(&text, *r, sel));
+        let mut spans = vec![Span::styled(if first { "> " } else { "  " }, prefix_style)];
+        for s in selection_spans(&text, *r, sel) {
+            // Continuation rows dim the unselected text; the selection keeps
+            // its own inverse shading and the whole row sits on the band.
+            let mut st = s.style;
+            if !first && st.bg.is_none() {
+                st = st.fg(Color::DarkGray);
+            }
+            if st.bg.is_none() {
+                st = st.bg(band);
+            }
+            spans.push(Span::styled(s.content, st));
+        }
+        // Pad the band flush to the right edge like the chat's user rows.
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let pad = usize::from(area.width).saturating_sub(used);
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), Style::default().bg(band)));
+        }
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), area);
@@ -2824,12 +2962,86 @@ fn layout_messages(
     app: &App,
     width: usize,
 ) -> (Vec<RenderRow>, Vec<Option<usize>>, Vec<(usize, usize)>) {
+    layout_chat_rows(&app.chat, &app.section_collapsed, &app.stream, width)
+}
+
+/// Pure row layout for a chat transcript. Org-style sections: each user turn is
+/// a heading ("prompt echo") and the exchange under it — every message up to
+/// the next user turn — is its body. A collapsed section renders only its
+/// heading plus a "… N more" marker, so the exchange folds to one tinted block.
+fn layout_chat_rows(
+    chat: &[Msg],
+    collapsed: &[bool],
+    stream: &str,
+    width: usize,
+) -> (Vec<RenderRow>, Vec<Option<usize>>, Vec<(usize, usize)>) {
     let mut out = Vec::new();
     let mut owner: Vec<Option<usize>> = Vec::new();
     let mut ranges = Vec::new();
-    for (i, msg) in app.chat.iter().enumerate() {
+    let dim = Style::default().fg(Color::DarkGray);
+    // Ordinal of the section we are inside + whether that section is collapsed.
+    // Re-synced whenever a user turn is reached (its own ordinal + state).
+    let mut ord = 0usize;
+    let mut hiding = false;
+    let mut i = 0;
+    while i < chat.len() {
+        let msg = &chat[i];
         let start = out.len();
         match msg.kind {
+            MsgKind::User => {
+                // A new exchange begins: recompute this section's visibility.
+                ord += 1;
+                hiding = collapsed.get(ord - 1).copied().unwrap_or(false);
+                // Count hidden interior messages for the collapse marker.
+                let hidden = if hiding {
+                    chat[i + 1..]
+                        .iter()
+                        .take_while(|m| m.kind != MsgKind::User)
+                        .count()
+                } else {
+                    0
+                };
+                // The heading is a SLIME-style prompt echo: "> text" on the
+                // first wrapped row, indented continuation rows beneath.
+                let echo = Span::styled(
+                    "> ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                );
+                let cont = Span::styled("  ", dim);
+                for (k, spans) in md_to_lines(&msg.text, width.saturating_sub(2))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut row = Vec::with_capacity(spans.len() + 1);
+                    row.push(if k == 0 { echo.clone() } else { cont.clone() });
+                    row.extend(spans);
+                    out.push(RenderRow {
+                        rule: Some(Color::Green),
+                        spans: row,
+                        tool_header: Some(i),
+                    });
+                }
+                if hiding && hidden > 0 {
+                    let marker = cap(
+                        &format!("  ··· {hidden} more · tab/click to expand"),
+                        width.saturating_sub(2),
+                    );
+                    out.push(RenderRow {
+                        rule: None,
+                        spans: vec![Span::styled(marker, dim)],
+                        tool_header: Some(i),
+                    });
+                }
+            }
+            _ if hiding => {
+                // The body of a collapsed exchange: keep the flat index valid
+                // but emit no rows until the next user turn starts.
+                ranges.push((out.len(), 0));
+                i += 1;
+                continue;
+            }
             MsgKind::Run => layout_run(&mut out, i, &msg.children),
             MsgKind::Failure => layout_failure(&mut out, i, msg.fail.as_ref().unwrap(), width),
             MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), width),
@@ -2845,18 +3057,7 @@ fn layout_messages(
                 for s in plain_wrap(&msg.text, width) {
                     out.push(RenderRow {
                         rule: None,
-                        spans: vec![Span::styled(s, Style::default().fg(Color::DarkGray))],
-                        tool_header: None,
-                    });
-                }
-            }
-            MsgKind::User => {
-                author_header(&mut out, "you", Color::Cyan, width);
-                let rule = Some(Color::Cyan);
-                for spans in md_to_lines(&msg.text, width) {
-                    out.push(RenderRow {
-                        rule,
-                        spans,
+                        spans: vec![Span::styled(s, dim)],
                         tool_header: None,
                     });
                 }
@@ -2896,10 +3097,11 @@ fn layout_messages(
         let end = out.len();
         owner.extend((start..end).map(|_| Some(i)));
         ranges.push((start, end - start));
+        i += 1;
     }
     // Live streaming preview (scaffolding hidden), never committed.
-    if !app.stream.is_empty() {
-        let visible = strip_react_scaffolding(&app.stream);
+    if !stream.is_empty() {
+        let visible = strip_react_scaffolding(stream);
         for spans in md_to_lines(&visible, width) {
             out.push(RenderRow {
                 rule: None,
@@ -4754,14 +4956,45 @@ mod tests {
     }
 
     #[test]
-    fn block_navigation_wraps_at_edges() {
-        // blocks: user, tool, assistant
-        assert_eq!(step_block(None, 3, 1), Some(0));
-        assert_eq!(step_block(None, 3, -1), Some(2));
-        assert_eq!(step_block(Some(0), 3, -1), Some(0));
-        assert_eq!(step_block(Some(2), 3, 1), Some(2));
-        assert_eq!(step_block(Some(1), 3, 1), Some(2));
-        assert_eq!(step_block(Some(0), 0, 1), None);
+    fn visible_block_navigation_wraps_at_edges() {
+        // user(0), assistant(1), user(2), assistant(3) — all visible expanded.
+        let chat = vec![
+            Msg::authored(MsgKind::User, "you", "a"),
+            Msg::authored(MsgKind::Assistant, "assistant", "r0"),
+            Msg::authored(MsgKind::User, "you", "b"),
+            Msg::authored(MsgKind::Assistant, "assistant", "r1"),
+        ];
+        let none = &[false, false];
+        assert_eq!(step_visible(&chat, none, None, 1), Some(0));
+        assert_eq!(step_visible(&chat, none, None, -1), Some(3));
+        // Past an edge there is no visible block: no move.
+        assert_eq!(step_visible(&chat, none, Some(0), -1), None);
+        assert_eq!(step_visible(&chat, none, Some(3), 1), None);
+        assert_eq!(step_visible(&chat, none, Some(1), 1), Some(2));
+        assert_eq!(step_visible(&[], &[], Some(0), 1), None);
+    }
+
+    #[test]
+    fn visible_block_navigation_skips_collapsed_interiors() {
+        // Exchange 0 (idx 0..1) collapsed: only its heading is navigable, so
+        // stepping down from it lands on exchange 1's heading (idx 2), and up
+        // from that heading lands back on idx 0.
+        let chat = vec![
+            Msg::authored(MsgKind::User, "you", "a"),
+            Msg::authored(MsgKind::Assistant, "assistant", "r0"),
+            Msg::authored(MsgKind::User, "you", "b"),
+            Msg::authored(MsgKind::Assistant, "assistant", "r1"),
+        ];
+        let collapsed = [true, false];
+        assert_eq!(step_visible(&chat, &collapsed, Some(0), 1), Some(2));
+        assert_eq!(step_visible(&chat, &collapsed, Some(2), -1), Some(0));
+        assert_eq!(step_visible(&chat, &collapsed, Some(1), -1), Some(0));
+        // chat_visible: headings always exposed; interiors only when expanded.
+        assert!(chat_visible(&chat, &collapsed, 0));
+        assert!(!chat_visible(&chat, &collapsed, 1));
+        assert!(chat_visible(&chat, &collapsed, 2));
+        assert!(chat_visible(&chat, &collapsed, 3));
+        assert!(!chat_visible(&chat, &collapsed, 99));
     }
 
     #[test]
@@ -5360,12 +5593,21 @@ const DIFF_TINT_ALPHA: f32 = 0.22;
 /// the single knob to retune when the terminal theme changes (light terminals
 /// will want a darker tint over a light base instead).
 const USER_BG_ALPHA: f32 = 0.08;
+/// Green tint under the prompt bar: the SLIME/REPL "you are typing here" band.
+/// Darker text themes read the bar as slightly green-black.
+const PROMPT_BG_TINT: (u8, u8, u8) = (0x1f, 0x9e, 0x6f);
+const PROMPT_BG_ALPHA: f32 = 0.16;
 
 /// Background for a user-message band: the chat base lightened by a touch of
 /// white so a user turn reads as a soft org-mode body block. Blended with the
 /// same technique as the diff tints above.
 fn user_band_bg() -> Color {
     blend_rgb(DIFF_BASE_BG, (0xff, 0xff, 0xff), USER_BG_ALPHA)
+}
+
+/// Background of the prompt bar at the bottom of the chat.
+fn prompt_bg() -> Color {
+    blend_rgb(DIFF_BASE_BG, PROMPT_BG_TINT, PROMPT_BG_ALPHA)
 }
 
 fn blend_rgb(base: (u8, u8, u8), tint: (u8, u8, u8), alpha: f32) -> Color {
@@ -5724,5 +5966,224 @@ mod mode_bar_tests {
         let out = "1\t1\tsrc/a.rs\n-\t-\timg.png\n10\t3\tsrc/c d.rs\n";
         assert_eq!(numstat_totals(out), (11, 4));
         assert_eq!(numstat_totals(""), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod section_tests {
+    use super::*;
+
+    /// chat: preamble meta, then exchange 0 (user a + assistant + tool run),
+    /// then exchange 1 (user b + assistant).
+    fn sample_chat() -> Vec<Msg> {
+        vec![
+            Msg::text(MsgKind::Meta, "comrade ready"),
+            Msg::authored(MsgKind::User, "you", "do the thing"),
+            Msg::authored(MsgKind::Assistant, "assistant", "on it"),
+            Msg::tool(ToolCard {
+                name: "run_tests".into(),
+                author: Some("assistant".into()),
+                args: String::new(),
+                justification: None,
+                risk: None,
+                result: Some("ok".into()),
+                ok: true,
+                open: false,
+                started: None,
+                taken_ms: None,
+                tokens: None,
+            }),
+            Msg::authored(MsgKind::User, "you", "second"),
+            Msg::authored(MsgKind::Assistant, "assistant", "done"),
+        ]
+    }
+
+    #[test]
+    fn section_count_is_user_turns() {
+        assert_eq!(section_count(&sample_chat()), 2);
+        assert_eq!(section_count(&[]), 0);
+    }
+
+    #[test]
+    fn section_of_msg_belongs_to_previous_user_turn() {
+        let chat = sample_chat();
+        // The assistant reply and tool call live inside exchange 0.
+        assert_eq!(section_of_msg(&chat, 2), Some((0, 1)));
+        assert_eq!(section_of_msg(&chat, 3), Some((0, 1)));
+        // Exchange 1's own messages.
+        assert_eq!(section_of_msg(&chat, 4), Some((1, 4)));
+        assert_eq!(section_of_msg(&chat, 5), Some((1, 4)));
+        // Preamble before the first user turn has no section.
+        assert_eq!(section_of_msg(&chat, 0), None);
+        assert_eq!(section_of_msg(&chat, 99), None);
+    }
+
+    #[test]
+    fn section_of_msg_handles_consecutive_users() {
+        let chat = vec![
+            Msg::authored(MsgKind::User, "you", "a"),
+            Msg::authored(MsgKind::User, "you", "b"),
+            Msg::authored(MsgKind::Assistant, "assistant", "reply to b"),
+        ];
+        assert_eq!(section_of_msg(&chat, 0), Some((0, 0)));
+        assert_eq!(section_of_msg(&chat, 1), Some((1, 1)));
+        assert_eq!(section_of_msg(&chat, 2), Some((1, 1)));
+    }
+
+    #[test]
+    fn collapsible_refuses_the_live_last_section_while_running() {
+        // Two sections, run in flight: only the older (ord 0) may collapse.
+        assert!(section_collapsible(true, 0, 2));
+        assert!(!section_collapsible(true, 1, 2));
+        // Idle: everything may collapse.
+        assert!(section_collapsible(false, 1, 2));
+        assert!(section_collapsible(false, 0, 1));
+        // Preamble-only edge: no section is ever the live one.
+        assert!(!section_collapsible(true, 0, 0));
+    }
+
+    fn row_text(r: &RenderRow) -> String {
+        r.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Two exchanges: 0 = user "first ask" + assistant "secret reply 0",
+    /// 1 = user "second ask" + assistant "visible reply 1".
+    fn two_exchanges() -> Vec<Msg> {
+        vec![
+            Msg::authored(MsgKind::User, "you", "first ask"),
+            Msg::authored(MsgKind::Assistant, "assistant", "secret reply 0"),
+            Msg::authored(MsgKind::User, "you", "second ask"),
+            Msg::authored(MsgKind::Assistant, "assistant", "visible reply 1"),
+        ]
+    }
+
+    #[test]
+    fn user_turn_renders_as_prompt_echo_heading() {
+        let (rows, owner, ranges) = layout_chat_rows(&two_exchanges(), &[], "", 60);
+        // The user turn is a single "> first ask" row (heading, no "you" bar).
+        assert_eq!(row_text(&rows[0]), "> first ask");
+        assert_eq!(owner[0], Some(0));
+        assert_eq!(ranges[0], (0, 1));
+        // The first heading row is a clickable section header.
+        assert_eq!(rows[0].tool_header, Some(0));
+        // Exchange 0's body: assistant author bar + one text row (rows 1..3).
+        assert_eq!(ranges[1], (1, 2));
+        assert_eq!(row_text(&rows[1]), "assistant");
+        // Exchange 1 starts its own heading right after.
+        assert_eq!(row_text(&rows[3]), "> second ask");
+        assert_eq!(rows[3].tool_header, Some(2));
+    }
+
+    #[test]
+    fn collapsed_section_hides_interior_but_keeps_flat_ranges() {
+        let (rows, owner, ranges) = layout_chat_rows(&two_exchanges(), &[true, false], "", 60);
+        let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
+        // Exchange 0 collapsed: only its echo + a "… N more" marker show.
+        assert!(all.contains("> first ask"), "{all}");
+        assert!(all.contains("··· 1 more"), "{all}");
+        assert!(!all.contains("secret reply 0"), "{all}");
+        // Exchange 1 still renders in full.
+        assert!(all.contains("> second ask"), "{all}");
+        assert!(all.contains("visible reply 1"), "{all}");
+        // Exchange 0 occupies rows 0-1 (echo + marker); its hidden interior
+        // (idx 1) keeps a zero-length range and owns no rendered row.
+        assert_eq!(ranges[0], (0, 2));
+        assert_eq!(ranges[1], (2, 0));
+        assert!(!owner.iter().any(|o| *o == Some(1)), "{owner:?}");
+        assert_eq!(owner[0], Some(0));
+        assert_eq!(owner[1], Some(0));
+        assert_eq!(owner[2], Some(2));
+        // Echo and marker rows are both clickable section headers.
+        assert_eq!(rows.iter().filter(|r| r.tool_header == Some(0)).count(), 2);
+    }
+
+    #[test]
+    fn expanding_a_section_restores_its_body() {
+        let (rows, _, _) = layout_chat_rows(&two_exchanges(), &[true, false], "", 60);
+        let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
+        assert!(!all.contains("secret reply 0"), "{all}");
+        let (rows, _, _) = layout_chat_rows(&two_exchanges(), &[false, false], "", 60);
+        let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
+        assert!(all.contains("secret reply 0"), "{all}");
+        assert!(!all.contains("··· 1 more"), "{all}");
+    }
+
+    #[test]
+    fn wrapped_user_echo_indents_continuation_rows() {
+        let text = "abcdefghijkl mnopqrstuvwxyz 1234567890";
+        let chat = vec![Msg::authored(MsgKind::User, "you", text)];
+        let (rows, _, ranges) = layout_chat_rows(&chat, &[false], "", 12);
+        assert!(
+            rows.len() >= 2,
+            "expected wrapping into rows, got {}",
+            rows.len()
+        );
+        assert!(
+            row_text(&rows[0]).starts_with("> "),
+            "{}",
+            row_text(&rows[0])
+        );
+        for r in &rows[1..] {
+            assert!(
+                row_text(r).starts_with("  "),
+                "continuation must indent: {:?}",
+                row_text(r)
+            );
+        }
+        assert_eq!(ranges[0], (0, rows.len()));
+    }
+
+    #[test]
+    fn toggle_section_folds_and_unfolds_an_exchange() {
+        let chat = two_exchanges();
+        let mut collapsed = Vec::new();
+        // Collapse exchange 0 (idle: allowed), verify state, then unfold.
+        toggle_section(&mut collapsed, &chat, false, 0);
+        assert_eq!(collapsed, vec![true]);
+        // idx 1 is exchange 0's interior, so toggling it expands exchange 0.
+        toggle_section(&mut collapsed, &chat, false, 1);
+        assert_eq!(collapsed, vec![false]);
+        // idx 3 is exchange 1's interior message: toggling folds exchange 1.
+        toggle_section(&mut collapsed, &chat, false, 3);
+        assert_eq!(collapsed, vec![false, true]);
+        // Toggling its own heading unfolds it again.
+        toggle_section(&mut collapsed, &chat, false, 2);
+        assert_eq!(collapsed, vec![false, false]);
+        // Toggling a preamble message (no section) is a no-op.
+        let preamble = vec![
+            Msg::text(MsgKind::Meta, "ready"),
+            Msg::authored(MsgKind::User, "you", "a"),
+        ];
+        let mut collapsed = Vec::new();
+        toggle_section(&mut collapsed, &preamble, false, 0);
+        assert!(collapsed.is_empty());
+    }
+
+    #[test]
+    fn running_keeps_the_live_last_section_expanded() {
+        let chat = two_exchanges();
+        let mut collapsed = Vec::new();
+        // A run in flight: only exchange 0 (older) may fold.
+        toggle_section(&mut collapsed, &chat, true, 0);
+        assert_eq!(collapsed, vec![true]);
+        toggle_section(&mut collapsed, &chat, true, 2);
+        assert!(collapsed.get(1) != Some(&true), "{collapsed:?}");
+        // But an already-collapsed last section can be expanded mid-run.
+        let mut collapsed = vec![false, true];
+        toggle_section(&mut collapsed, &chat, true, 2);
+        assert_eq!(collapsed, vec![false, false]);
+    }
+
+    #[test]
+    fn expand_section_clears_state_for_any_member() {
+        let chat = two_exchanges();
+        let mut collapsed = vec![true, true];
+        // Expanding from an interior body message of exchange 0 works too.
+        expand_section(&mut collapsed, &chat, 1);
+        assert_eq!(collapsed, vec![false, true]);
+        // Preamble/out-of-range indices leave the state untouched.
+        let mut collapsed = vec![true];
+        expand_section(&mut collapsed, &chat, 99);
+        assert_eq!(collapsed, vec![true]);
     }
 }
