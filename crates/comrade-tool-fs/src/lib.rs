@@ -16,6 +16,12 @@ use serde_json::{Value, json};
 /// Maximum characters a read/listing returns before truncation.
 const MAX_OUTPUT_CHARS: usize = 6000;
 
+/// A bare `read_file` (no window) on a file longer than this returns only the
+/// head of the file, not the whole thing, so reading one big file cannot burn
+/// the whole context budget. Pass `start_line`/`end_line` (or use `read_ranges`)
+/// to read past the default window; the footer reports the total line count.
+const MAX_UNWINDOWED_LINES: usize = 150;
+
 /// When `enabled`, returns the set of files that differ from HEAD; otherwise
 /// `None` (no restriction). Propagates the "not a git repository" error.
 fn changed_scope(ctx: &ToolContext, enabled: bool) -> Result<Option<HashSet<PathBuf>>> {
@@ -161,7 +167,7 @@ struct ReadFile;
 static READ_FILE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "read_file".into(),
-    description: "Read a text file (project-root relative). Returns raw contents, optionally windowed by line numbers.".into(),
+    description: "Read a text file (project-root relative). Returns raw contents, optionally windowed by line numbers. Reading a whole file costs context, so a bare read (no start_line/end_line) of a file longer than 150 lines returns only the head window and the total line count: to edit a small part, pass start_line/end_line or use read_ranges, and prefer read_symbol/structural_map to jump straight at one declaration instead of reading the whole file.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -212,29 +218,41 @@ impl Tool for ReadFile {
         }
         let text = String::from_utf8(bytes).context("file is not valid UTF-8")?;
         let lines: Vec<&str> = text.lines().collect();
+        let total = lines.len();
+        // Explicit windows are honoured as requested; a bare read (no window at
+        // all) is capped to the head of the file so whole big files don't eat
+        // the context budget. The footer always reports the total line count
+        // and how to read the rest.
         let (lo, hi) = match (args.start_line, args.end_line) {
-            (Some(s), Some(e)) => (s.saturating_sub(1), e.min(lines.len())),
-            (Some(s), None) => (s.saturating_sub(1), lines.len()),
-            (None, Some(e)) => (0, e.min(lines.len())),
-            (None, None) => (0, lines.len()),
+            (Some(s), Some(e)) => (s.saturating_sub(1), e.min(total)),
+            (Some(s), None) => (s.saturating_sub(1), total),
+            (None, Some(e)) => (0, e.min(total)),
+            (None, None) => (0, MAX_UNWINDOWED_LINES.min(total)),
         };
-        if lo >= lines.len() {
-            return Ok(format!(
-                "({} lines total; requested window is empty)",
-                lines.len()
+        if lo >= total {
+            return Ok(format!("({total} lines total; requested window is empty)"));
+        }
+        let unwindowed_cap =
+            args.start_line.is_none() && args.end_line.is_none() && total > MAX_UNWINDOWED_LINES;
+        // Clamp the content first so the informative footer below always
+        // survives (a plain whole-output clamp would cut it off).
+        let mut content = String::new();
+        for (idx, line) in lines[lo..hi].iter().enumerate() {
+            content.push_str(&format!("{:>6} {}\n", lo + idx + 1, line));
+        }
+        let mut out = clamp(content);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("-- {}..{} of {total} lines", lo + 1, hi));
+        if unwindowed_cap {
+            out.push_str(&format!(
+                " (file longer than the {MAX_UNWINDOWED_LINES}-line default window: \
+                 pass start_line/end_line or use read_ranges to read the rest)"
             ));
         }
-        let mut out = String::new();
-        for (idx, line) in lines[lo..hi].iter().enumerate() {
-            out.push_str(&format!("{:>6} {}\n", lo + idx + 1, line));
-        }
-        out.push_str(&format!(
-            "-- {}:{} of {} lines --\n",
-            lo + 1,
-            hi,
-            lines.len()
-        ));
-        Ok(clamp(out))
+        out.push_str(" --\n");
+        Ok(out)
     }
 }
 
@@ -1142,6 +1160,118 @@ mod tests {
         assert!(out.contains("brand_new.rs"), "{out}");
         assert!(out.contains("2 file(s)"), "{out}");
         assert!(!out.contains("notes.txt"), "{out}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_file_default_window_caps_bare_reads_of_long_files() {
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use comrade_tool::{
+            PlanStatus, PlanStep, PlanTarget, SessionControl, UndoLog, UserIo, UserPrompt,
+            UserReply,
+        };
+
+        struct StubSession;
+        impl SessionControl for StubSession {
+            fn set_title(&self, _t: &str) {}
+            fn title(&self) -> String {
+                "test".into()
+            }
+            fn set_plan(&self, _steps: Vec<comrade_tool::PlanStepDraft>) {}
+            fn plan(&self) -> Vec<PlanStep> {
+                vec![]
+            }
+            fn update_plan(&self, _t: PlanTarget, _s: PlanStatus, _n: Option<String>) -> bool {
+                true
+            }
+            fn finish_plan(&self, _s: Option<String>) {}
+            fn set_status(&self, _s: &str) {}
+            fn status(&self) -> String {
+                String::new()
+            }
+        }
+        struct StubUser;
+        #[async_trait]
+        impl UserIo for StubUser {
+            async fn ask(&self, _p: UserPrompt) -> anyhow::Result<UserReply> {
+                Ok(UserReply::Answer("yes".into()))
+            }
+        }
+        struct StubUndo;
+        #[async_trait]
+        impl UndoLog for StubUndo {
+            async fn capture(&self, _p: &str, _b: String) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn undo_last(&self) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+            async fn is_empty(&self) -> bool {
+                true
+            }
+            async fn len(&self) -> usize {
+                0
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "comrade-readfile-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let body: String = (1..=300).map(|i| format!("body line {i}\n")).collect();
+        std::fs::write(root.join("big.rs"), &body).unwrap();
+
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: Arc::new(StubSession),
+            user: Arc::new(StubUser),
+            undo: Arc::new(StubUndo),
+            auto_approve: true,
+            approval: Default::default(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // A bare read of a 300-line file returns only the head window, still
+        // states the total, and tells the caller how to read the rest.
+        let out = rt
+            .block_on(ReadFile.invoke(&ctx, json!({ "path": "big.rs" })))
+            .unwrap();
+        assert!(out.contains("body line 1"), "{out}");
+        assert!(!out.contains("body line 200"), "{out}");
+        assert!(out.contains("-- 1..150 of 300 lines"), "{out}");
+        assert!(
+            out.contains("pass start_line/end_line or use read_ranges to read the rest"),
+            "{out}"
+        );
+
+        // An explicit window is honoured exactly, even past the default cap.
+        let out = rt
+            .block_on(ReadFile.invoke(
+                &ctx,
+                json!({ "path": "big.rs", "start_line": 250, "end_line": 260 }),
+            ))
+            .unwrap();
+        assert!(out.contains("body line 250"), "{out}");
+        assert!(out.contains("body line 260"), "{out}");
+        assert!(!out.contains("body line 1"), "{out}");
+        assert!(out.contains("-- 250..260 of 300 lines"), "{out}");
+
+        // A file small enough to fit the default window is returned whole.
+        std::fs::write(root.join("small.rs"), "a\nb\nc\n").unwrap();
+        let out = rt
+            .block_on(ReadFile.invoke(&ctx, json!({ "path": "small.rs" })))
+            .unwrap();
+        assert!(out.contains("a\n") && out.contains("c"), "{out}");
+        assert!(out.contains("-- 1..3 of 3 lines"), "{out}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
