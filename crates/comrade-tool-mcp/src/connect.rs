@@ -86,8 +86,16 @@ impl ServerSession {
                 let peer: Peer<RoleClient> = running.clone();
                 (running, peer)
             }
-            McpTransport::Http { .. } => {
-                anyhow::bail!("streamable HTTP transport lands in a later step")
+            McpTransport::Http { url } => {
+                let config = crate::auth::http_transport_config(url, cfg.auth.as_ref()).await?;
+                let transport =
+                    rmcp::transport::streamable_http_client::StreamableHttpClientTransport::from_config(config);
+                let running =
+                    rmcp::service::serve_client((), transport).await.context(
+                        format!("MCP HTTP handshake with {name} failed"),
+                    )?;
+                let peer: Peer<RoleClient> = running.clone();
+                (running, peer)
             }
         };
         Ok(Self {
