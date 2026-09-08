@@ -1112,6 +1112,7 @@ impl App {
             auto_approve: self.cfg.auto_approve(),
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            stop: None,
         };
         self.session = session;
         self.ctx_base = ctx_base;

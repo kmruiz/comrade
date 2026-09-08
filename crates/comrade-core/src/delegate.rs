@@ -592,8 +592,17 @@ async fn run_delegate_subagent(
     // in between is refused, and the run aborts after a few such refusals so a
     // stuck delegate cannot loop forever on the same argument.
     let mut tracker = LoopTracker::default();
+    // The run's cancel token, set by the main agent loop (agent.rs). When the
+    // human interrupts the parent, a delegate stuck waiting on its model
+    // request must abort instead of holding the whole run at "working".
+    let stop = parent_ctx.stop.clone();
 
     for _ in 0..limits.max_iterations {
+        if let Some(stop) = &stop {
+            if stop.is_cancelled() {
+                bail!("delegate interrupted: the run was cancelled");
+            }
+        }
         ctxm.enforce_budget();
         let specs: Option<Vec<comrade_tool::ToolSpec>> = if native {
             let specs: Vec<_> = tools.iter().map(|t| t.spec().clone()).collect();
@@ -602,9 +611,21 @@ async fn run_delegate_subagent(
             None
         };
 
-        let turn = client
-            .chat_turn_once(ctxm.messages(), specs.as_deref())
-            .await?;
+        let turn = match &stop {
+            Some(stop) => {
+                tokio::select! {
+                    r = client.chat_turn_once(ctxm.messages(), specs.as_deref()) => r,
+                    _ = stop.cancelled() => {
+                        bail!("delegate interrupted: the run was cancelled while waiting for the model")
+                    }
+                }
+            }
+            None => {
+                client
+                    .chat_turn_once(ctxm.messages(), specs.as_deref())
+                    .await
+            }
+        }?;
 
         // Native tool calls: dispatch all of them like the main loop does.
         if !turn.tool_calls.is_empty() {
@@ -776,6 +797,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            stop: None,
         }
     }
 
@@ -879,6 +901,75 @@ mod tests {
                 ..LlmCfg::default()
             },
         }
+    }
+
+    /// A delegate stuck waiting for its model must abort when the run's cancel
+    /// token fires, instead of holding the whole run at "working" (the user
+    /// cannot interrupt it — Esc is dead until the request returns).
+    #[tokio::test]
+    async fn cancelled_run_aborts_a_delegate_stuck_waiting_for_the_model() {
+        // Server accepts the request, reads it, then never answers: the
+        // delegate's model request stays in flight until cancelled.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let mut used = 0usize;
+            loop {
+                let n = stream.read(&mut buf[used..]).unwrap();
+                if n == 0 {
+                    break;
+                }
+                used += n;
+                if buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Hold the connection open without replying.
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        });
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let mut d = delegate("silent", &base);
+        // Short client timeout so a regression fails in seconds, not in 600.
+        d.llm.timeout_secs = 5;
+        let client = LlmClient::new(&d.llm).unwrap();
+
+        let mut ctx = test_ctx();
+        let stop = tokio_util::sync::CancellationToken::new();
+        ctx.stop = Some(stop.clone());
+        // Cancel shortly after the request is in flight (300ms in).
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                stop.cancel();
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let res = run_delegate_subagent(
+            &client,
+            &ToolRegistry::new(),
+            &ctx,
+            "You are a test delegate.".into(),
+            "do the thing".into(),
+            "silent",
+            false,
+            &DelegateLimits::default(),
+        )
+        .await;
+        stopper.join().unwrap();
+
+        let err = res
+            .expect_err("a cancelled delegate run must fail, not hang")
+            .to_string();
+        assert!(err.contains("interrupted"), "unexpected error: {err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "delegate took {:?} to abort — cancel is not reaching it",
+            started.elapsed()
+        );
     }
 
     #[test]

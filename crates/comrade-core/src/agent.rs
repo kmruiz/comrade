@@ -418,6 +418,10 @@ async fn run_agent_loop(
     // doing into the chat as it happens.
     let mut ctx = ctx;
     ctx.events = std::sync::Arc::new(crate::session::SessionEvents(tx.clone()));
+    // Hand the run's cancel token to tools: the `delegate` sub-agent races its
+    // model requests against it, so a user cancel aborts a stuck delegate
+    // instead of leaving the run frozen at "working".
+    ctx.stop = Some(stop.clone());
 
     let max_iterations = cfg.agent.max_iterations;
     let mut iterations = 0usize;
@@ -1267,6 +1271,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            stop: None,
         };
         let tools = ToolRegistry::new();
         let client = LlmClient::new(&cfg.llm).unwrap();
@@ -1377,6 +1382,7 @@ mod tests {
             auto_approve: false,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tools = gated_registry(calls.clone());
@@ -1448,6 +1454,7 @@ mod tests {
             auto_approve: false,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tools = gated_registry(calls.clone());
@@ -1546,6 +1553,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tools = gated_registry(calls.clone());
@@ -1724,6 +1732,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            stop: None,
         };
         let delegate_tool = crate::delegate::DelegateTool::new(
             &cfg.delegates,
@@ -1811,6 +1820,7 @@ mod tests {
             auto_approve: false,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tools = gated_registry(calls.clone());
@@ -1953,6 +1963,7 @@ mod loop_tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            stop: None,
         };
         let tools = ToolRegistry::new();
         let client = LlmClient::new(&cfg.llm).unwrap();

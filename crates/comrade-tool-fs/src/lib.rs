@@ -1198,6 +1198,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            stop: None,
         };
         let list = ListFiles;
         let args = json!({ "pattern": "**/*.rs", "git_modified_only": true });
@@ -1286,6 +1287,7 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
+            stop: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

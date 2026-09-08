@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::plan::SessionControl;
 
@@ -84,6 +85,12 @@ pub struct ToolContext {
     /// runs. The agent core wires this to the session's event channel so the
     /// `delegate` tool can stream what its sub-agent is doing, as it happens.
     pub events: std::sync::Arc<dyn ActivityEvents>,
+    /// Cancel token for the currently running agent turn. Long-running tool
+    /// loops that can stall indefinitely (the `delegate` sub-agent) race their
+    /// in-flight model requests against it so a user cancel aborts them instead
+    /// of freezing the run at "working". The agent loop sets it at run start;
+    /// `None` in tests, headless runs and contexts with no live run.
+    pub stop: Option<CancellationToken>,
 }
 
 /// Sink a tool can report UI-visible activity through while it runs (e.g. the
@@ -311,6 +318,7 @@ mod tests {
             auto_approve: false,
             approval: Default::default(),
             events: Arc::new(crate::NoopEvents),
+            stop: None,
         };
         ctx.set_approval(ApprovalNotes {
             justification: "completes the requested rename".into(),
@@ -334,6 +342,7 @@ mod tests {
             auto_approve: false,
             approval: Default::default(),
             events: Arc::new(crate::NoopEvents),
+            stop: None,
         };
         ctx.confirm("edit", Some("--- a.rs".into())).await.unwrap();
         let shown = last.lock().unwrap().clone().unwrap();

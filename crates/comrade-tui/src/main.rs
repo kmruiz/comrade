@@ -176,6 +176,7 @@ fn new_session(
         auto_approve: deps.cfg.security.autonomy == comrade_core::Autonomy::Auto,
         approval: Default::default(),
         events: Arc::new(comrade_tool::NoopEvents),
+        stop: None,
     };
     (SessionBundle { session, ctx_base }, tx, rx)
 }
