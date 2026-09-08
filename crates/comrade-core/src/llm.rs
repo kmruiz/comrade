@@ -183,6 +183,21 @@ struct ChatChoice {
 struct ChatResponseMessage {
     #[serde(default)]
     content: Option<String>,
+    /// Native tool calls in a NON-streaming response.
+    #[serde(default)]
+    tool_calls: Option<Vec<ChatResponseToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponseToolCall {
+    id: String,
+    function: ChatResponseFunction,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponseFunction {
+    name: String,
+    arguments: String,
 }
 
 /// A tool call the model asked for.
@@ -446,6 +461,61 @@ impl LlmClient {
             .trim()
             .to_string();
         Ok(content)
+    }
+
+    /// One non-streaming chat round-trip with optional native tools. Unlike
+    /// [`chat`] the reply keeps any `tool_calls` the model made, so the caller
+    /// can run tools and feed results back — the delegate sub-agent loop uses
+    /// this because it needs tools but has no UI to stream tokens to.
+    pub async fn chat_turn_once(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolSpec]>,
+    ) -> Result<LlmTurn> {
+        let body = ChatRequest::new(
+            &self.cfg.model,
+            messages,
+            false,
+            tools,
+            self.cfg.temperature,
+        );
+        let resp = self
+            .http
+            .post(&self.endpoint)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("request to {} failed", self.endpoint))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            bail!("llm error {status}: {text}");
+        }
+        let parsed: ChatResponse = resp.json().await.context("malformed llm response")?;
+        let message = parsed.choices.into_iter().next().map(|c| c.message);
+        let Some(message) = message else {
+            return Ok(LlmTurn {
+                content: String::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+            });
+        };
+        let tool_calls = message
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tc| ModelToolCall {
+                id: tc.id,
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+            })
+            .collect();
+        Ok(LlmTurn {
+            content: message.content.unwrap_or_default().trim().to_string(),
+            tool_calls,
+            usage: None,
+        })
     }
 
     /// Stream a chat completion without native tools; returns the reply text.

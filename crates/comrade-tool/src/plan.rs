@@ -51,8 +51,8 @@ pub struct PlanStepDraft {
     /// outcome). Optional but strongly encouraged for isolatable steps.
     #[serde(default)]
     pub verification: String,
-    /// Which model will execute this step. Empty means the main (planner)
-    /// model itself; otherwise a configured delegate name. Shown in the UI.
+    /// Which model will execute this step. Empty means the main (tech lead)
+    /// model itself; otherwise a configured developer model name. Shown in the UI.
     #[serde(default)]
     pub model: String,
     /// Summarised context the executing model needs for this step. Fed to the
@@ -121,7 +121,7 @@ pub trait SessionControl: Send + Sync {
     /// Record that the `delegate` tool ran the given plan step (a delegate
     /// reply was received). Used to enforce that steps assigned a delegate
     /// model are executed on that delegate and cannot be silently completed by
-    /// the root model itself.
+    /// the tech lead itself.
     fn mark_step_delegated(&self, _step_id: u64) {}
 
     /// True when the `delegate` tool has run this plan step at least once.

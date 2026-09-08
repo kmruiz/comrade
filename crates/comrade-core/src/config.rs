@@ -99,15 +99,15 @@ impl LlmCfg {
 }
 
 /// An extra model — usually a cheaper/faster one, possibly on another provider
-/// — that the main "planner" model can delegate self-contained sub-tasks to via
-/// the `delegate` tool. One `[[delegates]]` entry per model.
+/// — that the main "tech lead" model can delegate self-contained sub-tasks to
+/// via the `delegate` tool. One `[[delegates]]` entry per model.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct DelegateCfg {
-    /// Unique name the planner model uses to select this model, e.g. `groq`.
+    /// Unique name the tech lead uses to select this model, e.g. `groq`.
     pub name: String,
     /// Short human-readable blurb of when to use this model (shown to the
-    /// planner so it can pick the right delegate for a task).
+    /// tech lead so it can pick the right developer for a task).
     pub description: String,
     /// The model settings for this delegate: `provider`, `model`, `api_key`,
     /// `temperature`, ... written inline at the same level as `name`.
@@ -176,7 +176,8 @@ pub struct Config {
     pub agent: AgentCfg,
     pub context: CtxCfg,
     pub security: SecurityCfg,
-    /// Extra models the planner can delegate sub-tasks to (see `delegate` tool).
+    /// Extra developer models the tech lead can delegate sub-tasks to (see the
+    /// `delegate` tool).
     pub delegates: Vec<DelegateCfg>,
 }
 

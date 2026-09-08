@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use comrade_core::{Config, DelegateTool, LlmClient, MemoryUndo};
+use comrade_core::{Config, DelegateLimits, DelegateTool, LlmClient, MemoryUndo};
 use comrade_tool::{ToolContext, ToolRegistry};
 
 #[derive(Parser, Debug)]
@@ -102,11 +102,44 @@ fn build_tools(cfg: &Config) -> Result<ToolRegistry> {
     reg.extend(comrade_tool_memory::all());
     reg.extend(comrade_tool_web::all());
     // Delegate models configured under [[delegates]] become the `delegate`
-    // tool; absent delegates mean no tool is advertised.
-    if let Some(delegate) = DelegateTool::new(&cfg.delegates)? {
+    // tool; absent delegates mean no tool is advertised. Delegates get a
+    // second, restricted registry (everything except git_commit and the
+    // session/UI tools) so they can do real work without ever committing.
+    if let Some(delegate) = DelegateTool::new(
+        &cfg.delegates,
+        delegate_registry(),
+        DelegateLimits {
+            max_iterations: cfg.agent.max_iterations,
+            budget_tokens: cfg.context.budget_tokens,
+            max_tool_output_chars: cfg.context.max_tool_output_chars,
+        },
+    )? {
         reg.register(Box::new(delegate));
     }
     Ok(reg)
+}
+
+/// The tools a delegated sub-agent may call: every repository/memory/project
+/// tool from the same crates as the main registry, minus the ones a delegate
+/// must never see (git_commit, the session/UI tools, and `delegate` itself so
+/// it cannot recurse). `deny` is shared with comrade-core's delegate module so
+/// the tool description and this registry can never drift apart.
+fn delegate_registry() -> ToolRegistry {
+    let mut reg = ToolRegistry::new();
+    for tool in comrade_tool_fs::all()
+        .into_iter()
+        .chain(comrade_tool_git::all())
+        .chain(comrade_tool_syntax::all())
+        .chain(comrade_tool_memory::all())
+        .chain(comrade_tool_project::all())
+        .chain(comrade_tool_web::all())
+    {
+        let name = tool.spec().name.clone();
+        if !DelegateTool::denied_for_delegates(&name) {
+            reg.register(tool);
+        }
+    }
+    reg
 }
 
 /// Session state + undo log wired to a fresh event channel. The caller chooses

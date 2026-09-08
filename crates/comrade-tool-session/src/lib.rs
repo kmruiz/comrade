@@ -204,7 +204,7 @@ impl Tool for UpdatePlan {
         };
 
         // A step assigned a delegate model can only be completed once the
-        // `delegate` tool has actually run it: the root model must not do a
+        // `delegate` tool has actually run it: the tech lead must not do a
         // delegated step's work itself and then mark it done.
         if status == PlanStatus::Done {
             let steps = ctx.session.plan();
@@ -217,7 +217,7 @@ impl Tool for UpdatePlan {
                 if !model.is_empty() && !ctx.session.step_was_delegated(step.id) {
                     anyhow::bail!(
                         "plan step {} is assigned to delegate {model:?}, but the `delegate` tool \
-                         has never run it — the root model cannot complete a delegated step \
+                         has never run it — the tech lead cannot complete a delegated step \
                          itself. Run the step with the delegate tool (pass `step` = {}), verify \
                          the result, then mark it done. If no delegate is available, replace the \
                          plan with `set_plan` leaving `model` empty.",

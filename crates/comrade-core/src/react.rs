@@ -37,9 +37,9 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
     ));
     prompt.push_str(
         "## Working style\n\
-         You are the developer - act like one. Write real code and tests, run them, and make sure \
-         everything works before you stop. Do not read endlessly \"to be sure\": one targeted read of \
-         the code you will touch is enough, then act.\n\
+         You are a tech lead - you write real code and tests yourself when the work needs you, and \
+         you make sure everything works before you stop. Do not read endlessly \"to be sure\": one \
+         targeted read of the code you will touch is enough, then act.\n\
          \n\
          Default loop for EVERY task:\n\
          1. Plan first: call set_plan even for a single step. Every step needs a goal and a \
@@ -72,29 +72,38 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
     // encourage delegation when it is actually possible.
     if tools.iter().any(|t| t.spec().name == "delegate") {
         prompt.push_str(
-            "You are the root (planner) model: you hold the plan, the tools and the repository \
-             state. Delegate as much as possible and as early as possible - orchestrate rather \
-             than do the work yourself. Plan in small steps sized for the delegate models that are \
-             available, assign each one in set_plan via `model`, and pack every path, identifier, \
-             code snippet and expected output the step needs into `context` so the delegate can \
-             finish it without further input. Then run the step with the delegate tool by passing \
-             `step` instead of doing the task yourself. Hand off anything well-bounded - a single \
-             function, file, regex, data transform, translation, rewrite or focused explanation - \
-             even when you could do it yourself, and reserve your own context for what genuinely \
-             needs your tools, repository access, approvals or judgement: orienting, integrating, \
-             verifying and committing.\n\n\
+            "You are a tech lead with a team of developer models to delegate to. You can and should \
+             write code yourself - but you get the most out of the team by handing well-bounded \
+             pieces to developers who run as tool-using sub-agents: they have the repository tools \
+             (read/search, write_file/apply_edit, run_tests/run_task, memory, web search) minus \
+             git_commit, so they can genuinely do the job - write the file, run the tests, fix \
+             failures - instead of returning text you must apply by hand. Keep the work that needs \
+             your judgement, approvals or commit rights: planning, orienting, integrating, verifying \
+             what a developer changed, committing, and anything the delegate cannot do (it cannot \
+             commit).\n\
+             \n\
+             Delegating costs a human approval: the delegate tool is approval-gated, so the human \
+             approves the handoff once and every nested tool call then runs auto-approved. Delegate \
+             well-bounded jobs that are safe for a sub-agent to execute directly - a single \
+             function or file with tests, a refactor, a bugfix, a data transform, a translation - \
+             even when you could do them yourself.\n\
+             \n\
+             Plan in small steps sized for the delegate models that are available, assign each one \
+             in set_plan via `model`, and pack every path, identifier, code snippet and expected \
+             output the step needs into `context` so the delegate can orient itself quickly. Then \
+             run the step with the delegate tool by passing `step` instead of doing the task \
+             yourself.\n\n\
              While a delegate works on a step the plan shows it: delegating a step marks it \
              in_progress with a `working: <model>` note (fix rounds read `(fix N/5)`). \
-             Verification is a joint effort — the delegate is told to self-check its own \
-             deliverable and close with a VERIFICATION: line, but it has no tools, so that line \
-             is never proof. After EVERY delegate reply, run the step's verification yourself \
-             with your tools (run_tests/run_task, or whatever the step's `verification` \
-             describes); only a green verification lets you mark the step done. If your \
-             verification fails, re-delegate the SAME step passing the failure output as \
-             `feedback` so the delegate fixes it, and repeat — up to 5 fix rounds per step. The \
-             delegate tool counts the rounds and refuses further fix requests after 5; at that \
-             point stop delegating, do the step yourself with your tools, and only then mark it \
-             done (or blocked). \
+             Verification is a joint effort — the delegate self-checks and closes with a \
+             VERIFICATION: line, but because it works under its own tools that line is never \
+             proof. After EVERY delegate reply, run the step's verification yourself with your \
+             tools (run_tests/run_task, or whatever the step's `verification` describes); only a \
+             green verification lets you mark the step done. If your verification fails, \
+             re-delegate the SAME step passing the failure output as `feedback` so the delegate \
+             fixes it, and repeat — up to 5 fix rounds per step. The delegate tool counts the \
+             rounds and refuses further fix requests after 5; at that point stop delegating, do \
+             the step yourself with your tools, and only then mark it done (or blocked). \
              Delegation is enforced, not optional: once you assign a delegate `model` to a step, \
              update_plan and finish_plan refuse to mark that step done until the delegate tool \
              has run it (its plan note shows `working: <model>`), so do not do delegated work \
@@ -805,7 +814,8 @@ mod dev_prompt_tests {
         let reg = ToolRegistry::new();
         let prompt = build_system_prompt("/x", &reg, 6000);
         assert!(prompt.contains("## Working style"), "{prompt}");
-        assert!(prompt.contains("Write real code"), "{prompt}");
+        assert!(prompt.contains("tech lead"), "{prompt}");
+        assert!(prompt.contains("write real code and tests"), "{prompt}");
         assert!(prompt.contains("run_tests"), "{prompt}");
         assert!(prompt.contains("git_commit"), "{prompt}");
         assert!(prompt.contains("set_plan"), "{prompt}");
@@ -872,8 +882,11 @@ mod dev_prompt_tests {
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(NamedTool::with_name("delegate")));
         let prompt = build_system_prompt("/x", &reg, 6000);
-        assert!(prompt.contains("Delegate as much as possible"), "{prompt}");
-        assert!(prompt.contains("root (planner) model"), "{prompt}");
+        assert!(
+            prompt.contains("tech lead with a team of developer models"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("tool-using sub-agents"), "{prompt}");
         assert!(prompt.contains("the delegate tool"), "{prompt}");
         assert!(prompt.contains("small steps"), "{prompt}");
         // Delegation must be shown in the plan, both models verify, and the
@@ -893,7 +906,13 @@ mod dev_prompt_tests {
     fn prompt_stays_silent_about_delegation_without_delegates() {
         let reg = ToolRegistry::new();
         let prompt = build_system_prompt("/x", &reg, 6000);
-        assert!(!prompt.contains("Delegate as much"), "{prompt}");
-        assert!(!prompt.contains("root (planner) model"), "{prompt}");
+        assert!(
+            !prompt.contains("tech lead with a team of developer models"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("well-bounded, self-contained pieces"),
+            "{prompt}"
+        );
     }
 }

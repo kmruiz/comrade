@@ -18,7 +18,7 @@ pub mod undo;
 pub use agent::run_agent;
 pub use config::{Autonomy, Config, DelegateCfg, LoadedConfig};
 pub use context::{ContextManager, estimate_tokens};
-pub use delegate::DelegateTool;
+pub use delegate::{DelegateLimits, DelegateTool};
 pub use llm::{ChatMessage, LlmClient, Role};
 pub use session::{AgentEvent, AgentSession};
 pub use undo::MemoryUndo;

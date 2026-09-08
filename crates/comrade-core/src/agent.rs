@@ -22,6 +22,7 @@ const MUTATING_TOOLS: &[&str] = &[
     "write_file",
     "rename",
     "git_commit",
+    "delegate",
     "run_task",
     "remember",
     "amend_decision",
@@ -33,9 +34,12 @@ const MUTATING_TOOLS: &[&str] = &[
 /// Tools that are approval-gated: the model MUST provide `justification` and
 /// `risk` before they run (a human approves based on them). `git_commit`,
 /// `run_task` and `run_tests` deliberately are NOT gated: they run directly.
+/// `delegate` IS gated: handing a task to a sub-agent that will edit the
+/// workspace deserves the same one-shot approval as the edits themselves.
 const APPROVAL_GATED_TOOLS: &[&str] = &[
     "write_file",
     "rename",
+    "delegate",
     "remember",
     "amend_decision",
     "format_code",
@@ -114,6 +118,7 @@ const CODE_CHANGES: &[&str] = &[
     "rename",
     "format_code",
     "shell",
+    "delegate",
 ];
 
 /// Update the "is the current change verified?" state after a tool ran.
@@ -811,10 +816,13 @@ async fn run_native_calls(
 
     ctxm.push(ChatMessage::assistant_with_calls(turn.content, calls));
 
-    // A native batch may hold several calls. `delegate` calls are independent
-    // (pure LLM work, no repository access) and slow, so when the whole batch
-    // is delegates they run concurrently below instead of one after the other.
-    // Mixed batches keep the historical strictly-sequential behaviour.
+    // A native batch may hold several calls. `delegate` calls are slow
+    // sub-agent runs, so when the whole batch is delegates they run
+    // concurrently below instead of one after the other. Mixed batches keep
+    // the historical strictly-sequential behaviour. Parallel delegates share
+    // the repo, session and undo log — they are expected to manage their own
+    // file conflicts (the delegate tool description warns the parent not to
+    // batch two delegates that touch the same files).
     let parallel_delegates = prepared.len() > 1
         && prepared
             .iter()
@@ -974,9 +982,10 @@ async fn run_native_calls(
         tracker.record(&p.name, sig);
     }
 
-    // Run the deferred delegates concurrently. They are all `delegate` calls,
-    // so they cannot mutate the workspace or depend on each other; results are
-    // streamed back and recorded in the original call order.
+    // Run the deferred delegates concurrently. They are all `delegate` calls;
+    // results are streamed back and recorded in the original call order.
+    // Parallel delegates may each mutate the workspace — the parent was told
+    // not to batch delegates that touch the same files.
     if !deferred.is_empty() {
         for p in &deferred {
             let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
@@ -1656,9 +1665,13 @@ mod tests {
             auto_approve: true,
             approval: Default::default(),
         };
-        let delegate_tool = crate::delegate::DelegateTool::new(&cfg.delegates)
-            .unwrap()
-            .unwrap();
+        let delegate_tool = crate::delegate::DelegateTool::new(
+            &cfg.delegates,
+            ToolRegistry::new(),
+            crate::delegate::DelegateLimits::default(),
+        )
+        .unwrap()
+        .unwrap();
         let mut tools = ToolRegistry::new();
         tools.extend(vec![Box::new(delegate_tool) as Box<dyn comrade_tool::Tool>]);
         let client = LlmClient::new(&cfg.llm).unwrap();
