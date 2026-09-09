@@ -49,6 +49,17 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
              only what needs your judgement or commit rights: planning, orienting, integrating, \
              verifying what a delegate changed, committing.\n\
              \n\
+             Delegate as much as you can and PARALLELISE: give independent steps to different \
+             delegates and run them in parallel batches instead of one after another; only make a \
+             step depend on another when it truly does. Match each step to the simplest delegate \
+             that can finish it — prefer the cheaper/faster models, including ones that run in a \
+             local environment.\n\
+             \n\
+             Use delegates as advisors too: when the plan or design gets complex, delegate a \
+             bounded review to one or more delegates (e.g. \"critique this plan: gaps, risks, \
+             cheaper alternatives\") and fold their answers in before you commit to the shape of \
+             the work.\n\
+             \n\
              Delegation is enforced, not a suggestion: a step you assign a delegate `model` cannot \
              be marked done until the delegate tool has actually run it, so assign `model` only to \
              steps you intend to delegate — then delegate them.\n\n",
@@ -61,21 +72,27 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          targeted read of the code you will touch is enough, then act.\n\
          \n\
          Default loop for EVERY task:\n\
-         1. Plan first: call set_plan even for a single step. Every step needs a goal, a \
+         1. Understand the request and read memory BEFORE planning: look up the concepts the \
+         task involves with find_glossary (or read_glossary for a full term), and search \
+         find_decisions for ADRs relevant to the new functionality, reading what matters — a \
+         past session may already hold the architecture, a code snippet, or the trap you are \
+         about to hit. Write using the glossary's terms and definitions. If anything you need \
+         is unclear and is not covered by the glossary, ask the human to clarify with \
+         ask_question before you plan.\n\
+         2. Plan: call set_plan even for a single step. Every step needs a goal, a \
          verification (how you will prove it works) and the `model` that will run it — \"self\" \
-         when you do it yourself, or a delegate's name. Break big work into the smallest steps \
-         that one agent can do end-to-end on its own: keep every step small, self-contained and \
-         independently verifiable, so it can be re-ordered or handed to another model. Advance \
-         steps with update_plan as you go.\n\
-         2. Read the ADRs and glossary before you orient or choose: durable project memory lives \
-         in .comrade/memory/ and is the only thing that survives the context reset at the end of a \
-         task. Search find_decisions with a query or tags for the area you are touching, then \
-         read_decision on anything relevant — a past session may already hold the architecture, a \
-         code snippet, or the trap you are about to hit. Check the glossary with find_glossary for \
-         keywords you are about to use.\n\
-         3. Orient only where it matters: project_model for layout; call structural_map to see where \
-         functions, modules, types, and methods live before searching. Then read only the exact code \
-         you will edit (use find_symbol/read_symbol to jump straight to a function).\n\
+         when you do it yourself, or a delegate's name. Break the work into MANY SMALL steps, \
+         each small enough that a simpler model — cheaper/faster, e.g. one that can run in a \
+         local environment — can execute it end-to-end on its own. Give EVERY step a context \
+         that is actionable on its own: a mini run book with what to change and why, the exact \
+         files, functions and types, snippets, commands to run, and how to verify — plus the \
+         feature background the executor needs. The executor only sees the step, never this \
+         conversation, so the context must carry all of that (it lives in the plan only, never \
+         in .comrade/memory/). Advance steps with update_plan as you go.\n\
+         3. Orient only where it matters, with the CHEAPEST tool that answers: project_model \
+         for layout; structural_map for where symbols live; rgrep or find_symbol over read_file; \
+         read_symbol over reading whole files; excerpts (find_decisions/find_glossary) over full \
+         reads when a snippet suffices. Never dump whole files into the conversation.\n\
          4. Implement with the most direct edit tool (write_file for new files, apply_patch/apply_edit \
          for changes). Write or update tests for what you changed.\n\
          5. Verify with run_tests (or run_task) and fix anything that fails until the suite is green. \
@@ -115,6 +132,11 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
              output the step needs into `context` so the delegate can orient itself quickly. Then \
              run the step with the delegate tool by passing `step` instead of doing the task \
              yourself.\n\n\
+             Keep every step runnable by the simplest delegate that can do it — small enough \
+             for a cheaper/faster model, e.g. one running locally — and hand independent steps \
+             to different delegates in parallel. Asking a delegate for advice is also a \
+             legitimate task: for a complex plan or design, delegate a short review (\"critique \
+             this plan, find gaps and risks\") and integrate the answers.\n\n\
              While a delegate works on a step the plan shows it: delegating a step marks it \
              in_progress with a `working: <model>` note (fix rounds read `(fix N/5)`). \
              Verification is a joint effort — the delegate self-checks and closes with a \
@@ -846,21 +868,26 @@ mod dev_prompt_tests {
         assert!(prompt.contains("context is cleared"), "{prompt}");
         assert!(prompt.contains("ADR"), "{prompt}");
         assert!(prompt.contains("glossary"), "{prompt}");
-        // Reading is part of the default loop, before orienting.
+        // The default loop looks memory up BEFORE planning and clarifies via
+        // ask_question when a concept is unclear and not in the glossary.
+        assert!(prompt.contains("read memory BEFORE planning"), "{prompt}");
         assert!(
-            prompt.contains("Read the ADRs and glossary before you orient"),
+            prompt.contains("ADRs relevant to the new functionality"),
             "{prompt}"
         );
+        assert!(prompt.contains("ask_question before you plan"), "{prompt}");
         assert!(prompt.contains("find_decisions"), "{prompt}");
         assert!(prompt.contains("read_decision"), "{prompt}");
         assert!(prompt.contains("find_glossary"), "{prompt}");
         assert!(prompt.contains("read_glossary"), "{prompt}");
-        // remember is reserved for important long-term decisions, ADR-style;
-        // run-book how-tos are explicitly not durable memory.
+        // remember is reserved for important long-term decisions; the "mini run
+        // book" phrase exists only as ephemeral plan-step context guidance.
         assert!(prompt.contains("important decision"), "{prompt}");
         assert!(prompt.contains("long term"), "{prompt}");
         assert!(prompt.contains("remember_glossary"), "{prompt}");
-        assert!(!prompt.contains("run book"), "{prompt}");
+        assert!(prompt.contains("a mini run book"), "{prompt}");
+        let memory_section = &prompt[prompt.find("## Memory").unwrap()..];
+        assert!(!memory_section.contains("run book"), "{memory_section}");
         assert!(!prompt.contains("ACTION -> VERIFICATION"), "{prompt}");
     }
 
@@ -919,6 +946,12 @@ mod dev_prompt_tests {
         assert!(prompt.contains("tool-using sub-agents"), "{prompt}");
         assert!(prompt.contains("the delegate tool"), "{prompt}");
         assert!(prompt.contains("small steps"), "{prompt}");
+        // Delegation should be parallelised, matched to the simplest model, and
+        // usable as advisory for complex plans.
+        assert!(prompt.contains("PARALLELISE"), "{prompt}");
+        assert!(prompt.contains("simplest delegate"), "{prompt}");
+        assert!(prompt.contains("advisors"), "{prompt}");
+        assert!(prompt.contains("local environment"), "{prompt}");
         // Delegation must be shown in the plan, both models verify, and the
         // parent retries the delegate with feedback up to 5 fix rounds.
         assert!(prompt.contains("working: <model>"), "{prompt}");
