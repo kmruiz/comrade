@@ -326,6 +326,23 @@ struct ModelPick {
     model_sel: Option<usize>,
 }
 
+/// One server listed in the M-x list-mcp-servers modal.
+struct McpServerRow {
+    name: String,
+    /// Transport detail lines (indented under the name): stdio command + args,
+    /// or the http base URL.
+    detail: Vec<String>,
+}
+
+/// The M-x list-mcp-servers modal: every server configured under `[mcp.servers]`
+/// with its transport, as a read-only scrollable list. No selection — the human
+/// reads it and closes (esc/enter).
+struct McpServersView {
+    servers: Vec<McpServerRow>,
+    /// Scroll offset into the row list when it is taller than the popup.
+    scroll: usize,
+}
+
 // ---------------------------------------------------------------------------
 // M-x command palette (Alt+X)
 // ---------------------------------------------------------------------------
@@ -438,7 +455,7 @@ impl MxCommand {
             MxCommand::MoveUserUp => Some("C-S-p"),
             // Starts a fresh session: unbound, run it from the M-x palette.
             MxCommand::NewSession => None,
-            // Palette-only: shows the configured MCP servers in the chat.
+            // Palette-only: shows the configured MCP servers in a modal.
             MxCommand::ListMcpServers => None,
             MxCommand::QueuePrompt => Some("C-<return>"),
             MxCommand::Quit => Some("C-c"),
@@ -630,6 +647,8 @@ struct App {
     dialog_ask: bool,
     /// Human-driven "assign a model to a plan step" overlay (Ctrl-A), when open.
     pick: Option<ModelPick>,
+    /// The M-x list-mcp-servers modal, when open.
+    mcp_view: Option<McpServersView>,
     /// The Alt+X (M-x) command palette, when open.
     mx: Option<Mx>,
     /// Sends a follow-up question's answer back from the ask-the-model task.
@@ -1220,28 +1239,56 @@ impl App {
         self.tools = Arc::new(tools);
     }
 
-    /// M-x list-mcp-servers: show the servers configured under `[mcp.servers]`
-    /// as a chat note — one line per server (stdio shows the command, http the
-    /// base URL).
+    /// M-x list-mcp-servers: open the modal listing the servers configured under
+    /// `[mcp.servers]` — one entry per server, its name plus transport detail
+    /// (stdio shows the command + args, http the base URL). An empty config
+    /// still reports as a chat note.
     fn list_mcp_servers(&mut self) {
         let servers = &self.cfg.mcp.servers;
         if servers.is_empty() {
             self.push_meta("no MCP servers configured");
             return;
         }
-        let rows: Vec<String> = servers
-            .iter()
-            .map(|s| {
-                let transport = match &s.transport {
-                    comrade_core::McpTransport::Stdio { command, .. } => {
-                        format!("stdio ({command})")
-                    }
-                    comrade_core::McpTransport::Http { url } => format!("http ({url})"),
-                };
-                format!("  {}: {transport}", s.name)
-            })
-            .collect();
-        self.push_meta(format!("configured MCP servers:\n{}", rows.join("\n")));
+        if self.pick.is_some() || self.mx.is_some() || self.search.is_some() {
+            return;
+        }
+        self.mcp_view = Some(McpServersView {
+            servers: mcp_server_rows(servers),
+            scroll: 0,
+        });
+    }
+
+    /// Scroll the open list-mcp-servers modal by `dir` (-1 up, 1 down); the
+    /// scroll position is clamped to the content at draw time.
+    fn mcp_scroll(&mut self, dir: isize) {
+        let Some(v) = &mut self.mcp_view else {
+            return;
+        };
+        if dir > 0 {
+            v.scroll = v.scroll.saturating_add(dir as usize);
+        } else {
+            v.scroll = v.scroll.saturating_sub(dir.unsigned_abs());
+        }
+    }
+
+    /// Keys while the list-mcp-servers modal is open.
+    fn handle_mcp_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => self.mcp_view = None,
+            // Enter and q (no modifier) also close the read-only modal.
+            KeyCode::Enter => self.mcp_view = None,
+            KeyCode::Char('q') if !ctrl && !alt => self.mcp_view = None,
+            KeyCode::Up => self.mcp_scroll(-1),
+            KeyCode::Down => self.mcp_scroll(1),
+            KeyCode::PageUp => self.mcp_scroll(-10),
+            KeyCode::PageDown => self.mcp_scroll(10),
+            // Emacs-style: ctrl-p previous line, ctrl-n next line.
+            KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&'p') => self.mcp_scroll(-1),
+            KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&'n') => self.mcp_scroll(1),
+            _ => {}
+        }
     }
 
     /// Start a fresh session in place, replacing the current one: a brand-new
@@ -1915,6 +1962,31 @@ impl App {
     }
 }
 
+/// Build the read-only rows shown in the M-x list-mcp-servers modal: one entry
+/// per configured server, name plus transport detail lines. Pure so the modal
+/// content is unit-testable without an `App`.
+fn mcp_server_rows(servers: &[comrade_core::McpServerCfg]) -> Vec<McpServerRow> {
+    servers
+        .iter()
+        .map(|s| {
+            let detail = match &s.transport {
+                comrade_core::McpTransport::Stdio { command, args, .. } => {
+                    if args.is_empty() {
+                        vec![format!("stdio ({command})")]
+                    } else {
+                        vec![format!("stdio ({command} {})", args.join(" "))]
+                    }
+                }
+                comrade_core::McpTransport::Http { url } => vec![format!("http ({url})")],
+            };
+            McpServerRow {
+                name: s.name.clone(),
+                detail,
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // entry
 // ---------------------------------------------------------------------------
@@ -1968,6 +2040,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         dialog_ask_tx: None,
         dialog_conv: Vec::new(),
         pick: None,
+        mcp_view: None,
         mx: None,
         chat_rect: Rect::default(),
         row_targets: Vec::new(),
@@ -2132,6 +2205,10 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
             }
             if app.pick.is_some() {
                 app.handle_pick_key(key);
+                return false;
+            }
+            if app.mcp_view.is_some() {
+                app.handle_mcp_key(key);
                 return false;
             }
             if app.search.is_some() {
@@ -3034,6 +3111,9 @@ fn draw(app: &mut App, frame: &mut Frame) {
     }
     if let Some(p) = &app.pick {
         draw_model_pick(p, frame);
+    }
+    if let Some(v) = &app.mcp_view {
+        draw_mcp_servers(v, frame);
     }
 }
 
@@ -4746,6 +4826,86 @@ fn draw_model_pick(pick: &ModelPick, frame: &mut Frame) {
     );
 }
 
+fn draw_mcp_servers(view: &McpServersView, frame: &mut Frame) {
+    let area = frame.area();
+    let w = area.width.saturating_sub(2).min(92);
+    let max_h = area.height.saturating_sub(2);
+    let width = usize::from(w).saturating_sub(4).max(16);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let count = view.servers.len();
+    for (i, s) in view.servers.iter().enumerate() {
+        let toks = vec![
+            tok(
+                if i + 1 < 10 {
+                    format!(" {}. ", i + 1)
+                } else {
+                    format!("{}. ", i + 1)
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+            tok(
+                &s.name,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        for wl in wrap_toks(&toks, width) {
+            push_tok_line(&mut lines, &wl);
+        }
+        for d in &s.detail {
+            for wl in wrap_toks(
+                &[
+                    tok("  ", Style::default().fg(Color::DarkGray)),
+                    tok(d.clone(), Style::default().fg(Color::Cyan)),
+                ],
+                width,
+            ) {
+                push_tok_line(&mut lines, &wl);
+            }
+        }
+        if i + 1 < count {
+            lines.push(Line::from(""));
+        }
+    }
+
+    let hint = if lines.len() as u16 > max_h.max(6).saturating_sub(4) {
+        "↑/↓ or ctrl-p/n scroll · pgup/pgdn · esc/enter/q closes"
+    } else {
+        "esc/enter/q closes"
+    };
+
+    let content_h = lines.len() as u16;
+    let h = (content_h + 3).clamp(6, max_h.max(6));
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" MCP servers ")
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let viewport = usize::from(rows[0].height).max(1);
+    let max_scroll = lines.len().saturating_sub(viewport);
+    let scroll = view.scroll.min(max_scroll) as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), rows[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
+}
+
 fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     let area = frame.area();
 
@@ -5343,6 +5503,42 @@ mod tests {
         assert_eq!(cmd.keys(), None, "list-mcp-servers is palette-only");
         assert!(!cmd.desc().is_empty());
         assert!(MxCommand::ALL.contains(&cmd));
+    }
+
+    #[test]
+    fn mcp_server_rows_renders_transports() {
+        use comrade_core::McpTransport;
+        let servers = vec![
+            comrade_core::McpServerCfg {
+                name: "files".into(),
+                transport: McpTransport::Stdio {
+                    command: "npx".into(),
+                    args: vec![
+                        "-y".into(),
+                        "@modelcontextprotocol/server-filesystem".into(),
+                    ],
+                    env: Default::default(),
+                },
+                auth: None,
+            },
+            comrade_core::McpServerCfg {
+                name: "search".into(),
+                transport: McpTransport::Http {
+                    url: "https://mcp.example.com/mcp".into(),
+                },
+                auth: None,
+            },
+        ];
+        let rows = mcp_server_rows(&servers);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "files");
+        assert_eq!(
+            rows[0].detail,
+            vec!["stdio (npx -y @modelcontextprotocol/server-filesystem)"]
+        );
+        assert_eq!(rows[1].name, "search");
+        assert_eq!(rows[1].detail, vec!["http (https://mcp.example.com/mcp)"]);
+        assert!(mcp_server_rows(&[]).is_empty());
     }
 
     #[test]
