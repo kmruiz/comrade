@@ -38,7 +38,8 @@ pub const TOOL_NAME: &str = "delegate";
 
 /// Tools a delegate must never see, by spec name. Only the tech lead commits,
 /// plans, renames the session or asks the human; `delegate` is excluded so a
-/// delegate cannot recurse, and `set_step_model` is excluded so a delegate
+/// delegate cannot recurse, `ask_advise` is excluded so a delegate cannot spawn
+/// extra model chats of its own, and `set_step_model` is excluded so a delegate
 /// cannot reassign its own (or any) plan step while working. Everything else
 /// in the main registry — including the mutating tools (write_file,
 /// apply_edit/apply_patch, shell, run_task, remember, amend_decision) — is fair
@@ -46,6 +47,7 @@ pub const TOOL_NAME: &str = "delegate";
 pub const DENIED_FOR_DELEGATES: &[&str] = &[
     "git_commit",
     "delegate",
+    "ask_advise",
     "ask_question",
     "rename_session",
     "set_status_bar",
@@ -85,9 +87,11 @@ impl Default for DelegateLimits {
 }
 
 /// One configured delegate model plus the HTTP client that talks to it.
-struct Target {
-    cfg: DelegateCfg,
-    client: LlmClient,
+/// Shared (pub(crate)) with the `ask_advise` tool in advise.rs so both tools
+/// talk to the same validated `[[delegates]]` entries.
+pub(crate) struct Target {
+    pub(crate) cfg: DelegateCfg,
+    pub(crate) client: LlmClient,
 }
 
 /// A tool that runs a tool-using sub-agent loop on one of the configured
@@ -107,11 +111,48 @@ pub struct DelegateTool {
 /// what the tech lead reads to pick the right developer for a task — so it must
 /// appear everywhere delegates are listed (tool doc, `model` arg, errors).
 /// Blank blurbs degrade to the plain `- name` line.
-fn delegate_line(name: &str, description: &str) -> String {
+pub(crate) fn delegate_line(name: &str, description: &str) -> String {
     match description.trim() {
         "" => format!("  - {name}"),
         desc => format!("  - {name}: {desc}"),
     }
+}
+
+/// Validate a `[[delegates]]` list and build one HTTP client per delegate.
+/// Shared by `DelegateTool::new` and `AskAdviseTool::new` (advise.rs) so the
+/// two tools always agree on which names are valid and how they are described.
+/// Fails on duplicate/blank names or a delegate that cannot build a client.
+pub(crate) fn build_targets(delegates: &[DelegateCfg]) -> Result<Vec<Target>> {
+    let mut names: Vec<String> = Vec::new();
+    let mut targets: Vec<Target> = Vec::with_capacity(delegates.len());
+    for (i, cfg) in delegates.iter().enumerate() {
+        if cfg.name.trim().is_empty() {
+            bail!("delegates[{i}]: every delegate needs a `name`");
+        }
+        if cfg.name.trim() == AGENT_MODEL {
+            bail!(
+                "delegates[{i}]: {AGENT_MODEL:?} is reserved for the main agent model in plan \
+                 steps; pick a different delegate name"
+            );
+        }
+        if cfg.llm.model.trim().is_empty() {
+            bail!(
+                "delegates[{i}] ({}): every delegate needs a `model`",
+                cfg.name
+            );
+        }
+        if names.iter().any(|n| n == &cfg.name) {
+            bail!("delegates: duplicate delegate name {:?}", cfg.name);
+        }
+        names.push(cfg.name.clone());
+        let client = LlmClient::new(&cfg.llm)
+            .with_context(|| format!("delegate {:?} failed to build client", cfg.name))?;
+        targets.push(Target {
+            cfg: cfg.clone(),
+            client,
+        });
+    }
+    Ok(targets)
 }
 
 impl DelegateTool {
@@ -124,8 +165,7 @@ impl DelegateTool {
 
     /// Build the delegate tool from the configured `[[delegates]]` entries.
     /// Returns `Ok(None)` when no delegates are configured (the tool is then
-    /// not advertised at all). Fails on duplicate/blank names or a delegate
-    /// that cannot build an HTTP client.
+    /// not advertised at all).
     ///
     /// `tools` is the registry the delegate may call: pass a filtered view of
     /// the main registry (everything except [`DENIED_FOR_DELEGATES`]) so the
@@ -139,36 +179,8 @@ impl DelegateTool {
         if delegates.is_empty() {
             return Ok(None);
         }
-
-        let mut names: Vec<String> = Vec::new();
-        let mut targets: Vec<Target> = Vec::with_capacity(delegates.len());
-        for (i, cfg) in delegates.iter().enumerate() {
-            if cfg.name.trim().is_empty() {
-                bail!("delegates[{i}]: every delegate needs a `name`");
-            }
-            if cfg.name.trim() == AGENT_MODEL {
-                bail!(
-                    "delegates[{i}]: {AGENT_MODEL:?} is reserved for the main agent model in plan \
-                     steps; pick a different delegate name"
-                );
-            }
-            if cfg.llm.model.trim().is_empty() {
-                bail!(
-                    "delegates[{i}] ({}): every delegate needs a `model`",
-                    cfg.name
-                );
-            }
-            if names.iter().any(|n| n == &cfg.name) {
-                bail!("delegates: duplicate delegate name {:?}", cfg.name);
-            }
-            names.push(cfg.name.clone());
-            let client = LlmClient::new(&cfg.llm)
-                .with_context(|| format!("delegate {:?} failed to build client", cfg.name))?;
-            targets.push(Target {
-                cfg: cfg.clone(),
-                client,
-            });
-        }
+        let targets = build_targets(delegates)?;
+        let names: Vec<String> = targets.iter().map(|t| t.cfg.name.clone()).collect();
 
         let listing = delegates
             .iter()
@@ -459,6 +471,7 @@ impl Tool for DelegateTool {
             &target.cfg.name,
             native,
             &self.limits,
+            DELEGATE_READ_NUDGE,
         )
         .await
         .with_context(|| format!("delegate {model} ({display}) failed"));
@@ -489,11 +502,21 @@ impl Tool for DelegateTool {
     }
 }
 
-/// System prompt for a delegated developer sub-agent that has real tools.
-/// Unlike the old text-only delegates it must know what it can call (and that
-/// it must NOT try to commit), so the prompt lists the delegate-scoped tool
-/// registry and explains the working protocol.
-fn delegate_system_prompt(project_root: &str, tools: &ToolRegistry, native: bool) -> String {
+/// Render any sub-agent system prompt whose static prose lives in a markdown
+/// file under `crates/comrade-core/prompts/` (embedded with include_str!). The
+/// dynamic pieces are substituted at runtime: `{tool_lines}` lists the scoped
+/// registry the sub-agent may call (one compact `- name — description` line
+/// each), `{protocol}` describes how to issue tool calls for the delegate's
+/// protocol (native function calling vs ReAct text), and `{project_root}` is
+/// the working directory. Order matters: `{tool_lines}` and `{protocol}` are
+/// filled first so tool descriptions that contain braces cannot disturb later
+/// substitutions.
+pub(crate) fn render_subagent_system(
+    body: &str,
+    project_root: &str,
+    tools: &ToolRegistry,
+    native: bool,
+) -> String {
     let mut tool_lines = String::new();
     for tool in tools.iter() {
         let desc: String = tool
@@ -519,14 +542,22 @@ fn delegate_system_prompt(project_root: &str, tools: &ToolRegistry, native: bool
          After each tool call you receive an Observation; continue until the task \
          is done, then reply with your final answer."
     };
-    // Static body prose lives in crates/comrade-core/prompts/delegate-system.md
-    // (include_str!); the dynamic pieces are substituted at runtime. Order
-    // matters: {tool_lines} and {protocol} are filled first so tool
-    // descriptions that contain braces cannot disturb later substitutions.
-    include_str!("../prompts/delegate-system.md")
-        .replace("{protocol}", protocol)
+    body.replace("{protocol}", protocol)
         .replace("{tool_lines}", &tool_lines)
         .replace("{project_root}", project_root)
+}
+
+/// System prompt for a delegated developer sub-agent that has real tools.
+/// Unlike the old text-only delegates it must know what it can call (and that
+/// it must NOT try to commit), so the prompt lists the delegate-scoped tool
+/// registry and explains the working protocol.
+fn delegate_system_prompt(project_root: &str, tools: &ToolRegistry, native: bool) -> String {
+    render_subagent_system(
+        include_str!("../prompts/delegate-system.md"),
+        project_root,
+        tools,
+        native,
+    )
 }
 
 /// No-progress guard for the delegate sub-agent loop, mirroring the main agent
@@ -552,23 +583,28 @@ fn refuse_repeat(tracker: &mut LoopTracker, sig: &str) -> Result<Option<String>>
 /// Read guard for the delegate sub-agent loop, mirroring the main loop's
 /// `allow_read_step` (agent.rs): once the delegate has done twenty consecutive
 /// read-only calls with no state change in between, the next read is refused
-/// and the delegate is nudged to implement instead of keep reading. Any
+/// and the delegate is nudged to make progress instead of keep reading. Any
 /// non-read action resets the counter. Returns the refusal message when the
 /// read must not run, `None` when it may.
-fn refuse_reading(name: &str, consecutive_reads: &mut usize) -> Option<String> {
+///
+/// `nudge` is the wording of the refusal and may contain a `{count}`
+/// placeholder for the number of consecutive reads; each caller passes wording
+/// that fits its sub-agent (a working delegate is told to implement, an
+/// advisor consulted via `ask_advise` is told to answer).
+fn refuse_reading(name: &str, consecutive_reads: &mut usize, nudge: &str) -> Option<String> {
     if allow_read_step(name, consecutive_reads) {
         return None;
     }
-    // Delegate wording: unlike the main loop there is no `update_plan` tool for
-    // the delegate to call (session/plan tools are denied), so the nudge points
-    // at implementing and answering instead.
-    Some(format!(
-        "You have performed {} reads in a row with no changes. You have enough context - \
-         implement now (write or edit a file) and verify your work, then reply with your final \
-         answer. Do not keep reading.",
-        *consecutive_reads
-    ))
+    Some(nudge.replace("{count}", &consecutive_reads.to_string()))
 }
+
+/// Wording of the read-guard nudge for a working `delegate` sub-agent: unlike
+/// the main loop there is no `update_plan` tool for the delegate to call
+/// (session/plan tools are denied), so the nudge points at implementing and
+/// answering instead.
+const DELEGATE_READ_NUDGE: &str = "You have performed {count} reads in a row with no changes. \
+     You have enough context - implement now (write or edit a file) and verify your work, then \
+     reply with your final answer. Do not keep reading.";
 
 /// Run one delegate as a tool-using sub-agent until it produces a final answer.
 /// Mirrors the main agent loop but for the delegate's own client, scoped tool
@@ -577,7 +613,10 @@ fn refuse_reading(name: &str, consecutive_reads: &mut usize) -> Option<String> {
 /// the main loop so any model works). Every nested tool call runs against a
 /// clone of the caller context with `auto_approve` forced on: the single human
 /// approval happened at the `delegate` handoff.
-async fn run_delegate_subagent(
+///
+/// `read_nudge` customises the read-guard refusal for the kind of sub-agent
+/// being run (see [`refuse_reading`]).
+pub(crate) async fn run_delegate_subagent(
     client: &LlmClient,
     tools: &ToolRegistry,
     parent_ctx: &ToolContext,
@@ -586,6 +625,7 @@ async fn run_delegate_subagent(
     author: &str,
     native: bool,
     limits: &DelegateLimits,
+    read_nudge: &str,
 ) -> Result<String> {
     // The delegate inherits the session/user/undo of the parent but runs
     // auto-approved (handoff already approved) with a fresh approval slot.
@@ -659,7 +699,7 @@ async fn run_delegate_subagent(
                 let args = serde_json::from_str(&tc.arguments).unwrap_or_default();
                 let args_pretty = serde_json::to_string(&args).unwrap_or_default();
                 let sig = format!("{} {}", tc.name, args_pretty);
-                if let Some(msg) = refuse_reading(&tc.name, &mut consecutive_reads) {
+                if let Some(msg) = refuse_reading(&tc.name, &mut consecutive_reads, read_nudge) {
                     // Too many reads in a row: nudge to implement. Still answer
                     // the call with a tool result so history stays API-valid.
                     let clamped = ctxm.truncate_observation(&msg);
@@ -719,7 +759,7 @@ async fn run_delegate_subagent(
         };
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
         let sig = format!("{} {}", tool_call.name, args_pretty);
-        if let Some(msg) = refuse_reading(&tool_call.name, &mut consecutive_reads) {
+        if let Some(msg) = refuse_reading(&tool_call.name, &mut consecutive_reads, read_nudge) {
             let obs = ctxm.truncate_observation(&msg);
             ctxm.push(ChatMessage::new(
                 Role::User,
@@ -989,6 +1029,7 @@ mod tests {
             "silent",
             false,
             &DelegateLimits::default(),
+            DELEGATE_READ_NUDGE,
         )
         .await;
         stopper.join().unwrap();
@@ -1891,17 +1932,18 @@ mod tests {
         let mut reads = 0usize;
         for i in 0..20 {
             assert!(
-                refuse_reading("read_file", &mut reads).is_none(),
+                refuse_reading("read_file", &mut reads, DELEGATE_READ_NUDGE).is_none(),
                 "read #{i} should be allowed before the threshold"
             );
         }
         assert_eq!(reads, 20);
-        let msg = refuse_reading("read_file", &mut reads).expect("the 21st read is refused");
+        let msg = refuse_reading("read_file", &mut reads, DELEGATE_READ_NUDGE)
+            .expect("the 21st read is refused");
         assert!(msg.contains("20 reads"), "{msg}");
         assert!(msg.contains("implement now"), "{msg}");
         assert!(!msg.contains("update_plan"), "delegates cannot plan: {msg}");
         // The counter never grows past the threshold: further reads stay refused.
-        assert!(refuse_reading("read_file", &mut reads).is_some());
+        assert!(refuse_reading("read_file", &mut reads, DELEGATE_READ_NUDGE).is_some());
         assert_eq!(reads, 20);
     }
 
@@ -1910,9 +1952,9 @@ mod tests {
     #[test]
     fn delegate_read_guard_resets_after_an_action() {
         let mut reads = 19usize; // one short of the threshold
-        assert!(refuse_reading("write_file", &mut reads).is_none());
+        assert!(refuse_reading("write_file", &mut reads, DELEGATE_READ_NUDGE).is_none());
         assert_eq!(reads, 0, "a mutating call resets the read counter");
-        assert!(refuse_reading("read_ranges", &mut reads).is_none());
+        assert!(refuse_reading("read_ranges", &mut reads, DELEGATE_READ_NUDGE).is_none());
         assert_eq!(reads, 1);
     }
 

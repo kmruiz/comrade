@@ -68,6 +68,13 @@ pub(crate) fn is_mutating(name: &str) -> bool {
     MUTATING_TOOLS.contains(&name)
 }
 
+/// Whether a tool call only gathers information (never changes state). Shared
+/// with the advisor registry for `ask_advise`: advisors may browse every
+/// read-only tool but nothing that writes, runs or commits.
+pub fn is_read_only(name: &str) -> bool {
+    READ_ONLY_TOOLS.contains(&name)
+}
+
 /// Tools that only gather information (never change state).
 const READ_ONLY_TOOLS: &[&str] = &[
     "list_dir",
@@ -92,10 +99,6 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "read_glossary",
     "web_search",
 ];
-
-fn is_read_only(name: &str) -> bool {
-    READ_ONLY_TOOLS.contains(&name)
-}
 
 /// After this many consecutive reads with no state change, we refuse another.
 const READ_GUARD_THRESHOLD: usize = 20;

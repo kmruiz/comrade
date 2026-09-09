@@ -1610,8 +1610,8 @@ impl App {
             AgentEvent::ToolResult { name, output, ok } => {
                 self.stream.clear();
                 self.activity = None;
-                if name == "delegate" {
-                    self.on_delegate_result(&output, ok);
+                if name == "delegate" || name == "ask_advise" {
+                    self.on_delegate_result(&name, &output, ok);
                 } else if name == "run_tests" {
                     if output.contains("test result:") {
                         // Render a rich summary card + one collapsible block per
@@ -1753,20 +1753,26 @@ impl App {
         }
     }
 
-    /// A `delegate` tool call finished: show the delegate's reply as its own
-    /// chat entry under the delegate's model name. The parent's tool card keeps
-    /// a compact summary; the full text lives in the delegate's message.
-    fn on_delegate_result(&mut self, output: &str, ok: bool) {
+    /// A `delegate`/`ask_advise` tool call finished: show the delegate's reply
+    /// (or advice) as its own chat entry under the delegate's model name. The
+    /// parent's tool card keeps a compact summary; the full text lives in the
+    /// delegate's message.
+    fn on_delegate_result(&mut self, tool: &str, output: &str, ok: bool) {
+        let parsed = match tool {
+            "delegate" => parse_delegate_reply(output),
+            "ask_advise" => parse_advice_reply(output),
+            _ => None,
+        };
         if ok {
-            if let Some((model, reply)) = parse_delegate_reply(output) {
-                if let Some(card) = self.last_tool_mut("delegate") {
+            if let Some((model, reply)) = parsed {
+                if let Some(card) = self.last_tool_mut(tool) {
                     card.ok = true;
                     card.open = false;
                     card.result = Some(format!("replied ({} chars)", reply.chars().count()));
                 }
                 if !reply.trim().is_empty() {
-                    // The delegate hand-off stretch (reads + the delegate call)
-                    // is done: fold it so the reply reads as a clean block.
+                    // The sub-agent stretch (reads + the tool call) is done:
+                    // fold it so the reply reads as a clean block.
                     self.fold_completed();
                     self.push_msg(Msg::authored(MsgKind::Delegate, model, reply));
                 }
@@ -1775,7 +1781,7 @@ impl App {
         }
         // Unparseable or failed hand-off: keep the plain tool-card behaviour so
         // the error/raw text is still visible.
-        if let Some(card) = self.last_tool_mut("delegate") {
+        if let Some(card) = self.last_tool_mut(tool) {
             card.result = Some(output.to_string());
             card.ok = ok;
         }
@@ -4039,7 +4045,7 @@ fn tool_icon(name: &str) -> (&'static str, Color) {
         "run_task" => ("▸", Color::Yellow),
         "shell" => ("$", Color::Green),
         "git_status" | "git_diff" | "git_log" | "git_commit" => ("↗", Color::Magenta),
-        "delegate" => ("⇄", Color::Magenta),
+        "delegate" | "ask_advise" => ("⇄", Color::Magenta),
         "read_file" | "read_ranges" => ("≡", Color::Blue),
         "list_dir" | "list_files" | "rgrep" | "list_symbols" | "find_symbol"
         | "find_definition" | "read_symbol" | "structural_map" | "references_count"
@@ -4091,8 +4097,9 @@ fn tool_headline(name: &str, args: &str) -> Option<String> {
         "web_search" => pick(&["query"]),
         "run_task" | "run_tests" => pick(&["task", "command"]),
         "shell" => pick(&["command", "dir"]),
-        "delegate" => {
-            // Which delegate is engaged (ad-hoc), or which plan step (step).
+        "delegate" | "ask_advise" => {
+            // Which delegate is engaged (ad-hoc), or which plan step (step);
+            // for advice, fall back to the question itself.
             if let Some(m) = map
                 .get("model")
                 .and_then(serde_json::Value::as_str)
@@ -4100,6 +4107,13 @@ fn tool_headline(name: &str, args: &str) -> Option<String> {
                 .filter(|s| !s.is_empty())
             {
                 Some(cap(m, 40))
+            } else if let Some(q) = map
+                .get("question")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(cap(q, 80))
             } else {
                 map.get("step")
                     .and_then(serde_json::Value::as_u64)
@@ -4124,6 +4138,22 @@ fn parse_delegate_reply(output: &str) -> Option<(String, String)> {
     let end = after.find(marker)?;
     let reply = after[end + marker.len()..].trim_end();
     Some((model.to_string(), reply.to_string()))
+}
+
+/// Parse the `ask_advise` tool's success output into (delegate name, advice):
+/// `advice from <name> (<display>):\n<advice>`.
+fn parse_advice_reply(output: &str) -> Option<(String, String)> {
+    let rest = output.strip_prefix("advice from ")?;
+    let open = rest.find(" (")?;
+    let model = rest[..open].trim();
+    if model.is_empty() {
+        return None;
+    }
+    let after = &rest[open + 2..];
+    let marker = "):\n";
+    let end = after.find(marker)?;
+    let advice = after[end + marker.len()..].trim_end();
+    Some((model.to_string(), advice.to_string()))
 }
 
 /// Visible reasoning extracted from a streamed assistant text: scaffold lines
@@ -4370,7 +4400,7 @@ fn layout_run(out: &mut Vec<RenderRow>, msg_idx: usize, children: &[Msg]) {
     let author = children
         .iter()
         .filter_map(|m| m.tool.as_ref())
-        .filter(|t| t.name != "delegate")
+        .filter(|t| t.name != "delegate" && t.name != "ask_advise")
         .filter_map(|t| t.author.as_deref())
         .next();
     let status = if d.calls > 0 && d.ok {
@@ -6496,6 +6526,17 @@ mod tests {
         assert!(parse_delegate_reply("ERROR: delegate mistral failed").is_none());
         assert!(parse_delegate_reply("").is_none());
         assert!(parse_delegate_reply("delegate replied:\nno name").is_none());
+    }
+
+    #[test]
+    fn advice_reply_is_parsed_into_delegate_and_text() {
+        let out = "advice from mistral (ollama/mistral:7b):\nSplit the task into three steps.";
+        let (model, advice) = parse_advice_reply(out).unwrap();
+        assert_eq!(model, "mistral");
+        assert_eq!(advice, "Split the task into three steps.");
+        // Failure output is not advice.
+        assert!(parse_advice_reply("ERROR: delegate mistral failed").is_none());
+        assert!(parse_advice_reply("advice from :\nnothing").is_none());
     }
 
     #[test]

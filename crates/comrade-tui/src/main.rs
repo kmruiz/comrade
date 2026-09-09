@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use comrade_core::{Config, DelegateLimits, DelegateTool, LlmClient, MemoryUndo};
+use comrade_core::{AskAdviseTool, Config, DelegateLimits, DelegateTool, LlmClient, MemoryUndo};
 use comrade_tool::{ToolContext, ToolRegistry};
 
 #[derive(Parser, Debug)]
@@ -148,6 +148,20 @@ fn build_tools(cfg: &Config) -> Result<ToolRegistry> {
     )? {
         reg.register(Box::new(delegate));
     }
+    // The same [[delegates]] back the `ask_advise` tool: consulting one of them
+    // for a second opinion. Advisors only get the read-only registry, so they
+    // can ground advice in the code but never change anything.
+    if let Some(advise) = AskAdviseTool::new(
+        &cfg.delegates,
+        advise_registry(),
+        DelegateLimits {
+            max_iterations: cfg.agent.max_iterations,
+            budget_tokens: cfg.context.budget_tokens,
+            max_tool_output_chars: cfg.context.max_tool_output_chars,
+        },
+    )? {
+        reg.register(Box::new(advise));
+    }
     Ok(reg)
 }
 
@@ -168,6 +182,30 @@ fn delegate_registry() -> ToolRegistry {
     {
         let name = tool.spec().name.clone();
         if !DelegateTool::denied_for_delegates(&name) {
+            reg.register(tool);
+        }
+    }
+    reg
+}
+
+/// The tools an advisor consulted via `ask_advise` may browse: only the
+/// read-only repository tools from the same crates as the main registry (no
+/// write/edit/shell/run/commit/plan tools), so an advisor can ground its
+/// advice in the code but can never mutate the workspace or the session.
+/// `AskAdviseTool::read_only_for_advice` shares the main loop's read-only
+/// classification (agent.rs) so the two can never drift apart.
+fn advise_registry() -> ToolRegistry {
+    let mut reg = ToolRegistry::new();
+    for tool in comrade_tool_fs::all()
+        .into_iter()
+        .chain(comrade_tool_git::all())
+        .chain(comrade_tool_syntax::all())
+        .chain(comrade_tool_memory::all())
+        .chain(comrade_tool_project::all())
+        .chain(comrade_tool_web::all())
+    {
+        let name = tool.spec().name.clone();
+        if AskAdviseTool::read_only_for_advice(&name) {
             reg.register(tool);
         }
     }
