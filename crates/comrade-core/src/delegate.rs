@@ -519,27 +519,14 @@ fn delegate_system_prompt(project_root: &str, tools: &ToolRegistry, native: bool
          After each tool call you receive an Observation; continue until the task \
          is done, then reply with your final answer."
     };
-    format!(
-        "\
-You are a developer sub-agent on Comrade's team. Your tech lead delegated ONE \
-self-contained task to you. Working directory: {project_root}. You have REAL \
-tools in this repository and are expected to use them to complete the task \
-yourself — read, search, edit and write files, run tests, and record ADR \
-decisions or glossary terms.\n\
-Your tool call for this task was approved by the human and every tool you call \
-runs auto-approved, so act directly and do not ask for permission.
-
-Hard rule: you CANNOT commit (no `git_commit` tool) — only the tech lead \
-commits. Never try to run git commit through other tools.
-
-Available tools:
-{tool_lines}
-{protocol}
-
-Before replying, verify your own work with the tools (run the tests / re-read \
-the code) and close your reply with a single line starting with `VERIFICATION:` \
-stating what you checked and whether it passes."
-    )
+    // Static body prose lives in crates/comrade-core/prompts/delegate-system.md
+    // (include_str!); the dynamic pieces are substituted at runtime. Order
+    // matters: {tool_lines} and {protocol} are filled first so tool
+    // descriptions that contain braces cannot disturb later substitutions.
+    include_str!("../prompts/delegate-system.md")
+        .replace("{protocol}", protocol)
+        .replace("{tool_lines}", &tool_lines)
+        .replace("{project_root}", project_root)
 }
 
 /// No-progress guard for the delegate sub-agent loop, mirroring the main agent
@@ -1117,6 +1104,37 @@ mod tests {
             "{desc}"
         );
         assert!(desc.trim_end().ends_with("  - bare"), "{desc}");
+    }
+
+    #[test]
+    fn delegate_system_prompt_substitutes_tokens_from_markdown() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(StubTool {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+        for native in [false, true] {
+            let prompt = delegate_system_prompt("/repo/root", &reg, native);
+            assert!(prompt.starts_with("You are a developer sub-agent on Comrade's team."));
+            assert!(
+                prompt.contains("Working directory: /repo/root."),
+                "{prompt}"
+            );
+            assert!(prompt.contains("Available tools:"), "{prompt}");
+            assert!(
+                prompt.contains("- write_file — stub write_file"),
+                "{prompt}"
+            );
+            assert!(
+                !prompt.contains("{project_root}")
+                    && !prompt.contains("{tool_lines}")
+                    && !prompt.contains("{protocol}"),
+                "unsubstituted token in:\n{prompt}"
+            );
+            assert!(
+                prompt.trim_end().ends_with("whether it passes."),
+                "{prompt}"
+            );
+        }
     }
 
     #[tokio::test]
