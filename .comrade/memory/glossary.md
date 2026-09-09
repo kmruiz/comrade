@@ -24,3 +24,26 @@ Reuses the Autonomy enum (ask/auto/deny). Delegates with ask/deny are annotated 
 **Notes:**
 Replaces the former unconditional "no approval" wording.
 
+## readiness handshake
+> ask_advise step=<id> — readiness-check mode of the ask_advise tool: consults the step's OWN delegate (read-only) about whether the step's context suffices to pick it up. Delegate closes with `VERDICT: READY` (step -> PlanStatus::Ready) or `VERDICT: NEEDS_MORE: <requests>` (step stays pending, note "awaiting context: ..."). Fire one call per delegate step in parallel after set_plan.
+
+**References:**
+- `crates/comrade-core/src/advise.rs (AskAdviseTool::invoke)`
+- `crates/comrade-core/prompts/advise-system.md`
+- `crates/comrade-core/src/delegate.rs (DENIED_FOR_DELEGATES)`
+
+**Notes:**
+Mutually exclusive with model/question/context args. The delegate tool description, delegation-lead.md, delegate-by-default.md and advise-system.md all instruct this handshake. Complemented by set_step_context to enrich a step and re-ask.
+
+## ready (PlanStatus::Ready)
+> PlanStatus::Ready ("ready") — a plan step whose assigned delegate has confirmed via ask_advise step=<id> that the step's context (goal/verification/context) is sufficient for it to do the work. Sits between Pending and InProgress (lifecycle pending -> ready -> in_progress). Soft gate: informational; the delegate tool still runs from pending.
+
+**References:**
+- `crates/comrade-tool/src/plan.rs (PlanStatus enum)`
+- `crates/comrade-core/src/advise.rs (readiness_verdict, step-mode invoke)`
+- `crates/comrade-tool-session/src/lib.rs (set_step_context tool)`
+- `crates/comrade-tui/src/tui.rs (plan_glyph)`
+
+**Notes:**
+Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; otherwise the step stays pending with an "awaiting context: ..." note. Reassigning the model or calling set_step_context on a ready step resets it to pending. TUI shows a blue ● glyph. Denied to delegate sub-agents.
+
