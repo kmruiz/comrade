@@ -24,7 +24,15 @@ use comrade_tool::{
     UserReply,
 };
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+// The kitty keyboard-enhancement protocol lets the terminal report SHIFT (and
+// other) modifiers for chords like Ctrl+Shift+C that are otherwise byte-
+// identical to their unshifted form. Unix terminals only.
+#[cfg(unix)]
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use ratatui::Frame;
@@ -475,7 +483,7 @@ impl MxCommand {
             MxCommand::BackwardWord => Some("M-<left>"),
             MxCommand::BeginningOfLine => Some("<home>"),
             MxCommand::CancelRun => Some("esc"),
-            MxCommand::Copy => Some("C-S-c"),
+            MxCommand::Copy => Some("C-S-c / M-w"),
             MxCommand::EndOfLine => Some("<end>"),
             MxCommand::ForwardWord => Some("M-<right>"),
             MxCommand::InsertNewline => Some("S-<return>"),
@@ -909,7 +917,8 @@ impl App {
     }
 
     /// Copy the plain text of the message currently under the cursor
-    /// (the selected block) to the system clipboard. Bound to Ctrl+Shift+C.
+    /// (the selected block) to the system clipboard. Bound to Ctrl+Shift+C
+    /// and M-w.
     fn copy_selected(&mut self) {
         let Some(idx) = self.sel else { return };
         let Some(msg) = self.chat.get(idx) else {
@@ -917,6 +926,42 @@ impl App {
         };
         let text = msg_searchable(msg).trim().to_string();
         self.copy_text(&text);
+    }
+
+    /// Copy the prompt's text selection when one exists, otherwise the chat
+    /// message under the cursor. Backs both the Ctrl+Shift+C and M-w chords.
+    fn copy_prompt_or_block(&mut self) {
+        if let Some(sel) = self.input.selected_text() {
+            let sel = sel.to_string();
+            self.copy_text(&sel);
+        } else {
+            self.copy_selected();
+        }
+    }
+
+    /// Cut the prompt's selection: delete it and put the text on the system
+    /// clipboard. Bound to C-k. No-op when nothing is selected (chat blocks
+    /// are read-only and cannot be cut).
+    fn cut_selection(&mut self) {
+        if let Some(text) = self.input.cut_selection() {
+            self.copy_text(&text);
+        }
+    }
+
+    /// Paste the system clipboard into the prompt at the cursor, replacing
+    /// any selection. Bound to C-y. Reports failures in the chat.
+    fn paste_clipboard(&mut self) {
+        let mut clip = match Clipboard::new() {
+            Ok(clip) => clip,
+            Err(e) => {
+                self.push_meta(format!("paste failed: {e}"));
+                return;
+            }
+        };
+        match clip.get_text() {
+            Ok(text) => self.input.insert_str(&text),
+            Err(e) => self.push_meta(format!("paste failed: {e}")),
+        }
     }
 
     /// Put `text` on the system clipboard, reporting failures in the chat.
@@ -1827,14 +1872,10 @@ impl App {
             MxCommand::BeginningOfLine => self.input.move_home(false),
             MxCommand::CancelRun => self.cancel_run(),
             MxCommand::Copy => {
-                // Mirrors Ctrl+Shift+C: copy the prompt's selection when there
-                // is one, otherwise the chat message under the cursor.
-                if let Some(sel) = self.input.selected_text() {
-                    let sel = sel.to_string();
-                    self.copy_text(&sel);
-                } else {
-                    self.copy_selected();
-                }
+                // Mirrors the Ctrl+Shift+C / M-w chords: copy the prompt's
+                // selection when there is one, otherwise the chat message
+                // under the cursor.
+                self.copy_prompt_or_block();
             }
             MxCommand::EndOfLine => self.input.move_end(false),
             MxCommand::ForwardWord => self.input.move_word_right(false),
@@ -2273,6 +2314,20 @@ pub async fn run(deps: &Deps) -> Result<()> {
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    // Ask the terminal for the kitty keyboard-enhancement protocol so that
+    // Ctrl+Shift+C arrives as a distinct key (with SHIFT) instead of being
+    // folded into plain Ctrl+C. Terminals that do not support it simply ignore
+    // the request and keep sending legacy byte streams.
+    #[cfg(unix)]
+    let _ = execute!(
+        std::io::stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
+    );
 
     // Terminal events arrive on a background thread.
     let (kev_tx, mut kev_rx) = mpsc::channel::<Event>(128);
@@ -2377,6 +2432,8 @@ pub async fn run(deps: &Deps) -> Result<()> {
         }
     };
 
+    #[cfg(unix)]
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     res
@@ -2386,6 +2443,11 @@ pub async fn run(deps: &Deps) -> Result<()> {
 fn handle_event(app: &mut App, ev: Event) -> bool {
     match ev {
         Event::Key(key) => {
+            // With REPORT_EVENT_TYPES active the terminal reports key releases
+            // too; act only on presses (and auto-repeat), never on the release.
+            if key.kind == KeyEventKind::Release {
+                return false;
+            }
             let ctrl_space = key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('\0'));
             if ctrl_space {
@@ -2399,12 +2461,7 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                         // Ctrl+Shift+C copies the prompt's text selection when
                         // one exists, otherwise the chat message under the
                         // cursor, to the system clipboard.
-                        if let Some(sel) = app.input.selected_text() {
-                            let sel = sel.to_string();
-                            app.copy_text(&sel);
-                        } else {
-                            app.copy_selected();
-                        }
+                        app.copy_prompt_or_block();
                         return false;
                     }
                     // Plain Ctrl+C quits.
@@ -2450,6 +2507,17 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                 app.reload_config();
                 return false;
             }
+            // Emacs-style kill/yank on the prompt editor: C-y pastes the
+            // system clipboard at the cursor; C-k cuts the selection to the
+            // clipboard (copy is M-w / Ctrl+Shift+C).
+            if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.paste_clipboard();
+                return false;
+            }
+            if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.cut_selection();
+                return false;
+            }
             // Emacs-style chat navigation. Plain Ctrl+p/n move block to block;
             // Ctrl+Shift and Alt variants (P/N) jump between user messages.
             if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2488,6 +2556,13 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                     }
                     if ch.eq_ignore_ascii_case(&'n') {
                         app.move_user(1);
+                        return false;
+                    }
+                    if ch.eq_ignore_ascii_case(&'w') {
+                        // M-w: Emacs-style "copy". Every terminal forwards
+                        // Alt+W, so this works even where Ctrl+Shift+C is
+                        // claimed by the terminal emulator itself.
+                        app.copy_prompt_or_block();
                         return false;
                     }
                 }

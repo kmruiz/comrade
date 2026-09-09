@@ -93,6 +93,30 @@ impl Editor {
         self.cur = at + ch.len_utf8();
     }
 
+    /// Insert `text` at the cursor, replacing any selection. Paste.
+    pub fn insert_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let at = match self.take_selection() {
+            Some((a, _)) => a,
+            None => self.cur,
+        };
+        self.buf.insert_str(at, text);
+        self.cur = at + text.len();
+    }
+
+    /// Delete the selection and return the removed text; `None` when there is
+    /// no selection. The cursor lands where the selection started. Cut.
+    pub fn cut_selection(&mut self) -> Option<String> {
+        let (a, b) = self.selection()?;
+        let out = self.buf[a..b].to_string();
+        self.buf.replace_range(a..b, "");
+        self.cur = a;
+        self.anchor = None;
+        Some(out)
+    }
+
     /// Delete the character before the cursor (or the whole selection).
     pub fn backspace(&mut self) {
         if self.selection().is_some() {
@@ -513,6 +537,44 @@ mod tests {
         e.backspace();
         assert_eq!(text(&e), "hello ");
         assert_eq!(e.cursor(), 6);
+    }
+
+    #[test]
+    fn insert_str_replaces_selection_like_paste() {
+        let mut e = Editor::new();
+        for ch in "hello world".chars() {
+            e.insert(ch);
+        }
+        e.move_word_left(true); // select "world"
+        e.insert_str("there");
+        assert_eq!(text(&e), "hello there");
+        assert_eq!(e.cursor(), "hello there".len());
+        assert_eq!(e.selection(), None);
+        // multiline paste lands at the cursor
+        e.move_home(false);
+        e.insert_str("say ");
+        assert_eq!(text(&e), "say hello there");
+        assert_eq!(e.cursor(), "say ".len());
+        // empty paste is a no-op
+        let before = text(&e);
+        e.insert_str("");
+        assert_eq!(text(&e), before);
+    }
+
+    #[test]
+    fn cut_selection_removes_and_returns() {
+        let mut e = Editor::new();
+        for ch in "hello world".chars() {
+            e.insert(ch);
+        }
+        // no selection: nothing to cut
+        assert_eq!(e.cut_selection(), None);
+        assert_eq!(text(&e), "hello world");
+        e.move_word_left(true); // select "world"
+        assert_eq!(e.cut_selection(), Some("world".to_string()));
+        assert_eq!(text(&e), "hello ");
+        assert_eq!(e.cursor(), 6);
+        assert_eq!(e.selection(), None);
     }
 
     #[test]
