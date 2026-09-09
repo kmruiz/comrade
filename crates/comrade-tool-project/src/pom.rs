@@ -64,9 +64,10 @@ pub struct ProjectModel {
     pub aliases: Vec<Alias>,
 }
 
-/// The cargo verbs the `run_task` tool executes. `test` is deliberately
-/// absent: running tests goes through the dedicated `run_tests` tool, which
-/// returns a compact failure summary instead of the full cargo output.
+/// The standard build-system verbs the `pom_run_task` tool executes. `test` is
+/// deliberately absent: running tests goes through the dedicated
+/// `pom_run_tests` tool, which returns a compact failure summary instead of the
+/// full raw output.
 pub const RUN_TASK_VERBS: &[&str] = &[
     "build", "run", "check", "clippy", "fmt", "doc", "bench", "release",
 ];
@@ -227,7 +228,7 @@ pub fn render(model: &ProjectModel) -> String {
                 .root
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "cargo-project".into())
+                .unwrap_or_else(|| "project".into())
         });
 
     let kind = if model.is_virtual {
@@ -236,7 +237,7 @@ pub fn render(model: &ProjectModel) -> String {
         "package"
     };
     out.push_str(&format!(
-        "Project: {project_name}  (cargo, {kind}, project root)\n"
+        "Project: {project_name}  ({kind}, project root)\n"
     ));
     if let Some(p) = &model.root_package {
         let (n, d, b) = p.dep_counts();
@@ -286,7 +287,7 @@ pub fn render(model: &ProjectModel) -> String {
     }
 
     out.push_str(&format!(
-        "Tasks (cargo verbs, run with run_task task=\"<name>\"; tests via run_tests): {}\n",
+        "Tasks (standard project tasks; run with pom_run_task task=\"<name>\"; tests via pom_run_tests): {}\n",
         RUN_TASK_VERBS.join(", ")
     ));
     if model.aliases.is_empty() {
@@ -294,7 +295,7 @@ pub fn render(model: &ProjectModel) -> String {
     } else {
         out.push_str("Aliases:\n");
         for a in &model.aliases {
-            out.push_str(&format!("  {} -> cargo {}\n", a.name, a.expansion));
+            out.push_str(&format!("  {} -> {}\n", a.name, a.expansion));
         }
     }
     out
@@ -467,7 +468,7 @@ anyhow = "1"
             .collect();
         assert!(!verbs.contains(&"test"), "{tasks_line}");
         assert!(verbs.contains(&"build"), "{tasks_line}");
-        assert!(tasks_line.contains("run_tests"), "{tasks_line}");
+        assert!(tasks_line.contains("pom_run_tests"), "{tasks_line}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -56,7 +56,7 @@ pub fn ensure(root: &Path) -> Result<()> {
 Project keywords and their meaning, with references to the code or \
 documentation where they appear. One `## term` section per keyword, sorted \
 alphabetically. Look terms up with read_glossary, search with find_glossary, \
-add or update with remember_glossary.
+add or update with record_glossary.
 
 ";
         std::fs::write(&p, header).with_context(|| format!("cannot write {}", p.display()))?;

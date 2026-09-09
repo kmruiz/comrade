@@ -28,24 +28,23 @@ fn usage_total(u: &Usage) -> Option<usize> {
 /// Tools that mutate the workspace (used by the loop tracker to tell "repeat
 /// but state changed" from "repeat doing nothing").
 const MUTATING_TOOLS: &[&str] = &[
-    "apply_edit",
-    "apply_patch",
-    "write_file",
-    "rename",
+    "fs_edit",
+    "fs_write_file",
+    "ts_rename",
     "git_commit",
     "delegate",
-    "run_task",
-    "remember",
-    "amend_decision",
-    "remember_glossary",
-    "format_code",
-    "run_tests",
+    "pom_run_task",
+    "record_adr",
+    "amend_adr",
+    "record_glossary",
+    "pom_format_code",
+    "pom_run_tests",
     "shell",
 ];
 
 /// Tools that are approval-gated: the model MUST provide a `justification`
 /// before they run (a human approves based on it). `git_commit`,
-/// `run_task`, `run_tests` and `delegate` deliberately are NOT gated: they run
+/// `pom_run_task`, `pom_run_tests` and `delegate` deliberately are NOT gated: they run
 /// directly. `delegate` runs ungated because it is the lead's normal way to
 /// hand work to sub-agents — a delegate's nested tool calls are auto-approved
 /// inside its own run, so a handoff needs no separate human confirmation.
@@ -54,11 +53,11 @@ const MUTATING_TOOLS: &[&str] = &[
 /// delegate.rs and advise.rs enforce it with a `ctx.confirm` before the
 /// sub-agent runs.
 const APPROVAL_GATED_TOOLS: &[&str] = &[
-    "write_file",
-    "rename",
-    "remember",
-    "amend_decision",
-    "remember_glossary",
+    "fs_write_file",
+    "ts_rename",
+    "record_adr",
+    "amend_adr",
+    "record_glossary",
     "shell",
 ];
 
@@ -81,25 +80,23 @@ pub fn is_read_only(name: &str) -> bool {
 
 /// Tools that only gather information (never change state).
 const READ_ONLY_TOOLS: &[&str] = &[
-    "list_dir",
-    "list_files",
-    "rgrep",
-    "read_file",
-    "read_ranges",
-    "list_symbols",
-    "structural_map",
-    "find_symbol",
-    "find_definition",
-    "read_symbol",
-    "references_count",
-    "find_references",
+    "fs_list_dir",
+    "fs_list_files",
+    "fs_rgrep",
+    "fs_read_file",
+    "fs_read_ranges",
+    "ts_list_symbols",
+    "ts_structural_map",
+    "ts_find_symbol",
+    "ts_read_symbol",
+    "ts_find_references",
     "git_status",
     "git_diff",
     "git_show",
     "git_log",
-    "project_model",
-    "find_decisions",
-    "read_decision",
+    "pom_model",
+    "find_adr",
+    "read_adr",
     "find_glossary",
     "read_glossary",
     "web_search",
@@ -135,11 +132,10 @@ fn read_guard_message(count: usize) -> String {
 
 /// Tools that modify source code (used by the verify-then-commit monitor).
 const CODE_CHANGES: &[&str] = &[
-    "apply_edit",
-    "apply_patch",
-    "write_file",
-    "rename",
-    "format_code",
+    "fs_edit",
+    "fs_write_file",
+    "ts_rename",
+    "pom_format_code",
     "shell",
     "delegate",
 ];
@@ -148,14 +144,16 @@ const CODE_CHANGES: &[&str] = &[
 fn update_verify_state(name: &str, ok: bool, output: &str, verified_after_change: &mut bool) {
     if CODE_CHANGES.contains(&name) {
         *verified_after_change = false;
-    } else if matches!(name, "run_tests" | "run_task") && ok && output.contains("test result: ok.")
+    } else if matches!(name, "pom_run_tests" | "pom_run_task")
+        && ok
+        && output.contains("test result: ok.")
     {
         *verified_after_change = true;
     }
 }
 
 fn verify_guard_message() -> String {
-    "You have unverified code changes. Run run_tests (or run_task test) and get them green BEFORE \
+    "You have unverified code changes. Run pom_run_tests (or pom_run_task test) and get them green BEFORE \
      calling git_commit."
         .to_string()
 }
@@ -183,7 +181,7 @@ fn failure_hint(name: &str, output: &str) -> String {
             .to_string();
     }
     if o.contains("test result: failed") || (o.contains("failures:") && o.contains("panicked")) {
-        return "the tests failed - fix the code (or the test) and rerun run_tests".to_string();
+        return "the tests failed - fix the code (or the test) and rerun pom_run_tests".to_string();
     }
     if o.contains("error[")
         || o.contains("cannot find")
@@ -593,10 +591,11 @@ async fn run_agent_loop(
                     .first()
                     .map(|c| c.name.as_str())
                     .unwrap_or("");
-                let is_plan_tool = matches!(first, "set_plan" | "rename_session" | "ask_question");
+                let is_plan_tool =
+                    matches!(first, "self_set_plan" | "self_rename_session" | "ask_user");
                 if !is_plan_tool {
                     plan_nudged = true;
-                    let msg = "Every task starts with a plan. Call set_plan first with your steps - \
+                    let msg = "Every task starts with a plan. Call self_set_plan first with your steps - \
                                each step needs a goal, a verification and the `model` that will run it \
                                (\"self\" or a delegate name) - before taking any other action.";
                     ctxm.push(ChatMessage::new(Role::Assistant, turn.content.clone()));
@@ -738,11 +737,11 @@ async fn run_agent_loop(
         if !plan_nudged && ctx.session.plan().is_empty() {
             let is_plan_tool = matches!(
                 tool_call.name.as_str(),
-                "set_plan" | "rename_session" | "ask_question"
+                "self_set_plan" | "self_rename_session" | "ask_user"
             );
             if !is_plan_tool {
                 plan_nudged = true;
-                let msg = "Every task starts with a plan. Call set_plan first with your steps - each step \
+                let msg = "Every task starts with a plan. Call self_set_plan first with your steps - each step \
                      needs a goal, a verification and the `model` that will run it (\"self\" or a delegate \
                      name) - before taking any other action.";
                 let _ = tx
@@ -1512,7 +1511,7 @@ mod tests {
     }
 
     /// A stand-in for an approval-gated tool: records invocations and asks for
-    /// confirmation like the real write_file would.
+    /// confirmation like the real fs_write_file would.
     struct RecordingWrite {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1521,7 +1520,7 @@ mod tests {
         fn spec(&self) -> &comrade_tool::ToolSpec {
             static SPEC: std::sync::LazyLock<comrade_tool::ToolSpec> =
                 std::sync::LazyLock::new(|| comrade_tool::ToolSpec {
-                    name: "write_file".into(),
+                    name: "fs_write_file".into(),
                     description: "write a file (test)".into(),
                     json_schema: serde_json::json!({ "type": "object", "properties": {} }),
                 });
@@ -1533,7 +1532,7 @@ mod tests {
             _args: serde_json::Value,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            ctx.confirm("write_file (test)", None).await?;
+            ctx.confirm("fs_write_file (test)", None).await?;
             Ok("wrote file".into())
         }
     }
@@ -1547,7 +1546,7 @@ mod tests {
     #[tokio::test]
     async fn approval_gated_tool_refused_without_justification() {
         let port = spawn_model_with(&[
-            "Thought: write it\nTool: write_file\nArgs: {\"path\": \"x.rs\", \"content\": \"a\"}",
+            "Thought: write it\nTool: fs_write_file\nArgs: {\"path\": \"x.rs\", \"content\": \"a\"}",
             "All done.",
         ]);
         let mut cfg = Config::default();
@@ -1620,7 +1619,7 @@ mod tests {
     #[tokio::test]
     async fn approval_gated_tool_runs_when_notes_present() {
         let port = spawn_model_with(&[
-            "Thought: write it\nJustification: needed to add the requested file\nTool: write_file\nArgs: {\"path\": \"y.rs\", \"content\": \"b\"}",
+            "Thought: write it\nJustification: needed to add the requested file\nTool: fs_write_file\nArgs: {\"path\": \"y.rs\", \"content\": \"b\"}",
             "All done.",
         ]);
         let mut cfg = Config::default();
@@ -1674,7 +1673,7 @@ mod tests {
     }
 
     /// Serve one native tool-call request (streamed `tool_calls`), then a final
-    /// text answer. When `gated` the tool call targets write_file without a
+    /// text answer. When `gated` the tool call targets fs_write_file without a
     /// justification.
     fn spawn_native_model() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1700,7 +1699,7 @@ mod tests {
                 }
                 let body = if n == 0 {
                     concat!(
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"Writing now.\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\": \\\"x.rs\\\", \\\"content\\\": \\\"a\\\"}\"}}]}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Writing now.\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"fs_write_file\",\"arguments\":\"{\\\"path\\\": \\\"x.rs\\\", \\\"content\\\": \\\"a\\\"}\"}}]}}]}\n\n",
                         "data: [DONE]\n\n"
                     )
                 } else {
@@ -2205,9 +2204,9 @@ mod loop_tests {
     #[test]
     fn identical_call_without_change_is_a_loop() {
         let mut t = LoopTracker::default();
-        let sig = "read_file {\"path\":\"a.rs\"}".to_string();
+        let sig = "fs_read_file {\"path\":\"a.rs\"}".to_string();
         assert_eq!(t.check(&sig), None);
-        t.record("read_file", sig.clone());
+        t.record("fs_read_file", sig.clone());
         // same call again, nothing changed -> refused (count 1, then 2)
         assert_eq!(t.check(&sig), Some(1));
         assert_eq!(t.check(&sig), Some(2));
@@ -2217,20 +2216,20 @@ mod loop_tests {
     #[test]
     fn repeat_after_a_mutation_is_allowed() {
         let mut t = LoopTracker::default();
-        let sig = "run_task {\"task\":\"test\"}".to_string();
-        t.record("run_task", sig.clone());
+        let sig = "pom_run_task {\"task\":\"test\"}".to_string();
+        t.record("pom_run_task", sig.clone());
         assert_eq!(t.check(&sig), Some(1));
 
         // a mutating call in between bumps the sequence; identical test re-run ok
-        t.record("apply_edit", "apply_edit {..}".to_string());
+        t.record("fs_edit", "fs_edit {..}".to_string());
         assert_eq!(t.check(&sig), None);
     }
 
     #[test]
     fn different_arguments_are_not_a_loop() {
         let mut t = LoopTracker::default();
-        t.record("read_file", "read_file a".to_string());
-        assert_eq!(t.check(&"read_file b".to_string()), None);
+        t.record("fs_read_file", "fs_read_file a".to_string());
+        assert_eq!(t.check(&"fs_read_file b".to_string()), None);
     }
 }
 
@@ -2241,11 +2240,11 @@ mod loop_tracker_tests {
     #[test]
     fn refusals_reset_after_different_action() {
         let mut t = LoopTracker::default();
-        let sig = "read_file a".to_string();
-        t.record("read_file", sig.clone());
+        let sig = "fs_read_file a".to_string();
+        t.record("fs_read_file", sig.clone());
         assert_eq!(t.check(&sig), Some(1));
         // model tries something else (still no mutation) -> counter resets
-        t.record("rgrep", "rgrep query".to_string());
+        t.record("fs_rgrep", "fs_rgrep query".to_string());
         assert_eq!(t.check(&sig), Some(1));
         assert_eq!(t.check(&sig), Some(2));
     }
@@ -2253,10 +2252,10 @@ mod loop_tracker_tests {
     #[test]
     fn refusals_reset_after_mutation() {
         let mut t = LoopTracker::default();
-        let sig = "run_task {\"task\":\"test\"}".to_string();
-        t.record("run_task", sig.clone());
+        let sig = "pom_run_task {\"task\":\"test\"}".to_string();
+        t.record("pom_run_task", sig.clone());
         assert_eq!(t.check(&sig), Some(1));
-        t.record("apply_edit", "apply_edit {..}".to_string());
+        t.record("fs_edit", "fs_edit {..}".to_string());
         assert_eq!(t.check(&sig), None); // legit re-run after an edit
     }
 
@@ -2264,7 +2263,7 @@ mod loop_tracker_tests {
     fn stuck_ends_gracefully() {
         let mut t = LoopTracker::default();
         assert!(t.stuck_reason().is_none());
-        t.mark_stuck("run_tests {..}");
+        t.mark_stuck("pom_run_tests {..}");
         assert!(t.stuck_reason().unwrap().contains("Stopped"));
     }
 }
@@ -2278,13 +2277,13 @@ mod read_guard_tests {
         let mut reads = 0usize;
         for _ in 0..READ_GUARD_THRESHOLD {
             assert!(
-                allow_read_step("read_file", &mut reads),
+                allow_read_step("fs_read_file", &mut reads),
                 "reads should be allowed until threshold"
             );
         }
         assert_eq!(reads, READ_GUARD_THRESHOLD);
         // the next read is refused (and does not bump the counter)
-        assert!(!allow_read_step("read_file", &mut reads));
+        assert!(!allow_read_step("fs_read_file", &mut reads));
         assert_eq!(reads, READ_GUARD_THRESHOLD);
     }
 
@@ -2292,14 +2291,14 @@ mod read_guard_tests {
     fn any_state_change_resets_the_counter() {
         let mut reads = 0usize;
         for _ in 0..READ_GUARD_THRESHOLD {
-            assert!(allow_read_step("rgrep", &mut reads));
+            assert!(allow_read_step("fs_rgrep", &mut reads));
         }
-        assert!(!allow_read_step("rgrep", &mut reads));
+        assert!(!allow_read_step("fs_rgrep", &mut reads));
 
         // an action (write/edit/plan) resets the read counter
-        assert!(allow_read_step("apply_edit", &mut reads));
+        assert!(allow_read_step("fs_edit", &mut reads));
         assert_eq!(reads, 0);
-        assert!(allow_read_step("rgrep", &mut reads));
+        assert!(allow_read_step("fs_rgrep", &mut reads));
         assert_eq!(reads, 1);
     }
 }
@@ -2313,10 +2312,13 @@ mod monitors_tests {
         assert!(failure_hint("shell", "user denied request").is_empty());
         let t = failure_hint("shell", "the command timed out after 300s and was killed");
         assert!(t.contains("timed out"), "{t}");
-        let c = failure_hint("run_task", "error[E0308]: mismatched types\n --> src/a.rs");
+        let c = failure_hint(
+            "pom_run_task",
+            "error[E0308]: mismatched types\n --> src/a.rs",
+        );
         assert!(c.contains("compile"), "{c}");
         let f = failure_hint(
-            "run_tests",
+            "pom_run_tests",
             "test result: FAILED. 1 failed\npanicked at src/lib.rs",
         );
         assert!(f.contains("tests failed"), "{f}");
@@ -2328,28 +2330,28 @@ mod monitors_tests {
     fn verify_state_tracks_change_and_green_tests() {
         let mut v = true;
         // a code edit invalidates verification
-        update_verify_state("apply_edit", true, "Edited src/a.rs.", &mut v);
+        update_verify_state("fs_edit", true, "Edited src/a.rs.", &mut v);
         assert!(!v);
         // a red test run does not re-verify
         update_verify_state(
-            "run_tests",
+            "pom_run_tests",
             true,
             "test result: FAILED. 0 passed; 1 failed",
             &mut v,
         );
         assert!(!v);
         // a green run does
-        update_verify_state("run_tests", true, "test result: ok. 4 passed", &mut v);
+        update_verify_state("pom_run_tests", true, "test result: ok. 4 passed", &mut v);
         assert!(v);
         // another edit invalidates again
-        update_verify_state("write_file", true, "Wrote src/b.rs.", &mut v);
+        update_verify_state("fs_write_file", true, "Wrote src/b.rs.", &mut v);
         assert!(!v);
     }
 
     #[test]
     fn verify_guard_message_is_actionable() {
         let m = verify_guard_message();
-        assert!(m.contains("run_tests"));
+        assert!(m.contains("pom_run_tests"));
         assert!(m.contains("git_commit"));
     }
 }

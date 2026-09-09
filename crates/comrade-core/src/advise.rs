@@ -641,14 +641,14 @@ mod tests {
         // Exactly the main loop's read-only classification: advisors may browse
         // but must never be able to change the workspace or session.
         for name in [
-            "read_file",
-            "read_ranges",
-            "rgrep",
-            "list_dir",
+            "fs_read_file",
+            "fs_read_ranges",
+            "fs_rgrep",
+            "fs_list_dir",
             "git_diff",
             "git_log",
-            "project_model",
-            "find_decisions",
+            "pom_model",
+            "find_adr",
             "web_search",
         ] {
             assert!(
@@ -657,20 +657,19 @@ mod tests {
             );
         }
         for name in [
-            "write_file",
-            "apply_edit",
-            "apply_patch",
-            "rename",
+            "fs_write_file",
+            "fs_edit",
+            "ts_rename",
             "shell",
-            "run_task",
-            "run_tests",
-            "format_code",
+            "pom_run_task",
+            "pom_run_tests",
+            "pom_format_code",
             "git_commit",
-            "remember",
-            "amend_decision",
+            "record_adr",
+            "amend_adr",
             "ask_advise",
             "delegate",
-            "set_plan",
+            "self_set_plan",
         ] {
             assert!(
                 !AskAdviseTool::read_only_for_advice(name),

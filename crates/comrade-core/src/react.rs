@@ -663,9 +663,9 @@ mod dev_prompt_tests {
         assert!(prompt.contains("## Working style"), "{prompt}");
         assert!(prompt.contains("tech lead"), "{prompt}");
         assert!(prompt.contains("write real code and tests"), "{prompt}");
-        assert!(prompt.contains("run_tests"), "{prompt}");
+        assert!(prompt.contains("pom_run_tests"), "{prompt}");
         assert!(prompt.contains("git_commit"), "{prompt}");
-        assert!(prompt.contains("set_plan"), "{prompt}");
+        assert!(prompt.contains("self_set_plan"), "{prompt}");
         assert!(prompt.contains("Never claim work is done"), "{prompt}");
     }
 
@@ -679,22 +679,22 @@ mod dev_prompt_tests {
         assert!(prompt.contains("ADR"), "{prompt}");
         assert!(prompt.contains("glossary"), "{prompt}");
         // The default loop looks memory up BEFORE planning and clarifies via
-        // ask_question when a concept is unclear and not in the glossary.
+        // ask_user when a concept is unclear and not in the glossary.
         assert!(prompt.contains("read memory BEFORE planning"), "{prompt}");
         assert!(
             prompt.contains("ADRs relevant to the new functionality"),
             "{prompt}"
         );
-        assert!(prompt.contains("ask_question before you plan"), "{prompt}");
-        assert!(prompt.contains("find_decisions"), "{prompt}");
-        assert!(prompt.contains("read_decision"), "{prompt}");
+        assert!(prompt.contains("ask_user before you plan"), "{prompt}");
+        assert!(prompt.contains("find_adr"), "{prompt}");
+        assert!(prompt.contains("read_adr"), "{prompt}");
         assert!(prompt.contains("find_glossary"), "{prompt}");
         assert!(prompt.contains("read_glossary"), "{prompt}");
-        // remember is reserved for important long-term decisions; the "mini run
+        // record_adr is reserved for important long-term decisions; the "mini run
         // book" phrase exists only as ephemeral plan-step context guidance.
         assert!(prompt.contains("important decision"), "{prompt}");
         assert!(prompt.contains("long term"), "{prompt}");
-        assert!(prompt.contains("remember_glossary"), "{prompt}");
+        assert!(prompt.contains("record_glossary"), "{prompt}");
         assert!(prompt.contains("a mini run book"), "{prompt}");
         let memory_section = &prompt[prompt.find("## Memory").unwrap()..];
         assert!(!memory_section.contains("run book"), "{memory_section}");

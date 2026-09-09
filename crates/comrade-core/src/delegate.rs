@@ -5,18 +5,18 @@
 //! offload a well-defined piece of work to a developer model configured in
 //! `config.toml` under `[[delegates]]`. Unlike plain-chat sub-agents, a
 //! delegate runs a **real tool-using sub-agent loop**: it is handed the same
-//! repository tools (read/search/write/edit, run_tests/run_task, memory, web
+//! repository tools (read/search/write/edit, pom_run_tests/pom_run_task, memory, web
 //! search) so it can genuinely do the job — write the file, run the tests, fix
 //! failures — instead of returning text the parent must apply by hand.
 //!
 //! Two design points keep the parent in control:
 //! - The delegate's tool registry excludes `git_commit` (only the tech lead
-//!   commits), the session/UI tools (`set_plan`, `update_plan`,
-//!   `set_step_model`, `finish_plan`, `rename_session`, `set_status_bar`,
-//!   `ask_question`) and `delegate` itself (no recursion). See
-//!   [`DENIED_FOR_DELEGATES`].
+//!   commits), the session/UI tools (`self_set_plan`, `self_update_plan`,
+//!   `self_set_step_model`, `self_finish_plan`, `self_rename_session`,
+//!   `self_set_status_bar`, `ask_user`) and `delegate` itself (no recursion).
+//!   See [`DENIED_FOR_DELEGATES`].
 //! - The delegate tool call is not approval-gated by default: delegating runs
-//!   directly (like `git_commit`/`run_task`/`run_tests`), and every nested tool
+//!   directly (like `git_commit`/`pom_run_task`/`pom_run_tests`), and every nested tool
 //!   call the delegate makes runs auto-approved (its context has `auto_approve`
 //!   set), so a delegate works end-to-end without pausing for a human.
 //!   EXCEPTION: a delegate whose `[[delegates]]` entry sets
@@ -43,23 +43,23 @@ pub const TOOL_NAME: &str = "delegate";
 /// Tools a delegate must never see, by spec name. Only the tech lead commits,
 /// plans, renames the session or asks the human; `delegate` is excluded so a
 /// delegate cannot recurse, `ask_advise` is excluded so a delegate cannot spawn
-/// extra model chats of its own, and `set_step_model` is excluded so a delegate
-/// cannot reassign its own (or any) plan step while working. Everything else
-/// in the main registry — including the mutating tools (write_file,
-/// apply_edit/apply_patch, shell, run_task, remember, amend_decision) — is fair
+/// extra model chats of its own, and `self_set_step_model` is excluded so a
+/// delegate cannot reassign its own (or any) plan step while working. Everything
+/// else in the main registry — including the mutating tools (fs_write_file,
+/// fs_edit, shell, pom_run_task, record_adr, amend_adr) — is fair
 /// game because the delegate runs auto-approved under a one-shot human handoff.
 pub const DENIED_FOR_DELEGATES: &[&str] = &[
     "git_commit",
     "delegate",
     "ask_advise",
-    "ask_question",
-    "rename_session",
-    "set_status_bar",
-    "set_plan",
-    "update_plan",
-    "set_step_model",
-    "set_step_context",
-    "finish_plan",
+    "ask_user",
+    "self_rename_session",
+    "self_set_status_bar",
+    "self_set_plan",
+    "self_update_plan",
+    "self_set_step_model",
+    "self_set_step_context",
+    "self_finish_plan",
 ];
 
 /// A delegated plan step gets one attempt from the delegate; if the parent's
@@ -245,7 +245,7 @@ impl DelegateTool {
             .join("\n");
         let body = [
             "Hand ONE self-contained task to another model - a delegate sub-agent WITH tools",
-            "(read/search, write_file, run_tests, memory, web) minus git_commit; only you commit.",
+            "(read/search, fs_write_file, pom_run_tests, memory, web) minus git_commit; only you commit.",
             "",
             "Delegating runs without human approval. A delegate configured `approval = \"ask\"`",
             "pauses for approval first; `approval = \"deny\"` refuses it.",
@@ -1265,11 +1265,11 @@ mod tests {
             if native {
                 // native mode: the tool schemas carry the descriptions, so the
                 // listing is names only to keep the prompt small
-                assert!(prompt.contains("- write_file\n"), "{prompt}");
-                assert!(!prompt.contains("stub write_file"), "{prompt}");
+                assert!(prompt.contains("- fs_write_file\n"), "{prompt}");
+                assert!(!prompt.contains("stub fs_write_file"), "{prompt}");
             } else {
                 assert!(
-                    prompt.contains("- write_file — stub write_file"),
+                    prompt.contains("- fs_write_file — stub fs_write_file"),
                     "{prompt}"
                 );
             }
@@ -1696,30 +1696,29 @@ mod tests {
     fn deny_list_keeps_commit_and_session_tools_away_but_not_work_tools() {
         assert!(DelegateTool::denied_for_delegates("git_commit"));
         assert!(DelegateTool::denied_for_delegates("delegate"));
-        assert!(DelegateTool::denied_for_delegates("ask_question"));
-        assert!(DelegateTool::denied_for_delegates("set_plan"));
-        assert!(DelegateTool::denied_for_delegates("update_plan"));
-        assert!(DelegateTool::denied_for_delegates("set_step_model"));
-        assert!(DelegateTool::denied_for_delegates("finish_plan"));
-        assert!(DelegateTool::denied_for_delegates("rename_session"));
-        assert!(DelegateTool::denied_for_delegates("set_status_bar"));
+        assert!(DelegateTool::denied_for_delegates("ask_user"));
+        assert!(DelegateTool::denied_for_delegates("self_set_plan"));
+        assert!(DelegateTool::denied_for_delegates("self_update_plan"));
+        assert!(DelegateTool::denied_for_delegates("self_set_step_model"));
+        assert!(DelegateTool::denied_for_delegates("self_finish_plan"));
+        assert!(DelegateTool::denied_for_delegates("self_rename_session"));
+        assert!(DelegateTool::denied_for_delegates("self_set_status_bar"));
         // The delegate must keep every tool that does the actual work...
         for name in [
-            "write_file",
-            "apply_edit",
-            "apply_patch",
+            "fs_write_file",
+            "fs_edit",
             "shell",
-            "run_task",
-            "run_tests",
-            "remember",
-            "amend_decision",
-            "find_decisions",
-            "remember_glossary",
+            "pom_run_task",
+            "pom_run_tests",
+            "record_adr",
+            "amend_adr",
+            "find_adr",
+            "record_glossary",
             "find_glossary",
             "read_glossary",
-            "read_file",
-            "rgrep",
-            "list_symbols",
+            "fs_read_file",
+            "fs_rgrep",
+            "ts_list_symbols",
             "git_status",
             "web_search",
         ] {
@@ -1728,7 +1727,7 @@ mod tests {
     }
 
     /// A recording stub tool standing in for a real repository tool (e.g.
-    /// write_file). Lets tests prove the delegate sub-agent actually dispatched
+    /// fs_write_file). Lets tests prove the delegate sub-agent actually dispatched
     /// a tool call without touching the real filesystem.
     struct StubTool {
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -1742,13 +1741,13 @@ mod tests {
 
         async fn invoke(&self, _ctx: &ToolContext, _args: Value) -> Result<String> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("stub write_file executed".to_string())
+            Ok("stub fs_write_file executed".to_string())
         }
     }
 
     static STUB_WRITE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| ToolSpec {
-        name: "write_file".into(),
-        description: "stub write_file".into(),
+        name: "fs_write_file".into(),
+        description: "stub fs_write_file".into(),
         json_schema: json!({
             "type": "object",
             "properties": {
@@ -1759,7 +1758,7 @@ mod tests {
         }),
     });
 
-    /// A recording stub that stands in for the read-only `read_file` tool (a
+    /// A recording stub that stands in for the read-only `fs_read_file` tool (a
     /// read is never a state change, so it feeds the delegate read guard).
     struct ReadStubTool {
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -1773,13 +1772,13 @@ mod tests {
 
         async fn invoke(&self, _ctx: &ToolContext, _args: Value) -> Result<String> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("stub read_file executed".to_string())
+            Ok("stub fs_read_file executed".to_string())
         }
     }
 
     static STUB_READ_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| ToolSpec {
-        name: "read_file".into(),
-        description: "stub read_file".into(),
+        name: "fs_read_file".into(),
+        description: "stub fs_read_file".into(),
         json_schema: json!({
             "type": "object",
             "properties": { "path": { "type": "string" } },
@@ -1820,7 +1819,7 @@ mod tests {
         format!("http://127.0.0.1:{port}/v1")
     }
 
-    /// Build a delegate whose registry contains one recording stub `write_file`
+    /// Build a delegate whose registry contains one recording stub `fs_write_file`
     /// tool, and a scripted model that first calls it natively then answers.
     #[tokio::test]
     async fn delegate_executes_its_tools_in_a_subagent_loop() {
@@ -1837,7 +1836,7 @@ mod tests {
                     "tool_calls": [{
                         "id": "call_1",
                         "function": {
-                            "name": "write_file",
+                            "name": "fs_write_file",
                             "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
                         }
                     }]
@@ -1865,7 +1864,7 @@ mod tests {
         assert_eq!(
             write_calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "delegate must have run its write_file tool once"
+            "delegate must have run its fs_write_file tool once"
         );
     }
 
@@ -1887,7 +1886,7 @@ mod tests {
                     "tool_calls": [{
                         "id": "call_1",
                         "function": {
-                            "name": "write_file",
+                            "name": "fs_write_file",
                             "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
                         }
                     }]
@@ -1927,14 +1926,14 @@ mod tests {
                 crate::session::AgentEvent::DelegateToolCall { model, name, .. } => {
                     seen_call = true;
                     assert_eq!(model, "cheap");
-                    assert_eq!(name, "write_file");
+                    assert_eq!(name, "fs_write_file");
                 }
                 crate::session::AgentEvent::DelegateToolResult {
                     model, name, ok, ..
                 } => {
                     seen_result = true;
                     assert_eq!(model, "cheap");
-                    assert_eq!(name, "write_file");
+                    assert_eq!(name, "fs_write_file");
                     assert!(ok);
                 }
                 _ => {}
@@ -1944,7 +1943,7 @@ mod tests {
         assert!(seen_result, "expected a DelegateToolResult event");
     }
 
-    /// A registry that contains exactly one recording stub `write_file` tool.
+    /// A registry that contains exactly one recording stub `fs_write_file` tool.
     fn write_stub_registry(calls: Arc<std::sync::atomic::AtomicUsize>) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(StubTool { calls }));
@@ -1967,7 +1966,7 @@ mod tests {
                     "tool_calls": [{
                         "id": "call_1",
                         "function": {
-                            "name": "write_file",
+                            "name": "fs_write_file",
                             "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
                         }
                     }]
@@ -1991,7 +1990,7 @@ mod tests {
             .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("repeated identical action"), "{text}");
-        assert!(text.contains("write_file"), "{text}");
+        assert!(text.contains("fs_write_file"), "{text}");
         assert_eq!(
             write_calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -2008,7 +2007,7 @@ mod tests {
         let registry = write_stub_registry(write_calls.clone());
 
         let call =
-            json!({"choices": [{"message": {"content": "Thought: retry the write\nTool: write_file\nArgs: {\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"}}]})
+            json!({"choices": [{"message": {"content": "Thought: retry the write\nTool: fs_write_file\nArgs: {\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"}}]})
                 .to_string();
         let base = scripted_server(vec![call.clone(), call.clone(), call.clone(), call]);
 
@@ -2050,7 +2049,7 @@ mod tests {
                     "tool_calls": [{
                         "id": "call_1",
                         "function": {
-                            "name": "write_file",
+                            "name": "fs_write_file",
                             "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
                         }
                     }]
@@ -2065,7 +2064,7 @@ mod tests {
                     "tool_calls": [{
                         "id": "call_2",
                         "function": {
-                            "name": "write_file",
+                            "name": "fs_write_file",
                             "arguments": "{\"path\":\"src/b.rs\",\"content\":\"pub fn b(){}\"}"
                         }
                     }]
@@ -2095,7 +2094,7 @@ mod tests {
         assert_eq!(
             write_calls.load(std::sync::atomic::Ordering::SeqCst),
             3,
-            "all three write_file calls were legitimate"
+            "all three fs_write_file calls were legitimate"
         );
     }
 
@@ -2155,18 +2154,18 @@ mod tests {
         let mut reads = 0usize;
         for i in 0..20 {
             assert!(
-                refuse_reading("read_file", &mut reads, DELEGATE_READ_NUDGE).is_none(),
+                refuse_reading("fs_read_file", &mut reads, DELEGATE_READ_NUDGE).is_none(),
                 "read #{i} should be allowed before the threshold"
             );
         }
         assert_eq!(reads, 20);
-        let msg = refuse_reading("read_file", &mut reads, DELEGATE_READ_NUDGE)
+        let msg = refuse_reading("fs_read_file", &mut reads, DELEGATE_READ_NUDGE)
             .expect("the 21st read is refused");
         assert!(msg.contains("20 reads"), "{msg}");
         assert!(msg.contains("implement now"), "{msg}");
         assert!(!msg.contains("update_plan"), "delegates cannot plan: {msg}");
         // The counter never grows past the threshold: further reads stay refused.
-        assert!(refuse_reading("read_file", &mut reads, DELEGATE_READ_NUDGE).is_some());
+        assert!(refuse_reading("fs_read_file", &mut reads, DELEGATE_READ_NUDGE).is_some());
         assert_eq!(reads, 20);
     }
 
@@ -2175,9 +2174,9 @@ mod tests {
     #[test]
     fn delegate_read_guard_resets_after_an_action() {
         let mut reads = 19usize; // one short of the threshold
-        assert!(refuse_reading("write_file", &mut reads, DELEGATE_READ_NUDGE).is_none());
+        assert!(refuse_reading("fs_write_file", &mut reads, DELEGATE_READ_NUDGE).is_none());
         assert_eq!(reads, 0, "a mutating call resets the read counter");
-        assert!(refuse_reading("read_ranges", &mut reads, DELEGATE_READ_NUDGE).is_none());
+        assert!(refuse_reading("fs_read_ranges", &mut reads, DELEGATE_READ_NUDGE).is_none());
         assert_eq!(reads, 1);
     }
 
@@ -2202,7 +2201,7 @@ mod tests {
                             "tool_calls": [{
                                 "id": format!("call_{i}"),
                                 "function": {
-                                    "name": "read_file",
+                                    "name": "fs_read_file",
                                     "arguments": json!({"path": format!("src/f{i}.rs")}).to_string()
                                 }
                             }]
@@ -2250,7 +2249,7 @@ mod tests {
         for i in 0..21 {
             turns.push(
                 json!({"choices": [{"message": {"content": format!(
-                    "Thought: still exploring\nTool: read_file\nArgs: {{\"path\":\"src/f{i}.rs\"}}"
+                    "Thought: still exploring\nTool: fs_read_file\nArgs: {{\"path\":\"src/f{i}.rs\"}}"
                 )}}]})
                 .to_string(),
             );
@@ -2344,7 +2343,7 @@ mod tests {
         }
     }
 
-    /// A write_file stub whose invocation signals `called` (a oneshot: safe to
+    /// A fs_write_file stub whose invocation signals `called` (a oneshot: safe to
     /// fire before the test awaits it) and then blocks on `release` (a Notify).
     /// Lets a test steer a running delegate at a deterministic moment: the stub
     /// is executing (so the sub-agent is mid-flight) when the steer is sent.
@@ -2368,12 +2367,12 @@ mod tests {
                 let _ = send.send(());
             }
             self.gate.release.notified().await;
-            Ok("stub write_file executed".to_string())
+            Ok("stub fs_write_file executed".to_string())
         }
     }
 
     /// A steering message typed while a DELEGATE owns the loop is delivered to
-    /// the delegate: sent while its write_file tool is still executing, it must
+    /// the delegate: sent while its fs_write_file tool is still executing, it must
     /// appear in the delegate's NEXT model request, and the run must then end
     /// normally.
     #[tokio::test]
@@ -2394,7 +2393,7 @@ mod tests {
                     "tool_calls": [{
                         "id": "call_1",
                         "function": {
-                            "name": "write_file",
+                            "name": "fs_write_file",
                             "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
                         }
                     }]
@@ -2435,7 +2434,7 @@ mod tests {
             "steer leaked into the first request"
         );
 
-        // The delegate is now executing write_file: steer it, then let the
+        // The delegate is now executing fs_write_file: steer it, then let the
         // tool finish so the loop reaches its next rest point.
         called_rx.await.unwrap();
         steer_tx.send(STEER.to_string()).unwrap();

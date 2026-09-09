@@ -136,7 +136,7 @@ struct TestFail {
     open: bool,
 }
 
-/// Structured summary of a `run_tests` invocation.
+/// Structured summary of a `pom_run_tests` invocation.
 #[derive(Default)]
 struct TestSummary {
     passed: usize,
@@ -1638,13 +1638,11 @@ impl App {
                 // This turn produced a tool call: keep whatever the model was
                 // saying before the call as a visible reasoning block, then
                 // show a compact card. Important cards (diffs, and
-                // run_tests/run_task results) open by default.
+                // pom_run_tests/pom_run_task results) open by default.
                 self.commit_stream_reasoning();
                 self.activity = Some(name.clone());
-                let open_default = matches!(
-                    name.as_str(),
-                    "apply_patch" | "apply_edit" | "run_tests" | "run_task"
-                );
+                let open_default =
+                    matches!(name.as_str(), "fs_edit" | "pom_run_tests" | "pom_run_task");
                 self.push_msg(Msg::tool(ToolCard {
                     name,
                     author: Some(self.actor_label()),
@@ -1664,7 +1662,7 @@ impl App {
                 self.activity = None;
                 if name == "delegate" || name == "ask_advise" {
                     self.on_delegate_result(&name, &output, ok);
-                } else if name == "run_tests" {
+                } else if name == "pom_run_tests" {
                     if output.contains("test result:") {
                         // Render a rich summary card + one collapsible block per
                         // failing test instead of a wall of text.
@@ -1676,7 +1674,7 @@ impl App {
                         } else {
                             format!(", {}", summary.duration)
                         };
-                        if let Some(card) = self.last_tool_mut("run_tests") {
+                        if let Some(card) = self.last_tool_mut("pom_run_tests") {
                             card.ok = fails == 0;
                             card.result =
                                 Some(format!("{passed} passed, {fails} failed{duration}"));
@@ -1687,7 +1685,7 @@ impl App {
                         if fails == 0 && passed > 0 {
                             self.push_meta(format!("all {passed} tests passed"));
                         }
-                    } else if let Some(card) = self.last_tool_mut("run_tests") {
+                    } else if let Some(card) = self.last_tool_mut("pom_run_tests") {
                         card.result = Some(output);
                         card.ok = ok;
                     }
@@ -1753,10 +1751,8 @@ impl App {
                 // what the delegate is doing while the main model is parked
                 // waiting on the hand-off.
                 self.activity = Some(name.clone());
-                let open_default = matches!(
-                    name.as_str(),
-                    "apply_patch" | "apply_edit" | "run_tests" | "run_task"
-                );
+                let open_default =
+                    matches!(name.as_str(), "fs_edit" | "pom_run_tests" | "pom_run_task");
                 self.push_msg(Msg::tool(ToolCard {
                     name,
                     author: Some(model),
@@ -1777,7 +1773,7 @@ impl App {
                 ok,
             } => {
                 self.activity = None;
-                if name == "run_tests" && output.contains("test result:") {
+                if name == "pom_run_tests" && output.contains("test result:") {
                     let summary = parse_test_summary(&output);
                     let fails = summary.failed;
                     let passed = summary.passed;
@@ -3058,9 +3054,9 @@ fn msg_matches(msg: &Msg, query: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// run_tests output parsing
+// pom_run_tests output parsing
 // ---------------------------------------------------------------------------
-/// Parse a `run_tests` summary: counts + duration + one (name, detail) per
+/// Parse a `pom_run_tests` summary: counts + duration + one (name, detail) per
 /// failing test (from `---- <name> stdout ----` sections).
 fn parse_test_summary(text: &str) -> TestSummary {
     let mut summary = TestSummary::default();
@@ -4029,19 +4025,17 @@ fn unfold_run(chat: &mut Vec<Msg>, idx: usize) {
 fn is_read_tool(name: &str) -> bool {
     matches!(
         name,
-        "read_file"
-            | "read_ranges"
-            | "list_dir"
-            | "list_files"
-            | "rgrep"
-            | "list_symbols"
-            | "find_symbol"
-            | "find_definition"
-            | "read_symbol"
-            | "structural_map"
-            | "references_count"
-            | "find_references"
-            | "project_model"
+        "fs_read_file"
+            | "fs_read_ranges"
+            | "fs_list_dir"
+            | "fs_list_files"
+            | "fs_rgrep"
+            | "ts_list_symbols"
+            | "ts_find_symbol"
+            | "ts_read_symbol"
+            | "ts_structural_map"
+            | "ts_find_references"
+            | "pom_model"
     )
 }
 
@@ -4123,17 +4117,18 @@ fn one_line(text: &str, max: usize) -> String {
 /// Icon + accent color per tool family, used as the card's leading glyph.
 fn tool_icon(name: &str) -> (&'static str, Color) {
     match name {
-        "apply_patch" | "apply_edit" => ("±", Color::Cyan),
-        "write_file" => ("✎", Color::Cyan),
-        "run_tests" => ("▶", Color::Yellow),
-        "run_task" => ("▸", Color::Yellow),
+        "fs_edit" => ("±", Color::Cyan),
+        "fs_write_file" => ("✎", Color::Cyan),
+        "pom_run_tests" => ("▶", Color::Yellow),
+        "pom_run_task" => ("▸", Color::Yellow),
         "shell" => ("$", Color::Green),
         "git_status" | "git_diff" | "git_show" | "git_log" | "git_commit" => ("↗", Color::Magenta),
         "delegate" | "ask_advise" => ("⇄", Color::Magenta),
-        "read_file" | "read_ranges" => ("≡", Color::Blue),
-        "list_dir" | "list_files" | "rgrep" | "list_symbols" | "find_symbol"
-        | "find_definition" | "read_symbol" | "structural_map" | "references_count"
-        | "find_references" | "project_model" => ("›", Color::DarkGray),
+        "fs_read_file" | "fs_read_ranges" => ("≡", Color::Blue),
+        "fs_list_dir" | "fs_list_files" | "fs_rgrep" | "ts_list_symbols" | "ts_find_symbol"
+        | "ts_read_symbol" | "ts_structural_map" | "ts_find_references" | "pom_model" => {
+            ("›", Color::DarkGray)
+        }
         _ => ("•", Color::Magenta),
     }
 }
@@ -4170,16 +4165,14 @@ fn tool_headline(name: &str, args: &str) -> Option<String> {
         None
     };
     match name {
-        "read_file" | "read_ranges" | "write_file" => pick(&["path", "file"]),
-        "list_dir" | "list_files" => pick(&["path", "dir", "glob"]),
-        "rgrep" => pick(&["pattern", "glob", "query"]),
-        "find_symbol" | "search_symbols" => pick(&["query", "symbol"]),
-        "find_definition" | "read_symbol" | "rename" | "find_references" | "references_count" => {
-            pick(&["symbol", "query"])
-        }
-        "structural_map" | "list_symbols" => pick(&["path", "kinds"]),
+        "fs_read_file" | "fs_read_ranges" | "fs_write_file" => pick(&["path", "file"]),
+        "fs_list_dir" | "fs_list_files" => pick(&["path", "dir", "glob"]),
+        "fs_rgrep" => pick(&["pattern", "glob", "query"]),
+        "ts_find_symbol" | "search_symbols" => pick(&["query", "symbol"]),
+        "ts_read_symbol" | "ts_rename" | "ts_find_references" => pick(&["symbol", "query"]),
+        "ts_structural_map" | "ts_list_symbols" => pick(&["path", "kinds"]),
         "web_search" => pick(&["query"]),
-        "run_task" | "run_tests" => pick(&["task", "command"]),
+        "pom_run_task" | "pom_run_tests" => pick(&["task", "command"]),
         "shell" => pick(&["command", "dir"]),
         "delegate" | "ask_advise" => {
             // Which delegate is engaged (ad-hoc), or which plan step (step);
@@ -7026,9 +7019,10 @@ fn hunk_token(text: &str) -> Option<String> {
 }
 
 /// Header label for an edit tool's diff rows: the edited file plus the hunk
-/// line numbers. For `apply_edit` the numbers come from the tool result (which
-/// now reports `(@@ -a,b +c,d @@)`); for `apply_patch` they are parsed from its
-/// own `@@` header. Falls back to plain `diff:` when nothing is derivable.
+/// line numbers. For `fs_edit` literal mode the numbers come from the tool
+/// result (which reports `(@@ -a,b +c,d @@)`); for `fs_edit` patch mode they
+/// are parsed from its own `@@` header. Falls back to plain `diff:` when
+/// nothing is derivable.
 fn edit_diff_label(name: &str, args_json: &str, result: Option<&str>) -> String {
     let value: Option<serde_json::Value> = serde_json::from_str(args_json).ok();
     let pick_path = |keys: &[&str]| -> Option<String> {
@@ -7043,8 +7037,7 @@ fn edit_diff_label(name: &str, args_json: &str, result: Option<&str>) -> String 
         None
     };
     let (rel, hunk) = match name {
-        "apply_edit" => (pick_path(&["path", "file"]), result.and_then(hunk_token)),
-        "apply_patch" => {
+        "fs_edit" if value.as_ref().and_then(|v| v.get("diff")).is_some() => {
             let diff = value
                 .as_ref()
                 .and_then(|v| v.get("diff"))
@@ -7069,6 +7062,7 @@ fn edit_diff_label(name: &str, args_json: &str, result: Option<&str>) -> String 
                 },
             )
         }
+        "fs_edit" => (pick_path(&["path", "file"]), result.and_then(hunk_token)),
         _ => (None, None),
     };
     match (rel, hunk) {
@@ -7086,7 +7080,7 @@ fn extract_diff_sides(name: &str, args_json: &str) -> Option<(Vec<String>, Vec<S
     let mut removed = Vec::new();
     let mut added = Vec::new();
     match name {
-        "apply_patch" => {
+        "fs_edit" if value.get("diff").is_some() => {
             let diff = value.get("diff")?.as_str()?;
             for line in diff.lines() {
                 if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
@@ -7098,7 +7092,7 @@ fn extract_diff_sides(name: &str, args_json: &str) -> Option<(Vec<String>, Vec<S
                 }
             }
         }
-        "apply_edit" => {
+        "fs_edit" => {
             let old = value.get("old")?.as_str()?;
             let new = value.get("new")?.as_str()?;
             removed.extend(old.lines().map(str::to_string));
@@ -7360,38 +7354,35 @@ mod diff_tests {
     use super::*;
 
     #[test]
-    fn apply_patch_extracts_sides() {
+    fn fs_edit_patch_mode_extracts_sides() {
         let diff = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}\n";
         let args = serde_json::json!({ "diff": diff }).to_string();
-        let (old, new) = extract_diff_sides("apply_patch", &args).unwrap();
+        let (old, new) = extract_diff_sides("fs_edit", &args).unwrap();
         assert_eq!(old, vec!["fn old() {}"]);
         assert_eq!(new, vec!["fn new() {}"]);
     }
 
     #[test]
     fn edit_diff_label_shows_file_and_hunk_numbers() {
-        // apply_patch: file + @@ come from its own diff text.
+        // fs_edit patch mode: file + @@ come from its own diff text.
         let diff = "--- a/a.rs\n+++ b/a.rs\n@@ -1,3 +1,3 @@\n-fn old() {}\n+fn new() {}\n";
         let args = serde_json::json!({ "diff": diff }).to_string();
         assert_eq!(
-            edit_diff_label("apply_patch", &args, None),
+            edit_diff_label("fs_edit", &args, None),
             "diff  a.rs  @@ -1,3 +1,3 @@"
         );
-        // apply_edit: file from args, numbers from the tool result token.
+        // fs_edit literal mode: file from args, numbers from the tool result token.
         let args = serde_json::json!({ "path": "src/lib.rs", "old": "a", "new": "b" }).to_string();
         assert_eq!(
             edit_diff_label(
-                "apply_edit",
+                "fs_edit",
                 &args,
                 Some("Edited src/lib.rs: replaced 1 exact block (@@ -12,2 +12,3 @@).")
             ),
             "diff  src/lib.rs  @@ -12,2 +12,3 @@"
         );
         // No result yet: file only.
-        assert_eq!(
-            edit_diff_label("apply_edit", &args, None),
-            "diff  src/lib.rs"
-        );
+        assert_eq!(edit_diff_label("fs_edit", &args, None), "diff  src/lib.rs");
         // Nothing derivable falls back to the plain label.
         assert_eq!(edit_diff_label("rgrep", "{}", None), "diff:");
     }
@@ -7403,7 +7394,7 @@ mod diff_tests {
     }
 
     #[test]
-    fn apply_edit_uses_old_new() {
+    fn fs_edit_literal_mode_uses_old_new() {
         let old = "a\nb\n";
         let new = "a\nc\n";
         let args = format!(
@@ -7411,7 +7402,7 @@ mod diff_tests {
             serde_json::to_string(old).unwrap(),
             serde_json::to_string(new).unwrap()
         );
-        let (removed, added) = extract_diff_sides("apply_edit", &args).unwrap();
+        let (removed, added) = extract_diff_sides("fs_edit", &args).unwrap();
         assert_eq!(removed, vec!["a", "b"]);
         assert_eq!(added, vec!["a", "c"]);
     }

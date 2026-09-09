@@ -37,26 +37,26 @@ fn is_open(status: &PlanStatus) -> bool {
 /// All session-control tools.
 pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(RenameSession),
-        Box::new(SetPlan),
-        Box::new(UpdatePlan),
-        Box::new(SetStepModel),
-        Box::new(SetStepContext),
-        Box::new(FinishPlan),
-        Box::new(SetStatusBar),
-        Box::new(AskQuestion),
+        Box::new(SelfRenameSession),
+        Box::new(SelfSetPlan),
+        Box::new(SelfUpdatePlan),
+        Box::new(SelfSetStepModel),
+        Box::new(SelfSetStepContext),
+        Box::new(SelfFinishPlan),
+        Box::new(SelfSetStatusBar),
+        Box::new(AskUser),
     ]
 }
 
 // ---------------------------------------------------------------------------
-// rename_session
+// self_rename_session
 // ---------------------------------------------------------------------------
 
-struct RenameSession;
+struct SelfRenameSession;
 
-static RENAME_SESSION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static SELF_RENAME_SESSION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "rename_session".into(),
+    name: "self_rename_session".into(),
     description: "Change the display title of the current session. Call early to give the task a short, descriptive name.".into(),
     json_schema: json!({
         "type": "object",
@@ -70,9 +70,9 @@ static RENAME_SESSION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for RenameSession {
+impl Tool for SelfRenameSession {
     fn spec(&self) -> &ToolSpec {
-        &RENAME_SESSION_SPEC
+        &SELF_RENAME_SESSION_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -87,15 +87,15 @@ impl Tool for RenameSession {
 }
 
 // ---------------------------------------------------------------------------
-// set_plan
+// self_set_plan
 // ---------------------------------------------------------------------------
 
-struct SetPlan;
+struct SelfSetPlan;
 
-static SET_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static SELF_SET_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "set_plan".into(),
-    description: "Lay out the plan before doing work. Each step: a goal, a verification (how to prove it worked) and the `model` that runs it ('self' or a delegate). Replaces any existing plan; advance steps with update_plan.".into(),
+    name: "self_set_plan".into(),
+    description: "Lay out the plan before doing work. Each step: a goal, a verification (how to prove it worked) and the `model` that runs it ('self' or a delegate). Replaces any existing plan; advance steps with self_update_plan.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -123,9 +123,9 @@ static SET_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for SetPlan {
+impl Tool for SelfSetPlan {
     fn spec(&self) -> &ToolSpec {
-        &SET_PLAN_SPEC
+        &SELF_SET_PLAN_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -178,14 +178,14 @@ impl Tool for SetPlan {
 }
 
 // ---------------------------------------------------------------------------
-// update_plan
+// self_update_plan
 // ---------------------------------------------------------------------------
 
-struct UpdatePlan;
+struct SelfUpdatePlan;
 
-static UPDATE_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static SELF_UPDATE_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "update_plan".into(),
+    name: "self_update_plan".into(),
     description: "Update one plan step's status (pending/ready/in_progress/done/blocked). Identify the step by its 1-based `index` (preferred) or by `text` in its goal.".into(),
     json_schema: json!({
         "type": "object",
@@ -206,9 +206,9 @@ static UPDATE_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for UpdatePlan {
+impl Tool for SelfUpdatePlan {
     fn spec(&self) -> &ToolSpec {
-        &UPDATE_PLAN_SPEC
+        &SELF_UPDATE_PLAN_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -229,7 +229,9 @@ impl Tool for UpdatePlan {
         let target = match (args.index, args.text.as_deref()) {
             (Some(i), _) if i >= 1 => PlanTarget::Id(i),
             (None, Some(t)) if !t.is_empty() => PlanTarget::Text(t.to_string()),
-            _ => anyhow::bail!("update_plan requires either a 1-based `index` or non-empty `text`"),
+            _ => anyhow::bail!(
+                "self_update_plan requires either a 1-based `index` or non-empty `text`"
+            ),
         };
 
         // A step assigned to a delegate model can only be completed once the
@@ -249,7 +251,7 @@ impl Tool for UpdatePlan {
                          has never run it — the tech lead cannot complete a delegated step \
                          itself. Run the step with the delegate tool (pass `step` = {}), verify \
                          the result, then mark it done. To do the step yourself instead, replace \
-                         the plan with `set_plan` naming your own model ({AGENT_MODEL:?}).",
+                         the plan with `self_set_plan` naming your own model ({AGENT_MODEL:?}).",
                         step.id,
                         step.model.trim(),
                         step.id
@@ -273,14 +275,14 @@ impl Tool for UpdatePlan {
 }
 
 // ---------------------------------------------------------------------------
-// set_step_model
+// self_set_step_model
 // ---------------------------------------------------------------------------
 
-struct SetStepModel;
+struct SelfSetStepModel;
 
-static SET_STEP_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static SELF_SET_STEP_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "set_step_model".into(),
+    name: "self_set_step_model".into(),
     description: "Change which model runs a plan step: 'self' for you, or a delegate name. Refused while the step is in_progress or done; only pending, ready or blocked steps can be reassigned.".into(),
     json_schema: json!({
         "type": "object",
@@ -300,9 +302,9 @@ static SET_STEP_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for SetStepModel {
+impl Tool for SelfSetStepModel {
     fn spec(&self) -> &ToolSpec {
-        &SET_STEP_MODEL_SPEC
+        &SELF_SET_STEP_MODEL_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -317,7 +319,7 @@ impl Tool for SetStepModel {
         let args: Args = serde_json::from_value(args)?;
         if args.model.trim().is_empty() {
             anyhow::bail!(
-                "set_step_model needs the `model` that will now run the step: {AGENT_MODEL:?} \
+                "self_set_step_model needs the `model` that will now run the step: {AGENT_MODEL:?} \
                  (\"self\") for yourself, or one of the delegate names listed by the `delegate` tool"
             );
         }
@@ -325,7 +327,7 @@ impl Tool for SetStepModel {
             (Some(i), _) if i >= 1 => PlanTarget::Id(i),
             (None, Some(t)) if !t.is_empty() => PlanTarget::Text(t.to_string()),
             _ => anyhow::bail!(
-                "set_step_model requires either a 1-based `index` or non-empty `text`"
+                "self_set_step_model requires either a 1-based `index` or non-empty `text`"
             ),
         };
         let model = args.model.trim().to_string();
@@ -377,14 +379,14 @@ impl Tool for SetStepModel {
 }
 
 // ---------------------------------------------------------------------------
-// set_step_context
+// self_set_step_context
 // ---------------------------------------------------------------------------
 
-struct SetStepContext;
+struct SelfSetStepContext;
 
-static SET_STEP_CONTEXT_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static SELF_SET_STEP_CONTEXT_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "set_step_context".into(),
+    name: "self_set_step_context".into(),
     description: "Replace one plan step's context - the instructions its executing delegate receives (never shown in the UI). Refused while in_progress or done; resets a `ready` step to pending.".into(),
     json_schema: json!({
         "type": "object",
@@ -404,9 +406,9 @@ static SET_STEP_CONTEXT_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for SetStepContext {
+impl Tool for SelfSetStepContext {
     fn spec(&self) -> &ToolSpec {
-        &SET_STEP_CONTEXT_SPEC
+        &SELF_SET_STEP_CONTEXT_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -423,7 +425,7 @@ impl Tool for SetStepContext {
             (Some(i), _) if i >= 1 => PlanTarget::Id(i),
             (None, Some(t)) if !t.is_empty() => PlanTarget::Text(t.to_string()),
             _ => anyhow::bail!(
-                "set_step_context requires either a 1-based `index` or non-empty `text`"
+                "self_set_step_context requires either a 1-based `index` or non-empty `text`"
             ),
         };
 
@@ -450,14 +452,14 @@ impl Tool for SetStepContext {
 }
 
 // ---------------------------------------------------------------------------
-// finish_plan
+// self_finish_plan
 // ---------------------------------------------------------------------------
 
-struct FinishPlan;
+struct SelfFinishPlan;
 
-static FINISH_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static SELF_FINISH_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "finish_plan".into(),
+    name: "self_finish_plan".into(),
     description: "Mark the whole plan as finished, optionally with a closing summary. Use when the task is complete. Refuses while any delegate-assigned step has not been run by the delegate tool.".into(),
     json_schema: json!({
         "type": "object",
@@ -470,9 +472,9 @@ static FINISH_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for FinishPlan {
+impl Tool for SelfFinishPlan {
     fn spec(&self) -> &ToolSpec {
-        &FINISH_PLAN_SPEC
+        &SELF_FINISH_PLAN_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -501,7 +503,7 @@ impl Tool for FinishPlan {
             anyhow::bail!(
                 "cannot finish the plan: {} still assigned to a delegate but never run by the \
                  `delegate` tool: {}. Delegate each step (delegate tool with `step` = <id>), \
-                 verify the result, or replace the plan with `set_plan` naming your own model \
+                 verify the result, or replace the plan with `self_set_plan` naming your own model \
                  ({AGENT_MODEL:?}) and do those steps yourself.",
                 stuck.len(),
                 stuck.join(", ")
@@ -514,14 +516,14 @@ impl Tool for FinishPlan {
 }
 
 // ---------------------------------------------------------------------------
-// set_status_bar
+// self_set_status_bar
 // ---------------------------------------------------------------------------
 
-struct SetStatusBar;
+struct SelfSetStatusBar;
 
-static SET_STATUS_BAR_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static SELF_SET_STATUS_BAR_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "set_status_bar".into(),
+    name: "self_set_status_bar".into(),
     description: "Set the freeform text shown in the UI status bar (e.g. the active git branch or current focus).".into(),
     json_schema: json!({
         "type": "object",
@@ -535,9 +537,9 @@ static SET_STATUS_BAR_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for SetStatusBar {
+impl Tool for SelfSetStatusBar {
     fn spec(&self) -> &ToolSpec {
-        &SET_STATUS_BAR_SPEC
+        &SELF_SET_STATUS_BAR_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -552,14 +554,14 @@ impl Tool for SetStatusBar {
 }
 
 // ---------------------------------------------------------------------------
-// ask_question
+// ask_user
 // ---------------------------------------------------------------------------
 
-struct AskQuestion;
+struct AskUser;
 
-static ASK_QUESTION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static ASK_USER_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "ask_question".into(),
+    name: "ask_user".into(),
     description: "Ask the human a question and wait for their answer. Use to resolve ambiguity, request confirmation, or let them pick between options. Prefer over guessing when a choice materially matters.".into(),
     json_schema: json!({
         "type": "object",
@@ -578,9 +580,9 @@ static ASK_QUESTION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for AskQuestion {
+impl Tool for AskUser {
     fn spec(&self) -> &ToolSpec {
-        &ASK_QUESTION_SPEC
+        &ASK_USER_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -617,7 +619,9 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{FinishPlan, SetPlan, SetStepContext, SetStepModel, UpdatePlan};
+    use super::{
+        SelfFinishPlan, SelfSetPlan, SelfSetStepContext, SelfSetStepModel, SelfUpdatePlan,
+    };
 
     /// A real-enough session: stores the plan and which steps the `delegate`
     /// tool has run, exactly like `AgentSession` does.
@@ -818,7 +822,7 @@ mod tests {
     #[tokio::test]
     async fn cannot_mark_delegated_step_done_before_delegate_ran() {
         let c = ctx(StubSession::with_plan(vec![delegated_step()]));
-        let err = UpdatePlan
+        let err = SelfUpdatePlan
             .invoke(&c, json!({"index": 1, "status": "done"}))
             .await
             .unwrap_err();
@@ -830,7 +834,7 @@ mod tests {
     async fn can_mark_delegated_step_done_after_delegate_ran() {
         let c = ctx(StubSession::with_plan(vec![delegated_step()]));
         c.session.mark_step_delegated(1);
-        let out = UpdatePlan
+        let out = SelfUpdatePlan
             .invoke(&c, json!({"index": 1, "status": "done"}))
             .await
             .unwrap();
@@ -843,7 +847,7 @@ mod tests {
         // A step the main model runs itself ("self") is the lead's own work:
         // it can be marked done without any `delegate` run.
         let c = ctx(StubSession::with_plan(vec![plain_step()]));
-        UpdatePlan
+        SelfUpdatePlan
             .invoke(&c, json!({"index": 1, "status": "done"}))
             .await
             .unwrap();
@@ -853,14 +857,14 @@ mod tests {
     #[tokio::test]
     async fn finish_plan_allows_open_self_steps() {
         let c = ctx(StubSession::with_plan(vec![plain_step()]));
-        FinishPlan.invoke(&c, json!({})).await.unwrap();
+        SelfFinishPlan.invoke(&c, json!({})).await.unwrap();
         assert_eq!(c.session.plan()[0].status, PlanStatus::Done);
     }
 
     #[tokio::test]
     async fn set_plan_requires_a_model_per_step() {
         let c = ctx(StubSession::with_plan(vec![]));
-        let err = SetPlan
+        let err = SelfSetPlan
             .invoke(
                 &c,
                 json!({ "steps": [{ "goal": "do a thing", "verification": "x", "model": "  " }] }),
@@ -874,7 +878,7 @@ mod tests {
     #[tokio::test]
     async fn set_plan_accepts_self_and_delegate_models() {
         let c = ctx(StubSession::with_plan(vec![]));
-        let out = SetPlan
+        let out = SelfSetPlan
             .invoke(
                 &c,
                 json!({ "steps": [
@@ -890,7 +894,7 @@ mod tests {
     #[tokio::test]
     async fn finish_plan_refuses_open_never_delegated_steps() {
         let c = ctx(StubSession::with_plan(vec![delegated_step(), plain_step()]));
-        let err = FinishPlan.invoke(&c, json!({})).await.unwrap_err();
+        let err = SelfFinishPlan.invoke(&c, json!({})).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("step 1"), "{msg}");
         assert_eq!(c.session.plan()[0].status, PlanStatus::Pending);
@@ -900,14 +904,14 @@ mod tests {
     async fn finish_plan_allows_delegated_steps_that_ran() {
         let c = ctx(StubSession::with_plan(vec![delegated_step()]));
         c.session.mark_step_delegated(1);
-        FinishPlan.invoke(&c, json!({})).await.unwrap();
+        SelfFinishPlan.invoke(&c, json!({})).await.unwrap();
         assert_eq!(c.session.plan()[0].status, PlanStatus::Done);
     }
 
     #[tokio::test]
     async fn set_step_model_reassigns_a_pending_self_step_to_a_delegate() {
         let c = ctx(StubSession::with_plan(vec![plain_step()]));
-        let out = SetStepModel
+        let out = SelfSetStepModel
             .invoke(&c, json!({ "index": 1, "model": "cheap" }))
             .await
             .unwrap();
@@ -922,7 +926,7 @@ mod tests {
         let c = ctx(StubSession::with_plan(vec![delegated_step()]));
         c.session.mark_step_delegated(1);
         assert!(c.session.step_was_delegated(1));
-        let out = SetStepModel
+        let out = SelfSetStepModel
             .invoke(&c, json!({ "index": 1, "model": "self" }))
             .await
             .unwrap();
@@ -941,7 +945,7 @@ mod tests {
         // block step 2 (goal "write the helper fn")
         c.session
             .update_plan(PlanTarget::Id(2), PlanStatus::Blocked, None);
-        let out = SetStepModel
+        let out = SelfSetStepModel
             .invoke(&c, json!({ "text": "helper fn", "model": "groq" }))
             .await
             .unwrap();
@@ -956,7 +960,7 @@ mod tests {
             .update_plan(PlanTarget::Id(1), PlanStatus::InProgress, None);
         c.session
             .update_plan(PlanTarget::Id(2), PlanStatus::Done, None);
-        let err = SetStepModel
+        let err = SelfSetStepModel
             .invoke(&c, json!({ "index": 1, "model": "cheap" }))
             .await
             .unwrap_err();
@@ -965,7 +969,7 @@ mod tests {
             err.to_string().contains("pending, ready or blocked"),
             "{err}"
         );
-        let err = SetStepModel
+        let err = SelfSetStepModel
             .invoke(&c, json!({ "index": 2, "model": "cheap" }))
             .await
             .unwrap_err();
@@ -977,18 +981,18 @@ mod tests {
     #[tokio::test]
     async fn set_step_model_rejects_blank_models_and_unknown_targets() {
         let c = ctx(StubSession::with_plan(vec![plain_step()]));
-        let err = SetStepModel
+        let err = SelfSetStepModel
             .invoke(&c, json!({ "index": 1, "model": "   " }))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("`model`"), "{err}");
         assert!(err.to_string().contains("self"), "{err}");
-        let err = SetStepModel
+        let err = SelfSetStepModel
             .invoke(&c, json!({ "index": 99, "model": "cheap" }))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no step matched"), "{err}");
-        let err = SetStepModel
+        let err = SelfSetStepModel
             .invoke(&c, json!({ "model": "cheap" }))
             .await
             .unwrap_err();
@@ -998,7 +1002,7 @@ mod tests {
     #[tokio::test]
     async fn set_step_model_is_a_no_op_when_the_model_is_unchanged() {
         let c = ctx(StubSession::with_plan(vec![delegated_step()]));
-        let out = SetStepModel
+        let out = SelfSetStepModel
             .invoke(&c, json!({ "index": 1, "model": "cheap" }))
             .await
             .unwrap();
@@ -1011,7 +1015,7 @@ mod tests {
         // Delegate names are validated by the `delegate` tool, not here (mirrors
         // set_plan): an arbitrary non-blank model is stored verbatim.
         let c = ctx(StubSession::with_plan(vec![plain_step()]));
-        SetStepModel
+        SelfSetStepModel
             .invoke(&c, json!({ "index": 1, "model": "claude" }))
             .await
             .unwrap();
@@ -1021,7 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn set_step_context_replaces_the_context_of_a_pending_step() {
         let c = ctx(StubSession::with_plan(vec![delegated_step()]));
-        let out = SetStepContext
+        let out = SelfSetStepContext
             .invoke(
                 &c,
                 json!({ "index": 1, "context": "the helper lives in crates/x" }),
@@ -1035,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn set_step_context_targets_by_goal_text() {
         let c = ctx(StubSession::with_plan(vec![plain_step(), delegated_step()]));
-        SetStepContext
+        SelfSetStepContext
             .invoke(&c, json!({ "text": "helper fn", "context": "new ctx" }))
             .await
             .unwrap();
@@ -1053,12 +1057,12 @@ mod tests {
             .update_plan(PlanTarget::Id(1), PlanStatus::InProgress, None);
         c.session
             .update_plan(PlanTarget::Id(2), PlanStatus::Done, None);
-        let err = SetStepContext
+        let err = SelfSetStepContext
             .invoke(&c, json!({ "index": 1, "context": "x" }))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("in_progress"), "{err}");
-        let err = SetStepContext
+        let err = SelfSetStepContext
             .invoke(&c, json!({ "index": 2, "context": "x" }))
             .await
             .unwrap_err();
@@ -1074,7 +1078,7 @@ mod tests {
             Some("ready: ok".into()),
         );
         assert_eq!(c.session.plan()[0].status, PlanStatus::Ready);
-        SetStepContext
+        SelfSetStepContext
             .invoke(&c, json!({ "index": 1, "context": "new enriched ctx" }))
             .await
             .unwrap();
@@ -1089,17 +1093,17 @@ mod tests {
     #[tokio::test]
     async fn set_step_context_rejects_blank_context_and_unknown_targets() {
         let c = ctx(StubSession::with_plan(vec![delegated_step()]));
-        let err = SetStepContext
+        let err = SelfSetStepContext
             .invoke(&c, json!({ "index": 1, "context": "   " }))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("non-empty"), "{err}");
-        let err = SetStepContext
+        let err = SelfSetStepContext
             .invoke(&c, json!({ "index": 99, "context": "x" }))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no step matched"), "{err}");
-        let err = SetStepContext
+        let err = SelfSetStepContext
             .invoke(&c, json!({ "context": "x" }))
             .await
             .unwrap_err();

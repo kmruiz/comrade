@@ -1,10 +1,10 @@
-//! Project object model (POM) and task-runner tools for Cargo projects.
+//! Project object model (POM) and task-runner tools.
 //!
-//! - `project_model` describes the workspace/project + subprojects (Cargo
-//!   workspace members), their dependencies, and available tasks — the Comrade
+//! - `pom_model` describes the workspace/project + subprojects (workspace
+//!   members), their dependencies, and available tasks — the Comrade
 //!   analogue of a Maven POM (project + modules).
-//! - `run_task` executes a named task (a cargo verb, a cargo alias, or a
-//!   `!shell` alias) optionally scoped to one subproject.
+//! - `pom_run_task` executes a named task (a standard build-system task, a
+//!   configured alias, or a `!shell` alias) optionally scoped to one subproject.
 
 mod pom;
 mod tasks;
@@ -21,24 +21,24 @@ pub use pom::{ProjectModel, load as load_model, render as render_model};
 
 pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(ProjectModelTool),
-        Box::new(RunTask),
-        Box::new(FormatCode),
-        Box::new(RunTests),
+        Box::new(PomModelTool),
+        Box::new(PomRunTask),
+        Box::new(PomFormatCode),
+        Box::new(PomRunTests),
         Box::new(Shell),
     ]
 }
 
 // ---------------------------------------------------------------------------
-// project_model
+// pom_model
 // ---------------------------------------------------------------------------
 
-struct ProjectModelTool;
+struct PomModelTool;
 
-static PROJECT_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static POM_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "project_model".into(),
-    description: "Report this Cargo project's dependencies, subprojects, layout and tasks (the POM). Use INSTEAD of reading Cargo.toml when asked about deps/modules/tasks. Read-only.".into(),
+    name: "pom_model".into(),
+    description: "Report this project's dependencies, subprojects, layout and tasks (the POM). Use INSTEAD of reading the project manifest (e.g. Cargo.toml) when asked about deps/modules/tasks. Read-only.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {},
@@ -48,9 +48,9 @@ static PROJECT_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for ProjectModelTool {
+impl Tool for PomModelTool {
     fn spec(&self) -> &ToolSpec {
-        &PROJECT_MODEL_SPEC
+        &POM_MODEL_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, _args: Value) -> Result<String> {
@@ -60,19 +60,19 @@ impl Tool for ProjectModelTool {
 }
 
 // ---------------------------------------------------------------------------
-// run_task
+// pom_run_task
 // ---------------------------------------------------------------------------
 
-struct RunTask;
+struct PomRunTask;
 
-static RUN_TASK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static POM_RUN_TASK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "run_task".into(),
-    description: "Run a named project task and return its output: cargo verbs (build, run, check, clippy, fmt, doc, bench, release) and aliases; optionally scope to a subproject. Runs directly without approval. Run tests with run_tests, not here - it returns only the failure summary and costs far less context.".into(),
+    name: "pom_run_task".into(),
+    description: "Run a named project task and return its output: standard project tasks (build, run, check, clippy, fmt, doc, bench, release) and configured aliases; optionally scope to a subproject. Runs directly without approval. Run tests with pom_run_tests, not here - it returns only the failure summary and costs far less context.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "task": { "type": "string", "description": "Task name, e.g. \"build\" or a cargo alias. Use run_tests to run tests." },
+            "task": { "type": "string", "description": "Task name, e.g. \"build\" or a configured alias. Use pom_run_tests to run tests." },
             "subproject": { "type": "string", "description": "Optional subproject directory relative to the root, e.g. \"crates/app\"." },
             "args": { "type": "string", "description": "Extra arguments appended to the command." },
             "timeout_secs": { "type": "integer", "minimum": 1, "default": 600, "description": "Kill the task after this many seconds." }
@@ -84,9 +84,9 @@ static RUN_TASK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for RunTask {
+impl Tool for PomRunTask {
     fn spec(&self) -> &ToolSpec {
-        &RUN_TASK_SPEC
+        &POM_RUN_TASK_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -106,7 +106,7 @@ impl Tool for RunTask {
         let args: Args = serde_json::from_value(args)?;
         if args.task.trim() == "test" {
             anyhow::bail!(
-                "running tests through run_task is disabled - use the run_tests tool instead \
+                "running tests through pom_run_task is disabled - use the pom_run_tests tool instead \
                  (it returns only failing tests and costs far less context)"
             );
         }
@@ -123,14 +123,14 @@ impl Tool for RunTask {
     }
 }
 
-/// Refuse a resolved run_task command that would execute `cargo test` (covers
+/// Refuse a resolved pom_run_task command that would execute `cargo test` (covers
 /// the literal `test` verb and aliases that expand to it). Tests belong to the
-/// dedicated `run_tests` tool, whose output is a compact failure summary.
+/// dedicated `pom_run_tests` tool, whose output is a compact failure summary.
 fn ensure_not_test_run(line: &tasks::CommandLine) -> anyhow::Result<()> {
     if let tasks::CommandLine::Cargo { args } = line {
         if args.first().map(String::as_str) == Some("test") {
             anyhow::bail!(
-                "running tests through run_task is disabled - use the run_tests tool instead \
+                "running tests through pom_run_task is disabled - use the pom_run_tests tool instead \
                  (it returns only failing tests and costs far less context)"
             );
         }
@@ -139,15 +139,15 @@ fn ensure_not_test_run(line: &tasks::CommandLine) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// format_code
+// pom_format_code
 // ---------------------------------------------------------------------------
 
-struct FormatCode;
+struct PomFormatCode;
 
-static FORMAT_CODE_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static POM_FORMAT_CODE_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "format_code".into(),
-    description: "Run the project formatter (cargo fmt --all) so code is formatted deterministically instead of hand-formatting tokens. Runs directly without approval (rustfmt only rewrites whitespace).".into(),
+    name: "pom_format_code".into(),
+    description: "Run the project's formatter so code is formatted deterministically instead of hand-formatting tokens. Runs directly without approval (whitespace-only rewrites).".into(),
     json_schema: json!({
         "type": "object",
         "properties": {},
@@ -157,40 +157,40 @@ static FORMAT_CODE_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for FormatCode {
+impl Tool for PomFormatCode {
     fn spec(&self) -> &ToolSpec {
-        &FORMAT_CODE_SPEC
+        &POM_FORMAT_CODE_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, _args: Value) -> Result<String> {
-        // Rustfmt is a deterministic, whitespace-only rewrite, so it runs
-        // directly (no human approval) like run_tests/run_task.
+        // A deterministic, whitespace-only rewrite, so it runs
+        // directly (no human approval) like pom_run_tests/pom_run_task.
         let resolved = tasks::Resolved {
             cwd: ctx.project_root.clone(),
             line: tasks::CommandLine::Cargo {
                 args: vec!["fmt".into(), "--all".into()],
             },
-            describe: "cargo fmt --all".to_string(),
+            describe: "format all code".to_string(),
         };
         tasks::run(&resolved, 300).await
     }
 }
 
 // ---------------------------------------------------------------------------
-// run_tests
+// pom_run_tests
 // ---------------------------------------------------------------------------
 
-struct RunTests;
+struct PomRunTests;
 
-static RUN_TESTS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static POM_RUN_TESTS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "run_tests".into(),
-    description: "Run the project's tests (cargo test) and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names, key error lines. Use to verify work instead of reasoning about code.".into(),
+    name: "pom_run_tests".into(),
+    description: "Run the project's tests and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names, key error lines. Use to verify work instead of reasoning about code.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "subproject": { "type": "string", "description": "Optional subproject directory relative to the root, e.g. \"crates/app\"." },
-            "args": { "type": "string", "description": "Extra cargo test arguments, e.g. \"--lib\" or a test filter." },
+            "args": { "type": "string", "description": "Extra test-runner arguments, e.g. \"--lib\" or a test filter." },
             "timeout_secs": { "type": "integer", "minimum": 1, "default": 600, "description": "Kill after this many seconds." }
         },
         "additionalProperties": false
@@ -199,9 +199,9 @@ static RUN_TESTS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for RunTests {
+impl Tool for PomRunTests {
     fn spec(&self) -> &ToolSpec {
-        &RUN_TESTS_SPEC
+        &POM_RUN_TESTS_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -277,7 +277,7 @@ struct Shell;
 static SHELL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "shell".into(),
-    description: "LAST RESORT - prefer a dedicated tool (read_file/list_dir, rgrep, run_task/run_tests, git_*, project_model) over the shell. Runs an arbitrary bash command and returns raw output. Approval-gated.".into(),
+    description: "LAST RESORT - prefer a dedicated tool (fs_read_file/fs_list_dir, fs_rgrep, pom_run_task/pom_run_tests, git_*, pom_model) over the shell. Runs an arbitrary bash command and returns raw output. Approval-gated.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -397,7 +397,7 @@ test result: FAILED. 11 passed; 1 failed; 0 ignored
             args: vec!["test".into(), "--lib".into()],
         };
         let err = ensure_not_test_run(&cargo).unwrap_err().to_string();
-        assert!(err.contains("run_tests"), "{err}");
+        assert!(err.contains("pom_run_tests"), "{err}");
         // a cargo alias expanding to `test` is caught the same way
         let alias = tasks::CommandLine::Cargo {
             args: vec!["test".into()],

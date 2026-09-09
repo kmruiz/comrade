@@ -1,4 +1,4 @@
-//! Filesystem tools: `list_dir`, `read_file`, `apply_edit`, `write_file`.
+//! Filesystem tools: `fs_list_dir`, `fs_read_file`, `fs_edit`, `fs_write_file`.
 //!
 //! All paths are project-root relative. Mutating tools ask for human approval
 //! through the [`ToolContext`] unless `auto_approve` is set, and record their
@@ -34,14 +34,13 @@ fn changed_scope(ctx: &ToolContext, enabled: bool) -> Result<Option<HashSet<Path
 
 pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(ListDir),
-        Box::new(ListFiles),
-        Box::new(RGrep),
-        Box::new(ReadFile),
-        Box::new(ReadRanges),
-        Box::new(ApplyEdit),
-        Box::new(ApplyPatch),
-        Box::new(WriteFile),
+        Box::new(FsListDir),
+        Box::new(FsListFiles),
+        Box::new(FsRgrep),
+        Box::new(FsReadFile),
+        Box::new(FsReadRanges),
+        Box::new(FsEdit),
+        Box::new(FsWriteFile),
     ]
 }
 
@@ -94,7 +93,7 @@ fn line_of(text: &str, byte: usize) -> usize {
         .count()
 }
 
-/// Unified-diff hunk header for an apply_edit: the old block starts at the
+/// Unified-diff hunk header for a literal fs_edit: the old block starts at the
 /// line containing its first byte; the replacement lands at the same line.
 /// Returns e.g. `@@ -12,3 +12,4 @@` (new side count is 0 for a pure delete).
 fn edit_location(before: &str, old: &str, new: &str) -> String {
@@ -113,14 +112,14 @@ fn edit_location(before: &str, old: &str, new: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// list_dir
+// fs_list_dir
 // ---------------------------------------------------------------------------
 
-struct ListDir;
+struct FsListDir;
 
-static LIST_DIR_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+static FS_LIST_DIR_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
-    name: "list_dir".into(),
+    name: "fs_list_dir".into(),
     description: "List a directory's entries (project-root relative). Use to discover files before reading or editing. With git_modified_only, only entries with changes vs HEAD are shown.".into(),
     json_schema: json!({
         "type": "object",
@@ -134,9 +133,9 @@ static LIST_DIR_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|
 });
 
 #[async_trait]
-impl Tool for ListDir {
+impl Tool for FsListDir {
     fn spec(&self) -> &ToolSpec {
-        &LIST_DIR_SPEC
+        &FS_LIST_DIR_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -185,15 +184,15 @@ impl Tool for ListDir {
 }
 
 // ---------------------------------------------------------------------------
-// read_file
+// fs_read_file
 // ---------------------------------------------------------------------------
 
-struct ReadFile;
+struct FsReadFile;
 
-static READ_FILE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+static FS_READ_FILE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
-    name: "read_file".into(),
-    description: "Read a text file (project-root relative). A bare read of a long file returns only its head: pass start_line/end_line or use read_ranges to read a window.".into(),
+    name: "fs_read_file".into(),
+    description: "Read a text file (project-root relative). A bare read of a long file returns only its head: pass start_line/end_line or use fs_read_ranges to read a window.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -209,9 +208,9 @@ static READ_FILE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(
 });
 
 #[async_trait]
-impl Tool for ReadFile {
+impl Tool for FsReadFile {
     fn spec(&self) -> &ToolSpec {
-        &READ_FILE_SPEC
+        &FS_READ_FILE_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -274,7 +273,7 @@ impl Tool for ReadFile {
         if unwindowed_cap {
             out.push_str(&format!(
                 " (file longer than the {MAX_UNWINDOWED_LINES}-line default window: \
-                 pass start_line/end_line or use read_ranges to read the rest)"
+                 pass start_line/end_line or use fs_read_ranges to read the rest)"
             ));
         }
         out.push_str(" --\n");
@@ -283,51 +282,84 @@ impl Tool for ReadFile {
 }
 
 // ---------------------------------------------------------------------------
-// apply_edit
+// fs_edit
 // ---------------------------------------------------------------------------
 
-struct ApplyEdit;
+struct FsEdit;
 
-static APPLY_EDIT_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+static FS_EDIT_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
-    name: "apply_edit".into(),
-    description: "Replace the first exact occurrence of `old` with `new` in `path` (byte-for-byte; include surrounding lines to be unique). Prefer several small precise edits over whole-file rewrites.".into(),
+    name: "fs_edit".into(),
+    description: "Edit a file (project-root relative) in one of two modes: (1) literal - replace the first exact occurrence of `old` with `new` in `path` (byte-for-byte; include surrounding lines to be unique); (2) patch - apply a unified `diff` string to one or more files (send +/- hunks with a little context; each old block must appear exactly once). Prefer several small precise edits over whole-file rewrites.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "description": "File to edit, relative to the project root." },
-            "old": { "type": "string", "description": "Exact text to find and replace." },
-            "new": { "type": "string", "description": "Replacement text." }
+            "path": { "type": "string", "description": "File to edit (literal mode)." },
+            "old": { "type": "string", "description": "Exact text to find and replace (literal mode)." },
+            "new": { "type": "string", "description": "Replacement text (literal mode)." },
+            "diff": { "type": "string", "description": "Unified diff text (patch mode)." }
         },
-        "required": ["path", "old", "new"],
+        "anyOf": [
+            { "required": ["path", "old", "new"] },
+            { "required": ["diff"] }
+        ],
         "additionalProperties": false
     }),
 }
 });
 
 #[async_trait]
-impl Tool for ApplyEdit {
+impl Tool for FsEdit {
     fn spec(&self) -> &ToolSpec {
-        &APPLY_EDIT_SPEC
+        &FS_EDIT_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
         #[derive(Deserialize)]
         struct Args {
-            path: String,
-            old: String,
-            new: String,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            old: Option<String>,
+            #[serde(default)]
+            new: Option<String>,
+            #[serde(default)]
+            diff: Option<String>,
         }
         let args: Args = serde_json::from_value(args)?;
-        if args.old.is_empty() {
+        // Patch mode wins when a `diff` is given; otherwise literal mode needs
+        // path + old + new.
+        if let Some(diff) = args.diff {
+            return self.patch_mode(ctx, diff).await;
+        }
+        let (path, old, new) = match (args.path, args.old, args.new) {
+            (Some(p), Some(o), Some(n)) => (p, o, n),
+            _ => anyhow::bail!(
+                "fs_edit needs either `diff` (patch mode) or `path` + `old` + `new` (literal mode)"
+            ),
+        };
+        self.literal_mode(ctx, &path, &old, &new).await
+    }
+}
+
+impl FsEdit {
+    /// Literal mode: replace the first exact occurrence of `old` with `new`.
+    async fn literal_mode(
+        &self,
+        ctx: &ToolContext,
+        path: &str,
+        old: &str,
+        new: &str,
+    ) -> Result<String> {
+        if old.is_empty() {
             anyhow::bail!("`old` must not be empty");
         }
-        let file = resolve(ctx, &args.path)?;
+        let file = resolve(ctx, path)?;
         let rel = display_path(ctx, &file);
         let before = tokio::fs::read_to_string(&file)
             .await
             .with_context(|| format!("cannot read {rel}"))?;
-        let count = before.matches(&args.old).count();
+        let count = before.matches(old).count();
         if count == 0 {
             anyhow::bail!(
                 "`old` block was not found in {rel}. Re-read the file and retry with an exact match."
@@ -338,14 +370,13 @@ impl Tool for ApplyEdit {
                 "`old` block appears {count} times in {rel}; include more context to make it unique."
             );
         }
-        let after = before.replacen(&args.old, &args.new, 1);
-        let loc = edit_location(&before, &args.old, &args.new);
+        let after = before.replacen(old, new, 1);
+        let loc = edit_location(&before, old, new);
         ctx.undo.capture(&rel, before.clone()).await?;
         ctx.confirm(
-            format!("apply_edit {rel}"),
+            format!("fs_edit {rel} (literal)"),
             Some(format!(
-                "{rel}\n{loc}\n--- remove ---\n{}\n+++ insert +++\n{}",
-                args.old, args.new
+                "{rel}\n{loc}\n--- remove ---\n{old}\n+++ insert +++\n{new}"
             )),
         )
         .await?;
@@ -354,18 +385,66 @@ impl Tool for ApplyEdit {
             .with_context(|| format!("cannot write {rel}"))?;
         Ok(format!("Edited {rel}: replaced 1 exact block ({loc})."))
     }
+
+    /// Patch mode: apply a unified diff, possibly spanning several files.
+    async fn patch_mode(&self, ctx: &ToolContext, diff: String) -> Result<String> {
+        let patches = parse_unified(&diff)?;
+        if patches.is_empty() {
+            anyhow::bail!("no hunks found in the diff");
+        }
+
+        // Compute the intended changes first, then ask for approval, then write.
+        let mut pending: Vec<(String, String, String, usize)> = Vec::new();
+        let mut preview = String::new();
+        for patch in &patches {
+            let abs = resolve(ctx, &patch.path)?;
+            let rel = display_path(ctx, &abs);
+            let before = tokio::fs::read_to_string(&abs)
+                .await
+                .with_context(|| format!("cannot read {rel}"))?;
+            let after = apply_hunks(&before, &patch.hunks)
+                .with_context(|| format!("failed to apply diff to {rel}"))?;
+            if before == after {
+                continue;
+            }
+            preview.push_str(&format!("{rel}: {} hunk(s)\n", patch.hunks.len()));
+            pending.push((rel, before, after, patch.hunks.len()));
+        }
+        if pending.is_empty() {
+            return Ok("Nothing to apply: diff matches current content.".to_string());
+        }
+        ctx.confirm(
+            format!("fs_edit ({pending} file(s))", pending = pending.len()),
+            Some(preview),
+        )
+        .await?;
+
+        let mut applied = 0usize;
+        for (rel, before, after, hunks) in pending {
+            ctx.undo.capture(&rel, before).await?;
+            let abs = resolve(ctx, &rel)?;
+            tokio::fs::write(&abs, after)
+                .await
+                .with_context(|| format!("cannot write {rel}"))?;
+            applied += hunks;
+        }
+        Ok(format!(
+            "Applied {applied} hunk(s) across {} file(s).",
+            patches.len()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// write_file
+// fs_write_file
 // ---------------------------------------------------------------------------
 
-struct WriteFile;
+struct FsWriteFile;
 
-static WRITE_FILE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+static FS_WRITE_FILE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
-    name: "write_file".into(),
-    description: "Overwrite or create a whole file (project-root relative). Parent directories are created as needed. Prefer apply_edit for small targeted changes.".into(),
+    name: "fs_write_file".into(),
+    description: "Overwrite or create a whole file (project-root relative). Parent directories are created as needed. Prefer fs_edit for small targeted changes.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -379,9 +458,9 @@ static WRITE_FILE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new
 });
 
 #[async_trait]
-impl Tool for WriteFile {
+impl Tool for FsWriteFile {
     fn spec(&self) -> &ToolSpec {
-        &WRITE_FILE_SPEC
+        &FS_WRITE_FILE_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -425,15 +504,15 @@ impl Tool for WriteFile {
 }
 
 // ---------------------------------------------------------------------------
-// list_files
+// fs_list_files
 // ---------------------------------------------------------------------------
 
-struct ListFiles;
+struct FsListFiles;
 
-static LIST_FILES_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+static FS_LIST_FILES_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
-    name: "list_files".into(),
-    description: "List project files matching a glob (project-root relative), one per line. `*` matches within a path segment, `**` across directories. Prefer over walking with list_dir.".into(),
+    name: "fs_list_files".into(),
+    description: "List project files matching a glob (project-root relative), one per line. `*` matches within a path segment, `**` across directories. Prefer over walking with fs_list_dir.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -447,9 +526,9 @@ static LIST_FILES_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new
 });
 
 #[async_trait]
-impl Tool for ListFiles {
+impl Tool for FsListFiles {
     fn spec(&self) -> &ToolSpec {
-        &LIST_FILES_SPEC
+        &FS_LIST_FILES_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -500,14 +579,14 @@ impl Tool for ListFiles {
 }
 
 // ---------------------------------------------------------------------------
-// rgrep
+// fs_rgrep
 // ---------------------------------------------------------------------------
 
-struct RGrep;
+struct FsRgrep;
 
-static RGREP_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+static FS_RGREP_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
-    name: "rgrep".into(),
+    name: "fs_rgrep".into(),
     description: "Search project files for literal text (like a filtered grep); returns file:line: text. Use to find every place a string or identifier appears. `glob` restricts the files searched; substring-based; use ignore_case as needed.".into(),
     json_schema: json!({
         "type": "object",
@@ -524,9 +603,9 @@ static RGREP_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for RGrep {
+impl Tool for FsRgrep {
     fn spec(&self) -> &ToolSpec {
-        &RGREP_SPEC
+        &FS_RGREP_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -729,15 +808,15 @@ fn no_sep(slice: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// read_ranges
+// fs_read_ranges
 // ---------------------------------------------------------------------------
 
-struct ReadRanges;
+struct FsReadRanges;
 
-static READ_RANGES_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+static FS_READ_RANGES_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
-    name: "read_ranges".into(),
-    description: "Read several non-contiguous 1-based line ranges of one file in a single call. Each range is [start, end] inclusive. Use instead of repeated read_file calls.".into(),
+    name: "fs_read_ranges".into(),
+    description: "Read several non-contiguous 1-based line ranges of one file in a single call. Each range is [start, end] inclusive. Use instead of repeated fs_read_file calls.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -751,9 +830,9 @@ static READ_RANGES_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::ne
 });
 
 #[async_trait]
-impl Tool for ReadRanges {
+impl Tool for FsReadRanges {
     fn spec(&self) -> &ToolSpec {
-        &READ_RANGES_SPEC
+        &FS_READ_RANGES_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -792,84 +871,8 @@ impl Tool for ReadRanges {
 }
 
 // ---------------------------------------------------------------------------
-// apply_patch (unified diff)
+// fs_edit patch mode (unified diff)
 // ---------------------------------------------------------------------------
-
-struct ApplyPatch;
-
-static APPLY_PATCH_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
-    ToolSpec {
-    name: "apply_patch".into(),
-    description: "Apply a unified diff to files (project-root relative) - more compact than apply_edit. Send +/- hunks with a little context; each old block must appear exactly once.".into(),
-    json_schema: json!({
-        "type": "object",
-        "properties": {
-            "diff": { "type": "string", "description": "Unified diff text." }
-        },
-        "required": ["diff"],
-        "additionalProperties": false
-    }),
-}
-});
-
-#[async_trait]
-impl Tool for ApplyPatch {
-    fn spec(&self) -> &ToolSpec {
-        &APPLY_PATCH_SPEC
-    }
-
-    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Args {
-            diff: String,
-        }
-        let args: Args = serde_json::from_value(args)?;
-        let patches = parse_unified(&args.diff)?;
-        if patches.is_empty() {
-            anyhow::bail!("no hunks found in the diff");
-        }
-
-        // Compute the intended changes first, then ask for approval, then write.
-        let mut pending: Vec<(String, String, String, usize)> = Vec::new();
-        let mut preview = String::new();
-        for patch in &patches {
-            let abs = resolve(ctx, &patch.path)?;
-            let rel = display_path(ctx, &abs);
-            let before = tokio::fs::read_to_string(&abs)
-                .await
-                .with_context(|| format!("cannot read {rel}"))?;
-            let after = apply_hunks(&before, &patch.hunks)
-                .with_context(|| format!("failed to apply diff to {rel}"))?;
-            if before == after {
-                continue;
-            }
-            preview.push_str(&format!("{rel}: {} hunk(s)\n", patch.hunks.len()));
-            pending.push((rel, before, after, patch.hunks.len()));
-        }
-        if pending.is_empty() {
-            return Ok("Nothing to apply: diff matches current content.".to_string());
-        }
-        ctx.confirm(
-            format!("apply_patch ({pending} file(s))", pending = pending.len()),
-            Some(preview),
-        )
-        .await?;
-
-        let mut applied = 0usize;
-        for (rel, before, after, hunks) in pending {
-            ctx.undo.capture(&rel, before).await?;
-            let abs = resolve(ctx, &rel)?;
-            tokio::fs::write(&abs, after)
-                .await
-                .with_context(|| format!("cannot write {rel}"))?;
-            applied += hunks;
-        }
-        Ok(format!(
-            "Applied {applied} hunk(s) across {} file(s).",
-            patches.len()
-        ))
-    }
-}
 
 /// A parsed file diff: one or more hunks to apply in order.
 struct FilePatch {
@@ -1201,7 +1204,7 @@ mod tests {
             steer: None,
             stop: None,
         };
-        let list = ListFiles;
+        let list = FsListFiles;
         let args = json!({ "pattern": "**/*.rs", "git_modified_only": true });
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1299,19 +1302,19 @@ mod tests {
         // A bare read of a 300-line file returns only the head window, still
         // states the total, and tells the caller how to read the rest.
         let out = rt
-            .block_on(ReadFile.invoke(&ctx, json!({ "path": "big.rs" })))
+            .block_on(FsReadFile.invoke(&ctx, json!({ "path": "big.rs" })))
             .unwrap();
         assert!(out.contains("body line 1"), "{out}");
         assert!(!out.contains("body line 200"), "{out}");
         assert!(out.contains("-- 1..150 of 300 lines"), "{out}");
         assert!(
-            out.contains("pass start_line/end_line or use read_ranges to read the rest"),
+            out.contains("pass start_line/end_line or use fs_read_ranges to read the rest"),
             "{out}"
         );
 
         // An explicit window is honoured exactly, even past the default cap.
         let out = rt
-            .block_on(ReadFile.invoke(
+            .block_on(FsReadFile.invoke(
                 &ctx,
                 json!({ "path": "big.rs", "start_line": 250, "end_line": 260 }),
             ))
@@ -1324,7 +1327,7 @@ mod tests {
         // A file small enough to fit the default window is returned whole.
         std::fs::write(root.join("small.rs"), "a\nb\nc\n").unwrap();
         let out = rt
-            .block_on(ReadFile.invoke(&ctx, json!({ "path": "small.rs" })))
+            .block_on(FsReadFile.invoke(&ctx, json!({ "path": "small.rs" })))
             .unwrap();
         assert!(out.contains("a\n") && out.contains("c"), "{out}");
         assert!(out.contains("-- 1..3 of 3 lines"), "{out}");

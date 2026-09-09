@@ -1,4 +1,4 @@
-//! Tree-sitter powered code tools: `find_references`, `rename`, `list_symbols`.
+//! Tree-sitter powered code tools: `ts_find_references`, `ts_rename`, `ts_list_symbols`.
 //!
 //! v1 is deliberately *lexical*: occurrences are identifier tokens parsed by
 //! tree-sitter, so matches never appear inside strings or comments (unlike

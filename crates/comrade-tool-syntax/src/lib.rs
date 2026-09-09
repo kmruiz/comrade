@@ -16,14 +16,12 @@ use serde_json::{Value, json};
 
 pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(FindReferences),
-        Box::new(Rename),
-        Box::new(ListSymbols),
-        Box::new(StructuralMap),
-        Box::new(FindDefinition),
-        Box::new(ReadSymbol),
-        Box::new(ReferencesCount),
-        Box::new(FindSymbol),
+        Box::new(TsFindReferences),
+        Box::new(TsRename),
+        Box::new(TsListSymbols),
+        Box::new(TsStructuralMap),
+        Box::new(TsReadSymbol),
+        Box::new(TsFindSymbol),
     ]
 }
 
@@ -98,14 +96,14 @@ fn normalize_kind(kind: Option<&str>) -> Result<Option<&str>> {
 }
 
 // ---------------------------------------------------------------------------
-// find_references
+// ts_find_references
 // ---------------------------------------------------------------------------
 
-struct FindReferences;
+struct TsFindReferences;
 
-static FIND_REFERENCES_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static TS_FIND_REFERENCES_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "find_references".into(),
+    name: "ts_find_references".into(),
     description: "Find uses of a symbol (fn/struct/field/variable name) across the project via tree-sitter. Matches identifier tokens only, never inside strings or comments. Lexical, not semantic.".into(),
     json_schema: json!({
         "type": "object",
@@ -121,9 +119,9 @@ static FIND_REFERENCES_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for FindReferences {
+impl Tool for TsFindReferences {
     fn spec(&self) -> &ToolSpec {
-        &FIND_REFERENCES_SPEC
+        &TS_FIND_REFERENCES_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -171,14 +169,14 @@ impl Tool for FindReferences {
 }
 
 // ---------------------------------------------------------------------------
-// rename
+// ts_rename
 // ---------------------------------------------------------------------------
 
-struct Rename;
+struct TsRename;
 
-static RENAME_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static TS_RENAME_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "rename".into(),
+    name: "ts_rename".into(),
     description: "Rename a symbol across the project by rewriting every tree-sitter identifier token equal to `symbol`. Approximate but safe (never matches inside strings/comments). Interactive: approve the preview first.".into(),
     json_schema: json!({
         "type": "object",
@@ -195,9 +193,9 @@ static RENAME_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for Rename {
+impl Tool for TsRename {
     fn spec(&self) -> &ToolSpec {
-        &RENAME_SPEC
+        &TS_RENAME_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -279,14 +277,14 @@ impl Tool for Rename {
 }
 
 // ---------------------------------------------------------------------------
-// list_symbols
+// ts_list_symbols
 // ---------------------------------------------------------------------------
 
-struct ListSymbols;
+struct TsListSymbols;
 
-static LIST_SYMBOLS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static TS_LIST_SYMBOLS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "list_symbols".into(),
+    name: "ts_list_symbols".into(),
     description: "List top-level declarations (fn, struct, enum, trait, impl, mod) in a file or the whole project, with line numbers. Use to orient before finding references or editing.".into(),
     json_schema: json!({
         "type": "object",
@@ -301,9 +299,9 @@ static LIST_SYMBOLS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for ListSymbols {
+impl Tool for TsListSymbols {
     fn spec(&self) -> &ToolSpec {
-        &LIST_SYMBOLS_SPEC
+        &TS_LIST_SYMBOLS_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -332,14 +330,14 @@ impl Tool for ListSymbols {
 }
 
 // ---------------------------------------------------------------------------
-// structural_map
+// ts_structural_map
 // ---------------------------------------------------------------------------
 
-struct StructuralMap;
+struct TsStructuralMap;
 
-static STRUCTURAL_MAP_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static TS_STRUCTURAL_MAP_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "structural_map".into(),
+    name: "ts_structural_map".into(),
     description: "Build a tree-sitter structural map of the project (or one file): declarations nested under mod/impl/trait containers, with line numbers. Filter by file or declaration kind. Orient fast.".into(),
     json_schema: json!({
         "type": "object",
@@ -355,9 +353,9 @@ static STRUCTURAL_MAP_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for StructuralMap {
+impl Tool for TsStructuralMap {
     fn spec(&self) -> &ToolSpec {
-        &STRUCTURAL_MAP_SPEC
+        &TS_STRUCTURAL_MAP_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
@@ -399,19 +397,20 @@ impl Tool for StructuralMap {
 }
 
 // ---------------------------------------------------------------------------
-// find_definition
+// ts_read_symbol
 // ---------------------------------------------------------------------------
 
-struct FindDefinition;
+struct TsReadSymbol;
 
-static FIND_DEFINITION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static TS_READ_SYMBOL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "find_definition".into(),
-    description: "Locate where a symbol is defined; returns its kind, one-line signature and file:line - never the whole body. Cheaper than reading the file when you only need its location.".into(),
+    name: "ts_read_symbol".into(),
+    description: "Locate a symbol's declaration and read its kind, one-line signature and file:line. With body:true, also returns the full declaration body (fn, struct, enum, const, ...). Use before editing a specific item instead of reading the whole file.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "symbol": { "type": "string", "description": "Identifier to locate (bare name, not \"fn name\")." },
+            "symbol": { "type": "string", "description": "Identifier whose declaration to locate (bare name, not \"fn name\")." },
+            "body": { "type": "boolean", "default": false, "description": "When true, return the full declaration body too. Default false: kind + signature + location only." },
             "type": { "type": "string", "enum": KIND_LABELS, "description": "Optional declaration kind to narrow to (fn, struct, enum, trait, impl, mod, type, static, const)." },
             "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." },
             "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD." }
@@ -423,91 +422,17 @@ static FIND_DEFINITION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for FindDefinition {
+impl Tool for TsReadSymbol {
     fn spec(&self) -> &ToolSpec {
-        &FIND_DEFINITION_SPEC
+        &TS_READ_SYMBOL_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
         #[derive(Deserialize)]
         struct Args {
             symbol: String,
-            #[serde(default, rename = "type")]
-            kind: Option<String>,
             #[serde(default)]
-            path: Option<String>,
-            #[serde(default)]
-            git_modified_only: bool,
-        }
-        let args: Args = serde_json::from_value(args)?;
-        let kind = normalize_kind(args.kind.as_deref())?;
-        // Report the bare name (kind keywords in the input are a filter, not
-        // part of the identifier), and detect prefix-vs-filter conflicts.
-        let (pfx, bare) = engine::split_kind_prefix(&args.symbol);
-        if let (Some(p), Some(k)) = (pfx, kind) {
-            if !p.eq_ignore_ascii_case(k) {
-                anyhow::bail!(
-                    "symbol {:?} already names kind {p:?}, which conflicts with the type filter {k:?}",
-                    bare
-                );
-            }
-        }
-        let scope = changed_scope(ctx, args.git_modified_only)?;
-        guard_path_scope(ctx, &args.path, &scope)?;
-        match engine::find_definition(
-            &ctx.project_root,
-            bare,
-            args.path.as_deref(),
-            scope.as_ref(),
-            pfx.or(kind),
-        )? {
-            Some(def) => Ok(format!(
-                "`{symbol}` defined at {file}:{line}\nkind: {kind}\nsignature: {signature}",
-                symbol = bare,
-                file = def.file,
-                line = def.line,
-                kind = def.kind,
-                signature = def.signature
-            )),
-            None => Ok(format!("No definition found for {:?}.", bare)),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// read_symbol
-// ---------------------------------------------------------------------------
-
-struct ReadSymbol;
-
-static READ_SYMBOL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
-    ToolSpec {
-    name: "read_symbol".into(),
-    description: "Read just one symbol's declaration body (fn, struct, enum, const, ...) with its file:line and signature. Use before editing a specific item instead of reading the whole file.".into(),
-    json_schema: json!({
-        "type": "object",
-        "properties": {
-            "symbol": { "type": "string", "description": "Identifier whose declaration body to read (bare name, not \"fn name\")." },
-            "type": { "type": "string", "enum": KIND_LABELS, "description": "Optional declaration kind to narrow to (fn, struct, enum, trait, impl, mod, type, static, const)." },
-            "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." },
-            "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD." }
-        },
-        "required": ["symbol"],
-        "additionalProperties": false
-    }),
-}
-});
-
-#[async_trait]
-impl Tool for ReadSymbol {
-    fn spec(&self) -> &ToolSpec {
-        &READ_SYMBOL_SPEC
-    }
-
-    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Args {
-            symbol: String,
+            body: bool,
             #[serde(default, rename = "type")]
             kind: Option<String>,
             #[serde(default)]
@@ -530,13 +455,34 @@ impl Tool for ReadSymbol {
         }
         let scope = changed_scope(ctx, args.git_modified_only)?;
         guard_path_scope(ctx, &args.path, &scope)?;
-        match engine::read_symbol(
-            &ctx.project_root,
-            bare,
-            args.path.as_deref(),
-            scope.as_ref(),
-            pfx.or(kind),
-        )? {
+        // body=true -> engine::read_symbol (full declaration); false ->
+        // engine::find_definition (kind + signature + location only).
+        let def = if args.body {
+            engine::read_symbol(
+                &ctx.project_root,
+                bare,
+                args.path.as_deref(),
+                scope.as_ref(),
+                pfx.or(kind),
+            )?
+        } else {
+            engine::find_definition(
+                &ctx.project_root,
+                bare,
+                args.path.as_deref(),
+                scope.as_ref(),
+                pfx.or(kind),
+            )?
+        };
+        match def {
+            Some(def) if !args.body => Ok(format!(
+                "`{symbol}` defined at {file}:{line}\nkind: {kind}\nsignature: {signature}",
+                symbol = bare,
+                file = def.file,
+                line = def.line,
+                kind = def.kind,
+                signature = def.signature
+            )),
             Some(def) => {
                 let body = def.body.unwrap_or_default();
                 let lines = body.lines().count();
@@ -557,83 +503,14 @@ impl Tool for ReadSymbol {
 }
 
 // ---------------------------------------------------------------------------
-// references_count
+// ts_find_symbol
 // ---------------------------------------------------------------------------
 
-struct ReferencesCount;
+struct TsFindSymbol;
 
-static REFERENCES_COUNT_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+static TS_FIND_SYMBOL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
-    name: "references_count".into(),
-    description: "Count references to a symbol across the project (lexical tree-sitter identifiers): total + per-file breakdown. Use to gauge blast radius, e.g. before a rename.".into(),
-    json_schema: json!({
-        "type": "object",
-        "properties": {
-            "symbol": { "type": "string", "description": "Identifier to count." },
-            "path": { "type": "string", "description": "Optional file to restrict the search to (project-root relative)." },
-            "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD." }
-        },
-        "required": ["symbol"],
-        "additionalProperties": false
-    }),
-}
-});
-
-#[async_trait]
-impl Tool for ReferencesCount {
-    fn spec(&self) -> &ToolSpec {
-        &REFERENCES_COUNT_SPEC
-    }
-
-    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Args {
-            symbol: String,
-            #[serde(default)]
-            path: Option<String>,
-            #[serde(default)]
-            git_modified_only: bool,
-        }
-        let args: Args = serde_json::from_value(args)?;
-        let symbol = engine::split_kind_prefix(&args.symbol).1;
-        let scope = changed_scope(ctx, args.git_modified_only)?;
-        guard_path_scope(ctx, &args.path, &scope)?;
-        let occ = engine::find_occurrences(
-            &ctx.project_root,
-            symbol,
-            args.path.as_deref(),
-            scope.as_ref(),
-        )?;
-        if occ.is_empty() {
-            return Ok(format!("`{symbol}` has no references."));
-        }
-        let mut per_file: std::collections::BTreeMap<&str, usize> =
-            std::collections::BTreeMap::new();
-        for o in &occ {
-            *per_file.entry(o.file.as_str()).or_insert(0) += 1;
-        }
-        let total = occ.len();
-        let files = per_file.len();
-        let mut out = format!("`{symbol}`: {total} reference(s) across {files} file(s)\n");
-        for (file, count) in per_file.iter().take(8) {
-            out.push_str(&format!("  {count:>4}  {file}\n"));
-        }
-        if per_file.len() > 8 {
-            out.push_str(&format!("  … and {} more file(s)\n", per_file.len() - 8));
-        }
-        Ok(out)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// find_symbol
-// ---------------------------------------------------------------------------
-
-struct FindSymbol;
-
-static FIND_SYMBOL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
-    ToolSpec {
-    name: "find_symbol".into(),
+    name: "ts_find_symbol".into(),
     description: "Find declarations whose NAME contains the query (case-insensitive), across the project or a file. Pass the bare name only, e.g. query=build - not fn build.".into(),
     json_schema: json!({
         "type": "object",
@@ -651,9 +528,9 @@ static FIND_SYMBOL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
 });
 
 #[async_trait]
-impl Tool for FindSymbol {
+impl Tool for TsFindSymbol {
     fn spec(&self) -> &ToolSpec {
-        &FIND_SYMBOL_SPEC
+        &TS_FIND_SYMBOL_SPEC
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
