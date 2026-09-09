@@ -6,16 +6,16 @@
 //! design or product on the long term. Each entry records when it happened,
 //! context/rationale, the decision, alternatives considered, scope and impact.
 //!
-//! - `record_adr` records a new ADR decision (approval-gated).
+//! - `record_adr` records a new ADR decision (runs directly without approval).
 //! - `find_adr` searches summaries + bodies and returns a cheap ranked
 //!   list (id · status · title · excerpt) - never full bodies.
 //! - `read_adr` returns a full entry by id.
-//! - `amend_adr` updates status or appends a note (approval-gated).
+//! - `amend_adr` updates status or appends a note (runs directly).
 //!
 //! Glossary: a single `.comrade/memory/glossary.md` mapping project keywords
 //! to their meaning and to references in code or documentation.
 //!
-//! - `record_glossary` adds or updates a term (approval-gated).
+//! - `record_glossary` adds or updates a term (runs directly without approval).
 //! - `find_glossary` searches terms and returns name + one-line meaning.
 //! - `read_glossary` returns one term's entry, or the whole file without a
 //!   term argument.
@@ -58,7 +58,7 @@ struct RecordAdr;
 static RECORD_ADR_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "record_adr".into(),
-    description: "Record an ADR decision (.comrade/memory/) for an important long-term architectural/design choice: date, context/rationale, decision, alternatives, scope, impact. Do NOT persist small operational notes or how-tos. Approval-gated: include Justification.".into(),
+    description: "Record an ADR decision (.comrade/memory/) for an important long-term architectural/design choice: date, context/rationale, decision, alternatives, scope, impact. Do NOT persist small operational notes or how-tos. Runs directly without approval.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -112,8 +112,6 @@ impl Tool for RecordAdr {
         let before = std::fs::read_to_string(&abs).unwrap_or_default();
         ctx.undo
             .capture(&format!(".comrade/memory/{rel}"), before)
-            .await?;
-        ctx.confirm(format!("record_adr #{id}: {}", args.title.trim()), None)
             .await?;
 
         let draft = store::DraftDecision {
@@ -256,7 +254,7 @@ struct AmendAdr;
 static AMEND_ADR_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "amend_adr".into(),
-    description: "Update an existing decision: change its status (proposed/accepted/superseded/rejected) and/or append a Note. Approval-gated: include Justification.".into(),
+    description: "Update an existing decision: change its status (proposed/accepted/superseded/rejected) and/or append a Note. Runs directly without approval.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -301,11 +299,6 @@ impl Tool for AmendAdr {
         ctx.undo
             .capture(&format!(".comrade/memory/{rel}"), before)
             .await?;
-        ctx.confirm(
-            format!("amend decision #{} ({})", args.id, entry.meta.status),
-            None,
-        )
-        .await?;
 
         store::amend(
             &ctx.project_root,
@@ -326,7 +319,7 @@ struct RecordGlossary;
 static RECORD_GLOSSARY_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "record_glossary".into(),
-    description: "Add or update one keyword in the project glossary (.comrade/memory/glossary.md): term -> meaning + references. Call when you meet a project-specific term the next session should understand. Approval-gated.".into(),
+    description: "Add or update one keyword in the project glossary (.comrade/memory/glossary.md): term -> meaning + references. Call when you meet a project-specific term the next session should understand. Runs directly without approval.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -367,8 +360,6 @@ impl Tool for RecordGlossary {
             .join(glossary::FILE_NAME);
         let before = std::fs::read_to_string(&abs).unwrap_or_default();
         ctx.undo.capture(&rel, before).await?;
-        ctx.confirm(format!("record glossary term: {}", args.term.trim()), None)
-            .await?;
 
         let was_new = glossary::upsert(
             &ctx.project_root,

@@ -44,22 +44,17 @@ const MUTATING_TOOLS: &[&str] = &[
 
 /// Tools that are approval-gated: the model MUST provide a `justification`
 /// before they run (a human approves based on it). `git_commit`,
-/// `pom_run_task`, `pom_run_tests` and `delegate` deliberately are NOT gated: they run
-/// directly. `delegate` runs ungated because it is the lead's normal way to
-/// hand work to sub-agents — a delegate's nested tool calls are auto-approved
-/// inside its own run, so a handoff needs no separate human confirmation.
-/// Individual delegates can opt back into an approval pause (or a hard
-/// refusal) via `approval = "ask"/"deny"` on their `[[delegates]]` entry;
+/// `pom_run_task`, `pom_run_tests`, `delegate`, `record_adr`, `amend_adr` and
+/// `record_glossary` deliberately are NOT gated: they run directly. The memory
+/// tools are ungated because their writes are confined to `.comrade/memory/`,
+/// which the agent owns. `delegate` runs ungated because it is the lead's
+/// normal way to hand work to sub-agents — a delegate's nested tool calls are
+/// auto-approved inside its own run, so a handoff needs no separate human
+/// confirmation. Individual delegates can opt back into an approval pause (or a
+/// hard refusal) via `approval = "ask"/"deny"` on their `[[delegates]]` entry;
 /// delegate.rs and advise.rs enforce it with a `ctx.confirm` before the
 /// sub-agent runs.
-const APPROVAL_GATED_TOOLS: &[&str] = &[
-    "fs_write_file",
-    "ts_rename",
-    "record_adr",
-    "amend_adr",
-    "record_glossary",
-    "shell",
-];
+const APPROVAL_GATED_TOOLS: &[&str] = &["fs_write_file", "ts_rename", "shell"];
 
 fn is_approval_gated(name: &str) -> bool {
     APPROVAL_GATED_TOOLS.contains(&name)
