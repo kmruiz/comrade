@@ -9,15 +9,16 @@
 //! search) so it can genuinely do the job — write the file, run the tests, fix
 //! failures — instead of returning text the parent must apply by hand.
 //!
-//! Two hard limits keep the parent in control:
+//! Two design points keep the parent in control:
 //! - The delegate's tool registry excludes `git_commit` (only the tech lead
 //!   commits), the session/UI tools (`set_plan`, `update_plan`,
 //!   `set_step_model`, `finish_plan`, `rename_session`, `set_status_bar`,
 //!   `ask_question`) and `delegate` itself (no recursion). See
 //!   [`DENIED_FOR_DELEGATES`].
-//! - The delegate tool call is approval-gated like any mutation: the human
-//!   approves handing the task off once, then every nested tool call the
-//!   delegate makes runs auto-approved (its context has `auto_approve` set).
+//! - The delegate tool call is not approval-gated: delegating runs directly
+//!   (like `git_commit`/`run_task`/`run_tests`), and every nested tool call
+//!   the delegate makes runs auto-approved (its context has `auto_approve`
+//!   set), so a delegate works end-to-end without pausing for a human.
 
 use std::sync::{Arc, Mutex};
 
@@ -196,10 +197,10 @@ remember, web_search and more) minus git_commit, so it can do the job itself —
 write the file, run the tests, fix failures — instead of returning text you \
 must apply by hand. Delegates cannot commit; only you can.
 
-The tool call itself is approval-gated (one human approval for the handoff); \
-once approved, every tool call the delegate makes runs auto-approved. Keep \
-using `delegate` for well-bounded jobs, but expect the delegate to iterate on \
-the repo with its own tools.
+The delegate tool call is not approval-gated: it runs directly, and every \
+tool call the delegate makes runs auto-approved, so handing off a well-bounded \
+job needs no human approval. Keep using `delegate` for well-bounded jobs, but \
+expect the delegate to iterate on the repo with its own tools.
 
 To execute one of your plan steps, pass `step` (the plan step id): the task and \
 context then come from that step and `model` must match the step's model. \
@@ -386,14 +387,9 @@ impl Tool for DelegateTool {
                     )
                 };
                 delegated_step = Some((id, found.status));
-                // Handoff approval: the human approves the delegation once
-                // (auto-approve skips this) BEFORE the step is marked working,
-                // so a denial leaves the plan untouched.
-                ctx.confirm(
-                    format!("Delegate plan step {id} to {model}?", model = found.model),
-                    Some(format!("Task:\n{goal}")),
-                )
-                .await?;
+                // No handoff approval: delegating runs directly (the delegate's
+                // nested tool calls are auto-approved inside its own run), so
+                // the step is simply marked working right away.
                 ctx.session
                     .update_plan(PlanTarget::Id(id), PlanStatus::InProgress, Some(note));
 
@@ -448,16 +444,6 @@ impl Tool for DelegateTool {
                  followed by the VERIFICATION: line."
             )
         };
-        // Ad-hoc handoff approval (plan steps were approved above, before being
-        // marked in-progress).
-        if delegated_step.is_none() {
-            ctx.confirm(
-                format!("Delegate task to {model}?"),
-                Some(format!("Task:\n{task}")),
-            )
-            .await?;
-        }
-
         let display = target.cfg.llm.display();
         let native = target.cfg.llm.protocol.native_enabled();
         let system =
@@ -611,8 +597,9 @@ const DELEGATE_READ_NUDGE: &str = "You have performed {count} reads in a row wit
 /// registry and limits: native tool calling when the delegate protocol allows
 /// it, ReAct-style text calls otherwise (both advertised/parsed exactly like
 /// the main loop so any model works). Every nested tool call runs against a
-/// clone of the caller context with `auto_approve` forced on: the single human
-/// approval happened at the `delegate` handoff.
+/// clone of the caller context with `auto_approve` forced on, so the delegate
+/// works end-to-end without pausing for confirmations (the `delegate` and
+/// `ask_advise` tools themselves are not approval-gated).
 ///
 /// `read_nudge` customises the read-guard refusal for the kind of sub-agent
 /// being run (see [`refuse_reading`]).
@@ -628,7 +615,8 @@ pub(crate) async fn run_delegate_subagent(
     read_nudge: &str,
 ) -> Result<String> {
     // The delegate inherits the session/user/undo of the parent but runs
-    // auto-approved (handoff already approved) with a fresh approval slot.
+    // auto-approved with a fresh approval slot, so its nested tool calls never
+    // pause for a human confirmation.
     let mut dctx = parent_ctx.clone();
     dctx.auto_approve = true;
     dctx.approval = Arc::new(Mutex::new(None));
