@@ -49,6 +49,10 @@ const MUTATING_TOOLS: &[&str] = &[
 /// directly. `delegate` runs ungated because it is the lead's normal way to
 /// hand work to sub-agents — a delegate's nested tool calls are auto-approved
 /// inside its own run, so a handoff needs no separate human confirmation.
+/// Individual delegates can opt back into an approval pause (or a hard
+/// refusal) via `approval = "ask"/"deny"` on their `[[delegates]]` entry;
+/// delegate.rs and advise.rs enforce it with a `ctx.confirm` before the
+/// sub-agent runs.
 const APPROVAL_GATED_TOOLS: &[&str] = &[
     "write_file",
     "rename",
@@ -1884,6 +1888,7 @@ mod tests {
             crate::config::DelegateCfg {
                 name: "a".into(),
                 description: "delegate a".into(),
+                approval: crate::config::Autonomy::Auto,
                 llm: crate::config::LlmCfg {
                     base_url: delegate_url.clone(),
                     model: "alpha".into(),
@@ -1893,6 +1898,7 @@ mod tests {
             crate::config::DelegateCfg {
                 name: "b".into(),
                 description: "delegate b".into(),
+                approval: crate::config::Autonomy::Auto,
                 llm: crate::config::LlmCfg {
                     base_url: delegate_url,
                     model: "beta".into(),

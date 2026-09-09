@@ -1,5 +1,5 @@
 # 0002 - delegate runs without handoff approval; nested delegate calls stay auto-approved
-status: accepted
+status: superseded
 date: 2026-09-09
 tags: tools, delegate, approval, security, autonomy
 summary: delegate is no longer approval-gated: removed from APPROVAL_GATED_TOOLS and its two ctx.confirm handoff prompts; nested delegate tool calls remain auto-approved. ask_advise was already ungated.
@@ -22,3 +22,6 @@ covers delegate approval classification in agent.rs (APPROVAL_GATED_TOOLS), the 
 ## Impact
 Delegating now has no human checkpoint: the lead can spawn sub-agents that auto-approve their own write/edit/run/remember calls unattended. Approval gates remain for write_file/rename/shell/remember/amend_decision/remember_glossary. The delegate tool's schema no longer advertises a `justification` argument. Follow-ups to consider: an autonomy-level config knob if unattended delegation ever needs to be restricted again.
 
+
+## Note
+Superseded by #3: delegation is no longer unconditionally approval-free. Each [[delegates]] entry can opt back into an approval pause (`approval = "ask"`) or a hard refusal (`approval = "deny"`); the default (`"auto"`) keeps ADR #2's ungated behaviour. delegate.rs/advise.rs enforce the per-delegate gate with ctx.confirm before running.

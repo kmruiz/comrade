@@ -15,10 +15,13 @@
 //!   `set_step_model`, `finish_plan`, `rename_session`, `set_status_bar`,
 //!   `ask_question`) and `delegate` itself (no recursion). See
 //!   [`DENIED_FOR_DELEGATES`].
-//! - The delegate tool call is not approval-gated: delegating runs directly
-//!   (like `git_commit`/`run_task`/`run_tests`), and every nested tool call
-//!   the delegate makes runs auto-approved (its context has `auto_approve`
+//! - The delegate tool call is not approval-gated by default: delegating runs
+//!   directly (like `git_commit`/`run_task`/`run_tests`), and every nested tool
+//!   call the delegate makes runs auto-approved (its context has `auto_approve`
 //!   set), so a delegate works end-to-end without pausing for a human.
+//!   EXCEPTION: a delegate whose `[[delegates]]` entry sets
+//!   `approval = "ask"` pauses for human approval before it runs, and one set
+//!   to `approval = "deny"` is refused outright (see [`enforce_approval`]).
 
 use std::sync::{Arc, Mutex};
 
@@ -28,7 +31,7 @@ use comrade_tool::{PlanStatus, PlanTarget, Tool, ToolContext, ToolRegistry, Tool
 use serde_json::{Value, json};
 
 use crate::agent::{LoopTracker, MAX_LOOP_REFUSALS, allow_read_step, loop_refusal};
-use crate::config::DelegateCfg;
+use crate::config::{Autonomy, DelegateCfg};
 use crate::context::ContextManager;
 use crate::llm::{ChatMessage, LlmClient, Role, ToolCallMsg};
 use crate::react::{parse_turn, render_observation};
@@ -119,6 +122,57 @@ pub(crate) fn delegate_line(name: &str, description: &str) -> String {
     }
 }
 
+/// One listing line for the tech lead, annotated with the delegate's approval
+/// policy so it can tell at a glance which models pause for human approval
+/// (`approval = "ask"`) and which are refused entirely (`approval = "deny"`).
+/// Used wherever delegates are advertised (tool description, `model` arg, and
+/// unknown-model errors) by both `delegate` and `ask_advise`.
+pub(crate) fn cfg_line(d: &DelegateCfg) -> String {
+    let line = delegate_line(&d.name, &d.description);
+    match d.approval {
+        Autonomy::Ask => format!("{line} [human approval required before it runs]"),
+        Autonomy::Deny => format!("{line} [refused: configured `approval = \"deny\"`]"),
+        Autonomy::Auto => line,
+    }
+}
+
+/// Enforce a delegate's approval policy before a `delegate`/`ask_advise` run
+/// starts. Called with the human-facing summary of what is about to run:
+/// - [`Autonomy::Auto`] (default): run without asking.
+/// - [`Autonomy::Ask`]: pause for [`ToolContext::confirm`] (which skips itself
+///   when the context is auto-approved, e.g. `[security] autonomy = "auto"`).
+/// - [`Autonomy::Deny`]: refuse to run this model through `delegate` /
+///   `ask_advise` at all — a config-level block that even auto-approval does
+///   not override.
+pub(crate) async fn enforce_approval(
+    cfg: &DelegateCfg,
+    ctx: &ToolContext,
+    summary: String,
+    preview: Option<String>,
+) -> Result<()> {
+    match cfg.approval {
+        Autonomy::Auto => Ok(()),
+        Autonomy::Ask => ctx.confirm(summary, preview).await,
+        Autonomy::Deny => bail!(
+            "delegate {:?} is configured `approval = \"deny\"`: refusing to run it via \
+             `delegate`/`ask_advise` (reconfigure it to \"ask\" or \"auto\" to use it)",
+            cfg.name
+        ),
+    }
+}
+
+/// Cap the preview shown on an approval dialog so it stays readable no matter
+/// how long the delegated task/context text is.
+pub(crate) fn approval_preview(text: &str, label: &str) -> String {
+    let cap = 3000usize;
+    let body: String = text.chars().take(cap).collect();
+    if text.chars().count() > cap {
+        format!("{label}\n\n{body}\n…[preview truncated]")
+    } else {
+        format!("{label}\n\n{body}")
+    }
+}
+
 /// Validate a `[[delegates]]` list and build one HTTP client per delegate.
 /// Shared by `DelegateTool::new` and `AskAdviseTool::new` (advise.rs) so the
 /// two tools always agree on which names are valid and how they are described.
@@ -185,7 +239,7 @@ impl DelegateTool {
 
         let listing = delegates
             .iter()
-            .map(|d| delegate_line(&d.name, &d.description))
+            .map(cfg_line)
             .collect::<Vec<_>>()
             .join("\n");
         let description = format!(
@@ -197,10 +251,14 @@ remember, web_search and more) minus git_commit, so it can do the job itself —
 write the file, run the tests, fix failures — instead of returning text you \
 must apply by hand. Delegates cannot commit; only you can.
 
-The delegate tool call is not approval-gated: it runs directly, and every \
-tool call the delegate makes runs auto-approved, so handing off a well-bounded \
-job needs no human approval. Keep using `delegate` for well-bounded jobs, but \
-expect the delegate to iterate on the repo with its own tools.
+Delegating normally needs no human approval: the tool call runs directly and \
+every tool call the delegate makes runs auto-approved, so a delegate works \
+end-to-end on its own. EXCEPTION — some delegates are configured \
+`approval = \"ask\"` (marked \"[human approval required before it runs]\" in \
+the listing below): calling one pauses for human approval before it runs. \
+Delegates configured `approval = \"deny\"` are refused entirely. Keep using \
+`delegate` for well-bounded jobs, but expect the delegate to iterate on the \
+repo with its own tools.
 
 To execute one of your plan steps, pass `step` (the plan step id): the task and \
 context then come from that step and `model` must match the step's model. \
@@ -312,6 +370,9 @@ impl Tool for DelegateTool {
         // When a plan step is delegated, remember its previous status so the
         // plan can be restored if the delegate call itself fails.
         let mut delegated_step: Option<(u64, PlanStatus)> = None;
+        // The `working: <model>` note to apply once the run is approved. Kept
+        // separate so the plan is only touched after the approval gate passes.
+        let mut delegated_note: Option<String> = None;
 
         // Resolve what to run: either an explicit ad-hoc task, or one plan step
         // (whose goal/verification/context/model all come from the plan).
@@ -360,8 +421,8 @@ impl Tool for DelegateTool {
                     format!("{goal}\n\nVerify your work: {verify}")
                 };
 
-                // Reflect the delegation in the plan so the UI shows which
-                // delegate is working, and count the fix rounds. A step gets one
+                // Compute the `working: <model>` note the plan will show once
+                // the run is approved, and count the fix rounds. A step gets one
                 // attempt from the delegate, then up to MAX_FIX_ROUNDS repairs
                 // requested via `feedback`; past that the parent must take over.
                 let fixes = fix_rounds_in_note(found.note.as_deref(), &found.model);
@@ -387,11 +448,9 @@ impl Tool for DelegateTool {
                     )
                 };
                 delegated_step = Some((id, found.status));
-                // No handoff approval: delegating runs directly (the delegate's
-                // nested tool calls are auto-approved inside its own run), so
-                // the step is simply marked working right away.
-                ctx.session
-                    .update_plan(PlanTarget::Id(id), PlanStatus::InProgress, Some(note));
+                // The plan is marked working after the approval gate (below):
+                // a denied run must leave the step in its previous status.
+                delegated_note = Some(note);
 
                 (task, found.context, found.model)
             }
@@ -417,11 +476,34 @@ impl Tool for DelegateTool {
             let listed = self
                 .targets
                 .iter()
-                .map(|t| delegate_line(&t.cfg.name, &t.cfg.description))
+                .map(|t| cfg_line(&t.cfg))
                 .collect::<Vec<_>>()
                 .join("\n");
             bail!("unknown delegate model {model:?}. Configured delegates:\n{listed}");
         };
+
+        // Per-delegate approval policy. `approval = "ask"` pauses for the human
+        // before this delegate runs (cheap/trusted delegates default to "auto"
+        // and keep running directly); `approval = "deny"` refuses outright.
+        let scope = match step_id {
+            Some(id) => format!("Delegate plan step {id} to delegate {model}?"),
+            None => format!("Delegate a task to delegate {model}?"),
+        };
+        let preview = match step_id {
+            Some(_) => approval_preview(&task, "Plan step to delegate:"),
+            None => approval_preview(&task, "Task to delegate:"),
+        };
+        enforce_approval(&target.cfg, ctx, scope, Some(preview)).await?;
+
+        // Reflect the delegation in the plan only after approval passed, so a
+        // denial or a deny-gated model never leaves the step half-claimed.
+        if let (Some(id), Some(note)) = (step_id, delegated_note.as_deref()) {
+            ctx.session.update_plan(
+                PlanTarget::Id(id),
+                PlanStatus::InProgress,
+                Some(note.to_string()),
+            );
+        }
 
         let user_prompt = if feedback.is_empty() {
             if context.trim().is_empty() {
@@ -832,7 +914,7 @@ mod tests {
 
     use super::*;
     use crate::MemoryUndo;
-    use crate::config::{Config, DelegateCfg, LlmCfg, Protocol};
+    use crate::config::{Autonomy, Config, DelegateCfg, LlmCfg, Protocol};
     use crate::session::AgentSession;
 
     /// The delegate tool never touches the session/user, so a no-op IO double
@@ -858,6 +940,50 @@ mod tests {
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             stop: None,
+        }
+    }
+
+    /// A context whose confirmations actually reach the UserIo (auto_approve
+    /// false), for exercising the per-delegate approval gate.
+    fn ask_ctx(user: Arc<dyn UserIo>) -> ToolContext {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        ToolContext {
+            project_root: "/tmp/x".into(),
+            cwd: "/tmp/x".into(),
+            session: Arc::new(AgentSession::new(tx)).as_control(),
+            user,
+            undo: Arc::new(MemoryUndo::new("/tmp/x".into())),
+            auto_approve: false,
+            approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            stop: None,
+        }
+    }
+
+    /// Records every confirm prompt's title and answers each one with `answer`
+    /// ("yes" approves; anything else denies).
+    struct RecordingIo {
+        titles: Arc<Mutex<Vec<String>>>,
+        answer: String,
+    }
+    #[async_trait]
+    impl UserIo for RecordingIo {
+        async fn ask(&self, prompt: UserPrompt) -> Result<UserReply> {
+            if let UserPrompt::Confirm { title, .. } = prompt {
+                self.titles.lock().unwrap().push(title);
+            }
+            Ok(UserReply::Answer(self.answer.clone()))
+        }
+    }
+
+    /// Fails the test if the context ever asks the human: used to prove that
+    /// auto/ungated delegates run without an approval prompt.
+    struct MustNotAsk;
+    #[async_trait]
+    impl UserIo for MustNotAsk {
+        async fn ask(&self, _prompt: UserPrompt) -> Result<UserReply> {
+            panic!("auto/ungated delegate must not prompt for approval");
         }
     }
 
@@ -955,6 +1081,7 @@ mod tests {
         DelegateCfg {
             name: name.into(),
             description: format!("{name} test delegate"),
+            approval: Autonomy::Auto,
             llm: LlmCfg {
                 base_url: base_url.into(),
                 model: "delegate-model".into(),
@@ -1343,6 +1470,121 @@ mod tests {
         let note = step.note.as_deref().unwrap_or_default();
         assert!(note.contains("working: cheap"), "{note}");
         assert!(!note.contains("fix"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn ask_gated_delegate_pauses_for_approval_then_runs() {
+        let (base, _spy) = request_spy();
+        let mut expensive = delegate("expensive", &base);
+        expensive.approval = Autonomy::Ask;
+        let tool = mk_delegate(&[expensive]).unwrap().unwrap();
+        let titles = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ask_ctx(Arc::new(RecordingIo {
+            titles: titles.clone(),
+            answer: "yes".into(),
+        }));
+
+        let out = tool
+            .invoke(&ctx, json!({"model": "expensive", "task": "add a test"}))
+            .await
+            .unwrap();
+        let held = titles.lock().unwrap();
+        assert_eq!(held.len(), 1, "exactly one approval prompt expected");
+        assert!(
+            held[0].contains("delegate expensive"),
+            "confirm title should name the delegate: {:?}",
+            held[0]
+        );
+        drop(held);
+        assert!(out.contains("delegate expensive"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn denied_approval_aborts_delegate_and_leaves_plan_untouched() {
+        let (base, _spy) = request_spy();
+        let mut expensive = delegate("expensive", &base);
+        expensive.approval = Autonomy::Ask;
+        let tool = mk_delegate(&[expensive]).unwrap().unwrap();
+        let titles = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ask_ctx(Arc::new(RecordingIo {
+            titles: titles.clone(),
+            answer: "".into(), // not affirmative -> denied
+        }));
+        ctx.session.set_plan(vec![PlanStepDraft {
+            goal: "Write double()".into(),
+            verification: "".into(),
+            model: "expensive".into(),
+            context: "".into(),
+        }]);
+
+        let err = tool.invoke(&ctx, json!({"step": 1})).await.unwrap_err();
+        assert!(err.to_string().contains("user denied"), "{err}");
+        // The step was never claimed: it stays pending with no working note.
+        let step = &ctx.session.plan()[0];
+        assert_eq!(step.status, PlanStatus::Pending, "{step:?}");
+        assert!(step.note.is_none(), "{step:?}");
+        assert_eq!(titles.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn approved_plan_step_delegation_still_marks_working_after_the_gate() {
+        let (base, _spy) = request_spy();
+        let mut expensive = delegate("expensive", &base);
+        expensive.approval = Autonomy::Ask;
+        let tool = mk_delegate(&[expensive]).unwrap().unwrap();
+        let titles = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ask_ctx(Arc::new(RecordingIo {
+            titles: titles.clone(),
+            answer: "yes".into(),
+        }));
+        ctx.session.set_plan(vec![PlanStepDraft {
+            goal: "Write double()".into(),
+            verification: "".into(),
+            model: "expensive".into(),
+            context: "".into(),
+        }]);
+
+        tool.invoke(&ctx, json!({"step": 1})).await.unwrap();
+        let held = titles.lock().unwrap();
+        assert!(
+            held[0].contains("plan step 1") && held[0].contains("expensive"),
+            "{:?}",
+            held[0]
+        );
+        drop(held);
+        let step = &ctx.session.plan()[0];
+        assert_eq!(step.status, PlanStatus::InProgress);
+        assert_eq!(step.note.as_deref(), Some("working: expensive"));
+    }
+
+    #[tokio::test]
+    async fn deny_gated_delegate_is_refused_without_running() {
+        // No server is spawned: a deny-gated delegate must never be contacted.
+        let mut guarded = delegate("guarded", "http://127.0.0.1:1/v1");
+        guarded.approval = Autonomy::Deny;
+        let tool = mk_delegate(&[guarded]).unwrap().unwrap();
+        let ctx = test_ctx();
+
+        let err = tool
+            .invoke(&ctx, json!({"model": "guarded", "task": "any task"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("approval = \"deny\"") && err.to_string().contains("guarded"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_gated_default_delegate_runs_without_any_prompt() {
+        let (base, _spy) = request_spy();
+        let tool = mk_delegate(&[delegate("cheap", &base)]).unwrap().unwrap();
+        let ctx = ask_ctx(Arc::new(MustNotAsk));
+        let out = tool
+            .invoke(&ctx, json!({"model": "cheap", "task": "add a test"}))
+            .await
+            .unwrap();
+        assert!(out.contains("delegate cheap"), "{out}");
     }
 
     fn cheap_tool(base_url: &str) -> DelegateTool {

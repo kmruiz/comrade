@@ -4,8 +4,11 @@
 //! second opinion before committing to an approach — how to plan or split a
 //! task, which delegate fits a piece of work, whether a design/plan is sound,
 //! what to watch out for. Unlike [`crate::delegate::DelegateTool`] nothing is
-//! handed off: no plan step is marked working, no fix rounds, no human
-//! approval, and the consulted delegate cannot change anything.
+//! handed off: no plan step is marked working, no fix rounds, and the consulted
+//! delegate cannot change anything. Consultations normally need no approval,
+//! but a delegate configured `approval = "ask"` pauses for human approval
+//! before the advice runs (and one set to "deny" is refused outright) — same
+//! policy as [`crate::delegate`].
 //!
 //! The advisor gets a READ-ONLY sub-agent loop over the repository (see
 //! [`AskAdviseTool::read_only_for_advice`] and the `advise_registry()` builder
@@ -23,8 +26,8 @@ use serde_json::{Value, json};
 
 use crate::config::DelegateCfg;
 use crate::delegate::{
-    DelegateLimits, Target, build_targets, delegate_line, render_subagent_system,
-    run_delegate_subagent,
+    DelegateLimits, Target, approval_preview, build_targets, cfg_line, enforce_approval,
+    render_subagent_system, run_delegate_subagent,
 };
 
 /// Name of the tool advertised to the tech lead model.
@@ -75,7 +78,7 @@ impl AskAdviseTool {
         let names: Vec<String> = targets.iter().map(|t| t.cfg.name.clone()).collect();
         let listing = delegates
             .iter()
-            .map(|d| delegate_line(&d.name, &d.description))
+            .map(cfg_line)
             .collect::<Vec<_>>()
             .join("\n");
         let description = format!(
@@ -87,8 +90,10 @@ approach is sound, what could go wrong, a review of your plan or design).
 
 The consulted delegate gets READ-ONLY repository tools (read/search files, git status/diff/log, \
 project_model, memory lookups, web_search) so the advice can be grounded in the actual code, but \
-it has no write/edit/shell/run/commit/plan tools and cannot change anything. The call is NOT \
-approval-gated and does not touch the plan; it only costs one extra model conversation.
+it has no write/edit/shell/run/commit/plan tools and cannot change anything. The call does not \
+touch the plan and costs one extra model conversation. Consulting normally needs no approval, \
+but a delegate configured `approval = \"ask\"` (marked \"[human approval required before it \
+runs]\" below) pauses for human approval first, and one set to `approval = \"deny\"` is refused.
 
 Ask with `model` + a self-contained `question` (+ optional `context` for anything the delegate \
 cannot discover itself, e.g. your plan draft or design notes). You get advice back — you still \
@@ -167,11 +172,21 @@ impl Tool for AskAdviseTool {
             let listed = self
                 .targets
                 .iter()
-                .map(|t| delegate_line(&t.cfg.name, &t.cfg.description))
+                .map(|t| cfg_line(&t.cfg))
                 .collect::<Vec<_>>()
                 .join("\n");
             bail!("unknown delegate model {model:?}. Configured delegates:\n{listed}");
         };
+
+        // Per-delegate approval policy, same as `delegate`: "ask" pauses for
+        // the human before the advice runs, "deny" refuses outright.
+        enforce_approval(
+            &target.cfg,
+            ctx,
+            format!("Ask delegate {model} for advice?"),
+            Some(approval_preview(&question, "Question:")),
+        )
+        .await?;
 
         let user_prompt = if context.is_empty() {
             format!("Question:\n{question}")
@@ -208,14 +223,14 @@ impl Tool for AskAdviseTool {
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use comrade_tool::ToolContext;
     use comrade_tool::tool::{UserIo, UserPrompt, UserReply};
 
     use super::*;
     use crate::MemoryUndo;
-    use crate::config::{DelegateCfg, LlmCfg};
+    use crate::config::{Autonomy, DelegateCfg, LlmCfg};
     use crate::session::AgentSession;
 
     /// The advise tool never touches the session/user (nothing is handed off),
@@ -241,6 +256,50 @@ mod tests {
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             stop: None,
+        }
+    }
+
+    /// A context whose confirmations actually reach the UserIo (auto_approve
+    /// false), for exercising the per-delegate approval gate.
+    fn ask_ctx(user: Arc<dyn UserIo>) -> ToolContext {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        ToolContext {
+            project_root: "/tmp/x".into(),
+            cwd: "/tmp/x".into(),
+            session: Arc::new(AgentSession::new(tx)).as_control(),
+            user,
+            undo: Arc::new(MemoryUndo::new("/tmp/x".into())),
+            auto_approve: false,
+            approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            stop: None,
+        }
+    }
+
+    /// Records every confirm prompt's title and answers each one with `answer`
+    /// ("yes" approves; anything else denies).
+    struct RecordingIo {
+        titles: Arc<Mutex<Vec<String>>>,
+        answer: String,
+    }
+    #[async_trait]
+    impl UserIo for RecordingIo {
+        async fn ask(&self, prompt: UserPrompt) -> Result<UserReply> {
+            if let UserPrompt::Confirm { title, .. } = prompt {
+                self.titles.lock().unwrap().push(title);
+            }
+            Ok(UserReply::Answer(self.answer.clone()))
+        }
+    }
+
+    /// Fails the test if the context ever asks the human: used to prove that
+    /// auto/ungated delegates run without an approval prompt.
+    struct MustNotAsk;
+    #[async_trait]
+    impl UserIo for MustNotAsk {
+        async fn ask(&self, _prompt: UserPrompt) -> Result<UserReply> {
+            panic!("auto/ungated delegate must not prompt for approval");
         }
     }
 
@@ -337,6 +396,7 @@ mod tests {
         DelegateCfg {
             name: name.into(),
             description: format!("{name} test delegate"),
+            approval: Autonomy::Auto,
             llm: LlmCfg {
                 base_url: base_url.into(),
                 model: "delegate-model".into(),
@@ -485,5 +545,93 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("question"));
+    }
+
+    #[tokio::test]
+    async fn ask_gated_advisor_pauses_for_approval_then_advises() {
+        let base = fake_chat_server("split the task into three small steps");
+        let mut expensive = delegate("expensive", &base);
+        expensive.approval = Autonomy::Ask;
+        let tool = mk_advise(&[expensive]).unwrap().unwrap();
+        let titles = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ask_ctx(Arc::new(RecordingIo {
+            titles: titles.clone(),
+            answer: "yes".into(),
+        }));
+
+        let out = tool
+            .invoke(
+                &ctx,
+                json!({"model": "expensive", "question": "Is my plan sound?"}),
+            )
+            .await
+            .unwrap();
+        let held = titles.lock().unwrap();
+        assert_eq!(held.len(), 1, "exactly one approval prompt expected");
+        assert!(
+            held[0].contains("Ask delegate expensive"),
+            "confirm title should name the delegate: {:?}",
+            held[0]
+        );
+        drop(held);
+        assert!(out.contains("advice from expensive"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn denied_approval_aborts_the_consultation() {
+        let base = fake_chat_server("ignored");
+        let mut expensive = delegate("expensive", &base);
+        expensive.approval = Autonomy::Ask;
+        let tool = mk_advise(&[expensive]).unwrap().unwrap();
+        let titles = Arc::new(Mutex::new(Vec::new()));
+        let ctx = ask_ctx(Arc::new(RecordingIo {
+            titles: titles.clone(),
+            answer: "".into(), // not affirmative -> denied
+        }));
+
+        let err = tool
+            .invoke(
+                &ctx,
+                json!({"model": "expensive", "question": "Is my plan sound?"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("user denied"), "{err}");
+        assert_eq!(titles.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deny_gated_advisor_is_refused_without_running() {
+        let mut guarded = delegate("guarded", "http://127.0.0.1:1/v1");
+        guarded.approval = Autonomy::Deny;
+        let tool = mk_advise(&[guarded]).unwrap().unwrap();
+        let ctx = test_ctx();
+
+        let err = tool
+            .invoke(
+                &ctx,
+                json!({"model": "guarded", "question": "Is my plan sound?"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("approval = \"deny\"") && err.to_string().contains("guarded"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_advisor_runs_without_any_prompt() {
+        let base = fake_chat_server("your plan is fine");
+        let tool = mk_advise(&[delegate("cheap", &base)]).unwrap().unwrap();
+        let ctx = ask_ctx(Arc::new(MustNotAsk));
+        let out = tool
+            .invoke(
+                &ctx,
+                json!({"model": "cheap", "question": "Is my plan sound?"}),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("advice from cheap"), "{out}");
     }
 }

@@ -109,6 +109,12 @@ pub struct DelegateCfg {
     /// Short human-readable blurb of when to use this model (shown to the
     /// tech lead so it can pick the right developer for a task).
     pub description: String,
+    /// Approval policy for running this model via the `delegate` and
+    /// `ask_advise` tools. `auto` (default) runs without asking, like any
+    /// un-gated delegate; `ask` pauses for human approval before each use
+    /// (skipped under `[security] autonomy = "auto"`); `deny` refuses to run
+    /// this model through `delegate`/`ask_advise` at all, even auto-approved.
+    pub approval: Autonomy,
     /// The model settings for this delegate: `provider`, `model`, `api_key`,
     /// `temperature`, ... written inline at the same level as `name`.
     #[serde(flatten)]
@@ -120,6 +126,7 @@ impl Default for DelegateCfg {
         Self {
             name: String::new(),
             description: String::new(),
+            approval: Autonomy::Auto,
             llm: LlmCfg::default(),
         }
     }
@@ -475,6 +482,7 @@ mod tests {
             [[delegates]]
             name = "groq-fast"
             description = "Groq Llama 3.3 70B - very fast and cheap"
+            approval = "ask"
             provider = "groq"
             model = "llama-3.3-70b-versatile"
             api_key = "gsk-x"
@@ -498,6 +506,9 @@ mod tests {
         // ...and omitted scalar settings fall back to defaults.
         assert_eq!(groq.llm.temperature, 0.2);
         assert_eq!(groq.llm.timeout_secs, 600);
+        // `approval` parses and defaults to Auto (ungated) when omitted.
+        assert_eq!(groq.approval, Autonomy::Ask);
+        assert_eq!(c.delegates[1].approval, Autonomy::Auto);
         // second delegate has no description and still resolves its provider.
         assert_eq!(c.delegates[1].llm.base_url, "http://localhost:11434/v1");
         assert!(c.delegates[1].description.is_empty());
