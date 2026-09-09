@@ -58,6 +58,7 @@ pub const DENIED_FOR_DELEGATES: &[&str] = &[
     "set_plan",
     "update_plan",
     "set_step_model",
+    "set_step_context",
     "finish_plan",
 ];
 
@@ -277,7 +278,9 @@ the tool refuses further fix requests and you must do the step yourself. \
 Running a plan step through this tool is what entitles it to be marked done: \
 update_plan and finish_plan refuse to close a step assigned a delegate model \
 until the delegate tool has run it, so you cannot complete delegated work \
-yourself.
+yourself. Pick up a step only once it is `ready` — ask its delegate first via \
+ask_advise step = <id> (that marks the step `ready` when the delegate confirms \
+the context suffices; enrich with set_step_context and re-ask until it does).
 
 Several delegate calls issued in one message run in PARALLEL: split \
 independent sub-tasks into separate calls and batch them together instead of \

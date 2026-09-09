@@ -25,6 +25,15 @@ fn is_delegate_model(model: &str) -> bool {
     !m.is_empty() && m != AGENT_MODEL
 }
 
+/// Whether a step is still on someone's plate: not yet finished or blocked.
+/// `Ready` counts as open — the step has been confirmed but not yet picked up.
+fn is_open(status: &PlanStatus) -> bool {
+    matches!(
+        status,
+        PlanStatus::Pending | PlanStatus::Ready | PlanStatus::InProgress
+    )
+}
+
 /// All session-control tools.
 pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
@@ -32,6 +41,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(SetPlan),
         Box::new(UpdatePlan),
         Box::new(SetStepModel),
+        Box::new(SetStepContext),
         Box::new(FinishPlan),
         Box::new(SetStatusBar),
         Box::new(AskQuestion),
@@ -176,13 +186,13 @@ struct UpdatePlan;
 static UPDATE_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "update_plan".into(),
-    description: "Update the status of one plan step (mark in_progress/done/blocked). Identify a step by its 1-based `index` (preferred) or by `text` that appears in its goal. A step assigned a delegate `model` can only be marked done after the `delegate` tool has run it.".into(),
+    description: "Update the status of one plan step (mark pending/ready/in_progress/done/blocked). Identify a step by its 1-based `index` (preferred) or by `text` that appears in its goal. A step assigned a delegate `model` can only be marked done after the `delegate` tool has run it.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "index": { "type": "integer", "minimum": 1, "description": "1-based step id." },
             "text": { "type": "string", "description": "Text contained in the step goal." },
-            "status": { "type": "string", "enum": ["pending", "in_progress", "done", "blocked"] },
+            "status": { "type": "string", "enum": ["pending", "ready", "in_progress", "done", "blocked"], "description": "pending = not started; ready = the step's delegate confirmed via ask_advise step=<id> that the context suffices to pick it up; in_progress = being worked; done / blocked." },
             "note": { "type": "string", "description": "Optional note appended to the step." }
         },
         "required": ["status"],
@@ -253,7 +263,7 @@ impl Tool for UpdatePlan {
                 .session
                 .plan()
                 .into_iter()
-                .filter(|s| matches!(s.status, PlanStatus::Pending | PlanStatus::InProgress))
+                .filter(|s| is_open(&s.status))
                 .count();
             Ok(format!("Step marked {status}. {open} step(s) still open."))
         } else {
@@ -271,7 +281,7 @@ struct SetStepModel;
 static SET_STEP_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "set_step_model".into(),
-    description: "Change which model runs an existing plan step, e.g. to hand a pending \\\"self\\\" step to a delegate or to take a delegate-assigned step back onto yourself. Identify the step by its 1-based `index` (preferred) or by `text` in its goal, and give the `model` that will run it: \\\"self\\\" for you, or a configured delegate name. Refused while the step is in_progress or done: only pending or blocked steps can be reassigned. Reassigning clears the step's delegation record, so the newly assigned model must actually run the step before it can be marked done.".into(),
+    description: "Change which model runs an existing plan step, e.g. to hand a pending \\\"self\\\" step to a delegate or to take a delegate-assigned step back onto yourself. Identify the step by its 1-based `index` (preferred) or by `text` in its goal, and give the `model` that will run it: \\\"self\\\" for you, or a configured delegate name. Refused while the step is in_progress or done: only pending, ready or blocked steps can be reassigned. Reassigning a ready step drops it back to pending (readiness was confirmed for the old delegate). Reassigning clears the step's delegation record, so the newly assigned model must actually run the step before it can be marked done.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -331,16 +341,13 @@ impl Tool for SetStepModel {
             if matches!(step.status, PlanStatus::InProgress | PlanStatus::Done) {
                 anyhow::bail!(
                     "plan step {} is {} — a step's model can only be changed while it is \
-                     pending or blocked, not once a model is working it or it is done",
+                     pending, ready or blocked, not once a model is working it or it is done",
                     step.id,
                     step.status
                 );
             }
             if step.model == model {
-                let open = steps
-                    .iter()
-                    .filter(|s| matches!(s.status, PlanStatus::Pending | PlanStatus::InProgress))
-                    .count();
+                let open = steps.iter().filter(|s| is_open(&s.status)).count();
                 return Ok(format!(
                     "Step {} is already assigned to {model:?}; nothing changed. {open} step(s) \
                      still open.",
@@ -355,12 +362,85 @@ impl Tool for SetStepModel {
                     .session
                     .plan()
                     .into_iter()
-                    .filter(|s| matches!(s.status, PlanStatus::Pending | PlanStatus::InProgress))
+                    .filter(|s| is_open(&s.status))
                     .count();
                 Ok(format!(
                     "Step now assigned to model {model:?}. Reassignment cleared its delegation \
                      record, so that model must run the step before it can be marked done. {open} \
                      step(s) still open."
+                ))
+            }
+            Ok(false) => anyhow::bail!("no step matched the given index/text"),
+            Err(why) => anyhow::bail!("{why}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// set_step_context
+// ---------------------------------------------------------------------------
+
+struct SetStepContext;
+
+static SET_STEP_CONTEXT_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "set_step_context".into(),
+    description: "Replace the summarised context of one plan step — the instructions the executing delegate will actually receive (never shown in the UI). Use it to feed a delegate's \\\"I need more info\\\" requests back into a step after `ask_advise` step = <id> reported the context insufficient, then re-run ask_advise step = <id> until the delegate confirms the step is `ready`. Identify the step by its 1-based `index` (preferred) or by `text` in its goal, and give the new `context`. Refused while the step is in_progress or done; setting the context of a `ready` step drops it back to `pending`, because the readiness confirmation described the old context.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "index": { "type": "integer", "minimum": 1, "description": "1-based step id." },
+            "text": { "type": "string", "description": "Text contained in the step goal." },
+            "context": { "type": "string", "description": "The new summarised context for the executing model (replaces the step's current context entirely)." }
+        },
+        "required": ["context"],
+        "oneOf": [
+            { "required": ["index"] },
+            { "required": ["text"] }
+        ],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for SetStepContext {
+    fn spec(&self) -> &ToolSpec {
+        &SET_STEP_CONTEXT_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            index: Option<u64>,
+            #[serde(default)]
+            text: Option<String>,
+            context: String,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let target = match (args.index, args.text.as_deref()) {
+            (Some(i), _) if i >= 1 => PlanTarget::Id(i),
+            (None, Some(t)) if !t.is_empty() => PlanTarget::Text(t.to_string()),
+            _ => anyhow::bail!(
+                "set_step_context requires either a 1-based `index` or non-empty `text`"
+            ),
+        };
+
+        // Report the matched step's id on success, like the other step tools.
+        let steps = ctx.session.plan();
+        let matched = steps.iter().find(|s| match &target {
+            PlanTarget::Id(id) => s.id == *id,
+            PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+        });
+        let matched_id = matched.map(|s| s.id);
+
+        match ctx.session.set_step_context(&target, &args.context) {
+            Ok(true) => {
+                let id = matched_id.expect("set_step_context matched, so the id exists");
+                Ok(format!(
+                    "Context of step {id} replaced. Re-run ask_advise step = {id} so the \
+                     delegate can confirm the step is `ready`."
                 ))
             }
             Ok(false) => anyhow::bail!("no step matched the given index/text"),
@@ -412,7 +492,7 @@ impl Tool for FinishPlan {
             .iter()
             .filter(|s| {
                 is_delegate_model(&s.model)
-                    && matches!(s.status, PlanStatus::Pending | PlanStatus::InProgress)
+                    && is_open(&s.status)
                     && !ctx.session.step_was_delegated(s.id)
             })
             .map(|s| format!("step {} (delegate {:?})", s.id, s.model.trim()))
@@ -537,7 +617,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{FinishPlan, SetPlan, SetStepModel, UpdatePlan};
+    use super::{FinishPlan, SetPlan, SetStepContext, SetStepModel, UpdatePlan};
 
     /// A real-enough session: stores the plan and which steps the `delegate`
     /// tool has run, exactly like `AgentSession` does.
@@ -625,7 +705,7 @@ mod tests {
                 if matches!(step.status, PlanStatus::InProgress | PlanStatus::Done) {
                     return Err(format!(
                         "plan step {} is {} — a step's model can only be changed while it is \
-                         pending or blocked",
+                         pending, ready or blocked",
                         step.id, step.status
                     ));
                 }
@@ -633,6 +713,42 @@ mod tests {
                 step.id
             };
             self.delegated.lock().unwrap().remove(&step_id);
+            Ok(true)
+        }
+        fn set_step_context(
+            &self,
+            target: &PlanTarget,
+            context: &str,
+        ) -> std::result::Result<bool, String> {
+            let context = context.trim();
+            let (step_id, was_ready) = {
+                let mut plan = self.plan.lock().unwrap();
+                let Some(step) = plan.iter_mut().find(|s| match &target {
+                    PlanTarget::Id(id) => s.id == *id,
+                    PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+                }) else {
+                    return Ok(false);
+                };
+                if matches!(step.status, PlanStatus::InProgress | PlanStatus::Done) {
+                    return Err(format!(
+                        "plan step {} is {} — a step's context can only be changed while it is \
+                         pending, ready or blocked",
+                        step.id, step.status
+                    ));
+                }
+                if context.is_empty() {
+                    return Err(format!("plan step {} needs a non-empty context", step.id));
+                }
+                step.context = context.to_string();
+                (step.id, step.status == PlanStatus::Ready)
+            };
+            if was_ready {
+                self.update_plan(
+                    PlanTarget::Id(step_id),
+                    PlanStatus::Pending,
+                    Some("ready reset: context changed".into()),
+                );
+            }
             Ok(true)
         }
         fn set_status(&self, _s: &str) {}
@@ -845,7 +961,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("in_progress"), "{err}");
-        assert!(err.to_string().contains("pending or blocked"), "{err}");
+        assert!(
+            err.to_string().contains("pending, ready or blocked"),
+            "{err}"
+        );
         let err = SetStepModel
             .invoke(&c, json!({ "index": 2, "model": "cheap" }))
             .await
@@ -897,5 +1016,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(c.session.plan()[0].model, "claude");
+    }
+
+    #[tokio::test]
+    async fn set_step_context_replaces_the_context_of_a_pending_step() {
+        let c = ctx(StubSession::with_plan(vec![delegated_step()]));
+        let out = SetStepContext
+            .invoke(
+                &c,
+                json!({ "index": 1, "context": "the helper lives in crates/x" }),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Context of step 1 replaced"), "{out}");
+        assert_eq!(c.session.plan()[0].context, "the helper lives in crates/x");
+    }
+
+    #[tokio::test]
+    async fn set_step_context_targets_by_goal_text() {
+        let c = ctx(StubSession::with_plan(vec![plain_step(), delegated_step()]));
+        SetStepContext
+            .invoke(&c, json!({ "text": "helper fn", "context": "new ctx" }))
+            .await
+            .unwrap();
+        assert_eq!(c.session.plan()[1].context, "new ctx");
+        assert_eq!(c.session.plan()[0].context, String::new());
+    }
+
+    #[tokio::test]
+    async fn set_step_context_refuses_in_progress_and_done_steps() {
+        let c = ctx(StubSession::with_plan(vec![
+            delegated_step(),
+            delegated_step(),
+        ]));
+        c.session
+            .update_plan(PlanTarget::Id(1), PlanStatus::InProgress, None);
+        c.session
+            .update_plan(PlanTarget::Id(2), PlanStatus::Done, None);
+        let err = SetStepContext
+            .invoke(&c, json!({ "index": 1, "context": "x" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("in_progress"), "{err}");
+        let err = SetStepContext
+            .invoke(&c, json!({ "index": 2, "context": "x" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("done"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn set_step_context_drops_a_ready_step_back_to_pending() {
+        let c = ctx(StubSession::with_plan(vec![delegated_step()]));
+        c.session.update_plan(
+            PlanTarget::Id(1),
+            PlanStatus::Ready,
+            Some("ready: ok".into()),
+        );
+        assert_eq!(c.session.plan()[0].status, PlanStatus::Ready);
+        SetStepContext
+            .invoke(&c, json!({ "index": 1, "context": "new enriched ctx" }))
+            .await
+            .unwrap();
+        assert_eq!(c.session.plan()[0].context, "new enriched ctx");
+        assert_eq!(c.session.plan()[0].status, PlanStatus::Pending);
+        assert_eq!(
+            c.session.plan()[0].note.as_deref(),
+            Some("ready reset: context changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_step_context_rejects_blank_context_and_unknown_targets() {
+        let c = ctx(StubSession::with_plan(vec![delegated_step()]));
+        let err = SetStepContext
+            .invoke(&c, json!({ "index": 1, "context": "   " }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-empty"), "{err}");
+        let err = SetStepContext
+            .invoke(&c, json!({ "index": 99, "context": "x" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no step matched"), "{err}");
+        let err = SetStepContext
+            .invoke(&c, json!({ "context": "x" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("`index`"), "{err}");
     }
 }

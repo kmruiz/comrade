@@ -10,12 +10,30 @@ use std::fmt;
 pub const AGENT_MODEL: &str = "self";
 
 /// Status of a single plan step.
+///
+/// The lifecycle for a step assigned to a delegate model is
+/// `Pending -> Ready -> InProgress -> Done` (or `Blocked`): the tech lead first
+/// asks the step's delegate (ask_advise `step` = id) whether its context is
+/// sufficient, and once the delegate confirms the context the step becomes
+/// [`PlanStatus::Ready`] — "ready to pick up". Only then is the step delegated
+/// (which moves it to `InProgress`/working). A step whose delegate still needs
+/// more context stays `Pending` with an "awaiting context: ..." note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
+    /// Created by `set_plan`, or put back when more context is needed before
+    /// the assigned delegate can pick the step up.
     Pending,
+    /// The step's assigned delegate was consulted (ask_advise `step` = id) and
+    /// confirmed that the step's context is sufficient for it to do the work.
+    /// Sits between `Pending` and `InProgress`; delegating the step moves it to
+    /// `InProgress`.
+    Ready,
+    /// A model (the lead or a delegate) is currently working the step.
     InProgress,
+    /// Work finished and verified.
     Done,
+    /// Could not be completed as planned.
     Blocked,
 }
 
@@ -23,6 +41,7 @@ impl PlanStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             PlanStatus::Pending => "pending",
+            PlanStatus::Ready => "ready",
             PlanStatus::InProgress => "in_progress",
             PlanStatus::Done => "done",
             PlanStatus::Blocked => "blocked",
@@ -34,6 +53,7 @@ impl PlanStatus {
         let n = s.to_ascii_lowercase().replace(['-', ' '], "_");
         match n.as_str() {
             "pending" | "todo" | "waiting" => Some(PlanStatus::Pending),
+            "ready" | "prepared" | "confirmed" | "ok" => Some(PlanStatus::Ready),
             "in_progress" | "inprogress" | "running" | "doing" | "active" => {
                 Some(PlanStatus::InProgress)
             }
@@ -136,7 +156,7 @@ impl PlanStep {
             return;
         }
         match status {
-            PlanStatus::Pending => {
+            PlanStatus::Pending | PlanStatus::Ready => {
                 self.started_at_ms = None;
                 self.took_ms = None;
             }
@@ -210,18 +230,39 @@ pub trait SessionControl: Send + Sync {
     /// assigned to the main model ([`AGENT_MODEL`]) to a delegate, or to take a
     /// delegate-assigned step back onto yourself.
     ///
-    /// Allowed only while the step is `Pending` or `Blocked`: a step that is
-    /// `InProgress` (a model is already working it) or `Done` keeps its model.
+    /// Allowed only while the step is `Pending`, `Ready` or `Blocked`: a step
+    /// that is `InProgress` (a model is already working it) or `Done` keeps its
+    /// model.
     ///
     /// Reassignment also clears the step's delegation record ([`Self::step_was_delegated`]
     /// becomes false), so the newly assigned model must actually run the step
-    /// before a delegated step can be marked done.
+    /// before a delegated step can be marked done. A `Ready` step drops back to
+    /// `Pending`: its readiness was confirmed by the old delegate, and the new
+    /// model must be consulted again before the step is picked up.
     ///
     /// Returns `Ok(true)` when the step was reassigned, `Ok(false)` when no step
     /// matched `target`, and `Err(reason)` when the matched step may not be
     /// reassigned.
     fn reassign_step_model(&self, _target: &PlanTarget, _model: &str) -> Result<bool, String> {
         Err("reassigning a step's model is not supported by this session".to_string())
+    }
+
+    /// Replace the summarised context of an existing plan step. The context is
+    /// fed to the executing model verbatim and never shown in the UI, so this
+    /// is how a tech lead enriches a step after its delegate reported (via
+    /// ask_advise `step` = id) that it needs more context to pick the step up.
+    ///
+    /// Allowed only while the step is `Pending`, `Ready` or `Blocked`: a step
+    /// that is `InProgress` (a model is already working it) or `Done` keeps its
+    /// context. Setting the context of a `Ready` step drops it back to
+    /// `Pending` — the readiness confirmation described a different context, so
+    /// the delegate must be consulted again before the step is picked up.
+    ///
+    /// Returns `Ok(true)` when the context was replaced, `Ok(false)` when no
+    /// step matched `target`, and `Err(reason)` when the matched step may not
+    /// be changed.
+    fn set_step_context(&self, _target: &PlanTarget, _context: &str) -> Result<bool, String> {
+        Err("setting a step's context is not supported by this session".to_string())
     }
 
     fn set_status(&self, status: &str);
@@ -311,5 +352,40 @@ mod tests {
         assert_eq!(s.note.as_deref(), Some("hello"));
         s.update_at(PlanStatus::InProgress, Some("   ".into()), 2);
         assert_eq!(s.note.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn ready_is_between_pending_and_inprogress() {
+        assert_eq!(PlanStatus::Ready.as_str(), "ready");
+        assert_eq!(PlanStatus::parse("ready"), Some(PlanStatus::Ready));
+        assert_eq!(PlanStatus::parse("prepared"), Some(PlanStatus::Ready));
+
+        // ready is a pre-work state: no clock while waiting to be picked up
+        let mut s = step();
+        s.update_at(PlanStatus::Ready, None, 1_000);
+        assert_eq!(s.started_at_ms, None);
+        assert_eq!(s.took_ms, None);
+        // picking the step up starts the clock from the Ready state
+        s.update_at(PlanStatus::InProgress, None, 2_000);
+        s.update_at(PlanStatus::Done, None, 2_500);
+        assert_eq!(s.took_ms, Some(500));
+    }
+
+    #[test]
+    fn back_to_ready_clears_partial_timing() {
+        let mut s = step();
+        s.update_at(PlanStatus::InProgress, None, 100);
+        // a delegate run aborted and the step returns to the ready state it was
+        // in before being picked up: the aborted attempt must not count
+        s.update_at(
+            PlanStatus::Ready,
+            Some("delegate failed to run".into()),
+            200,
+        );
+        assert_eq!(s.started_at_ms, None);
+        assert_eq!(s.took_ms, None);
+        s.update_at(PlanStatus::InProgress, None, 300);
+        s.update_at(PlanStatus::Done, None, 350);
+        assert_eq!(s.took_ms, Some(50));
     }
 }

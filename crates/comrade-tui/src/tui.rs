@@ -4779,6 +4779,7 @@ fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
             PlanStatus::InProgress => Color::Yellow,
             PlanStatus::Blocked => Color::Red,
             PlanStatus::Pending => Color::DarkGray,
+            PlanStatus::Ready => Color::Blue,
         };
         // A finished step collapses to a single line: the note and the
         // verification (which mattered while it was being worked) are dropped,
@@ -4865,11 +4866,13 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-/// The status glyph shown before a plan step: "-" for pending, a rotating
-/// spinner for in-progress, a tick for done and a cross for failed/blocked.
+/// The status glyph shown before a plan step: "-" for pending, "●" for a step
+/// whose delegate confirmed it is ready to pick up, a rotating spinner for
+/// in-progress, a tick for done and a cross for failed/blocked.
 fn plan_glyph(s: &PlanStatus, now_ms: u128) -> &'static str {
     match s {
         PlanStatus::Pending => "-",
+        PlanStatus::Ready => "●",
         PlanStatus::InProgress => {
             let frame = ((now_ms / SPINNER_FRAME_MS) as usize) % SPINNER_FRAMES.len();
             SPINNER_FRAMES[frame]
@@ -7550,6 +7553,7 @@ mod plan_step_tests {
         assert_eq!(plan_glyph(&PlanStatus::Done, 0), "✓");
         assert_eq!(plan_glyph(&PlanStatus::Blocked, 0), "✗");
         assert_eq!(plan_glyph(&PlanStatus::Pending, 0), "-");
+        assert_eq!(plan_glyph(&PlanStatus::Ready, 0), "●");
         // The in-progress spinner picks a frame from the rotation by time and
         // every frame is a single-width glyph.
         for ms in [0u128, 100, 350, 799] {

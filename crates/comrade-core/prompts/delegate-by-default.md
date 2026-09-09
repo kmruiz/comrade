@@ -7,3 +7,5 @@ Use delegates as advisors too: when the plan or design gets complex, ask one or 
 
 Delegation is enforced, not a suggestion: a step you assign a delegate `model` cannot be marked done until the delegate tool has actually run it, so assign `model` only to steps you intend to delegate — then delegate them.
 
+Confirm each delegated step's context BEFORE delegating it: right after set_plan, fire `ask_advise step = <id>` for every delegate-assigned step — one call per step, batched in the same message so they run in PARALLEL while you keep doing your own work. The step's own delegate is consulted about whether the step's context (goal + verification + context) is enough for it to pick the step up: when it confirms, the step is marked `ready` (pending -> ready -> working); when it needs more, the step stays pending with an "awaiting context: ..." note telling you what to add. Feed the request back with `set_step_context` (index = <id>), re-run ask_advise step = <id>, and only delegate a step once it shows `ready` — that is what makes the delegate's work land well-scoped instead of under-contextualised.
+

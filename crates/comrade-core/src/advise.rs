@@ -3,12 +3,25 @@
 //! The main ("tech lead") model keeps a task on its own plate but wants a
 //! second opinion before committing to an approach — how to plan or split a
 //! task, which delegate fits a piece of work, whether a design/plan is sound,
-//! what to watch out for. Unlike [`crate::delegate::DelegateTool`] nothing is
-//! handed off: no plan step is marked working, no fix rounds, and the consulted
-//! delegate cannot change anything. Consultations normally need no approval,
-//! but a delegate configured `approval = "ask"` pauses for human approval
-//! before the advice runs (and one set to "deny" is refused outright) — same
-//! policy as [`crate::delegate`].
+//! what to watch out for.
+//!
+//! Besides free-form advice, the tool doubles as the *readiness handshake* for
+//! delegated plan steps: pass `step` = a plan step id (instead of `model` +
+//! `question`) and the step's OWN delegate is consulted about whether the
+//! step's context (goal/verification/context) is enough for it to pick the step
+//! up. When the delegate's reply says the context suffices (a final
+//! `VERDICT: READY` line) the step is marked [`PlanStatus::Ready`] — ready to
+//! be delegated; when the delegate reports it needs more, the step stays
+//! `Pending` with an "awaiting context: ..." note and the lead can feed the
+//! request back via `set_step_context` and re-ask. This lets the lead run the
+//! readiness checks in parallel while doing other work.
+//!
+//! Unlike [`crate::delegate::DelegateTool`] nothing is handed off: no step is
+//! marked working, no fix rounds, and the consulted delegate cannot change the
+//! repository. Consultations normally need no approval, but a delegate
+//! configured `approval = "ask"` pauses for human approval before the advice
+//! runs (and one set to "deny" is refused outright) — same policy as
+//! [`crate::delegate`].
 //!
 //! The advisor gets a READ-ONLY sub-agent loop over the repository (see
 //! [`AskAdviseTool::read_only_for_advice`] and the `advise_registry()` builder
@@ -21,7 +34,9 @@
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
-use comrade_tool::{Tool, ToolContext, ToolRegistry, ToolSpec};
+use comrade_tool::{
+    AGENT_MODEL, PlanStatus, PlanTarget, Tool, ToolContext, ToolRegistry, ToolSpec,
+};
 use serde_json::{Value, json};
 
 use crate::config::DelegateCfg;
@@ -84,20 +99,28 @@ impl AskAdviseTool {
         let description = format!(
             "\
 Ask one of the configured delegate models for ADVICE — a second opinion — while you keep the \
-task yourself. Unlike `delegate`, nothing is handed off: no plan step is marked working, nothing \
-runs on the repo, and the delegate only answers you (e.g. how to plan or split a task, which \
-approach is sound, what could go wrong, a review of your plan or design).
+task yourself. Two modes:
+
+1. Free-form advice: `model` + a self-contained `question` (+ optional `context`). Nothing is \
+handed off, nothing runs on the repo, the delegate only answers you (e.g. how to plan or split a \
+task, which approach is sound, what could go wrong). You get advice back — you still decide.
+
+2. Readiness check for a delegated plan step: pass `step` = a plan step id (do NOT pass `model`, \
+`question` or `context`). The step's OWN delegate — the model that will execute it — is consulted \
+read-only about whether the step's context is sufficient for it to pick the step up. If the \
+delegate confirms (VERDICT: READY), the step is marked `ready` and is ready to be delegated; if \
+it needs more context, the step stays `pending` with an \"awaiting context: ...\" note and the \
+reply tells you what to add. Enrich the step with `set_step_context`, then re-run ask_advise \
+step = <id> until it is `ready`. Fire these readiness checks in PARALLEL (one ask_advise step = \
+<id> per delegated step, batched) while you keep doing your own work, and only pick up a step \
+once it shows `ready`.
 
 The consulted delegate gets READ-ONLY repository tools (read/search files, git status/diff/log, \
 project_model, memory lookups, web_search) so the advice can be grounded in the actual code, but \
-it has no write/edit/shell/run/commit/plan tools and cannot change anything. The call does not \
-touch the plan and costs one extra model conversation. Consulting normally needs no approval, \
-but a delegate configured `approval = \"ask\"` (marked \"[human approval required before it \
-runs]\" below) pauses for human approval first, and one set to `approval = \"deny\"` is refused.
-
-Ask with `model` + a self-contained `question` (+ optional `context` for anything the delegate \
-cannot discover itself, e.g. your plan draft or design notes). You get advice back — you still \
-decide and do the work.
+it has no write/edit/shell/run/commit/plan tools and cannot change anything. Consulting normally \
+needs no approval, but a delegate configured `approval = \"ask\"` (marked \"[human approval \
+required before it runs]\" below) pauses for human approval first, and one set to \
+`approval = \"deny\"` is refused.
 
 Configured delegates — pick the one whose description best fits the advice you need:
 {listing}"
@@ -106,6 +129,11 @@ Configured delegates — pick the one whose description best fits the advice you
         let schema = json!({
             "type": "object",
             "properties": {
+                "step": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Plan step id to run a readiness check on: the step's own assigned delegate (its `model`) is consulted about whether the step's context suffices for it to pick the step up. The step is marked `ready` when the delegate confirms (VERDICT: READY), or stays `pending` with an \"awaiting context\" note when it needs more. Do not pass `model`, `question` or `context` together with `step` — they come from the plan step."
+                },
                 "model": {
                     "type": "string",
                     "enum": names,
@@ -122,7 +150,10 @@ Configured delegates — pick the one whose description best fits the advice you
                     "description": "Optional background the delegate cannot discover itself: your plan draft, design notes, error output, constraints — anything that would let it advise without re-reading the repo."
                 }
             },
-            "required": ["model", "question"],
+            "oneOf": [
+                { "required": ["step"] },
+                { "required": ["model", "question"] }
+            ],
             "additionalProperties": false
         });
 
@@ -146,7 +177,8 @@ impl Tool for AskAdviseTool {
     }
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
-        let model = args
+        let step_id = args.get("step").and_then(Value::as_u64);
+        let model_arg = args
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or_default()
@@ -158,15 +190,109 @@ impl Tool for AskAdviseTool {
             .unwrap_or_default()
             .trim()
             .to_string();
-        if question.is_empty() {
-            bail!("`question` must not be empty: tell the delegate what you want advice on");
-        }
         let context = args
             .get("context")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .trim()
             .to_string();
+
+        // Two mutually exclusive modes: a readiness check on a plan step, or a
+        // free-form advice consult.
+        let (model, user_prompt, approval_title) = match step_id {
+            Some(id) => {
+                for (key, label) in [("question", "question"), ("context", "context")] {
+                    let present = args
+                        .get(key)
+                        .map(|v| v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(true))
+                        .unwrap_or(false);
+                    if present {
+                        bail!(
+                            "cannot pass `{label}` together with `step`: the {label} comes from \
+                             the plan step"
+                        );
+                    }
+                }
+                let found = ctx
+                    .session
+                    .plan()
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("no plan step with id {id}"))?;
+                if !model_arg.is_empty() && model_arg != found.model {
+                    bail!(
+                        "`model` {model_arg:?} does not match the delegate assigned to plan step \
+                         {id} ({:?}) — a step's readiness is checked with its own delegate",
+                        found.model
+                    );
+                }
+                if found.model.trim().is_empty() {
+                    bail!(
+                        "plan step {id} has no delegate model assigned; it runs on the main model"
+                    );
+                }
+                if found.model.trim() == AGENT_MODEL {
+                    bail!(
+                        "plan step {id} is assigned to the main agent model ({AGENT_MODEL:?}), not \
+                         a delegate — there is no delegate to confirm its readiness"
+                    );
+                }
+                if matches!(found.status, PlanStatus::InProgress | PlanStatus::Done) {
+                    bail!(
+                        "plan step {id} is {} — readiness is checked while the step is pending, \
+                         ready or blocked, before a delegate picks it up",
+                        found.status
+                    );
+                }
+                let goal = found.goal.trim();
+                let verify = found.verification.trim();
+                let step_ctx = found.context.trim();
+                let prompt = format!(
+                    "Context readiness check for plan step {id} (delegate {}):\n\
+                     Goal: {goal}\n\
+                     Verification: {verify}\n\
+                     Context: {}\n\n\
+                     You are the delegate that will execute this step. Working directory: {} — \
+                     browse the repository read-only if you need more to judge. Tell the tech lead \
+                     whether the context above is ENOUGH for you to accomplish the goal, or \
+                     exactly what is missing.\n\n\
+                     Reply with your verdict as the FINAL line, exactly one of:\n\
+                     VERDICT: READY\n\
+                     VERDICT: NEEDS_MORE: <exactly what extra context you need>",
+                    found.model,
+                    if step_ctx.is_empty() {
+                        "(none)"
+                    } else {
+                        step_ctx
+                    },
+                    ctx.project_root.display(),
+                );
+                let model = found.model.clone();
+                (
+                    model.clone(),
+                    prompt,
+                    format!("Ask delegate {model} about readiness of plan step {id}?"),
+                )
+            }
+            None => {
+                if question.is_empty() {
+                    bail!(
+                        "`question` must not be empty: tell the delegate what you want advice on"
+                    );
+                }
+                let model = model_arg.clone();
+                let prompt = if context.is_empty() {
+                    format!("Question:\n{question}")
+                } else {
+                    format!("Context:\n{context}\n\nQuestion:\n{question}")
+                };
+                (
+                    model,
+                    prompt,
+                    format!("Ask delegate {model_arg} for advice?"),
+                )
+            }
+        };
 
         let Some(target) = self.targets.iter().find(|t| t.cfg.name == model) else {
             let listed = self
@@ -183,16 +309,11 @@ impl Tool for AskAdviseTool {
         enforce_approval(
             &target.cfg,
             ctx,
-            format!("Ask delegate {model} for advice?"),
-            Some(approval_preview(&question, "Question:")),
+            approval_title,
+            Some(approval_preview(&user_prompt, "Question:")),
         )
         .await?;
 
-        let user_prompt = if context.is_empty() {
-            format!("Question:\n{question}")
-        } else {
-            format!("Context:\n{context}\n\nQuestion:\n{question}")
-        };
         let display = target.cfg.llm.display();
         let native = target.cfg.llm.protocol.native_enabled();
         let system = render_subagent_system(
@@ -215,8 +336,88 @@ impl Tool for AskAdviseTool {
         .await
         .with_context(|| format!("delegate {model} ({display}) failed to give advice"))?;
 
-        Ok(format!("advice from {model} ({display}):\n{reply}"))
+        // A readiness check resolves the delegate's reply into a plan status:
+        // an explicit final VERDICT: READY marks the step ready to pick up;
+        // anything else leaves it pending with an "awaiting context" note.
+        if let Some(id) = step_id {
+            match readiness_verdict(&reply) {
+                Readiness::Ready => {
+                    ctx.session.update_plan(
+                        PlanTarget::Id(id),
+                        PlanStatus::Ready,
+                        Some(format!("ready: {model} confirmed the context")),
+                    );
+                    Ok(format!(
+                        "delegate {model} ({display}) confirmed plan step {id} is READY to pick \
+                         up — the context suffices.\n\n{reply}"
+                    ))
+                }
+                Readiness::NeedsMore(request) => {
+                    ctx.session.update_plan(
+                        PlanTarget::Id(id),
+                        PlanStatus::Pending,
+                        Some(format!("awaiting context: {request}")),
+                    );
+                    Ok(format!(
+                        "delegate {model} ({display}) needs more context for plan step {id}:\n\
+                         {request}\n\nAdd it with `set_step_context` (index = {id}), then re-run \
+                         ask_advise step = {id} until the step is `ready`.\n\n{reply}"
+                    ))
+                }
+            }
+        } else {
+            Ok(format!("advice from {model} ({display}):\n{reply}"))
+        }
     }
+}
+
+/// The delegate's answer to a context-readiness check for a plan step.
+enum Readiness {
+    Ready,
+    NeedsMore(String),
+}
+
+/// Extract the verdict from an advisor's reply. The readiness prompt asks the
+/// delegate to close with exactly one final `VERDICT:` line; the last one wins.
+/// A reply without any `VERDICT:` line is treated as "needs more" (a step is
+/// never marked ready without an explicit READY verdict).
+fn readiness_verdict(reply: &str) -> Readiness {
+    let mut verdict: Option<Readiness> = None;
+    for line in reply.lines() {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix("VERDICT:")
+            .or_else(|| line.strip_prefix("verdict:"))
+        else {
+            continue;
+        };
+        let rest = rest.trim();
+        let value = rest
+            .split_once(':')
+            .map(|(k, v)| (k.trim(), Some(v.trim())))
+            .or_else(|| Some((rest, None)));
+        let Some((kind, extra)) = value else {
+            continue;
+        };
+        verdict = Some(if kind.eq_ignore_ascii_case("READY") {
+            Readiness::Ready
+        } else if kind.eq_ignore_ascii_case("NEEDS_MORE") {
+            Readiness::NeedsMore(extra.filter(|e| !e.is_empty()).unwrap_or(rest).to_string())
+        } else {
+            // Unknown verdict keyword: be conservative.
+            Readiness::NeedsMore(line.to_string())
+        });
+    }
+    verdict.unwrap_or_else(|| {
+        Readiness::NeedsMore(
+            reply
+                .lines()
+                .last()
+                .unwrap_or("(the delegate gave no verdict)")
+                .trim()
+                .to_string(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -225,8 +426,10 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    use comrade_tool::ToolContext;
-    use comrade_tool::tool::{UserIo, UserPrompt, UserReply};
+    use comrade_tool::{
+        PlanStepDraft, ToolContext,
+        tool::{UserIo, UserPrompt, UserReply},
+    };
 
     use super::*;
     use crate::MemoryUndo;
@@ -330,7 +533,10 @@ mod tests {
             }
             let body = format!(
                 "{{\"choices\":[{{\"message\":{{\"content\":\"{}\"}}}}]}}",
-                content.replace('"', "\\\"")
+                content
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
             );
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -421,7 +627,15 @@ mod tests {
         .unwrap();
         assert_eq!(tool.spec().name, "ask_advise");
         let schema = &tool.spec().json_schema;
-        assert_eq!(schema["required"], serde_json::json!(["model", "question"]));
+        // Either a free-form consult (model + question) or a readiness check on
+        // a plan step (step alone).
+        assert_eq!(
+            schema["oneOf"],
+            serde_json::json!([
+                { "required": ["step"] },
+                { "required": ["model", "question"] }
+            ])
+        );
         let models = schema["properties"]["model"]["enum"]
             .as_array()
             .map(|a| a.iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>())
@@ -633,5 +847,148 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("advice from cheap"), "{out}");
+    }
+
+    /// A context whose session already holds one delegate-assigned plan step
+    /// (id 1) so readiness checks have something to consult about.
+    fn step_ctx() -> ToolContext {
+        let ctx = test_ctx();
+        ctx.session.set_plan(vec![PlanStepDraft {
+            goal: "refactor the helper fn".into(),
+            verification: "cargo test passes".into(),
+            model: "cheap".into(),
+            context: "old signature lives in crates/x/src/lib.rs".into(),
+        }]);
+        ctx
+    }
+
+    #[tokio::test]
+    async fn step_mode_marks_step_ready_when_delegate_confirms() {
+        let base = fake_chat_server("That is enough for me.\nVERDICT: READY");
+        let tool = mk_advise(&[delegate("cheap", &base)]).unwrap().unwrap();
+        let ctx = step_ctx();
+        let out = tool.invoke(&ctx, json!({"step": 1})).await.unwrap();
+        assert!(out.contains("READY to pick up"), "{out}");
+        let step = &ctx.session.plan()[0];
+        assert_eq!(step.status, PlanStatus::Ready);
+        assert_eq!(
+            step.note.as_deref(),
+            Some("ready: cheap confirmed the context")
+        );
+    }
+
+    #[tokio::test]
+    async fn step_mode_stays_pending_and_reports_request_when_delegate_needs_more() {
+        let base = fake_chat_server(
+            "I need more detail.\nVERDICT: NEEDS_MORE: the exact fn signature of the helper",
+        );
+        let tool = mk_advise(&[delegate("cheap", &base)]).unwrap().unwrap();
+        let ctx = step_ctx();
+        let out = tool.invoke(&ctx, json!({"step": 1})).await.unwrap();
+        assert!(out.contains("needs more context for plan step 1"), "{out}");
+        assert!(
+            out.contains("the exact fn signature of the helper"),
+            "{out}"
+        );
+        let step = &ctx.session.plan()[0];
+        assert_eq!(step.status, PlanStatus::Pending);
+        assert_eq!(
+            step.note.as_deref(),
+            Some("awaiting context: the exact fn signature of the helper")
+        );
+    }
+
+    #[tokio::test]
+    async fn step_mode_readiness_prompt_reaches_the_delegate() {
+        let (base, spy) = request_spy();
+        let tool = mk_advise(&[delegate("cheap", &base)]).unwrap().unwrap();
+        let ctx = step_ctx();
+        tool.invoke(&ctx, json!({"step": 1})).await.unwrap();
+        let body = spy.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            body.contains("Context readiness check for plan step 1"),
+            "{body}"
+        );
+        assert!(body.contains("refactor the helper fn"), "{body}");
+        assert!(
+            body.contains("old signature lives in crates/x/src/lib.rs"),
+            "{body}"
+        );
+        // The advisor must close with an explicit verdict line.
+        assert!(body.contains("VERDICT: NEEDS_MORE"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn step_mode_without_a_verdict_is_never_marked_ready() {
+        // request_spy's canned answer ("ok") carries no VERDICT: line; the step
+        // must stay pending rather than being optimistically confirmed.
+        let (base, _spy) = request_spy();
+        let tool = mk_advise(&[delegate("cheap", &base)]).unwrap().unwrap();
+        let ctx = step_ctx();
+        tool.invoke(&ctx, json!({"step": 1})).await.unwrap();
+        let step = &ctx.session.plan()[0];
+        assert_eq!(step.status, PlanStatus::Pending);
+        let note = step.note.as_deref().unwrap_or_default();
+        assert!(note.contains("awaiting context"), "note was {note:?}");
+    }
+
+    #[tokio::test]
+    async fn step_mode_rejects_mixed_and_mismatched_args() {
+        let base = fake_chat_server("ignored");
+        let tool = mk_advise(&[delegate("cheap", &base)]).unwrap().unwrap();
+        let ctx = step_ctx();
+
+        // `step` together with `question` or `context` is ambiguous: they come
+        // from the plan step.
+        let err = tool
+            .invoke(&ctx, json!({"step": 1, "question": "is it enough?"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot pass `question`"), "{err}");
+
+        // The consulted delegate must be the step's own assigned delegate.
+        let err = tool
+            .invoke(&ctx, json!({"step": 1, "model": "other"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match the delegate assigned"),
+            "{err}"
+        );
+
+        // Unknown step id.
+        let err = tool.invoke(&ctx, json!({"step": 42})).await.unwrap_err();
+        assert!(err.to_string().contains("no plan step with id 42"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn step_mode_refuses_steps_without_a_delegate_or_already_working() {
+        let base = fake_chat_server("ignored");
+        let tool = mk_advise(&[delegate("cheap", &base)]).unwrap().unwrap();
+
+        // A step assigned to the main model has no delegate to consult.
+        let ctx = test_ctx();
+        ctx.session.set_plan(vec![PlanStepDraft {
+            goal: "my own work".into(),
+            verification: String::new(),
+            model: AGENT_MODEL.into(),
+            context: String::new(),
+        }]);
+        let err = tool.invoke(&ctx, json!({"step": 1})).await.unwrap_err();
+        assert!(err.to_string().contains("not a delegate"), "{err}");
+
+        // An in-progress step is already being worked: no readiness check.
+        let ctx = test_ctx();
+        ctx.session.set_plan(vec![PlanStepDraft {
+            goal: "delegated work".into(),
+            verification: String::new(),
+            model: "cheap".into(),
+            context: String::new(),
+        }]);
+        ctx.session
+            .update_plan(PlanTarget::Id(1), PlanStatus::InProgress, None);
+        let err = tool.invoke(&ctx, json!({"step": 1})).await.unwrap_err();
+        assert!(err.to_string().contains("in_progress"), "{err}");
     }
 }

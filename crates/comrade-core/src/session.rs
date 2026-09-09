@@ -237,7 +237,7 @@ impl SessionControl for AgentSession {
     }
 
     fn reassign_step_model(&self, target: &PlanTarget, model: &str) -> Result<bool, String> {
-        let step_id = {
+        let (step_id, was_ready) = {
             let mut plan = self.plan.write().unwrap();
             let hit = plan.iter_mut().find(|s| match target {
                 PlanTarget::Id(id) => s.id == *id,
@@ -249,16 +249,63 @@ impl SessionControl for AgentSession {
             if matches!(step.status, PlanStatus::InProgress | PlanStatus::Done) {
                 return Err(format!(
                     "plan step {} is {} — a step's model can only be changed while it is \
-                     pending or blocked",
+                     pending, ready or blocked",
                     step.id, step.status
                 ));
             }
             step.model = model.trim().to_string();
-            step.id
+            (step.id, step.status == PlanStatus::Ready)
         };
         // A new model must actually run the step: drop the old delegation
         // record so update_plan/finish_plan keep enforcing the delegate run.
         self.delegated.write().unwrap().remove(&step_id);
+        // A Ready step's readiness was confirmed by the OLD delegate: a new
+        // model must be consulted again before the step is picked up.
+        if was_ready {
+            self.update_plan(
+                PlanTarget::Id(step_id),
+                PlanStatus::Pending,
+                Some("ready reset: a new model must confirm the context".into()),
+            );
+        }
+        self.emit(AgentEvent::PlanChanged);
+        Ok(true)
+    }
+
+    fn set_step_context(&self, target: &PlanTarget, context: &str) -> Result<bool, String> {
+        let context = context.trim();
+        let (step_id, was_ready) = {
+            let mut plan = self.plan.write().unwrap();
+            let hit = plan.iter_mut().find(|s| match target {
+                PlanTarget::Id(id) => s.id == *id,
+                PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+            });
+            let Some(step) = hit else {
+                return Ok(false);
+            };
+            if matches!(step.status, PlanStatus::InProgress | PlanStatus::Done) {
+                return Err(format!(
+                    "plan step {} is {} — a step's context can only be changed while it is \
+                     pending, ready or blocked",
+                    step.id, step.status
+                ));
+            }
+            if context.is_empty() {
+                return Err(format!("plan step {} needs a non-empty context", step.id));
+            }
+            step.context = context.to_string();
+            (step.id, step.status == PlanStatus::Ready)
+        };
+        // The readiness confirmation described the old context: replacing the
+        // context sends the step back to pending so the delegate is consulted
+        // again (ask_advise step = id) before it is picked up.
+        if was_ready {
+            self.update_plan(
+                PlanTarget::Id(step_id),
+                PlanStatus::Pending,
+                Some("ready reset: context changed".into()),
+            );
+        }
         self.emit(AgentEvent::PlanChanged);
         Ok(true)
     }
@@ -417,5 +464,83 @@ mod tests {
             !s.reassign_step_model(&PlanTarget::Id(99), "mistral")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn ready_steps_drop_to_pending_on_reassign() {
+        let (tx, _rx) = mpsc::channel(16);
+        let s = AgentSession::new(tx);
+        s.set_plan(vec![PlanStepDraft {
+            goal: "delegate me".into(),
+            verification: "".into(),
+            model: "mistral".into(),
+            context: "ctx".into(),
+        }]);
+        // The delegate confirmed the context, then the lead changes the model:
+        // the readiness was for the old delegate, so the step goes back to
+        // pending.
+        s.update_plan(
+            PlanTarget::Id(1),
+            PlanStatus::Ready,
+            Some("ready: ok".into()),
+        );
+        assert_eq!(s.plan()[0].status, PlanStatus::Ready);
+        assert!(s.reassign_step_model(&PlanTarget::Id(1), "groq").unwrap());
+        assert_eq!(s.plan()[0].model, "groq");
+        assert_eq!(s.plan()[0].status, PlanStatus::Pending);
+        assert_eq!(
+            s.plan()[0].note.as_deref(),
+            Some("ready reset: a new model must confirm the context")
+        );
+    }
+
+    #[test]
+    fn set_step_context_replaces_context_and_resets_ready() {
+        let (tx, _rx) = mpsc::channel(16);
+        let s = AgentSession::new(tx);
+        s.set_plan(vec![PlanStepDraft {
+            goal: "delegate me".into(),
+            verification: "".into(),
+            model: "mistral".into(),
+            context: "old context".into(),
+        }]);
+
+        // ready step: context replacement sends it back to pending.
+        s.update_plan(
+            PlanTarget::Id(1),
+            PlanStatus::Ready,
+            Some("ready: ok".into()),
+        );
+        assert!(
+            s.set_step_context(&PlanTarget::Id(1), "new enriched context")
+                .unwrap()
+        );
+        assert_eq!(s.plan()[0].context, "new enriched context");
+        assert_eq!(s.plan()[0].status, PlanStatus::Pending);
+
+        // pending step: just replaces the context.
+        assert!(
+            s.set_step_context(&PlanTarget::Text("delegate me".into()), "more context")
+                .unwrap()
+        );
+        assert_eq!(s.plan()[0].context, "more context");
+        assert_eq!(s.plan()[0].status, PlanStatus::Pending);
+
+        // in_progress / done steps are protected; empty context is rejected.
+        s.update_plan(PlanTarget::Id(1), PlanStatus::InProgress, None);
+        let err = s.set_step_context(&PlanTarget::Id(1), "x").unwrap_err();
+        assert!(err.contains("in_progress"), "unexpected error: {err}");
+        s.update_plan(PlanTarget::Id(1), PlanStatus::Done, None);
+        let err = s.set_step_context(&PlanTarget::Id(1), "x").unwrap_err();
+        assert!(err.contains("done"), "unexpected error: {err}");
+        s.update_plan(PlanTarget::Id(1), PlanStatus::Blocked, None);
+        let err = s.set_step_context(&PlanTarget::Id(1), "   ").unwrap_err();
+        assert!(err.contains("non-empty"), "unexpected error: {err}");
+        // blocked steps may still get a context update (to unblock them).
+        assert!(s.set_step_context(&PlanTarget::Id(1), "x").unwrap());
+        assert_eq!(s.plan()[0].context, "x");
+
+        // unknown target -> Ok(false).
+        assert!(!s.set_step_context(&PlanTarget::Id(99), "x").unwrap());
     }
 }
