@@ -5557,6 +5557,216 @@ fn hard_cut(line: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// markdown tables (GFM pipe tables rendered as aligned text lines)
+// ---------------------------------------------------------------------------
+
+/// Column alignment from a separator cell: `:---:` centre, `---:` right, else
+/// left.
+#[derive(Clone, Copy, PartialEq)]
+enum Align {
+    Left,
+    Right,
+    Centre,
+}
+
+/// Split one pipe-table row into cells. Accepts rows with or without the outer
+/// pipes (`| a | b |` and `a | b`); surrounding empties from outer pipes are
+/// dropped, interior empties (`| a || c |`) are kept as blank cells.
+fn table_row_cells(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let inner = if trimmed.starts_with('|') {
+        trimmed.trim_matches('|')
+    } else {
+        trimmed
+    };
+    let cells: Vec<String> = inner.split('|').map(|c| c.trim().to_string()).collect();
+    if cells.is_empty() { None } else { Some(cells) }
+}
+
+/// True when `cells` look like a table separator row: every cell is at least
+/// three chars, all dashes/colons, with at least one dash (`---`, `:--:`).
+fn is_table_sep(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells.iter().all(|c| {
+            let t = c.trim();
+            t.chars().count() >= 3 && t.contains('-') && t.chars().all(|ch| ch == '-' || ch == ':')
+        })
+}
+
+fn sep_alignment(cell: &str) -> Align {
+    let t = cell.trim();
+    match (t.starts_with(':'), t.ends_with(':')) {
+        (true, true) => Align::Centre,
+        (false, true) => Align::Right,
+        _ => Align::Left,
+    }
+}
+
+/// Whether `lines[at]` begins a pipe table: a row whose next line is a
+/// separator row.
+fn is_table_start(lines: &[&str], at: usize) -> bool {
+    lines
+        .get(at)
+        .and_then(|l| table_row_cells(l))
+        .is_some_and(|cells| {
+            lines
+                .get(at + 1)
+                .and_then(|l| table_row_cells(l))
+                .is_some_and(|sep| is_table_sep(&sep))
+                && !cells.is_empty()
+        })
+}
+
+/// The rendered text of a cell: strip inline markers so the measured width
+/// equals what the reader sees (cell content is styled as a whole - bold
+/// header, plain body - rather than per-run).
+fn cell_plain(cell: &str) -> String {
+    inline_toks(cell, base_style())
+        .into_iter()
+        .map(|t| t.text)
+        .collect()
+}
+
+/// Wrap one cell's text into chunks of at most `w` chars (word-aware, with
+/// hard cuts for overlong words).
+fn cell_chunks(text: &str, w: usize) -> Vec<String> {
+    let w = w.max(1);
+    let mut out = Vec::new();
+    for line in plain_wrap(text, w) {
+        out.extend(hard_cut(&line, w));
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Pad `text` to width `w` per alignment.
+fn pad_to(text: &str, w: usize, a: Align) -> String {
+    let len = text.chars().count();
+    if len >= w {
+        return text.to_string();
+    }
+    let pad = w - len;
+    match a {
+        Align::Left => format!("{text}{}", " ".repeat(pad)),
+        Align::Right => format!("{}{text}", " ".repeat(pad)),
+        Align::Centre => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{text}{}", " ".repeat(left), " ".repeat(right))
+        }
+    }
+}
+
+/// Fit per-column widths into `avail` total cells by shrinking the widest
+/// column(s), never below 1.
+fn fit_widths(widths: &mut [usize], avail: usize) {
+    loop {
+        let total: usize = widths.iter().sum();
+        if total <= avail {
+            return;
+        }
+        let widest = widths
+            .iter()
+            .enumerate()
+            .filter(|&(_, w)| *w > 1)
+            .max_by_key(|&(_, w)| *w);
+        let Some((i, _)) = widest else { return };
+        widths[i] -= 1;
+    }
+}
+
+/// Render a GFM pipe table into aligned, styled text lines no wider than
+/// `width`. Header is bold; a `-`/`+` rule separates it from the body; body
+/// rows that wrap keep their columns aligned.
+fn table_block_toks(
+    header: &[String],
+    sep: &[String],
+    body: &[Vec<String>],
+    width: usize,
+) -> Vec<Vec<Tok>> {
+    let n = sep.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let truncate = |cells: &[String]| -> Vec<String> {
+        let mut v: Vec<String> = cells.iter().take(n).cloned().collect();
+        while v.len() < n {
+            v.push(String::new());
+        }
+        v
+    };
+
+    // Natural column widths from content.
+    let mut widths = vec![1usize; n];
+    let mut widen = |cells: &[String]| {
+        for (i, c) in cells.iter().take(n).enumerate() {
+            widths[i] = widths[i].max(cell_plain(c).chars().count());
+        }
+    };
+    widen(header);
+    for row in body {
+        widen(row);
+    }
+    // Each column occupies `w_i` content cells, then a fixed ` | ` separator
+    // (3 cells): the bar of every row sits at the same offset and content
+    // starts line up, whatever a cell's length. The header rule's `+` is
+    // offset the same way so it lands under each bar.
+    let overhead = 3usize * n.saturating_sub(1);
+    fit_widths(&mut widths, width.saturating_sub(overhead).max(n));
+
+    let aligns: Vec<Align> = sep.iter().map(|c| sep_alignment(c)).collect();
+    let joiner = tok(" | ", Style::default().fg(Color::DarkGray));
+    let mut out: Vec<Vec<Tok>> = Vec::new();
+
+    // Emit one logical row as one or more aligned lines (wrapping cells).
+    let emit_row = |row: &[String], style: Style, out: &mut Vec<Vec<Tok>>| {
+        let cells = truncate(row);
+        let chunks: Vec<Vec<String>> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| cell_chunks(&cell_plain(c), widths[i]))
+            .collect();
+        let depth = chunks.iter().map(|c| c.len()).max().unwrap_or(1);
+        for d in 0..depth {
+            let mut line: Vec<Tok> = Vec::new();
+            for i in 0..n {
+                if i > 0 {
+                    line.push(joiner.clone());
+                }
+                let chunk = chunks[i].get(d).cloned().unwrap_or_else(|| String::new());
+                line.push(tok(pad_to(&chunk, widths[i], aligns[i]), style));
+            }
+            out.push(line);
+        }
+    };
+
+    emit_row(
+        header,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        &mut out,
+    );
+    // Rule line under the header: dashes cover the content region plus the
+    // separator's leading space, so each `+` sits directly under a row's `|`.
+    let rule = widths
+        .iter()
+        .map(|w| "-".repeat(*w + 1))
+        .collect::<Vec<_>>()
+        .join("+");
+    out.push(vec![tok(rule, Style::default().fg(Color::DarkGray))]);
+    for row in body {
+        emit_row(row, base_style(), &mut out);
+    }
+    out
+}
+
 /// Parse markdown into wrapped, styled token lines.
 fn md_tok_lines(md: &str, width: usize) -> Vec<Vec<Tok>> {
     let width = width.max(8);
@@ -5627,6 +5837,29 @@ fn md_tok_lines(md: &str, width: usize) -> Vec<Vec<Tok>> {
             i += 1;
             continue;
         }
+        // GFM pipe table: a row whose next line is a separator row.
+        if is_table_start(&lines, i) {
+            let header = table_row_cells(lines[i]).expect("table start has a header");
+            let sep = table_row_cells(lines[i + 1]).expect("table start has a separator");
+            i += 2;
+            let mut body_rows: Vec<Vec<String>> = Vec::new();
+            while i < lines.len() {
+                let t = lines[i].trim();
+                if t.is_empty() {
+                    break;
+                }
+                let Some(cells) = table_row_cells(t) else {
+                    break;
+                };
+                if is_table_sep(&cells) {
+                    break; // a second separator ends the table
+                }
+                body_rows.push(cells);
+                i += 1;
+            }
+            out.extend(table_block_toks(&header, &sep, &body_rows, width));
+            continue;
+        }
         // plain paragraph: gather consecutive plain lines
         let mut para = String::new();
         while i < lines.len() {
@@ -5637,6 +5870,7 @@ fn md_tok_lines(md: &str, width: usize) -> Vec<Vec<Tok>> {
                 || t == "---"
                 || t.starts_with('>')
                 || bullet(t).is_some()
+                || is_table_start(&lines, i)
             {
                 break;
             }
@@ -6056,6 +6290,62 @@ mod tests {
         assert!(flat.contains("Title"), "{flat}");
         assert!(flat.contains("fn main() {}"), "{flat}");
         assert!(flat.contains("plain"), "{flat}");
+    }
+
+    #[test]
+    fn renders_a_pipe_table_as_aligned_columns() {
+        let md = "| name | role |\n| --- | --- |\n| ana | dev |\n| bob | pm |\n";
+        let lines = md_text(md, 40);
+        assert_eq!(
+            lines,
+            vec!["name | role", "-----+-----", "ana  | dev ", "bob  | pm  ",],
+            "{lines:?}"
+        );
+        // column content starts and the bar column line up across header/body
+        for (i, l) in lines.iter().enumerate() {
+            assert_eq!(l.chars().count(), 11, "row {i}: {l:?}");
+        }
+    }
+
+    #[test]
+    fn narrow_table_wraps_cells_within_width() {
+        let md = "| tool | purpose |\n| --- | --- |\n| read_file | read a text file from disk, optionally windowed |\n";
+        for w in [20usize, 30] {
+            let lines = md_text(md, w);
+            for l in &lines {
+                assert!(
+                    l.chars().count() <= w,
+                    "line exceeds {w}: {l:?} (len {})",
+                    l.chars().count()
+                );
+            }
+            // wrapping keeps every word of the long cell visible
+            let flat = lines.join("\n");
+            for word in ["read", "a", "text", "file", "windowed"] {
+                assert!(flat.contains(word), "missing {word:?} in {flat}");
+            }
+        }
+    }
+
+    #[test]
+    fn pipe_text_without_a_separator_is_not_a_table() {
+        let md = "use | for bitwise or\nin a plain sentence";
+        let lines = md_text(md, 40);
+        // treated as ordinary paragraph text, not aligned columns
+        let flat = lines.join("\n");
+        assert!(flat.contains("use | for bitwise or"), "{flat}");
+        assert!(flat.contains("in a plain sentence"), "{flat}");
+        assert_eq!(lines.len(), 1, "{flat}");
+    }
+
+    #[test]
+    fn right_aligned_column_pads_cells() {
+        let md = "| item | count |\n| :--- | ---: |\n| x | 42 |\n";
+        let lines = md_text(md, 40);
+        assert_eq!(lines[0], "item | count");
+        assert_eq!(lines[1], "-----+------");
+        // right-aligned column: value flush to the right edge of its column
+        assert_eq!(lines[2], "x    |    42");
     }
 
     #[test]
