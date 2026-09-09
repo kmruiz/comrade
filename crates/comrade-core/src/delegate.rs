@@ -524,7 +524,8 @@ fn delegate_system_prompt(project_root: &str, tools: &ToolRegistry, native: bool
 You are a developer sub-agent on Comrade's team. Your tech lead delegated ONE \
 self-contained task to you. Working directory: {project_root}. You have REAL \
 tools in this repository and are expected to use them to complete the task \
-yourself — read, search, edit and write files, run tests, remember decisions. \
+yourself — read, search, edit and write files, run tests, and record ADR \
+decisions or glossary terms.\n\
 Your tool call for this task was approved by the human and every tool you call \
 runs auto-approved, so act directly and do not ask for permission.
 
@@ -1431,6 +1432,9 @@ mod tests {
             "remember",
             "amend_decision",
             "find_decisions",
+            "remember_glossary",
+            "find_glossary",
+            "read_glossary",
             "read_file",
             "rgrep",
             "list_symbols",

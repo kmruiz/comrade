@@ -37,6 +37,7 @@ const MUTATING_TOOLS: &[&str] = &[
     "run_task",
     "remember",
     "amend_decision",
+    "remember_glossary",
     "format_code",
     "run_tests",
     "shell",
@@ -53,6 +54,7 @@ const APPROVAL_GATED_TOOLS: &[&str] = &[
     "delegate",
     "remember",
     "amend_decision",
+    "remember_glossary",
     "shell",
 ];
 
@@ -86,6 +88,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "project_model",
     "find_decisions",
     "read_decision",
+    "find_glossary",
+    "read_glossary",
     "web_search",
 ];
 

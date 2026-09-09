@@ -1,4 +1,4 @@
-//! Persistent project decisions store (ADR-style), at `<root>/.comrade/memory/`.
+//! Persistent project decision store (ADRs), at `<root>/.comrade/memory/`.
 //!
 //! Every decision is a Markdown file with a lightweight header the engine
 //! parses directly (no YAML dependency):
@@ -6,12 +6,28 @@
 //! ```text
 //! # 0001 - Some title
 //! status: accepted
+//! date: 2026-09-09
 //! tags: a, b
 //! summary: one line used in search results
 //!
 //! ## Context
 //! ...
+//! ## Decision
+//! ...
+//! ## Rationale
+//! ...
+//! ## Alternatives considered
+//! ...
+//! ## Scope
+//! ...
+//! ## Impact
+//! ...
 //! ```
+//!
+//! Decisions are recorded only when an important choice was made that will
+//! affect the architecture, design or product on the long term. Older entries
+//! written before this layout remain parseable (their header simply has no
+//! `date:` line and their body sections are whatever they were).
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +41,8 @@ pub struct EntryMeta {
     pub slug: String,
     pub file_name: String,
     pub status: String,
+    /// When the decision was made, `YYYY-MM-DD` (absent on pre-ADR entries).
+    pub date: Option<String>,
     pub tags: Vec<String>,
     pub summary: String,
 }
@@ -64,6 +82,7 @@ fn parse_file(file_name: &str, text: &str) -> Option<EntryMeta> {
     let title = lines.next()?.trim();
     let (id, slug) = parse_title(title)?;
     let mut status = String::from("accepted");
+    let mut date = None;
     let mut tags = Vec::new();
     let mut summary = String::new();
     for line in lines.by_ref() {
@@ -72,6 +91,11 @@ fn parse_file(file_name: &str, text: &str) -> Option<EntryMeta> {
         }
         if let Some(v) = line.strip_prefix("status:") {
             status = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("date:") {
+            let v = v.trim();
+            if !v.is_empty() {
+                date = Some(v.to_string());
+            }
         } else if let Some(v) = line.strip_prefix("tags:") {
             tags = v
                 .split(',')
@@ -82,12 +106,12 @@ fn parse_file(file_name: &str, text: &str) -> Option<EntryMeta> {
             summary = v.trim().to_string();
         }
     }
-    let _ = summary.is_empty();
     Some(EntryMeta {
         id,
         slug,
         file_name: file_name.to_string(),
         status,
+        date,
         tags,
         summary,
     })
@@ -200,17 +224,54 @@ pub fn plan_path(root: &Path, title: &str) -> Result<(u32, String)> {
     Ok((id, format!("{id:04}-{slug}.md")))
 }
 
-/// Write a new decision and return its id.
-pub fn write(
-    root: &Path,
-    title: &str,
-    summary: &str,
-    context: Option<&str>,
-    decision: Option<&str>,
-    consequences: Option<&str>,
-    tags: Vec<String>,
-) -> Result<u32> {
-    let title = title.trim();
+/// A new ADR decision: `title` and `summary` are required; everything else is
+/// optional prose. `date` defaults to today (UTC) when omitted.
+#[derive(Debug, Clone)]
+pub struct DraftDecision {
+    pub title: String,
+    /// One line used in search results.
+    pub summary: String,
+    /// Background: what happened and why a decision was needed now.
+    pub context: Option<String>,
+    /// What was decided.
+    pub decision: Option<String>,
+    /// Why this choice over others.
+    pub rationale: Option<String>,
+    /// Alternatives considered and why they were rejected.
+    pub alternatives: Option<String>,
+    /// What this decision covers - and what it deliberately does not.
+    pub scope: Option<String>,
+    /// Expected consequences, trade-offs and follow-ups.
+    pub impact: Option<String>,
+    /// When it happened, `YYYY-MM-DD`. Defaults to today when `None`.
+    pub date: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// Today's date as `YYYY-MM-DD` (UTC, civil calendar) without a date crate.
+pub fn today_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Write a new ADR decision and return its id.
+pub fn write(root: &Path, draft: DraftDecision) -> Result<u32> {
+    let title = draft.title.trim();
     if title.is_empty() {
         anyhow::bail!("title must not be empty");
     }
@@ -225,13 +286,18 @@ pub fn write(
         anyhow::bail!("entry {file_name} already exists");
     }
 
+    let date = match draft.date.as_deref() {
+        Some(d) if !d.trim().is_empty() => d.trim().to_string(),
+        _ => today_iso(),
+    };
     let mut text = format!("# {id:04} - {title}\n");
-    text.push_str(&format!("status: accepted\n"));
-    if !tags.is_empty() {
-        text.push_str(&format!("tags: {}\n", tags.join(", ")));
+    text.push_str("status: accepted\n");
+    text.push_str(&format!("date: {date}\n"));
+    if !draft.tags.is_empty() {
+        text.push_str(&format!("tags: {}\n", draft.tags.join(", ")));
     }
-    if !summary.trim().is_empty() {
-        text.push_str(&format!("summary: {}\n", summary.trim()));
+    if !draft.summary.trim().is_empty() {
+        text.push_str(&format!("summary: {}\n", draft.summary.trim()));
     }
     text.push('\n');
     let mut section = |name: &str, body: Option<&str>| {
@@ -242,9 +308,12 @@ pub fn write(
             }
         }
     };
-    section("Context", context);
-    section("Decision", decision);
-    section("Consequences", consequences);
+    section("Context", draft.context.as_deref());
+    section("Decision", draft.decision.as_deref());
+    section("Rationale", draft.rationale.as_deref());
+    section("Alternatives considered", draft.alternatives.as_deref());
+    section("Scope", draft.scope.as_deref());
+    section("Impact", draft.impact.as_deref());
 
     ensure_dir(root)?;
     std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
@@ -367,43 +436,123 @@ mod tests {
         dir
     }
 
+    fn draft(
+        title: &str,
+        summary: &str,
+        context: Option<&str>,
+        decision: Option<&str>,
+        tags: Vec<String>,
+    ) -> DraftDecision {
+        DraftDecision {
+            title: title.into(),
+            summary: summary.into(),
+            context: context.map(str::to_string),
+            decision: decision.map(str::to_string),
+            rationale: None,
+            alternatives: None,
+            scope: None,
+            impact: None,
+            date: None,
+            tags,
+        }
+    }
+
     #[test]
     fn write_list_read_roundtrip() {
         let root = scratch();
-        let id = write(
-            &root,
-            "Prefer run_task for batch rewrites",
-            "Batch work goes through run_task.",
-            Some("Repeated apply_edit calls are slow."),
-            Some("Use run_task check/test instead."),
-            None,
-            vec!["tooling".into(), "perf".into()],
-        )
-        .unwrap();
+        let d = DraftDecision {
+            title: "Prefer run_task for batch rewrites".into(),
+            summary: "Batch work goes through run_task.".into(),
+            context: Some("Repeated apply_edit calls are slow.".into()),
+            decision: Some("Use run_task check/test instead.".into()),
+            rationale: None,
+            alternatives: None,
+            scope: None,
+            impact: None,
+            date: None,
+            tags: vec!["tooling".into(), "perf".into()],
+        };
+        let id = write(&root, d).unwrap();
         assert_eq!(id, 1);
 
-        let id2 = write(
-            &root,
+        let d2 = draft(
             "Error handling",
             "Top-level anyhow only",
             None,
             None,
-            None,
             vec![],
-        )
-        .unwrap();
+        );
+        let id2 = write(&root, d2).unwrap();
         assert_eq!(id2, 2);
 
         let metas = list(&root).unwrap();
         assert_eq!(metas.len(), 2);
         assert_eq!(metas[0].id, 2); // newest first
         assert_eq!(metas[0].slug, "error-handling");
+        assert!(metas[0].date.is_some()); // date: defaulted to today
         assert_eq!(metas[1].tags, vec!["tooling", "perf"]);
 
         let entry = read(&root, 1).unwrap();
         assert!(entry.body.contains("Prefer run_task"));
         assert!(entry.body.contains("## Context"));
         assert!(entry.body.contains("## Decision"));
+        assert!(entry.meta.date.as_deref() == Some(today_iso().as_str()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_emits_adr_sections_in_order_and_honours_date() {
+        let root = scratch();
+        let id = write(
+            &root,
+            DraftDecision {
+                title: "ADR layout".into(),
+                summary: "decisions are ADRs".into(),
+                context: Some("an important choice was made".into()),
+                decision: Some("use the ADR template".into()),
+                rationale: Some("traceable long-term choices".into()),
+                alternatives: Some("run books; no store at all".into()),
+                scope: Some("memory tooling only, not UI".into()),
+                impact: Some("entries get longer".into()),
+                date: Some("2026-09-09".into()),
+                tags: vec!["meta".into()],
+            },
+        )
+        .unwrap();
+        let body = read(&root, id).unwrap().body;
+        assert!(body.starts_with("# 0001 - ADR layout\n"));
+        assert!(body.contains("\nstatus: accepted\ndate: 2026-09-09\n"));
+        let ctx = body.find("## Context").unwrap();
+        let decision = body.find("## Decision").unwrap();
+        let rationale = body.find("## Rationale").unwrap();
+        let alt = body.find("## Alternatives considered").unwrap();
+        let scope = body.find("## Scope").unwrap();
+        let impact = body.find("## Impact").unwrap();
+        assert!(ctx < decision && decision < rationale);
+        assert!(rationale < alt && alt < scope && scope < impact);
+        // Consequences is gone from the new template.
+        assert!(!body.contains("## Consequences"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_entries_without_date_still_parse() {
+        let root = scratch();
+        let text = "# 0007 - Old style\nstatus: accepted\ntags: a\nsummary: pre-ADR note\n\n## Context\nwas a run book\n";
+        std::fs::create_dir_all(root.join(".comrade").join("memory")).unwrap();
+        std::fs::write(
+            root.join(".comrade")
+                .join("memory")
+                .join("0007-old-style.md"),
+            text,
+        )
+        .unwrap();
+        let metas = list(&root).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].id, 7);
+        assert_eq!(metas[0].date, None);
+        let entry = read(&root, 7).unwrap();
+        assert!(entry.body.contains("run book"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -412,22 +561,24 @@ mod tests {
         let root = scratch();
         write(
             &root,
-            "Use serde for config",
-            "serde everywhere",
-            Some("toml"),
-            None,
-            None,
-            vec!["rust".into()],
+            draft(
+                "Use serde for config",
+                "serde everywhere",
+                Some("toml"),
+                None,
+                vec!["rust".into()],
+            ),
         )
         .unwrap();
         write(
             &root,
-            "Batch edits",
-            "prefer run_task for batch work",
-            Some("slow loops"),
-            None,
-            None,
-            vec!["tooling".into()],
+            draft(
+                "Batch edits",
+                "prefer run_task for batch work",
+                Some("slow loops"),
+                None,
+                vec!["tooling".into()],
+            ),
         )
         .unwrap();
 
@@ -448,7 +599,7 @@ mod tests {
     #[test]
     fn amend_changes_status_and_appends_note() {
         let root = scratch();
-        write(&root, "Decision A", "summary a", None, None, None, vec![]).unwrap();
+        write(&root, draft("Decision A", "summary a", None, None, vec![])).unwrap();
         amend(&root, 1, Some("superseded"), Some("Replaced by B.")).unwrap();
         let entry = read(&root, 1).unwrap();
         assert!(entry.body.contains("status: superseded"));
@@ -463,8 +614,23 @@ mod tests {
         let (pid, rel) = plan_path(&root, "First: decide things").unwrap();
         assert_eq!(pid, 1);
         assert_eq!(rel, "0001-first-decide-things.md");
-        let id = write(&root, "First: decide things", "s", None, None, None, vec![]).unwrap();
+        let id = write(
+            &root,
+            draft("First: decide things", "s", None, None, vec![]),
+        )
+        .unwrap();
         assert_eq!(id, pid);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn today_iso_is_shaped_like_a_date() {
+        let d = today_iso();
+        let parts: Vec<&str> = d.split('-').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].len() == 4 && parts[1].len() == 2 && parts[2].len() == 2);
+        assert!(parts[0].chars().all(|c| c.is_ascii_digit()));
+        assert!(parts[1].chars().all(|c| c.is_ascii_digit()));
+        assert!(parts[2].chars().all(|c| c.is_ascii_digit()));
     }
 }

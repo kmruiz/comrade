@@ -67,11 +67,12 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          that one agent can do end-to-end on its own: keep every step small, self-contained and \
          independently verifiable, so it can be re-ordered or handed to another model. Advance \
          steps with update_plan as you go.\n\
-         2. Read the run books before you orient or choose: durable project memory lives in \
-         .comrade/memory/ and is the only thing that survives the context reset at the end of a \
+         2. Read the ADRs and glossary before you orient or choose: durable project memory lives \
+         in .comrade/memory/ and is the only thing that survives the context reset at the end of a \
          task. Search find_decisions with a query or tags for the area you are touching, then \
          read_decision on anything relevant — a past session may already hold the architecture, a \
-         code snippet, or the trap you are about to hit.\n\
+         code snippet, or the trap you are about to hit. Check the glossary with find_glossary for \
+         keywords you are about to use.\n\
          3. Orient only where it matters: project_model for layout; call structural_map to see where \
          functions, modules, types, and methods live before searching. Then read only the exact code \
          you will edit (use find_symbol/read_symbol to jump straight to a function).\n\
@@ -79,7 +80,8 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          for changes). Write or update tests for what you changed.\n\
          5. Verify with run_tests (or run_task) and fix anything that fails until the suite is green. \
          Trust test output over reasoning about code.\n\
-         6. Record what the next session must know as a run book (see ## Memory), then stage and \
+         6. Record what the next session must know (see ## Memory): remember an ADR when an \
+         important long-term decision happened, remember_glossary for keywords — then stage and \
          commit the verified work with git_commit using a clear message.\n\
          If a tool or a shell command fails (e.g. exits non-zero): read the actual error, state one \
          hypothesis about the cause, update your plan if needed, then take the smallest corrective \
@@ -131,31 +133,32 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
         );
     }
     prompt.push_str(
-        "## Memory: context is cleared, run books persist\n\
+        "## Memory: context is cleared, ADRs and the glossary persist\n\
          Every task ends with your conversation context discarded. The only thing that survives \
-         into the next session is what you wrote to .comrade/memory/ with remember — treat memory \
-         as the project's run book library: read it before you act, write to it before you finish.\n\
+         into the next session is what you wrote to .comrade/memory/ — ADR decisions via remember \
+         and glossary keywords via remember_glossary. Read it before you act, write to it before \
+         you finish.\n\
          \n\
-         READ before you act (find_decisions/read_decision cost little; rediscovering costs more):\n\
-         - At the start of every task, search find_decisions with a query or tags for the area you \
-         will touch, and read_decision on the entries that look relevant. Do this before planning, \
-         orienting, or making architectural and behavioural choices.\n\
-         - Re-check before editing anything a run book mentions: a past session already worked \
-         this ground — build on it instead of repeating it.\n\
+         ADR DECISIONS (.comrade/memory/NNNN-*.md): call remember ONLY when an important decision \
+         happened that will impact the architecture, design or product on the long term. Record it \
+         ADR-style with when it happened (date), context/rationale, the decision, alternatives \
+         considered, scope and impact. Do NOT persist small operational notes, how-tos or \
+         step-by-step guides as decisions — if it is not a long-term choice, it does not belong \
+         in memory.\n\
+         - Before planning or making architectural/behavioural choices, search find_decisions \
+         (query or tags) and read_decision anything relevant — a past session may already hold \
+         the architecture or the trap you are about to hit.\n\
          \n\
-         WRITE after you learn something a future session would need to find, reuse, or avoid:\n\
-         - Important architectural changes and the reason behind them.\n\
-         - Code snippets worth reusing: non-obvious locations, signatures, or patterns.\n\
-         - Common issues and their fixes — errors that cost you time are prime candidates.\n\
-         - Format every entry as a run book: a short title and context, then numbered steps of \
-         ACTION -> VERIFICATION — \"do X; then check that Y passes or Z output appears\". Spell out \
-         exact commands, paths and identifiers so the next agent can execute the steps and prove \
-         they work without asking. Store the steps in the entry: summary as the search line, \
-         context as background, decision for the run-book steps, consequences for follow-ups.\n\
-         - Prefer several small, searchable, tagged run books over one long essay: remember is \
-         cheap and find_decisions ranks results.\n\
-         - Record while the work is fresh: at the end of every task, before your final reply, ask \
-         \"what would the next session need to redo, avoid, or find?\" — then remember it.\n\n",
+         GLOSSARY (.comrade/memory/glossary.md): one keyword -> meaning + references per entry.\n\
+         - When a keyword, acronym, crate or concept is unfamiliar, look it up with find_glossary \
+         (search) or read_glossary (one term, or omit the term to read the whole file).\n\
+         - When you meet a project-specific term the next session should understand, define it \
+         with remember_glossary (meaning + at least one reference to code or docs where it \
+         appears).\n\
+         \n\
+         Record while the work is fresh: at the end of every task, before your final reply, ask \
+         \"what long-term decision or keyword would the next session need?\" — then remember or \
+         remember_glossary it.\n\n",
     );
     prompt.push_str(
         "## Trust boundaries\n\
@@ -174,11 +177,11 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          - For anything about the project itself — dependencies, crates/subprojects, workspace \
          layout, runnable tasks — call project_model FIRST. Do NOT read Cargo.toml files just to \
          answer such questions; project_model already summarizes them.\n\
-         - Durable project memory lives in .comrade/memory/ as run books and decisions. Read it \
-         before you plan or choose: find_decisions (then read_decision) for the area you are \
-         touching. Write with remember anything a future session must know — architectural \
-         changes, relevant code snippets, common issues and their fixes — as numbered \
-         action + verification steps (see ## Memory).\n\
+         - Durable project memory lives in .comrade/memory/ as ADR decisions and the glossary. \
+         Read it before you plan or choose: find_decisions (then read_decision) for the area you \
+         are touching, find_glossary/read_glossary for keywords. Write with remember only when an \
+         important long-term decision happened, and keep project keywords defined in the glossary \
+         with remember_glossary (see ## Memory).\n\
          - Use list_files and rgrep to discover files and search text; use read_file to open a \
          specific file.\n\n",
     );
@@ -198,7 +201,7 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
          Args MUST be valid strict JSON: quote every key and every string value, e.g. {\"path\": \"src/main.rs\"}.\n\
          \n\
          Before running an approval-gated tool — write_file, rename, \
-         shell, remember, amend_decision — you MUST also write, between Thought and Tool:\n\
+         shell, remember, amend_decision, remember_glossary — you MUST also write, between Thought and Tool:\n\
          \n\
          Justification: <why this action should run, one or two short lines>\n\
          \n\
@@ -835,27 +838,30 @@ mod dev_prompt_tests {
     }
 
     #[test]
-    fn prompt_encodes_memory_run_books() {
+    fn prompt_encodes_adr_decisions_and_glossary() {
         let reg = ToolRegistry::new();
         let prompt = build_system_prompt("/x", &reg, 6000);
         // A dedicated section survives: read before acting, write before finishing.
         assert!(prompt.contains("## Memory"), "{prompt}");
         assert!(prompt.contains("context is cleared"), "{prompt}");
-        assert!(prompt.contains("run book"), "{prompt}");
+        assert!(prompt.contains("ADR"), "{prompt}");
+        assert!(prompt.contains("glossary"), "{prompt}");
         // Reading is part of the default loop, before orienting.
         assert!(
-            prompt.contains("Read the run books before you orient"),
+            prompt.contains("Read the ADRs and glossary before you orient"),
             "{prompt}"
         );
         assert!(prompt.contains("find_decisions"), "{prompt}");
         assert!(prompt.contains("read_decision"), "{prompt}");
-        // Writing covers the durable knowledge kinds and uses the run-book shape:
-        // numbered actions each paired with a verification.
-        assert!(prompt.contains("architectural changes"), "{prompt}");
-        assert!(prompt.contains("Code snippets"), "{prompt}");
-        assert!(prompt.contains("Common issues"), "{prompt}");
-        assert!(prompt.contains("ACTION -> VERIFICATION"), "{prompt}");
-        assert!(prompt.contains("remember it"), "{prompt}");
+        assert!(prompt.contains("find_glossary"), "{prompt}");
+        assert!(prompt.contains("read_glossary"), "{prompt}");
+        // remember is reserved for important long-term decisions, ADR-style;
+        // run-book how-tos are explicitly not durable memory.
+        assert!(prompt.contains("important decision"), "{prompt}");
+        assert!(prompt.contains("long term"), "{prompt}");
+        assert!(prompt.contains("remember_glossary"), "{prompt}");
+        assert!(!prompt.contains("run book"), "{prompt}");
+        assert!(!prompt.contains("ACTION -> VERIFICATION"), "{prompt}");
     }
 
     struct NamedTool {

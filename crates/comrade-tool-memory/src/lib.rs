@@ -1,12 +1,26 @@
-//! Persistent project decisions/memories: ADR-style notes stored under
-//! `.comrade/memory/`, plus free-text search.
+//! Persistent project memory: ADR-style decisions + a project glossary, both
+//! under `.comrade/memory/`.
 //!
-//! - `remember` writes a new decision (approval-gated).
+//! Decisions (ADR): one numbered Markdown file per decision, recorded only
+//! when an important choice was made that will affect the architecture,
+//! design or product on the long term. Each entry records when it happened,
+//! context/rationale, the decision, alternatives considered, scope and impact.
+//!
+//! - `remember` records a new ADR decision (approval-gated).
 //! - `find_decisions` searches summaries + bodies and returns a cheap ranked
 //!   list (id · status · title · excerpt) - never full bodies.
 //! - `read_decision` returns a full entry by id.
 //! - `amend_decision` updates status or appends a note (approval-gated).
+//!
+//! Glossary: a single `.comrade/memory/glossary.md` mapping project keywords
+//! to their meaning and to references in code or documentation.
+//!
+//! - `remember_glossary` adds or updates a term (approval-gated).
+//! - `find_glossary` searches terms and returns name + one-line meaning.
+//! - `read_glossary` returns one term's entry, or the whole file without a
+//!   term argument.
 
+mod glossary;
 mod store;
 
 use std::sync::LazyLock;
@@ -25,6 +39,9 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(FindDecisions),
         Box::new(ReadDecision),
         Box::new(AmendDecision),
+        Box::new(RememberGlossary),
+        Box::new(FindGlossary),
+        Box::new(ReadGlossary),
     ]
 }
 
@@ -41,15 +58,18 @@ struct Remember;
 static REMEMBER_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "remember".into(),
-    description: "Write what a future session must find, reuse, or avoid as a persistent run book under .comrade/memory/ (find_decisions/read_decision). Format: title + context, numbered steps of ACTION -> VERIFICATION stored as summary/context/decision/consequences. Approval-gated: include Justification.".into(),
+    description: "Record an ADR decision (architecture decision record) under .comrade/memory/ when an important choice was made that will impact the architecture, design or product on the long term - with when it happened, context/rationale, the decision, alternatives considered, scope and impact. Do NOT use it for small operational notes, how-tos or run books: those are not durable memory. Read decisions back with find_decisions/read_decision. Approval-gated: include Justification.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "title": { "type": "string", "description": "Short decision title, e.g. \"Prefer run_task for batch rewrites\"." },
-            "summary": { "type": "string", "description": "One-line summary shown in search results." },
-            "context": { "type": "string", "description": "Optional background / why this decision matters." },
-            "decision": { "type": "string", "description": "Optional what was decided." },
-            "consequences": { "type": "string", "description": "Optional trade-offs / follow-ups." },
+            "summary": { "type": "string", "description": "One-line summary shown in search results: the decision in one sentence." },
+            "context": { "type": "string", "description": "Background: what happened and why a decision was needed now." },
+            "decision": { "type": "string", "description": "What was decided." },
+            "rationale": { "type": "string", "description": "Why this choice over the alternatives." },
+            "alternatives": { "type": "string", "description": "Alternatives considered and why they were rejected." },
+            "scope": { "type": "string", "description": "What this decision covers, and what it deliberately does not." },
+            "impact": { "type": "string", "description": "Expected consequences, trade-offs and follow-ups." },
             "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags for filtering." }
         },
         "required": ["title"],
@@ -75,7 +95,13 @@ impl Tool for Remember {
             #[serde(default)]
             decision: Option<String>,
             #[serde(default)]
-            consequences: Option<String>,
+            rationale: Option<String>,
+            #[serde(default)]
+            alternatives: Option<String>,
+            #[serde(default)]
+            scope: Option<String>,
+            #[serde(default)]
+            impact: Option<String>,
             #[serde(default)]
             tags: Vec<String>,
         }
@@ -90,15 +116,19 @@ impl Tool for Remember {
         ctx.confirm(format!("remember #{id}: {}", args.title.trim()), None)
             .await?;
 
-        let written = store::write(
-            &ctx.project_root,
-            &args.title,
-            args.summary.as_deref().unwrap_or(""),
-            args.context.as_deref(),
-            args.decision.as_deref(),
-            args.consequences.as_deref(),
-            args.tags.clone(),
-        )?;
+        let draft = store::DraftDecision {
+            title: args.title,
+            summary: args.summary.unwrap_or_default(),
+            context: args.context,
+            decision: args.decision,
+            rationale: args.rationale,
+            alternatives: args.alternatives,
+            scope: args.scope,
+            impact: args.impact,
+            date: None,
+            tags: args.tags,
+        };
+        let written = store::write(&ctx.project_root, draft)?;
         debug_assert_eq!(written, id);
         Ok(format!("Recorded decision #{id} in .comrade/memory/{rel}"))
     }
@@ -113,7 +143,7 @@ struct FindDecisions;
 static FIND_DECISIONS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "find_decisions".into(),
-    description: "Free-text search the project's persistent decisions (.comrade/memory/). Returns a cheap ranked list of id, status, title and a one-line excerpt - call read_decision for a full body. Check this before making architectural/behavioral choices you may have already decided.".into(),
+    description: "Free-text search the project's persistent ADR decisions (.comrade/memory/). Returns a cheap ranked list of id, status, title and a one-line excerpt - call read_decision for a full body. Check this before making architectural/behavioral choices you may have already decided.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -159,8 +189,13 @@ impl Tool for FindDecisions {
         let mut out = format!("{} decision(s):\n", hits.len());
         for m in hits {
             let excerpt = m.excerpt();
+            let when = m
+                .date
+                .as_deref()
+                .map(|d| format!(" {d}"))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "  #{id} [{status}] {title}{excerpt}\n",
+                "  #{id} [{status}]{when} {title}{excerpt}\n",
                 id = m.id,
                 status = m.status,
                 title = if excerpt.is_empty() {
@@ -279,5 +314,192 @@ impl Tool for AmendDecision {
             args.note.as_deref(),
         )?;
         Ok(format!("Amended decision #{}.", args.id))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// remember_glossary
+// ---------------------------------------------------------------------------
+
+struct RememberGlossary;
+
+static REMEMBER_GLOSSARY_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "remember_glossary".into(),
+    description: "Add or update one keyword in the project glossary (.comrade/memory/glossary.md, a single file mapping project keywords to their meaning and to references in code or documentation). Call it when you meet a project-specific keyword, acronym, crate or pattern the next session should understand - or when a definition changes. Give the meaning and at least one reference (a file path or doc where the term appears). Look terms up with find_glossary/read_glossary. Approval-gated: include Justification.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "term": { "type": "string", "description": "The keyword, e.g. \"ADR\" or \"ToolSpec\"." },
+            "meaning": { "type": "string", "description": "What the keyword means for this project." },
+            "references": { "type": "array", "items": { "type": "string" }, "description": "File paths or docs where the term is defined or used, e.g. [\"crates/comrade-tool-memory/src/store.rs\"]." },
+            "notes": { "type": "string", "description": "Optional extra context beyond the meaning." }
+        },
+        "required": ["term", "meaning"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for RememberGlossary {
+    fn spec(&self) -> &ToolSpec {
+        &REMEMBER_GLOSSARY_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            term: String,
+            meaning: String,
+            #[serde(default)]
+            references: Vec<String>,
+            #[serde(default)]
+            notes: Option<String>,
+        }
+        let args: Args = serde_json::from_value(args)?;
+
+        let rel = format!(".comrade/{}/{}", store::DIR_NAME, glossary::FILE_NAME);
+        let abs = ctx
+            .project_root
+            .join(".comrade")
+            .join(store::DIR_NAME)
+            .join(glossary::FILE_NAME);
+        let before = std::fs::read_to_string(&abs).unwrap_or_default();
+        ctx.undo.capture(&rel, before).await?;
+        ctx.confirm(
+            format!("remember glossary term: {}", args.term.trim()),
+            None,
+        )
+        .await?;
+
+        let was_new = glossary::upsert(
+            &ctx.project_root,
+            &args.term,
+            &args.meaning,
+            &args.references,
+            args.notes.as_deref(),
+        )?;
+        Ok(format!(
+            "{} glossary term {:?} in {rel}",
+            if was_new { "Added" } else { "Updated" },
+            args.term.trim()
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// find_glossary
+// ---------------------------------------------------------------------------
+
+struct FindGlossary;
+
+static FIND_GLOSSARY_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "find_glossary".into(),
+    description: "Search the project glossary (.comrade/memory/glossary.md) for keywords and return term + one-line meaning. Read a full entry with read_glossary, add/update with remember_glossary. Call this when a term, acronym or concept in the conversation is unfamiliar.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string", "description": "Substring to match against term names or meanings (optional; omit to list glossary terms)." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Max results." }
+        },
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for FindGlossary {
+    fn spec(&self) -> &ToolSpec {
+        &FIND_GLOSSARY_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            query: Option<String>,
+            #[serde(default = "default_limit")]
+            limit: usize,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let hits = glossary::find(&ctx.project_root, args.query.as_deref(), args.limit)?;
+        if hits.is_empty() {
+            if glossary::read_whole(&ctx.project_root)?.trim().is_empty() {
+                return Ok("The glossary is empty (no .comrade/memory/glossary.md yet). Define keywords with remember_glossary.".to_string());
+            }
+            return Ok("No matching glossary terms found.".to_string());
+        }
+        let mut out = format!("{} glossary term(s):\n", hits.len());
+        for t in hits {
+            let excerpt = t.excerpt.trim();
+            let line = if excerpt.is_empty() {
+                format!("## {}", t.term)
+            } else {
+                format!("## {} — {excerpt}", t.term)
+            };
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// read_glossary
+// ---------------------------------------------------------------------------
+
+struct ReadGlossary;
+
+static READ_GLOSSARY_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "read_glossary".into(),
+    description: "Read a glossary entry: pass a term to read just that keyword's full entry (meaning + references), or omit term to read the WHOLE .comrade/memory/glossary.md file. See find_glossary to search, remember_glossary to add/update.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "term": { "type": "string", "description": "Keyword to read (optional). Omit to return the whole glossary file." }
+        },
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for ReadGlossary {
+    fn spec(&self) -> &ToolSpec {
+        &READ_GLOSSARY_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            term: Option<String>,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        match args
+            .term
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            Some(term) => match glossary::read_term(&ctx.project_root, term)? {
+                Some(t) => Ok(format!("## {}\n{}", t.term, t.body)),
+                None => Ok(format!(
+                    "No glossary term {:?}. See find_glossary to search, remember_glossary to add it.",
+                    term
+                )),
+            },
+            None => {
+                let whole = glossary::read_whole(&ctx.project_root)?;
+                if whole.trim().is_empty() {
+                    Ok("The glossary is empty (no .comrade/memory/glossary.md yet). Define keywords with remember_glossary.".to_string())
+                } else {
+                    Ok(whole)
+                }
+            }
+        }
     }
 }
