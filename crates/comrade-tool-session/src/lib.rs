@@ -95,7 +95,7 @@ struct SetPlan;
 static SET_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "set_plan".into(),
-    description: "Lay out the plan before doing work. Each step is an isolated unit with a goal, a verification (how to prove it succeeded) and the model that will run it, so steps can later be run independently or delegated. Replaces any existing plan; advance steps with update_plan.".into(),
+    description: "Lay out the plan before doing work. Each step: a goal, a verification (how to prove it worked) and the `model` that runs it ('self' or a delegate). Replaces any existing plan; advance steps with update_plan.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -186,7 +186,7 @@ struct UpdatePlan;
 static UPDATE_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "update_plan".into(),
-    description: "Update the status of one plan step (mark pending/ready/in_progress/done/blocked). Identify a step by its 1-based `index` (preferred) or by `text` that appears in its goal. A step assigned a delegate `model` can only be marked done after the `delegate` tool has run it.".into(),
+    description: "Update one plan step's status (pending/ready/in_progress/done/blocked). Identify the step by its 1-based `index` (preferred) or by `text` in its goal.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -281,7 +281,7 @@ struct SetStepModel;
 static SET_STEP_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "set_step_model".into(),
-    description: "Change which model runs an existing plan step, e.g. to hand a pending \\\"self\\\" step to a delegate or to take a delegate-assigned step back onto yourself. Identify the step by its 1-based `index` (preferred) or by `text` in its goal, and give the `model` that will run it: \\\"self\\\" for you, or a configured delegate name. Refused while the step is in_progress or done: only pending, ready or blocked steps can be reassigned. Reassigning a ready step drops it back to pending (readiness was confirmed for the old delegate). Reassigning clears the step's delegation record, so the newly assigned model must actually run the step before it can be marked done.".into(),
+    description: "Change which model runs a plan step: 'self' for you, or a delegate name. Refused while the step is in_progress or done; only pending, ready or blocked steps can be reassigned.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -385,7 +385,7 @@ struct SetStepContext;
 static SET_STEP_CONTEXT_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "set_step_context".into(),
-    description: "Replace the summarised context of one plan step — the instructions the executing delegate will actually receive (never shown in the UI). Use it to feed a delegate's \\\"I need more info\\\" requests back into a step after `ask_advise` step = <id> reported the context insufficient, then re-run ask_advise step = <id> until the delegate confirms the step is `ready`. Identify the step by its 1-based `index` (preferred) or by `text` in its goal, and give the new `context`. Refused while the step is in_progress or done; setting the context of a `ready` step drops it back to `pending`, because the readiness confirmation described the old context.".into(),
+    description: "Replace one plan step's context - the instructions its executing delegate receives (never shown in the UI). Refused while in_progress or done; resets a `ready` step to pending.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -458,7 +458,7 @@ struct FinishPlan;
 static FINISH_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "finish_plan".into(),
-    description: "Mark the whole plan as finished, optionally with a closing summary. Use when the task is complete. Refuses while any step assigned a delegate model has never been run by the `delegate` tool.".into(),
+    description: "Mark the whole plan as finished, optionally with a closing summary. Use when the task is complete. Refuses while any delegate-assigned step has not been run by the delegate tool.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -560,7 +560,7 @@ struct AskQuestion;
 static ASK_QUESTION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "ask_question".into(),
-    description: "Ask the human a question and wait for their answer. Use to resolve ambiguity, request confirmation, or let the human pick between options. Prefer this over guessing when a choice materially affects the outcome. If you recommend one specific answer or approach, be explicit about it.".into(),
+    description: "Ask the human a question and wait for their answer. Use to resolve ambiguity, request confirmation, or let them pick between options. Prefer over guessing when a choice materially matters.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {

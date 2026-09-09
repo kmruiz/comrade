@@ -58,7 +58,7 @@ struct Remember;
 static REMEMBER_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "remember".into(),
-    description: "Record an ADR decision (architecture decision record) under .comrade/memory/ when an important choice was made that will impact the architecture, design or product on the long term - with when it happened, context/rationale, the decision, alternatives considered, scope and impact. Do NOT use it for small operational notes, how-tos or run books: those are not durable memory. Read decisions back with find_decisions/read_decision. Approval-gated: include Justification.".into(),
+    description: "Record an ADR decision (.comrade/memory/) for an important long-term architectural/design choice: date, context/rationale, decision, alternatives, scope, impact. Do NOT persist small operational notes or how-tos. Approval-gated: include Justification.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -143,7 +143,7 @@ struct FindDecisions;
 static FIND_DECISIONS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "find_decisions".into(),
-    description: "Free-text search the project's persistent ADR decisions (.comrade/memory/). Returns a cheap ranked list of id, status, title and a one-line excerpt - call read_decision for a full body. Check this before making architectural/behavioral choices you may have already decided.".into(),
+    description: "Free-text search persistent ADR decisions (.comrade/memory/). Returns a ranked list of id, status, title and a one-line excerpt - call read_decision for the full body. Check before architectural choices.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -326,7 +326,7 @@ struct RememberGlossary;
 static REMEMBER_GLOSSARY_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "remember_glossary".into(),
-    description: "Add or update one keyword in the project glossary (.comrade/memory/glossary.md, a single file mapping project keywords to their meaning and to references in code or documentation). Call it when you meet a project-specific keyword, acronym, crate or pattern the next session should understand - or when a definition changes. Give the meaning and at least one reference (a file path or doc where the term appears). Look terms up with find_glossary/read_glossary. Approval-gated: include Justification.".into(),
+    description: "Add or update one keyword in the project glossary (.comrade/memory/glossary.md): term -> meaning + references. Call when you meet a project-specific term the next session should understand. Approval-gated.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -397,7 +397,7 @@ struct FindGlossary;
 static FIND_GLOSSARY_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "find_glossary".into(),
-    description: "Search the project glossary (.comrade/memory/glossary.md) for keywords and return term + one-line meaning. Read a full entry with read_glossary, add/update with remember_glossary. Call this when a term, acronym or concept in the conversation is unfamiliar.".into(),
+    description: "Search the project glossary for keywords; returns each term + one-line meaning. Read a full entry with read_glossary, add/update with remember_glossary.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -455,7 +455,7 @@ struct ReadGlossary;
 static READ_GLOSSARY_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "read_glossary".into(),
-    description: "Read a glossary entry: pass a term to read just that keyword's full entry (meaning + references), or omit term to read the WHOLE .comrade/memory/glossary.md file. See find_glossary to search, remember_glossary to add/update.".into(),
+    description: "Read a glossary entry: pass a term for its full entry (meaning + references), or omit the term to read the WHOLE .comrade/memory/glossary.md file.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {

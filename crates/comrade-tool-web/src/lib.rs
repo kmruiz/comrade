@@ -346,7 +346,7 @@ struct WebSearch;
 static WEB_SEARCH_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "web_search".into(),
-    description: "Search the web (Bing-backed, DuckDuckGo fallback). Returns only each result's URL, title and a short description - no HTML, no page content. Use to find docs, APIs, or answers about topics outside the repository.".into(),
+    description: "Search the web (Bing-backed, DuckDuckGo fallback). Returns only each result's URL, title and short description - no page content. Use to find docs, APIs or answers outside the repo.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {

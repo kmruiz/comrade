@@ -28,7 +28,6 @@ pub struct ToolCall {
 const INTRO: &str = include_str!("../prompts/intro.md");
 const DELEGATE_BY_DEFAULT: &str = include_str!("../prompts/delegate-by-default.md");
 const WORKING_STYLE: &str = include_str!("../prompts/working-style.md");
-const DELEGATION_LEAD: &str = include_str!("../prompts/delegation-lead.md");
 const MEMORY: &str = include_str!("../prompts/memory.md");
 const TRUST_BOUNDARIES: &str = include_str!("../prompts/trust-boundaries.md");
 const TOOLS_INTRO: &str = include_str!("../prompts/tools-intro.md");
@@ -45,9 +44,6 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
         prompt.push_str(DELEGATE_BY_DEFAULT);
     }
     prompt.push_str(WORKING_STYLE);
-    if tools.iter().any(|t| t.spec().name == "delegate") {
-        prompt.push_str(DELEGATION_LEAD);
-    }
     prompt.push_str(MEMORY);
     prompt.push_str(TRUST_BOUNDARIES);
     prompt.push_str(TOOLS_INTRO);

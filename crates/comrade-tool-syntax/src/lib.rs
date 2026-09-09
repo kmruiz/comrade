@@ -106,7 +106,7 @@ struct FindReferences;
 static FIND_REFERENCES_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "find_references".into(),
-    description: "Find uses of a symbol (function/struct/field/variable name) across the project using tree-sitter parsing. Matches identifier tokens only (never inside strings/comments) but is lexical, not semantic. Returns file:line:col with source context.".into(),
+    description: "Find uses of a symbol (fn/struct/field/variable name) across the project via tree-sitter. Matches identifier tokens only, never inside strings or comments. Lexical, not semantic.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -179,7 +179,7 @@ struct Rename;
 static RENAME_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "rename".into(),
-    description: "Rename a symbol across the project by rewriting every tree-sitter identifier token that equals `symbol`. Approximate but safe (never matches inside strings/comments). Interactive: you approve the change preview before files are written. Prefer an LSP rename tool when available for semantic accuracy.".into(),
+    description: "Rename a symbol across the project by rewriting every tree-sitter identifier token equal to `symbol`. Approximate but safe (never matches inside strings/comments). Interactive: approve the preview first.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -340,7 +340,7 @@ struct StructuralMap;
 static STRUCTURAL_MAP_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "structural_map".into(),
-    description: "Build a tree-sitter structural map of the project (or one file): each file section lists its declarations nested under inline mod/impl/trait containers, with line numbers — so you can see where functions, modules, types, and methods live at a glance. Filter by file, git-modified files, or declaration kinds. Prefer this over grepping the codebase to orient yourself; then read_symbol / read_ranges the exact item you will touch.".into(),
+    description: "Build a tree-sitter structural map of the project (or one file): declarations nested under mod/impl/trait containers, with line numbers. Filter by file or declaration kind. Orient fast.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -407,7 +407,7 @@ struct FindDefinition;
 static FIND_DEFINITION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "find_definition".into(),
-    description: "Locate where a symbol is defined and return its kind, one-line signature, and file:line — never the whole body. Cheaper than reading the file when you only need to know a declaration. Pass the bare identifier; the optional type narrows to one declaration kind, and a leading \"fn \" style prefix in symbol is stripped automatically.".into(),
+    description: "Locate where a symbol is defined; returns its kind, one-line signature and file:line - never the whole body. Cheaper than reading the file when you only need its location.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -483,7 +483,7 @@ struct ReadSymbol;
 static READ_SYMBOL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "read_symbol".into(),
-    description: "Read just one symbol's declaration body (function, struct, enum, trait, const, ...) with its file:line and signature. Use before editing a specific item instead of reading the whole file. Pass the bare identifier; the optional type narrows to one declaration kind, and a leading \"fn \" style prefix in symbol is stripped automatically.".into(),
+    description: "Read just one symbol's declaration body (fn, struct, enum, const, ...) with its file:line and signature. Use before editing a specific item instead of reading the whole file.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -565,7 +565,7 @@ struct ReferencesCount;
 static REFERENCES_COUNT_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "references_count".into(),
-    description: "Count references to a symbol across the project (lexical tree-sitter identifiers). Returns a total and per-file breakdown, not context lines — use it to gauge blast radius (e.g. before a rename) cheaply.".into(),
+    description: "Count references to a symbol across the project (lexical tree-sitter identifiers): total + per-file breakdown. Use to gauge blast radius, e.g. before a rename.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -634,7 +634,7 @@ struct FindSymbol;
 static FIND_SYMBOL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "find_symbol".into(),
-    description: "Find declarations whose NAME contains the query (case-insensitive), across the project or a file. Pass the bare name only (query=\"build\"), not a keyword like \"fn build\" — a leading kind prefix is stripped automatically into the type filter. Returns kind, name, one-line signature and file:line so you can locate the right symbol and then read only its body with read_symbol.".into(),
+    description: "Find declarations whose NAME contains the query (case-insensitive), across the project or a file. Pass the bare name only, e.g. query=build - not fn build.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {

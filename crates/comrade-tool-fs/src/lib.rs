@@ -121,7 +121,7 @@ struct ListDir;
 static LIST_DIR_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "list_dir".into(),
-    description: "List the entries in a directory (project-root relative). Use to discover files before reading or editing. With git_modified_only, only entries containing changes vs HEAD are shown.".into(),
+    description: "List a directory's entries (project-root relative). Use to discover files before reading or editing. With git_modified_only, only entries with changes vs HEAD are shown.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -193,7 +193,7 @@ struct ReadFile;
 static READ_FILE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "read_file".into(),
-    description: "Read a text file (project-root relative). Returns raw contents, optionally windowed by line numbers. Reading a whole file costs context, so a bare read (no start_line/end_line) of a file longer than 150 lines returns only the head window and the total line count: to edit a small part, pass start_line/end_line or use read_ranges, and prefer read_symbol/structural_map to jump straight at one declaration instead of reading the whole file.".into(),
+    description: "Read a text file (project-root relative). A bare read of a long file returns only its head: pass start_line/end_line or use read_ranges to read a window.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -291,7 +291,7 @@ struct ApplyEdit;
 static APPLY_EDIT_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "apply_edit".into(),
-    description: "Replace the first exact occurrence of `old` with `new` inside `path`. `old` must match byte-for-byte (include enough surrounding lines to be unique). Fails when not found or ambiguous; narrow the window and retry. Prefer several small precise edits over whole-file rewrites.".into(),
+    description: "Replace the first exact occurrence of `old` with `new` in `path` (byte-for-byte; include surrounding lines to be unique). Prefer several small precise edits over whole-file rewrites.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -365,7 +365,7 @@ struct WriteFile;
 static WRITE_FILE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "write_file".into(),
-    description: "Overwrite (or create) a whole file (project-root relative). Parent directories are created as needed. Prefer apply_edit for targeted changes to keep diffs small.".into(),
+    description: "Overwrite or create a whole file (project-root relative). Parent directories are created as needed. Prefer apply_edit for small targeted changes.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -433,7 +433,7 @@ struct ListFiles;
 static LIST_FILES_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "list_files".into(),
-    description: "List project files matching a glob pattern (project-root relative), one per line. Prefer this over walking with list_dir. `*` matches within a path segment, `**` matches across directories. Examples: \"**/*.rs\", \"src/**/*.rs\", \"Cargo.toml\", \"*.md\".".into(),
+    description: "List project files matching a glob (project-root relative), one per line. `*` matches within a path segment, `**` across directories. Prefer over walking with list_dir.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -508,7 +508,7 @@ struct RGrep;
 static RGREP_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "rgrep".into(),
-    description: "Search for literal text in project files, like a filtered grep. Returns matching lines as file:line: text. Use when you need to find every place a string, identifier, or phrase appears. `glob` restricts which files are searched (default \"**/*\"). Matching is substring-based; use ignore_case for case-insensitive search.".into(),
+    description: "Search project files for literal text (like a filtered grep); returns file:line: text. Use to find every place a string or identifier appears. `glob` restricts the files searched; substring-based; use ignore_case as needed.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -737,7 +737,7 @@ struct ReadRanges;
 static READ_RANGES_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "read_ranges".into(),
-    description: "Read several non-contiguous 1-based line ranges of one file in a single call. Each range is [start, end] inclusive. Use instead of repeated read_file calls when you need a few windows of the same file.".into(),
+    description: "Read several non-contiguous 1-based line ranges of one file in a single call. Each range is [start, end] inclusive. Use instead of repeated read_file calls.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -800,7 +800,7 @@ struct ApplyPatch;
 static APPLY_PATCH_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "apply_patch".into(),
-    description: "Apply a unified diff to files (project-root relative), much more compact than apply_edit: send only +/- hunks with a little surrounding context. Format:\n  --- a/<path>\n  +++ b/<path>\n  @@ ... @@ (ignored)\n    context line\n  - removed line\n  + added line\nEach hunk's old block must appear exactly once in the file. The change is approved by the human before being written.".into(),
+    description: "Apply a unified diff to files (project-root relative) - more compact than apply_edit. Send +/- hunks with a little context; each old block must appear exactly once.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {

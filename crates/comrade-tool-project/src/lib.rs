@@ -38,7 +38,7 @@ struct ProjectModelTool;
 static PROJECT_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "project_model".into(),
-    description: "Report this Cargo project's dependencies, subprojects, and tasks (the project object model, POM). Use this INSTEAD of reading Cargo.toml files whenever the user asks about dependencies, crates/modules, the workspace layout, or what tasks can be run. Read-only.".into(),
+    description: "Report this Cargo project's dependencies, subprojects, layout and tasks (the POM). Use INSTEAD of reading Cargo.toml when asked about deps/modules/tasks. Read-only.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {},
@@ -68,7 +68,7 @@ struct RunTask;
 static RUN_TASK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "run_task".into(),
-    description: "Run a named project task and return its output. Tasks come from project_model: cargo verbs (build, run, check, test, clippy, fmt, doc, bench, release) and aliases defined in .cargo/config.toml (!-prefixed aliases run as shell). Optionally scope to a subproject with its directory (relative to the root). Runs directly without approval.".into(),
+    description: "Run a named project task and return its output: cargo verbs (build, run, check, test, clippy, fmt, doc, bench, release) and aliases; optionally scope to a subproject. Runs directly without approval.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -164,7 +164,7 @@ struct RunTests;
 static RUN_TESTS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "run_tests".into(),
-    description: "Run the project's tests (cargo test) and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names and key error lines - build noise is filtered out. Use to verify work instead of reading code to reason about correctness. Runs directly without approval.".into(),
+    description: "Run the project's tests (cargo test) and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names, key error lines. Use to verify work instead of reasoning about code.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -256,7 +256,7 @@ struct Shell;
 static SHELL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "shell".into(),
-    description: "LAST RESORT — prefer any cheaper, safer dedicated tool over this one. Run an arbitrary shell command via bash in the project (optionally in a subdirectory) and return its raw output. Use ONLY when no dedicated tool can do the job: use read_file/list_dir over cat/ls, rgrep over grep/find, run_task/run_tests/format_code over cargo … commands, git_status/git_diff/git_log/git_commit over git …, project_model over reading Cargo.toml. Shell output is unparsed and the command is arbitrary side effects. Approval-gated: include Justification.".into(),
+    description: "LAST RESORT - prefer a dedicated tool (read_file/list_dir, rgrep, run_task/run_tests, git_*, project_model) over the shell. Runs an arbitrary bash command and returns raw output. Approval-gated.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
