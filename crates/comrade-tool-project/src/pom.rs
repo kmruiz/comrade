@@ -64,9 +64,11 @@ pub struct ProjectModel {
     pub aliases: Vec<Alias>,
 }
 
-/// Standard Cargo verbs surfaced as tasks.
-pub const CARGO_VERBS: &[&str] = &[
-    "build", "run", "check", "test", "clippy", "fmt", "doc", "bench", "release",
+/// The cargo verbs the `run_task` tool executes. `test` is deliberately
+/// absent: running tests goes through the dedicated `run_tests` tool, which
+/// returns a compact failure summary instead of the full cargo output.
+pub const RUN_TASK_VERBS: &[&str] = &[
+    "build", "run", "check", "clippy", "fmt", "doc", "bench", "release",
 ];
 
 /// Load the Cargo POM for `root` (the workspace/project root). Errors when the
@@ -284,8 +286,8 @@ pub fn render(model: &ProjectModel) -> String {
     }
 
     out.push_str(&format!(
-        "Tasks (cargo verbs, run with run_task task=\"<name>\"): {}\n",
-        CARGO_VERBS.join(", ")
+        "Tasks (cargo verbs, run with run_task task=\"<name>\"; tests via run_tests): {}\n",
+        RUN_TASK_VERBS.join(", ")
     ));
     if model.aliases.is_empty() {
         out.push_str("Aliases: none (add [alias] to .cargo/config.toml)\n");
@@ -424,6 +426,48 @@ anyhow = "1"
     fn errors_when_not_a_cargo_project() {
         let root = scratch();
         assert!(load(&root).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_task_verbs_exclude_test() {
+        assert!(
+            !RUN_TASK_VERBS.contains(&"test"),
+            "run_task must not advertise test"
+        );
+        assert!(RUN_TASK_VERBS.contains(&"build"));
+        // run_tests still resolves the internal `test` verb (see tasks.rs tests)
+        assert_eq!(
+            RUN_TASK_VERBS.len(),
+            8,
+            "all cargo verbs except test: build run check clippy fmt doc bench release"
+        );
+    }
+
+    #[test]
+    fn render_does_not_advertise_test_as_a_run_task_verb() {
+        let root = scratch();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let m = load(&root).unwrap();
+        let rendered = render(&m);
+        let tasks_line = rendered
+            .lines()
+            .find(|l| l.starts_with("Tasks ("))
+            .expect("tasks line present");
+        let verbs: Vec<&str> = tasks_line
+            .split("):")
+            .nth(1)
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .collect();
+        assert!(!verbs.contains(&"test"), "{tasks_line}");
+        assert!(verbs.contains(&"build"), "{tasks_line}");
+        assert!(tasks_line.contains("run_tests"), "{tasks_line}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

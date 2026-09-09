@@ -47,3 +47,16 @@ Mutually exclusive with model/question/context args. The delegate tool descripti
 **Notes:**
 Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; otherwise the step stays pending with an "awaiting context: ..." note. Reassigning the model or calling set_step_context on a ready step resets it to pending. TUI shows a blue ● glyph. Denied to delegate sub-agents.
 
+## runbook-style prompt
+> The convention that all model-facing prompt text in Comrade must be terse, imperative runbook prose (numbered steps, one idea per line, short sentences, exact tool names in backticks), so that small models can act as the tech lead. Applies to the tech-lead prompt sections, the delegate/advisor sub-agent system bodies, and ToolSpec descriptions.
+
+**References:**
+- `crates/comrade-core/prompts/delegate-by-default.md`
+- `crates/comrade-core/prompts/delegate-system.md`
+- `crates/comrade-core/src/react.rs`
+- `crates/comrade-core/src/delegate.rs`
+- `.comrade/memory/0006-restyle-all-model-facing-prompts-as-terse-runbooks-for-small-model-tech-leads.md`
+
+**Notes:**
+Adopted in ADR #6. Prompt sources: crates/comrade-core/prompts/*.md (assembled by react::build_system_prompt and delegate::render_subagent_system) and the ToolSpec.description strings in every comrade-tool-* crate. Known follow-ups: comrade-core delegate/ask_advise tool descriptions and json_schema per-property descriptions are still verbose.
+

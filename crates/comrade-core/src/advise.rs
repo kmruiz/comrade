@@ -96,34 +96,29 @@ impl AskAdviseTool {
             .map(cfg_line)
             .collect::<Vec<_>>()
             .join("\n");
+        let body = [
+            "Ask one of the configured delegate models for ADVICE - a second opinion - while you",
+            "keep the task yourself. Two modes:",
+            "",
+            "1. Free-form advice: pass `model` + a self-contained `question` (+ optional `context`).",
+            "Nothing is handed off and nothing runs; the advisor only answers. You get advice back -",
+            "you still decide.",
+            "",
+            "2. Readiness check for a delegated plan step: pass `step` = a plan step id (do NOT",
+            "pass `model`, `question` or `context`). The step's OWN delegate is consulted about",
+            "whether the step's context suffices for it to pick the step up. VERDICT: READY marks",
+            "the step `ready` to delegate; NEEDS_MORE keeps it `pending` with an \"awaiting",
+            "context: ...\" note. Enrich with set_step_context, then re-ask until `ready`. Fire",
+            "these checks in PARALLEL (one ask_advise step = <id> per delegated step, batched).",
+            "",
+            "The advisor is READ-ONLY: it can read/search files and git history and use memory/web",
+            "tools, but has no write/edit/shell/run/commit/plan tools and cannot change anything.",
+            "Consulting normally needs no approval; a delegate configured `approval = \"ask\"`",
+            "pauses for human approval first, and `approval = \"deny\"` is refused.",
+        ]
+        .join("\n");
         let description = format!(
-            "\
-Ask one of the configured delegate models for ADVICE — a second opinion — while you keep the \
-task yourself. Two modes:
-
-1. Free-form advice: `model` + a self-contained `question` (+ optional `context`). Nothing is \
-handed off, nothing runs on the repo, the delegate only answers you (e.g. how to plan or split a \
-task, which approach is sound, what could go wrong). You get advice back — you still decide.
-
-2. Readiness check for a delegated plan step: pass `step` = a plan step id (do NOT pass `model`, \
-`question` or `context`). The step's OWN delegate — the model that will execute it — is consulted \
-read-only about whether the step's context is sufficient for it to pick the step up. If the \
-delegate confirms (VERDICT: READY), the step is marked `ready` and is ready to be delegated; if \
-it needs more context, the step stays `pending` with an \"awaiting context: ...\" note and the \
-reply tells you what to add. Enrich the step with `set_step_context`, then re-run ask_advise \
-step = <id> until it is `ready`. Fire these readiness checks in PARALLEL (one ask_advise step = \
-<id> per delegated step, batched) while you keep doing your own work, and only pick up a step \
-once it shows `ready`.
-
-The consulted delegate gets READ-ONLY repository tools (read/search files, git status/diff/log, \
-project_model, memory lookups, web_search) so the advice can be grounded in the actual code, but \
-it has no write/edit/shell/run/commit/plan tools and cannot change anything. Consulting normally \
-needs no approval, but a delegate configured `approval = \"ask\"` (marked \"[human approval \
-required before it runs]\" below) pauses for human approval first, and one set to \
-`approval = \"deny\"` is refused.
-
-Configured delegates — pick the one whose description best fits the advice you need:
-{listing}"
+            "{body}\n\nConfigured delegates — pick the one whose description best fits the advice you need:\n{listing}"
         );
 
         let schema = json!({
@@ -132,22 +127,20 @@ Configured delegates — pick the one whose description best fits the advice you
                 "step": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Plan step id to run a readiness check on: the step's own assigned delegate (its `model`) is consulted about whether the step's context suffices for it to pick the step up. The step is marked `ready` when the delegate confirms (VERDICT: READY), or stays `pending` with an \"awaiting context\" note when it needs more. Do not pass `model`, `question` or `context` together with `step` — they come from the plan step."
+                    "description": "Plan step id for a readiness check: the step's own delegate is consulted about whether its context suffices. VERDICT: READY marks it `ready`; NEEDS_MORE keeps it `pending`. Do not pass `model`, `question` or `context` with `step`."
                 },
                 "model": {
                     "type": "string",
                     "enum": names,
-                    "description": format!(
-                        "Which configured delegate model should give the advice. Choose the delegate whose description best fits the question:\n{listing}"
-                    )
+                    "description": "Which configured delegate model should give the advice."
                 },
                 "question": {
                     "type": "string",
-                    "description": "The thing you want advice on, self-contained: what you are about to do, the situation, and what you need judged (e.g. how to plan/split a task, whether an approach is sound)."
+                    "description": "The advice you want, self-contained: what you are about to do, what you need judged (e.g. how to plan/split a task, whether an approach is sound)."
                 },
                 "context": {
                     "type": "string",
-                    "description": "Optional background the delegate cannot discover itself: your plan draft, design notes, error output, constraints — anything that would let it advise without re-reading the repo."
+                    "description": "Optional background the advisor cannot discover itself: plan draft, design notes, error output, constraints."
                 }
             },
             "oneOf": [

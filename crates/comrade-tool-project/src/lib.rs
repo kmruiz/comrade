@@ -68,11 +68,11 @@ struct RunTask;
 static RUN_TASK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "run_task".into(),
-    description: "Run a named project task and return its output: cargo verbs (build, run, check, test, clippy, fmt, doc, bench, release) and aliases; optionally scope to a subproject. Runs directly without approval.".into(),
+    description: "Run a named project task and return its output: cargo verbs (build, run, check, clippy, fmt, doc, bench, release) and aliases; optionally scope to a subproject. Runs directly without approval. Run tests with run_tests, not here - it returns only the failure summary and costs far less context.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "task": { "type": "string", "description": "Task name, e.g. \"test\" or a cargo alias." },
+            "task": { "type": "string", "description": "Task name, e.g. \"build\" or a cargo alias. Use run_tests to run tests." },
             "subproject": { "type": "string", "description": "Optional subproject directory relative to the root, e.g. \"crates/app\"." },
             "args": { "type": "string", "description": "Extra arguments appended to the command." },
             "timeout_secs": { "type": "integer", "minimum": 1, "default": 600, "description": "Kill the task after this many seconds." }
@@ -104,7 +104,12 @@ impl Tool for RunTask {
             600
         }
         let args: Args = serde_json::from_value(args)?;
-
+        if args.task.trim() == "test" {
+            anyhow::bail!(
+                "running tests through run_task is disabled - use the run_tests tool instead \
+                 (it returns only failing tests and costs far less context)"
+            );
+        }
         let extra: Vec<String> = args
             .args
             .as_deref()
@@ -112,9 +117,25 @@ impl Tool for RunTask {
             .unwrap_or_default();
 
         let resolved = tasks::resolve(&ctx.project_root, &args.task, &args.subproject, &extra)?;
+        ensure_not_test_run(&resolved.line)?;
         let output = tasks::run(&resolved, args.timeout_secs).await?;
         Ok(output)
     }
+}
+
+/// Refuse a resolved run_task command that would execute `cargo test` (covers
+/// the literal `test` verb and aliases that expand to it). Tests belong to the
+/// dedicated `run_tests` tool, whose output is a compact failure summary.
+fn ensure_not_test_run(line: &tasks::CommandLine) -> anyhow::Result<()> {
+    if let tasks::CommandLine::Cargo { args } = line {
+        if args.first().map(String::as_str) == Some("test") {
+            anyhow::bail!(
+                "running tests through run_task is disabled - use the run_tests tool instead \
+                 (it returns only failing tests and costs far less context)"
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -368,5 +389,28 @@ test result: FAILED. 11 passed; 1 failed; 0 ignored
         assert!(out.contains("panicked at"));
         assert!(!out.contains("Compiling"));
         assert!(!out.contains("Finished"));
+    }
+
+    #[test]
+    fn run_task_rejects_test_runs() {
+        let cargo = tasks::CommandLine::Cargo {
+            args: vec!["test".into(), "--lib".into()],
+        };
+        let err = ensure_not_test_run(&cargo).unwrap_err().to_string();
+        assert!(err.contains("run_tests"), "{err}");
+        // a cargo alias expanding to `test` is caught the same way
+        let alias = tasks::CommandLine::Cargo {
+            args: vec!["test".into()],
+        };
+        assert!(ensure_not_test_run(&alias).is_err());
+        // non-test cargo commands and shell aliases still pass
+        let build = tasks::CommandLine::Cargo {
+            args: vec!["build".into()],
+        };
+        assert!(ensure_not_test_run(&build).is_ok());
+        let shell = tasks::CommandLine::Shell {
+            script: "echo hi".into(),
+        };
+        assert!(ensure_not_test_run(&shell).is_ok());
     }
 }

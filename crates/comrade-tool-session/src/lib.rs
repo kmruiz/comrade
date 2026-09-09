@@ -105,8 +105,8 @@ static SET_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
                     "type": "object",
                     "properties": {
                         "goal": { "type": "string", "description": "What this step aims to accomplish, summarised, for a human to read." },
-                        "verification": { "type": "string", "description": "How to verify the step succeeded, e.g. \"cargo test passes\" or \"rgrep finds the new call sites\"." },
-                        "model": { "type": "string", "description": "REQUIRED. The model that will execute this step: write \"self\" when you (the main agent model) will run it yourself, or one of the configured delegate names (see the delegate tool's model listing). Every step must name who runs it." },
+                        "verification": { "type": "string", "description": "How to prove the step worked (e.g. a test command to run)." },
+                        "model": { "type": "string", "description": "REQUIRED. Who runs this step: \"self\" (you) or a configured delegate name." },
                         "context": { "type": "string", "description": "Summarised context the executing model needs for this step (mandatory; never shown in the UI)." }
                     },
                     "required": ["goal", "model", "verification", "context"],
@@ -192,7 +192,7 @@ static UPDATE_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
         "properties": {
             "index": { "type": "integer", "minimum": 1, "description": "1-based step id." },
             "text": { "type": "string", "description": "Text contained in the step goal." },
-            "status": { "type": "string", "enum": ["pending", "ready", "in_progress", "done", "blocked"], "description": "pending = not started; ready = the step's delegate confirmed via ask_advise step=<id> that the context suffices to pick it up; in_progress = being worked; done / blocked." },
+            "status": { "type": "string", "enum": ["pending", "ready", "in_progress", "done", "blocked"], "description": "New status. ready = delegate confirmed the context; done only after a green verification." },
             "note": { "type": "string", "description": "Optional note appended to the step." }
         },
         "required": ["status"],

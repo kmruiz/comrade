@@ -243,56 +243,30 @@ impl DelegateTool {
             .map(cfg_line)
             .collect::<Vec<_>>()
             .join("\n");
+        let body = [
+            "Hand ONE self-contained task to another model - a delegate sub-agent WITH tools",
+            "(read/search, write_file, run_tests, memory, web) minus git_commit; only you commit.",
+            "",
+            "Delegating runs without human approval. A delegate configured `approval = \"ask\"`",
+            "pauses for approval first; `approval = \"deny\"` refuses it.",
+            "",
+            "To run one of your plan steps, pass `step`: the task, context and model then come from",
+            "the step, and `model` must match the step's model. Otherwise pass `model` + `task`",
+            "(+ optional `context`) for ad-hoc work. Plan steps you run yourself carry the reserved",
+            "model \"self\" and cannot be delegated via `step`.",
+            "",
+            "Delegating a step marks it in_progress with a `working: <model>` note. After the",
+            "delegate replies, run the step's verification yourself with your tools; on failure",
+            "re-delegate the SAME step with `feedback` so it fixes its work (up to 5 fix rounds,",
+            "then do the step yourself). The delegate closes with a VERIFICATION: line, but that is",
+            "never proof - you verify.",
+            "",
+            "Several independent delegate calls issued in one message run in PARALLEL - split",
+            "independent sub-tasks into separate calls and batch them together.",
+        ]
+        .join("\n");
         let description = format!(
-            "\
-Run one single, self-contained piece of work on another model while you keep \
-planning and orchestrating. The delegate runs a real sub-agent WITH TOOLS: it \
-gets the repository tools (read/search, write_file/apply_edit, run_tests, \
-remember, web_search and more) minus git_commit, so it can do the job itself — \
-write the file, run the tests, fix failures — instead of returning text you \
-must apply by hand. Delegates cannot commit; only you can.
-
-Delegating normally needs no human approval: the tool call runs directly and \
-every tool call the delegate makes runs auto-approved, so a delegate works \
-end-to-end on its own. EXCEPTION — some delegates are configured \
-`approval = \"ask\"` (marked \"[human approval required before it runs]\" in \
-the listing below): calling one pauses for human approval before it runs. \
-Delegates configured `approval = \"deny\"` are refused entirely. Keep using \
-`delegate` for well-bounded jobs, but expect the delegate to iterate on the \
-repo with its own tools.
-
-To execute one of your plan steps, pass `step` (the plan step id): the task and \
-context then come from that step and `model` must match the step's model. \
-Otherwise delegate ad-hoc work with `model` + `task` (+ optional `context`). \
-Plan steps you will run yourself carry the reserved model \"self\" and cannot be \
-delegated via `step`.
-
-The plan shows who is working: delegating a step marks it in_progress with a \
-`working: <model>` note, and fix rounds show up as `(fix N/5)`. Verification is \
-joint: the delegate self-checks and closes with a `VERIFICATION:` line, but it \
-runs under its own tools, so that line is never proof. After the delegate \
-replies, run the step's verification yourself with your tools (e.g. \
-run_tests); if it fails, re-delegate the SAME step with `feedback` set to the \
-failure output so the delegate fixes it — up to 5 fix rounds per step. After 5 \
-the tool refuses further fix requests and you must do the step yourself. \
-Running a plan step through this tool is what entitles it to be marked done: \
-update_plan and finish_plan refuse to close a step assigned a delegate model \
-until the delegate tool has run it, so you cannot complete delegated work \
-yourself. Pick up a step only once it is `ready` — ask its delegate first via \
-ask_advise step = <id> (that marks the step `ready` when the delegate confirms \
-the context suffices; enrich with set_step_context and re-ask until it does).
-
-Several delegate calls issued in one message run in PARALLEL: split \
-independent sub-tasks into separate calls and batch them together instead of \
-delegating one at a time and waiting. Every call must be fully self-contained: \
-delegates cannot see each other's work, so never make one depend on another's \
-result, and never delegate the same plan step twice in one batch. Because \
-delegates now write files and share the repo/session/undo, do not batch two \
-delegates that will touch the same files — parallel delegates manage their \
-own conflicts.
-
-Configured delegates — pick the one whose description best fits the task:
-{listing}"
+            "{body}\n\nConfigured delegates — pick the one whose description best fits the task:\n{listing}"
         );
 
         let schema = json!({
@@ -301,26 +275,24 @@ Configured delegates — pick the one whose description best fits the task:
                 "step": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Plan step id to execute. The task comes from the step's goal (+verification) and the context from the step's summarised context; the step's own model is used."
+                    "description": "Plan step id to execute. The task, context and model come from the step."
                 },
                 "model": {
                     "type": "string",
                     "enum": names,
-                    "description": format!(
-                        "Which configured delegate model should do the work (must match the step's model when `step` is given). Choose the delegate whose description best fits the task:\n{listing}"
-                    )
+                    "description": "Which configured delegate model does the work. Must match the step's model when `step` is given."
                 },
                 "task": {
                     "type": "string",
-                    "description": "The exact, self-contained job for the delegate, with all needed details (paths, code, identifiers, expected output). Mutually exclusive with `step`."
+                    "description": "The exact, self-contained job for the delegate: paths, code, identifiers, expected output. Mutually exclusive with `step`."
                 },
                 "context": {
                     "type": "string",
-                    "description": "Optional background material the delegate should consider (existing code, error logs, constraints). Mutually exclusive with `step`."
+                    "description": "Optional background for the delegate: existing code, error logs, constraints. Mutually exclusive with `step`."
                 },
                 "feedback": {
                     "type": "string",
-                    "description": "Verification failure output from the parent for a delegate that previously attempted `step`: the delegate must fix its deliverable until it passes. Counts as one fix round (max 5 per step, tracked on the step's note). The feedback must contain an actionable plan so the delegate model knows what is wrong and what do to to fix it."
+                    "description": "Your verification failure output for a step this delegate already attempted; it must fix its work until it passes. One fix round (max 5 per step). Must contain an actionable plan."
                 }
             },
             "oneOf": [
@@ -590,17 +562,26 @@ pub(crate) fn render_subagent_system(
 ) -> String {
     let mut tool_lines = String::new();
     for tool in tools.iter() {
-        let desc: String = tool
-            .spec()
-            .description
-            .split('\n')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .chars()
-            .take(140)
-            .collect();
-        tool_lines.push_str(&format!("- {} — {desc}\n", tool.spec().name));
+        // In native mode the tool schemas already carry each tool's description,
+        // so the listing is names only - keeps the delegate prompt small. In
+        // ReAct mode the listing line is the delegate's only source of "what is
+        // this tool for", so it keeps a short description.
+        let line = if native {
+            format!("- {}\n", tool.spec().name)
+        } else {
+            let desc: String = tool
+                .spec()
+                .description
+                .split('\n')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(140)
+                .collect();
+            format!("- {} — {desc}\n", tool.spec().name)
+        };
+        tool_lines.push_str(&line);
     }
     let protocol = if native {
         "You call tools natively (function calling). When the task is done and \
@@ -1209,9 +1190,9 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(models, vec!["groq-fast", "mistral"]);
-        // The tool description and the `model` argument both advertise the
-        // delegates with their descriptions, so the tech lead picks a delegate
-        // by what the blurb says fits the task.
+        // The tool description advertises the delegates with their
+        // descriptions, so the tech lead picks a delegate by what the blurb
+        // says fits the task. The `model` arg schema stays small (see below).
         let spec_desc = &tool.spec().description;
         assert!(spec_desc.contains("Configured delegates"), "{spec_desc}");
         assert!(
@@ -1225,9 +1206,11 @@ mod tests {
         let model_desc = schema["properties"]["model"]["description"]
             .as_str()
             .unwrap();
+        // The delegate listing lives once (in the tool description) to keep the
+        // model arg schema small; the `model` arg itself carries only a pointer.
         assert!(
-            model_desc.contains("mistral: mistral test delegate"),
-            "{model_desc}"
+            !model_desc.contains("mistral test delegate"),
+            "model arg must not duplicate the listing:\n{model_desc}"
         );
         assert!(schema["properties"]["task"].is_object());
         assert!(schema["properties"]["step"].is_object());
@@ -1279,10 +1262,17 @@ mod tests {
                 "{prompt}"
             );
             assert!(prompt.contains("Available tools:"), "{prompt}");
-            assert!(
-                prompt.contains("- write_file — stub write_file"),
-                "{prompt}"
-            );
+            if native {
+                // native mode: the tool schemas carry the descriptions, so the
+                // listing is names only to keep the prompt small
+                assert!(prompt.contains("- write_file\n"), "{prompt}");
+                assert!(!prompt.contains("stub write_file"), "{prompt}");
+            } else {
+                assert!(
+                    prompt.contains("- write_file — stub write_file"),
+                    "{prompt}"
+                );
+            }
             assert!(
                 !prompt.contains("{project_root}")
                     && !prompt.contains("{tool_lines}")

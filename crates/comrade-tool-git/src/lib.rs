@@ -1,4 +1,4 @@
-//! Git tools: `git_status`, `git_diff`, `git_log`, `git_commit`.
+//! Git tools: `git_status`, `git_diff`, `git_show`, `git_log`, `git_commit`.
 //!
 //! Shells out to the user's `git` so credentials, hooks, and config are reused.
 //! `git_commit` runs without human approval.
@@ -17,6 +17,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(GitStatus),
         Box::new(GitDiff),
+        Box::new(GitShow),
         Box::new(GitLog),
         Box::new(GitCommit),
     ]
@@ -153,6 +154,61 @@ impl Tool for GitDiff {
 }
 
 // ---------------------------------------------------------------------------
+// git_show
+// ---------------------------------------------------------------------------
+
+struct GitShow;
+
+static GIT_SHOW_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+    ToolSpec {
+    name: "git_show".into(),
+    description: "Show a git object: a commit (metadata + diff), tag, or a file at a revision. Pass `rev` (default HEAD) and optionally `path` for a file inside that revision. Use instead of the shell.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "rev": { "type": "string", "description": "Revision to show, e.g. a hash, branch, tag, or HEAD~2 (default: HEAD)." },
+            "path": { "type": "string", "description": "Optional file within `rev`; shows its content at that revision." }
+        },
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for GitShow {
+    fn spec(&self) -> &ToolSpec {
+        &GIT_SHOW_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default = "default_rev")]
+            rev: String,
+            #[serde(default)]
+            path: Option<String>,
+        }
+        fn default_rev() -> String {
+            "HEAD".to_string()
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let spec: Vec<String> = match args.path {
+            Some(p) => vec![format!("{}:{}", args.rev, p)],
+            None => vec![args.rev],
+        };
+        let mut git_args: Vec<String> = vec!["show".to_string()];
+        git_args.extend(spec);
+        let refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
+        let body = git(ctx, &refs).await?;
+        Ok(clamp(if body.is_empty() {
+            "(nothing to show)".into()
+        } else {
+            body
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // git_log
 // ---------------------------------------------------------------------------
 
@@ -203,11 +259,12 @@ struct GitCommit;
 static GIT_COMMIT_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "git_commit".into(),
-    description: "Stage all changes and create a commit with the given message. Call git_diff/git_status first to verify what is being committed.".into(),
+    description: "Stage and commit. Pass `paths` to commit only those files; omit it to stage and commit everything. Call git_diff/git_status first to verify what is being committed.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "message": { "type": "string", "description": "Commit message. Match the repo's existing style (see git_log)." }
+            "message": { "type": "string", "description": "Commit message. Match the repo's existing style (see git_log)." },
+            "paths": { "type": "array", "items": { "type": "string" }, "description": "Files to stage (project-root relative). Omit to stage all changes." }
         },
         "required": ["message"],
         "additionalProperties": false
@@ -225,9 +282,13 @@ impl Tool for GitCommit {
         #[derive(Deserialize)]
         struct Args {
             message: String,
+            #[serde(default)]
+            paths: Vec<String>,
         }
         let args: Args = serde_json::from_value(args)?;
-        git(ctx, &["add", "-A"]).await?;
+        let stage = stage_args(&args.paths);
+        let refs: Vec<&str> = stage.iter().map(String::as_str).collect();
+        git(ctx, &refs).await?;
         let message_file = write_message_file(&args.message).await?;
         let msg_arg = message_file.to_str().unwrap_or("/dev/null").to_string();
         let result = git(ctx, &["commit", "-F", &msg_arg]).await.map_err(|e| {
@@ -239,8 +300,50 @@ impl Tool for GitCommit {
     }
 }
 
+/// Shape the `git add` invocation: no paths stages everything (`-A`); given
+/// paths, stage exactly those (the `--` stops git parsing a path as an option).
+fn stage_args(paths: &[String]) -> Vec<String> {
+    let paths: Vec<&str> = paths
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if paths.is_empty() {
+        vec!["add".into(), "-A".into()]
+    } else {
+        let mut args = vec!["add".to_string(), "--".to_string()];
+        args.extend(paths.into_iter().map(str::to_string));
+        args
+    }
+}
+
 async fn write_message_file(message: &str) -> Result<std::path::PathBuf> {
     let path = std::env::temp_dir().join(format!("comrade-commit-{}.txt", std::process::id()));
     tokio::fs::write(&path, message).await?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_args_stages_all_without_paths() {
+        assert_eq!(stage_args(&[]), vec!["add", "-A"]);
+        // blank paths behave like no paths
+        assert_eq!(stage_args(&["  ".into()]), vec!["add", "-A"]);
+    }
+
+    #[test]
+    fn stage_args_stages_exactly_the_given_paths() {
+        assert_eq!(
+            stage_args(&["crates/foo/src/lib.rs".into(), "Cargo.toml".into()]),
+            vec!["add", "--", "crates/foo/src/lib.rs", "Cargo.toml"]
+        );
+        // blank entries are dropped, the `--` guards dash-prefixed names
+        assert_eq!(
+            stage_args(&["-x".into(), " ".into(), "a.rs".into()]),
+            vec!["add", "--", "-x", "a.rs"]
+        );
+    }
 }

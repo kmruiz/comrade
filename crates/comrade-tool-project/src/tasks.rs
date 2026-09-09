@@ -122,7 +122,7 @@ pub fn resolve(
             .join(", ");
         anyhow::bail!(
             "unknown task {task:?}. Known verbs: {}; aliases: {available}",
-            pom::CARGO_VERBS.join(", ")
+            pom::RUN_TASK_VERBS.join(", ")
         );
     };
 

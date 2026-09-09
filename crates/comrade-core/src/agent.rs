@@ -95,6 +95,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "find_references",
     "git_status",
     "git_diff",
+    "git_show",
     "git_log",
     "project_model",
     "find_decisions",

@@ -4128,7 +4128,7 @@ fn tool_icon(name: &str) -> (&'static str, Color) {
         "run_tests" => ("▶", Color::Yellow),
         "run_task" => ("▸", Color::Yellow),
         "shell" => ("$", Color::Green),
-        "git_status" | "git_diff" | "git_log" | "git_commit" => ("↗", Color::Magenta),
+        "git_status" | "git_diff" | "git_show" | "git_log" | "git_commit" => ("↗", Color::Magenta),
         "delegate" | "ask_advise" => ("⇄", Color::Magenta),
         "read_file" | "read_ranges" => ("≡", Color::Blue),
         "list_dir" | "list_files" | "rgrep" | "list_symbols" | "find_symbol"
