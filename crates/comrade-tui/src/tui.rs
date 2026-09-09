@@ -358,17 +358,15 @@ enum RowRef {
 /// The M-x list-mcp-servers modal: every configured MCP server as a
 /// collapsible group of its connected tools. The human toggles each tool on or
 /// off (a live filter shared with the agent loop via the registry), filters by
-/// tool or server name, and collapses groups with Tab.
+/// tool or server name by just typing, and collapses groups with Tab.
 struct McpServersView {
     groups: Vec<McpToolGroup>,
     /// Live on/off switch shared with the `ToolRegistry` the agent runs with
     /// (see `comrade_tool::ToolRegistry::disabled_handle`).
     disabled: Arc<RwLock<HashSet<String>>>,
     /// Filter text; matched case-insensitively against a server name OR a
-    /// tool's full `mcp_...` name.
+    /// tool's full `mcp_...` name. Typing always edits it (no mode toggle).
     filter: String,
-    /// True while typed keys edit `filter` instead of navigating the list.
-    filtering: bool,
     /// Group indexes (into `groups`) whose tool rows are hidden.
     collapsed: HashSet<usize>,
     /// Selection over the visible flat row list (see [`RowRef`] and
@@ -1289,7 +1287,6 @@ impl App {
             groups: mcp_tool_groups(servers, &self.tools),
             disabled: self.tools.disabled_handle(),
             filter: String::new(),
-            filtering: false,
             collapsed: HashSet::new(),
             sel: 0,
         });
@@ -1401,31 +1398,26 @@ impl App {
         }
     }
 
-    /// Keys while the M-x list-mcp-servers modal is open. While the filter is
-    /// being typed (`filtering`) every printable key edits the query and Esc
-    /// drops back to the list; otherwise keys navigate and toggle.
+    /// Keys while the M-x list-mcp-servers modal is open. The filter is always
+    /// active: any printable key edits the query live (so the human can just
+    /// type to search); arrow keys navigate, Enter toggles, and Esc closes.
     fn handle_mcp_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        if self.mcp_view.as_ref().is_some_and(|v| v.filtering) {
-            match key.code {
-                KeyCode::Esc => self.mcp_view.as_mut().unwrap().filtering = false,
-                KeyCode::Backspace => {
-                    self.mcp_view.as_mut().unwrap().filter.pop();
-                }
-                KeyCode::Char(c) if !ctrl && !alt => self.mcp_view.as_mut().unwrap().filter.push(c),
-                _ => {}
-            }
-            self.mcp_clamp_sel();
-            return;
-        }
         match key.code {
-            // Close the modal (Esc, ctrl-g, or q with no modifier).
+            // Close the modal. Esc is the only close key — q and every other
+            // printable key must stay free for typing filter text.
             KeyCode::Esc => self.mcp_view = None,
-            KeyCode::Char('g') if ctrl => self.mcp_view = None,
-            KeyCode::Char('q') if !ctrl && !alt => self.mcp_view = None,
-            // Enter or space activates the row under the cursor.
-            KeyCode::Enter | KeyCode::Char(' ') if !ctrl && !alt => self.mcp_activate(),
+            // Edit the filter (always active).
+            KeyCode::Backspace => {
+                self.mcp_view.as_mut().unwrap().filter.pop();
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.mcp_view.as_mut().unwrap().filter.clear();
+            }
+            KeyCode::Char(c) if !ctrl && !alt => self.mcp_view.as_mut().unwrap().filter.push(c),
+            // Enter activates the row under the cursor.
+            KeyCode::Enter => self.mcp_activate(),
             // Tab collapses/expands the group under the cursor.
             KeyCode::Tab => self.mcp_toggle_group(),
             KeyCode::Up => self.mcp_move(-1),
@@ -1435,15 +1427,12 @@ impl App {
             // Left/right collapse/expand the group under the cursor.
             KeyCode::Left => self.mcp_collapse_group(true),
             KeyCode::Right => self.mcp_collapse_group(false),
-            // Start typing in the filter ('/' or 'f').
-            KeyCode::Char('/') | KeyCode::Char('f') if !ctrl && !alt => {
-                self.mcp_view.as_mut().unwrap().filtering = true;
-            }
             // Emacs-style: ctrl-p previous row, ctrl-n next row.
             KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&'p') => self.mcp_move(-1),
             KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&'n') => self.mcp_move(1),
             _ => {}
         }
+        self.mcp_clamp_sel();
     }
 
     /// Start a fresh session in place, replacing the current one: a brand-new
@@ -5132,11 +5121,7 @@ fn draw_mcp_servers(view: &McpServersView, frame: &mut Frame) {
         )));
     }
 
-    let hint = if view.filtering {
-        "esc: back to list · typing filters by server or tool name"
-    } else {
-        "↑/↓ or ctrl-p/n select · space toggles a tool · tab collapses a group · / filters · esc/q closes"
-    };
+    let hint = "typing filters by server or tool name · ↑/↓ or ctrl-p/n select · enter toggles · tab collapses a group · esc closes";
 
     let content_h = lines.len() as u16;
     let h = (content_h + 4).clamp(6, max_h.max(6));
@@ -5160,28 +5145,23 @@ fn draw_mcp_servers(view: &McpServersView, frame: &mut Frame) {
         ])
         .split(inner);
 
-    // Filter line: label + the query, highlighted while being typed.
+    // Filter line: label + the query. Typing is always active, so the query is
+    // always highlighted with a trailing cursor.
     let mut fspans = vec![
         Span::styled("filter: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             view.filter.clone(),
-            if view.filtering {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Cyan)
-            },
-        ),
-    ];
-    if view.filtering {
-        fspans.push(Span::styled(
-            "|",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        ));
-    }
+        ),
+    ];
+    fspans.push(Span::styled(
+        "|",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ));
     frame.render_widget(Paragraph::new(Line::from(fspans)), rows[0]);
 
     // Content list: selection-driven scrolling so the cursor stays visible.
@@ -5877,7 +5857,6 @@ mod tests {
             groups,
             disabled: comrade_tool::ToolRegistry::new().disabled_handle(),
             filter: filter.to_string(),
-            filtering: false,
             collapsed: collapsed.iter().copied().collect(),
             sel: 0,
         };
