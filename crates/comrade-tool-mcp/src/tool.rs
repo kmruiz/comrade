@@ -81,6 +81,14 @@ pub fn mcp_tool_name(server: &str, tool: &str) -> String {
     format!("mcp_{}_{}", sanitise(server), sanitise(tool))
 }
 
+/// Local-name prefix shared by every adapter of one server: `mcp_<server>_`
+/// (both parts sanitised the same way as [`mcp_tool_name`]). Grouping
+/// registered tools by server (e.g. the TUI's list-mcp-servers modal) matches
+/// a tool name against this prefix.
+pub fn mcp_server_prefix(server: &str) -> String {
+    format!("mcp_{}_", sanitise(server))
+}
+
 fn sanitise(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 1);
     let mut prev_underscore = false;
@@ -125,6 +133,24 @@ mod tests {
     fn empty_parts_never_yield_empty_token() {
         assert_eq!(name("", ""), "mcp_tool_tool");
         assert_eq!(name("srv", "@@@"), "mcp_srv_tool");
+    }
+
+    #[test]
+    fn server_prefix_matches_adapter_names() {
+        assert_eq!(mcp_server_prefix("github"), "mcp_github_");
+        assert_eq!(mcp_server_prefix("My Server"), "mcp_my_server_");
+        for (server, tool) in [
+            ("github", "list_repos"),
+            ("My Server", "do.The.Thing!"),
+            ("filesystem", "read"),
+            ("", ""),
+        ] {
+            assert!(
+                mcp_tool_name(server, tool).starts_with(&mcp_server_prefix(server)),
+                "{:?} prefix must prefix its own tool names",
+                server
+            );
+        }
     }
 
     #[test]

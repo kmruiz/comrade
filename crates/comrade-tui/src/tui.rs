@@ -8,7 +8,8 @@
 //!   (or the mouse wheel) opens the details
 //! - assistant/user text is rendered as markdown
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -326,21 +327,53 @@ struct ModelPick {
     model_sel: Option<usize>,
 }
 
-/// One server listed in the M-x list-mcp-servers modal.
-struct McpServerRow {
+/// One discovered MCP tool shown in the M-x list-mcp-servers modal.
+#[derive(Clone)]
+struct McpToolEntry {
+    /// Full local tool name (`mcp_<server>_<tool>`), the agent-facing id that
+    /// toggling enables or disables.
     name: String,
-    /// Transport detail lines (indented under the name): stdio command + args,
-    /// or the http base URL.
-    detail: Vec<String>,
+    /// Server-advertised description with the "[MCP server `X`] " prefix
+    /// stripped (the group header already names the server).
+    desc: String,
 }
 
-/// The M-x list-mcp-servers modal: every server configured under `[mcp.servers]`
-/// with its transport, as a read-only scrollable list. No selection — the human
-/// reads it and closes (esc/enter).
+/// One server's tools, grouped under its header row in the modal.
+#[derive(Clone)]
+struct McpToolGroup {
+    /// Configured server name (the group header).
+    server: String,
+    /// Registered tools of this server, in registry order.
+    tools: Vec<McpToolEntry>,
+}
+
+/// Reference to one visible row of the modal list: a group header or a tool
+/// row inside a group. Indexes are into [`McpServersView::groups`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowRef {
+    Header(usize),
+    Tool(usize, usize),
+}
+
+/// The M-x list-mcp-servers modal: every configured MCP server as a
+/// collapsible group of its connected tools. The human toggles each tool on or
+/// off (a live filter shared with the agent loop via the registry), filters by
+/// tool or server name, and collapses groups with Tab.
 struct McpServersView {
-    servers: Vec<McpServerRow>,
-    /// Scroll offset into the row list when it is taller than the popup.
-    scroll: usize,
+    groups: Vec<McpToolGroup>,
+    /// Live on/off switch shared with the `ToolRegistry` the agent runs with
+    /// (see `comrade_tool::ToolRegistry::disabled_handle`).
+    disabled: Arc<RwLock<HashSet<String>>>,
+    /// Filter text; matched case-insensitively against a server name OR a
+    /// tool's full `mcp_...` name.
+    filter: String,
+    /// True while typed keys edit `filter` instead of navigating the list.
+    filtering: bool,
+    /// Group indexes (into `groups`) whose tool rows are hidden.
+    collapsed: HashSet<usize>,
+    /// Selection over the visible flat row list (see [`RowRef`] and
+    /// [`mcp_visible_rows`]).
+    sel: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -480,7 +513,7 @@ impl MxCommand {
             MxCommand::ForwardWord => "move the prompt cursor forward one word",
             MxCommand::InsertNewline => "insert a newline in the prompt",
             MxCommand::KillWord => "delete the word after the prompt cursor",
-            MxCommand::ListMcpServers => "show the configured MCP servers",
+            MxCommand::ListMcpServers => "view and toggle MCP server tools",
             MxCommand::MoveBlockDown => "move to the next chat block",
             MxCommand::MoveBlockUp => "move to the previous chat block",
             MxCommand::MoveUserDown => "jump to the next message you sent",
@@ -1239,10 +1272,10 @@ impl App {
         self.tools = Arc::new(tools);
     }
 
-    /// M-x list-mcp-servers: open the modal listing the servers configured under
-    /// `[mcp.servers]` — one entry per server, its name plus transport detail
-    /// (stdio shows the command + args, http the base URL). An empty config
-    /// still reports as a chat note.
+    /// M-x list-mcp-servers: open the modal showing every server configured
+    /// under `[mcp.servers]` as a collapsible group of its connected tools,
+    /// with a live on/off toggle per tool and a filter over server/tool names.
+    /// An empty config still reports as a chat note.
     fn list_mcp_servers(&mut self) {
         let servers = &self.cfg.mcp.servers;
         if servers.is_empty() {
@@ -1253,40 +1286,162 @@ impl App {
             return;
         }
         self.mcp_view = Some(McpServersView {
-            servers: mcp_server_rows(servers),
-            scroll: 0,
+            groups: mcp_tool_groups(servers, &self.tools),
+            disabled: self.tools.disabled_handle(),
+            filter: String::new(),
+            filtering: false,
+            collapsed: HashSet::new(),
+            sel: 0,
         });
     }
 
-    /// Scroll the open list-mcp-servers modal by `dir` (-1 up, 1 down); the
-    /// scroll position is clamped to the content at draw time.
-    fn mcp_scroll(&mut self, dir: isize) {
+    /// Move the modal selection by `dir` visible rows (-1 up, +1 down); larger
+    /// jumps (page keys) step several rows at once. Clamped to the visible list.
+    fn mcp_move(&mut self, dir: isize) {
         let Some(v) = &mut self.mcp_view else {
             return;
         };
-        if dir > 0 {
-            v.scroll = v.scroll.saturating_add(dir as usize);
+        let rows = mcp_visible_rows(v).len();
+        if rows == 0 {
+            v.sel = 0;
+            return;
+        }
+        let max = rows - 1;
+        v.sel = if dir > 0 {
+            v.sel.saturating_add(dir as usize).min(max)
         } else {
-            v.scroll = v.scroll.saturating_sub(dir.unsigned_abs());
+            v.sel.saturating_sub(dir.unsigned_abs())
+        };
+    }
+
+    /// Re-clamp the selection after the visible rows changed (filter edits,
+    /// collapse toggles).
+    fn mcp_clamp_sel(&mut self) {
+        let Some(v) = &mut self.mcp_view else {
+            return;
+        };
+        let rows = mcp_visible_rows(v).len();
+        v.sel = mcp_clamp(v.sel, rows);
+    }
+
+    /// The row the selection currently points at, when the list is non-empty.
+    fn mcp_row_at(&self) -> Option<RowRef> {
+        let v = self.mcp_view.as_ref()?;
+        let rows = mcp_visible_rows(v);
+        rows.get(mcp_clamp(v.sel, rows.len())).copied()
+    }
+
+    /// Group index owning the current selection.
+    fn mcp_sel_group(&self) -> Option<usize> {
+        match self.mcp_row_at()? {
+            RowRef::Header(g) => Some(g),
+            RowRef::Tool(g, _) => Some(g),
         }
     }
 
-    /// Keys while the list-mcp-servers modal is open.
+    /// Collapse/expand the group under the selection (Tab / Enter on a header).
+    fn mcp_toggle_group(&mut self) {
+        let Some(group) = self.mcp_sel_group() else {
+            return;
+        };
+        let Some(v) = &mut self.mcp_view else {
+            return;
+        };
+        if !v.collapsed.remove(&group) {
+            v.collapsed.insert(group);
+        }
+        let rows = mcp_visible_rows(v).len();
+        v.sel = mcp_clamp(v.sel, rows);
+    }
+
+    /// Force the collapse state of the group under the selection (Left/Right).
+    fn mcp_collapse_group(&mut self, collapsed: bool) {
+        let Some(group) = self.mcp_sel_group() else {
+            return;
+        };
+        let Some(v) = &mut self.mcp_view else {
+            return;
+        };
+        if collapsed {
+            v.collapsed.insert(group);
+        } else {
+            v.collapsed.remove(&group);
+        }
+        let rows = mcp_visible_rows(v).len();
+        v.sel = mcp_clamp(v.sel, rows);
+    }
+
+    /// Activate the row under the selection: a tool row flips its enabled state
+    /// in the live filter (the agent loop stops advertising/invoking it from
+    /// its next iteration); a group header toggles collapse instead.
+    fn mcp_activate(&mut self) {
+        let Some(row) = self.mcp_row_at() else {
+            return;
+        };
+        match row {
+            RowRef::Header(_) => self.mcp_toggle_group(),
+            RowRef::Tool(group, tool) => {
+                let name = self
+                    .mcp_view
+                    .as_ref()
+                    .and_then(|v| v.groups.get(group))
+                    .and_then(|g| g.tools.get(tool))
+                    .map(|e| e.name.clone());
+                let Some(name) = name else {
+                    return;
+                };
+                let Some(v) = &mut self.mcp_view else {
+                    return;
+                };
+                let mut disabled = v.disabled.write().unwrap_or_else(|p| p.into_inner());
+                if !disabled.remove(&name) {
+                    disabled.insert(name);
+                }
+            }
+        }
+    }
+
+    /// Keys while the M-x list-mcp-servers modal is open. While the filter is
+    /// being typed (`filtering`) every printable key edits the query and Esc
+    /// drops back to the list; otherwise keys navigate and toggle.
     fn handle_mcp_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if self.mcp_view.as_ref().is_some_and(|v| v.filtering) {
+            match key.code {
+                KeyCode::Esc => self.mcp_view.as_mut().unwrap().filtering = false,
+                KeyCode::Backspace => {
+                    self.mcp_view.as_mut().unwrap().filter.pop();
+                }
+                KeyCode::Char(c) if !ctrl && !alt => self.mcp_view.as_mut().unwrap().filter.push(c),
+                _ => {}
+            }
+            self.mcp_clamp_sel();
+            return;
+        }
         match key.code {
+            // Close the modal (Esc, ctrl-g, or q with no modifier).
             KeyCode::Esc => self.mcp_view = None,
-            // Enter and q (no modifier) also close the read-only modal.
-            KeyCode::Enter => self.mcp_view = None,
+            KeyCode::Char('g') if ctrl => self.mcp_view = None,
             KeyCode::Char('q') if !ctrl && !alt => self.mcp_view = None,
-            KeyCode::Up => self.mcp_scroll(-1),
-            KeyCode::Down => self.mcp_scroll(1),
-            KeyCode::PageUp => self.mcp_scroll(-10),
-            KeyCode::PageDown => self.mcp_scroll(10),
-            // Emacs-style: ctrl-p previous line, ctrl-n next line.
-            KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&'p') => self.mcp_scroll(-1),
-            KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&'n') => self.mcp_scroll(1),
+            // Enter or space activates the row under the cursor.
+            KeyCode::Enter | KeyCode::Char(' ') if !ctrl && !alt => self.mcp_activate(),
+            // Tab collapses/expands the group under the cursor.
+            KeyCode::Tab => self.mcp_toggle_group(),
+            KeyCode::Up => self.mcp_move(-1),
+            KeyCode::Down => self.mcp_move(1),
+            KeyCode::PageUp => self.mcp_move(-10),
+            KeyCode::PageDown => self.mcp_move(10),
+            // Left/right collapse/expand the group under the cursor.
+            KeyCode::Left => self.mcp_collapse_group(true),
+            KeyCode::Right => self.mcp_collapse_group(false),
+            // Start typing in the filter ('/' or 'f').
+            KeyCode::Char('/') | KeyCode::Char('f') if !ctrl && !alt => {
+                self.mcp_view.as_mut().unwrap().filtering = true;
+            }
+            // Emacs-style: ctrl-p previous row, ctrl-n next row.
+            KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&'p') => self.mcp_move(-1),
+            KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&'n') => self.mcp_move(1),
             _ => {}
         }
     }
@@ -1962,29 +2117,87 @@ impl App {
     }
 }
 
-/// Build the read-only rows shown in the M-x list-mcp-servers modal: one entry
-/// per configured server, name plus transport detail lines. Pure so the modal
-/// content is unit-testable without an `App`.
-fn mcp_server_rows(servers: &[comrade_core::McpServerCfg]) -> Vec<McpServerRow> {
+/// Build the modal's tool groups: one group per configured server (config
+/// order) whose members are every registered tool whose full local name starts
+/// with that server's MCP prefix (`mcp_<server>_`, see
+/// [`comrade_tool_mcp::mcp_server_prefix`]). Servers with no connected tool
+/// yield an empty group. Uses `iter_all` so tools the human already disabled
+/// stay visible and can be turned back on.
+fn mcp_tool_groups(
+    servers: &[comrade_core::McpServerCfg],
+    tools: &comrade_tool::ToolRegistry,
+) -> Vec<McpToolGroup> {
     servers
         .iter()
         .map(|s| {
-            let detail = match &s.transport {
-                comrade_core::McpTransport::Stdio { command, args, .. } => {
-                    if args.is_empty() {
-                        vec![format!("stdio ({command})")]
-                    } else {
-                        vec![format!("stdio ({command} {})", args.join(" "))]
+            let prefix = comrade_tool_mcp::mcp_server_prefix(&s.name);
+            let desc_prefix = format!("[MCP server `{}`] ", s.name);
+            let tools = tools
+                .iter_all()
+                .filter(|t| t.spec().name.starts_with(&prefix))
+                .map(|t| {
+                    let spec = t.spec();
+                    let desc = spec
+                        .description
+                        .strip_prefix(&desc_prefix)
+                        .unwrap_or(&spec.description);
+                    McpToolEntry {
+                        name: spec.name.clone(),
+                        desc: desc.trim().to_string(),
                     }
-                }
-                comrade_core::McpTransport::Http { url } => vec![format!("http ({url})")],
-            };
-            McpServerRow {
-                name: s.name.clone(),
-                detail,
+                })
+                .collect();
+            McpToolGroup {
+                server: s.name.clone(),
+                tools,
             }
         })
         .collect()
+}
+
+/// Flat visible rows of the modal in draw order, honouring the filter and the
+/// collapsed set:
+///
+/// * empty filter — every group header, then each group's tool rows unless the
+///   group is collapsed;
+/// * non-empty filter `q` — a group is kept when its server name matches `q`
+///   (showing ALL of its tools) or any of its tools' names match (showing just
+///   those rows). A collapsed group keeps only its header.
+///
+/// Each visible row renders as exactly one screen line, so a row's index here
+/// doubles as its line offset.
+fn mcp_visible_rows(view: &McpServersView) -> Vec<RowRef> {
+    let q = view.filter.to_lowercase();
+    let mut out = Vec::new();
+    for (gi, group) in view.groups.iter().enumerate() {
+        let server_hit = group.server.to_lowercase().contains(&q);
+        let tool_hits: Vec<usize> = if q.is_empty() || server_hit {
+            (0..group.tools.len()).collect()
+        } else {
+            group
+                .tools
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.name.to_lowercase().contains(&q))
+                .map(|(ti, _)| ti)
+                .collect()
+        };
+        let kept = q.is_empty() || server_hit || !tool_hits.is_empty();
+        if !kept {
+            continue;
+        }
+        out.push(RowRef::Header(gi));
+        if view.collapsed.contains(&gi) {
+            continue;
+        }
+        out.extend(tool_hits.into_iter().map(|ti| RowRef::Tool(gi, ti)));
+    }
+    out
+}
+
+/// Number of visible rows; clamps a selection cursor into range (0 when empty).
+fn mcp_clamp(sel: usize, rows: usize) -> usize {
+    rows.saturating_sub(1).min(sel)
 }
 
 // ---------------------------------------------------------------------------
@@ -4830,79 +5043,157 @@ fn draw_mcp_servers(view: &McpServersView, frame: &mut Frame) {
     let area = frame.area();
     let w = area.width.saturating_sub(2).min(92);
     let max_h = area.height.saturating_sub(2);
-    let width = usize::from(w).saturating_sub(4).max(16);
 
+    // Snapshot the live on/off set once per frame for the [x]/[ ] markers.
+    let disabled: HashSet<String> = match view.disabled.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+
+    let rows = mcp_visible_rows(view);
+    let sel = mcp_clamp(view.sel, rows.len());
     let mut lines: Vec<Line> = Vec::new();
-    let count = view.servers.len();
-    for (i, s) in view.servers.iter().enumerate() {
-        let toks = vec![
-            tok(
-                if i + 1 < 10 {
-                    format!(" {}. ", i + 1)
+    for (i, row) in rows.iter().enumerate() {
+        let selected = i == sel;
+        let cursor = if selected {
+            Span::styled("> ", Style::default().fg(Color::Yellow))
+        } else {
+            Span::styled("  ", Style::default())
+        };
+        let mut spans = vec![cursor];
+        match row {
+            RowRef::Header(g) => {
+                let group = &view.groups[*g];
+                let collapsed = view.collapsed.contains(g);
+                spans.push(Span::styled(
+                    format!("{} ", if collapsed { "+" } else { "-" }),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                let name_style = if selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    format!("{}. ", i + 1)
-                },
-                Style::default().fg(Color::DarkGray),
-            ),
-            tok(
-                &s.name,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ];
-        for wl in wrap_toks(&toks, width) {
-            push_tok_line(&mut lines, &wl);
-        }
-        for d in &s.detail {
-            for wl in wrap_toks(
-                &[
-                    tok("  ", Style::default().fg(Color::DarkGray)),
-                    tok(d.clone(), Style::default().fg(Color::Cyan)),
-                ],
-                width,
-            ) {
-                push_tok_line(&mut lines, &wl);
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                };
+                spans.push(Span::styled(group.server.clone(), name_style));
+                let tail = if group.tools.is_empty() {
+                    "  (no tools connected)".to_string()
+                } else {
+                    let on = group
+                        .tools
+                        .iter()
+                        .filter(|t| !disabled.contains(&t.name))
+                        .count();
+                    format!("  · {on}/{} on", group.tools.len())
+                };
+                spans.push(Span::styled(tail, Style::default().fg(Color::DarkGray)));
+            }
+            RowRef::Tool(g, t) => {
+                let Some(entry) = view.groups.get(*g).and_then(|grp| grp.tools.get(*t)) else {
+                    continue;
+                };
+                let enabled = !disabled.contains(&entry.name);
+                spans.push(Span::styled(
+                    if enabled { "[x]" } else { "[ ]" },
+                    Style::default().fg(if enabled {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    }),
+                ));
+                spans.push(Span::styled(" ", Style::default()));
+                let name_style = if selected {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else if enabled {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                spans.push(Span::styled(entry.name.clone(), name_style));
+                if !entry.desc.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  ·  {}", entry.desc),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
             }
         }
-        if i + 1 < count {
-            lines.push(Line::from(""));
-        }
+        lines.push(Line::from(spans));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no matching tools)",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
-    let hint = if lines.len() as u16 > max_h.max(6).saturating_sub(4) {
-        "↑/↓ or ctrl-p/n scroll · pgup/pgdn · esc/enter/q closes"
+    let hint = if view.filtering {
+        "esc: back to list · typing filters by server or tool name"
     } else {
-        "esc/enter/q closes"
+        "↑/↓ or ctrl-p/n select · space toggles a tool · tab collapses a group · / filters · esc/q closes"
     };
 
     let content_h = lines.len() as u16;
-    let h = (content_h + 3).clamp(6, max_h.max(6));
+    let h = (content_h + 4).clamp(6, max_h.max(6));
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let popup = Rect::new(x, y, w, h);
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" MCP servers ")
+        .title(" MCP tools ")
         .border_style(Style::default().fg(Color::Magenta));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(inner);
-    let viewport = usize::from(rows[0].height).max(1);
-    let max_scroll = lines.len().saturating_sub(viewport);
-    let scroll = view.scroll.min(max_scroll) as u16;
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), rows[0]);
+
+    // Filter line: label + the query, highlighted while being typed.
+    let mut fspans = vec![
+        Span::styled("filter: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            view.filter.clone(),
+            if view.filtering {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            },
+        ),
+    ];
+    if view.filtering {
+        fspans.push(Span::styled(
+            "|",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(fspans)), rows[0]);
+
+    // Content list: selection-driven scrolling so the cursor stays visible.
+    let viewport = usize::from(rows[1].height).max(1);
+    let scroll = sel.saturating_sub(viewport.saturating_sub(1)) as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), rows[1]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
             Style::default().fg(Color::DarkGray),
         ))),
-        rows[1],
+        rows[2],
     );
 }
 
@@ -5506,39 +5797,136 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_rows_renders_transports() {
+    fn mcp_tool_groups_assigns_tools_by_server_prefix() {
+        use async_trait::async_trait;
         use comrade_core::McpTransport;
-        let servers = vec![
-            comrade_core::McpServerCfg {
-                name: "files".into(),
-                transport: McpTransport::Stdio {
-                    command: "npx".into(),
-                    args: vec![
-                        "-y".into(),
-                        "@modelcontextprotocol/server-filesystem".into(),
-                    ],
-                    env: Default::default(),
+
+        struct Stub {
+            spec: comrade_tool::ToolSpec,
+        }
+        #[async_trait]
+        impl comrade_tool::Tool for Stub {
+            fn spec(&self) -> &comrade_tool::ToolSpec {
+                &self.spec
+            }
+            async fn invoke(
+                &self,
+                _ctx: &comrade_tool::ToolContext,
+                _args: serde_json::Value,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        let stub = |name: &str, desc: &str| -> Box<dyn comrade_tool::Tool> {
+            Box::new(Stub {
+                spec: comrade_tool::ToolSpec {
+                    name: name.to_string(),
+                    description: desc.to_string(),
+                    json_schema: serde_json::json!({}),
                 },
-                auth: None,
+            })
+        };
+        let mut reg = comrade_tool::ToolRegistry::new();
+        reg.register(stub("mcp_files_read", "[MCP server `files`] Reads a file."));
+        reg.register(stub(
+            "mcp_files_write",
+            "[MCP server `files`] Writes a file.",
+        ));
+        reg.register(stub(
+            "mcp_search_query",
+            "[MCP server `search`] Runs a search.",
+        ));
+        // A non-MCP tool must never land in a group.
+        reg.register(stub("write_file", "plain built-in"));
+
+        let server = |name: &str| comrade_core::McpServerCfg {
+            name: name.into(),
+            transport: McpTransport::Http {
+                url: "https://x/mcp".into(),
             },
-            comrade_core::McpServerCfg {
-                name: "search".into(),
-                transport: McpTransport::Http {
-                    url: "https://mcp.example.com/mcp".into(),
-                },
-                auth: None,
-            },
-        ];
-        let rows = mcp_server_rows(&servers);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].name, "files");
+            auth: None,
+        };
+        let groups = mcp_tool_groups(&[server("files"), server("search"), server("ghost")], &reg);
         assert_eq!(
-            rows[0].detail,
-            vec!["stdio (npx -y @modelcontextprotocol/server-filesystem)"]
+            groups.iter().map(|g| g.server.as_str()).collect::<Vec<_>>(),
+            vec!["files", "search", "ghost"],
+            "config order preserved"
         );
-        assert_eq!(rows[1].name, "search");
-        assert_eq!(rows[1].detail, vec!["http (https://mcp.example.com/mcp)"]);
-        assert!(mcp_server_rows(&[]).is_empty());
+        let names =
+            |g: &McpToolGroup| -> Vec<String> { g.tools.iter().map(|t| t.name.clone()).collect() };
+        assert_eq!(names(&groups[0]), vec!["mcp_files_read", "mcp_files_write"]);
+        assert_eq!(names(&groups[1]), vec!["mcp_search_query"]);
+        assert!(groups[2].tools.is_empty(), "server with no tools is empty");
+        // The "[MCP server `files`] " description prefix is stripped.
+        assert_eq!(groups[0].tools[0].desc, "Reads a file.");
+    }
+
+    #[test]
+    fn mcp_visible_rows_orders_and_filters() {
+        let group = |server: &str, tools: &[&str]| McpToolGroup {
+            server: server.to_string(),
+            tools: tools
+                .iter()
+                .map(|n| McpToolEntry {
+                    name: n.to_string(),
+                    desc: String::new(),
+                })
+                .collect(),
+        };
+        let view = |groups: Vec<McpToolGroup>, filter: &str, collapsed: &[usize]| McpServersView {
+            groups,
+            disabled: comrade_tool::ToolRegistry::new().disabled_handle(),
+            filter: filter.to_string(),
+            filtering: false,
+            collapsed: collapsed.iter().copied().collect(),
+            sel: 0,
+        };
+
+        let groups = vec![
+            group("files", &["mcp_files_read", "mcp_files_write"]),
+            group("search", &["mcp_search_query"]),
+        ];
+        // No filter: every header then every tool row, in order.
+        assert_eq!(
+            mcp_visible_rows(&view(groups.clone(), "", &[])),
+            vec![
+                RowRef::Header(0),
+                RowRef::Tool(0, 0),
+                RowRef::Tool(0, 1),
+                RowRef::Header(1),
+                RowRef::Tool(1, 0),
+            ]
+        );
+        // A collapsed group keeps only its header.
+        assert_eq!(
+            mcp_visible_rows(&view(groups.clone(), "", &[1])),
+            vec![
+                RowRef::Header(0),
+                RowRef::Tool(0, 0),
+                RowRef::Tool(0, 1),
+                RowRef::Header(1),
+            ]
+        );
+        // Filter matching the SERVER name shows its whole group, others drop.
+        assert_eq!(
+            mcp_visible_rows(&view(groups.clone(), "files", &[])),
+            vec![RowRef::Header(0), RowRef::Tool(0, 0), RowRef::Tool(0, 1)]
+        );
+        // Filter matching one TOOL shows that header + row only.
+        assert_eq!(
+            mcp_visible_rows(&view(groups.clone(), "write", &[])),
+            vec![RowRef::Header(0), RowRef::Tool(0, 1)]
+        );
+        // Case-insensitive.
+        assert_eq!(
+            mcp_visible_rows(&view(groups.clone(), "SEARCH", &[])),
+            vec![RowRef::Header(1), RowRef::Tool(1, 0)]
+        );
+        // A collapsed group matching only via its tools still shows its header.
+        assert_eq!(
+            mcp_visible_rows(&view(groups, "query", &[1])),
+            vec![RowRef::Header(1)]
+        );
     }
 
     #[test]

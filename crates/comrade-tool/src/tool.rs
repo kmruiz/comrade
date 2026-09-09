@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -32,9 +34,28 @@ pub trait Tool: Send + Sync {
 
 /// Registry of tools handed to the agent loop. Ordering is preserved and
 /// controls the order tools are advertised to the model.
-#[derive(Default)]
+///
+/// Every registry carries a live on/off switch ([`ToolRegistry::disabled`]),
+/// empty by default so all tools are enabled. When the UI (the TUI's
+/// list-mcp-servers modal) switches a tool off, [`ToolRegistry::iter`] stops
+/// advertising it and [`ToolRegistry::get`] refuses to run it — the switch is
+/// shared by `Arc` with the running agent loop, so a toggle reaches the next
+/// model iteration immediately. [`ToolRegistry::iter_all`] ignores the filter
+/// so disabled tools can still be listed and re-enabled.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    /// Tool names switched off at runtime (empty = every tool enabled). Shared
+    /// by Arc so the UI can read/write it live while the agent loop runs.
+    disabled: Arc<RwLock<HashSet<String>>>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self {
+            tools: Vec::new(),
+            disabled: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
 }
 
 impl ToolRegistry {
@@ -50,15 +71,78 @@ impl ToolRegistry {
         self.tools.extend(tools);
     }
 
+    /// Look a tool up by name. Returns `None` when the tool is disabled or not
+    /// registered, so a disabled tool can never be invoked.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+        if !self.is_enabled(name) {
+            return None;
+        }
         self.tools
             .iter()
             .find(|t| t.spec().name == name)
             .map(|b| b.as_ref())
     }
 
+    /// Iterate over every enabled tool, in registration order. The disabled set
+    /// is snapshotted once up front so the returned iterator never holds the
+    /// lock across yields.
     pub fn iter(&self) -> impl Iterator<Item = &dyn Tool> {
+        let disabled = self.disabled_snapshot();
+        self.tools
+            .iter()
+            .filter(move |t| !disabled.contains(&t.spec().name))
+            .map(|b| b.as_ref())
+    }
+
+    /// Iterate over every registered tool regardless of the enabled filter —
+    /// the UI builds its tool list from this so disabled tools stay visible and
+    /// can be turned back on.
+    pub fn iter_all(&self) -> impl Iterator<Item = &dyn Tool> {
         self.tools.iter().map(|b| b.as_ref())
+    }
+
+    /// True when `name` is registered and not switched off.
+    pub fn is_enabled(&self, name: &str) -> bool {
+        !self.disabled_snapshot().contains(name)
+    }
+
+    /// Switch a tool on or off at runtime. Off tools disappear from
+    /// [`ToolRegistry::iter`] and are refused by [`ToolRegistry::get`].
+    pub fn set_enabled(&self, name: &str, enabled: bool) {
+        let mut disabled = self.lock_disabled();
+        if enabled {
+            disabled.remove(name);
+        } else {
+            disabled.insert(name.to_string());
+        }
+    }
+
+    /// Flip a tool's enabled state and report the new state (`true` = enabled).
+    pub fn toggle(&self, name: &str) -> bool {
+        let mut disabled = self.lock_disabled();
+        if disabled.remove(name) {
+            true
+        } else {
+            disabled.insert(name.to_string());
+            false
+        }
+    }
+
+    /// The live on/off set itself, for UIs that read it repeatedly while
+    /// rendering (e.g. to show per-tool enable markers and counts).
+    pub fn disabled_handle(&self) -> Arc<RwLock<HashSet<String>>> {
+        self.disabled.clone()
+    }
+
+    fn disabled_snapshot(&self) -> HashSet<String> {
+        match self.disabled.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn lock_disabled(&self) -> std::sync::RwLockWriteGuard<'_, HashSet<String>> {
+        self.disabled.write().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -383,5 +467,109 @@ mod tests {
         ctx.confirm("edit", Some("--- a.rs".into())).await.unwrap();
         let shown = last.lock().unwrap().clone().unwrap();
         assert_eq!(shown, "--- a.rs");
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    struct Stub {
+        spec: ToolSpec,
+    }
+
+    #[async_trait]
+    impl Tool for Stub {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(&self, _ctx: &ToolContext, _args: Value) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn tool(name: &str) -> Box<dyn Tool> {
+        Box::new(Stub {
+            spec: ToolSpec {
+                name: name.to_string(),
+                description: format!("desc {name}"),
+                json_schema: serde_json::json!({}),
+            },
+        })
+    }
+
+    fn names<'a>(it: impl Iterator<Item = &'a dyn Tool>) -> Vec<String> {
+        it.map(|t| t.spec().name.clone()).collect()
+    }
+
+    fn registry() -> ToolRegistry {
+        let mut reg = ToolRegistry::new();
+        reg.register(tool("a"));
+        reg.register(tool("b"));
+        reg.register(tool("c"));
+        reg
+    }
+
+    #[test]
+    fn nothing_disabled_by_default() {
+        let reg = registry();
+        assert_eq!(names(reg.iter()), vec!["a", "b", "c"]);
+        assert!(reg.is_enabled("a"));
+        assert!(reg.get("a").is_some());
+    }
+
+    #[test]
+    fn set_enabled_filters_iter_and_blocks_get() {
+        let reg = registry();
+        reg.set_enabled("b", false);
+        assert_eq!(names(reg.iter()), vec!["a", "c"]);
+        assert!(
+            reg.get("b").is_none(),
+            "disabled tool must not be invocable"
+        );
+        assert!(reg.get("a").is_some());
+        assert!(!reg.is_enabled("b"));
+        reg.set_enabled("b", true);
+        assert_eq!(names(reg.iter()), vec!["a", "b", "c"]);
+        assert!(reg.get("b").is_some());
+    }
+
+    #[test]
+    fn toggle_reports_new_state() {
+        let reg = registry();
+        assert!(!reg.toggle("b"), "first toggle disables");
+        assert_eq!(names(reg.iter()), vec!["a", "c"]);
+        assert!(reg.toggle("b"), "second toggle re-enables");
+        assert_eq!(names(reg.iter()), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn iter_all_still_yields_disabled_tools() {
+        let reg = registry();
+        reg.set_enabled("b", false);
+        assert_eq!(names(reg.iter_all()), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn disabled_handle_mutations_are_live() {
+        let reg = registry();
+        let handle = reg.disabled_handle();
+        handle.write().unwrap().insert("a".to_string());
+        assert!(!reg.is_enabled("a"));
+        assert_eq!(names(reg.iter()), vec!["b", "c"]);
+        handle.write().unwrap().remove("a");
+        assert!(reg.is_enabled("a"));
+    }
+
+    #[test]
+    fn iter_snapshots_disabled_set() {
+        let reg = registry();
+        let it = reg.iter();
+        // Mutating the set mid-iteration must not poison the lock or change an
+        // already-created iterator.
+        reg.set_enabled("a", false);
+        assert_eq!(names(it), vec!["a", "b", "c"]);
+        assert_eq!(names(reg.iter()), vec!["b", "c"]);
     }
 }
