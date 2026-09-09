@@ -947,11 +947,13 @@ impl App {
         }
     }
 
-    /// Cut the prompt's selection: delete it and put the text on the system
-    /// clipboard. Bound to C-k. No-op when nothing is selected (chat blocks
-    /// are read-only and cannot be cut).
-    fn cut_selection(&mut self) {
-        if let Some(text) = self.input.cut_selection() {
+    /// Emacs-style kill-line on the prompt editor, bound to C-k: cut the
+    /// active selection, otherwise cut from the cursor to the end of the
+    /// line; at the end of a line the newline is cut too, joining the next
+    /// line. The killed text goes on the system clipboard. No-op at the end
+    /// of the buffer (chat blocks are read-only and cannot be cut).
+    fn kill_line(&mut self) {
+        if let Some(text) = self.input.kill_line() {
             self.copy_text(&text);
         }
     }
@@ -2514,14 +2516,15 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                 return false;
             }
             // Emacs-style kill/yank on the prompt editor: C-y pastes the
-            // system clipboard at the cursor; C-k cuts the selection to the
-            // clipboard (copy is M-w / Ctrl+Shift+C).
+            // system clipboard at the cursor; C-k kills to the end of the
+            // line (or the selection, when one is active), joining lines at
+            // the end of a line. Copy is M-w / Ctrl+Shift+C.
             if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.paste_clipboard();
                 return false;
             }
             if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                app.cut_selection();
+                app.kill_line();
                 return false;
             }
             // Emacs-style chat navigation. Plain Ctrl+p/n move block to block;

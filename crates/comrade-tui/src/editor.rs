@@ -117,6 +117,42 @@ impl Editor {
         Some(out)
     }
 
+    /// Emacs-style kill-line: cut the active selection, otherwise cut from
+    /// the cursor to the end of the line. At the end of a line (cursor right
+    /// before a `\n`) the newline itself is cut, joining the next line; at
+    /// the end of the buffer nothing is cut. Returns the killed text, or
+    /// `None` when there was nothing to kill.
+    pub fn kill_line(&mut self) -> Option<String> {
+        if let Some(out) = self.cut_selection() {
+            return Some(out);
+        }
+        let cur = self.cur;
+        match self.buf[cur..].find('\n') {
+            Some(rel) if rel == 0 => {
+                // Cursor sits at the end of a line: cut the newline itself.
+                self.buf.remove(cur);
+                self.anchor = None;
+                Some("\n".to_string())
+            }
+            Some(rel) => {
+                let end = cur + rel;
+                let out = self.buf[cur..end].to_string();
+                self.buf.replace_range(cur..end, "");
+                self.anchor = None;
+                Some(out)
+            }
+            None => {
+                if cur == self.buf.len() {
+                    return None;
+                }
+                let out = self.buf[cur..].to_string();
+                self.buf.truncate(cur);
+                self.anchor = None;
+                Some(out)
+            }
+        }
+    }
+
     /// Delete the character before the cursor (or the whole selection).
     pub fn backspace(&mut self) {
         if self.selection().is_some() {
@@ -575,6 +611,59 @@ mod tests {
         assert_eq!(text(&e), "hello ");
         assert_eq!(e.cursor(), 6);
         assert_eq!(e.selection(), None);
+    }
+
+    #[test]
+    fn kill_line_cuts_to_end_of_line() {
+        let mut e = Editor::new();
+        for ch in "hello world".chars() {
+            e.insert(ch);
+        }
+        e.move_word_left(false); // cursor before "world"
+        assert_eq!(e.cursor(), 6);
+        assert_eq!(e.kill_line(), Some("world".to_string()));
+        assert_eq!(text(&e), "hello ");
+        assert_eq!(e.cursor(), 6);
+        assert_eq!(e.selection(), None);
+    }
+
+    #[test]
+    fn kill_line_joins_at_end_of_line() {
+        let mut e = Editor::new();
+        for ch in "ab\ncd".chars() {
+            e.insert(ch);
+        }
+        // cursor after "ab", right before the newline (end of line)
+        e.move_home(false); // start of the second line ("cd")
+        e.move_left(false); // onto the newline char
+        assert_eq!(e.cursor(), 2);
+        assert_eq!(e.kill_line(), Some("\n".to_string()));
+        assert_eq!(text(&e), "abcd");
+        assert_eq!(e.cursor(), 2);
+    }
+
+    #[test]
+    fn kill_line_at_end_of_buffer_is_noop() {
+        let mut e = Editor::new();
+        for ch in "hi".chars() {
+            e.insert(ch);
+        }
+        assert_eq!(e.cursor(), 2);
+        assert_eq!(e.kill_line(), None);
+        assert_eq!(text(&e), "hi");
+        assert_eq!(e.cursor(), 2);
+    }
+
+    #[test]
+    fn kill_line_cuts_selection_first() {
+        let mut e = Editor::new();
+        for ch in "hello world".chars() {
+            e.insert(ch);
+        }
+        e.move_word_left(true); // select "world"
+        assert_eq!(e.kill_line(), Some("world".to_string()));
+        assert_eq!(text(&e), "hello ");
+        assert_eq!(e.cursor(), 6);
     }
 
     #[test]
