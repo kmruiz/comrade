@@ -718,6 +718,14 @@ struct App {
     balance: Option<String>,
     /// Name of the tool currently running (auto status while no agent text).
     activity: Option<String>,
+    /// Lazily-created system-clipboard handle, kept alive for the whole
+    /// session. Creating and dropping a `Clipboard` per write makes arboard
+    /// (X11) hand the clipboard window over to a clipboard manager and destroy
+    /// it <100 ms after `set_text`, before the manager can grab the contents
+    /// ("Clipboard was dropped very quickly after writing"); holding one
+    /// handle for the app's lifetime keeps the X11 window and its server
+    /// thread serving our contents until the next copy or app exit.
+    clipboard: Option<Clipboard>,
 }
 
 /// Snapshot of the repo state shown on the emacs-style mode line, refreshed in
@@ -951,14 +959,7 @@ impl App {
     /// Paste the system clipboard into the prompt at the cursor, replacing
     /// any selection. Bound to C-y. Reports failures in the chat.
     fn paste_clipboard(&mut self) {
-        let mut clip = match Clipboard::new() {
-            Ok(clip) => clip,
-            Err(e) => {
-                self.push_meta(format!("paste failed: {e}"));
-                return;
-            }
-        };
-        match clip.get_text() {
+        match self.with_clipboard(|clip| Ok(clip.get_text()?)) {
             Ok(text) => self.input.insert_str(&text),
             Err(e) => self.push_meta(format!("paste failed: {e}")),
         }
@@ -969,16 +970,20 @@ impl App {
         if text.is_empty() {
             return;
         }
-        let mut clip = match Clipboard::new() {
-            Ok(clip) => clip,
-            Err(e) => {
-                self.push_meta(format!("copy failed: {e}"));
-                return;
-            }
-        };
-        if let Err(e) = clip.set_text(text.to_string()) {
+        if let Err(e) = self.with_clipboard(|clip| Ok(clip.set_text(text.to_string())?)) {
             self.push_meta(format!("copy failed: {e}"));
         }
+    }
+
+    /// Run `f` against the system clipboard, creating the handle on first use
+    /// and reusing it afterwards. The handle is stored on `self` (see the
+    /// `clipboard` field) so it lives for the whole session instead of being
+    /// dropped right after each write.
+    fn with_clipboard<T>(&mut self, f: impl FnOnce(&mut Clipboard) -> Result<T>) -> Result<T> {
+        if self.clipboard.is_none() {
+            self.clipboard = Some(Clipboard::new().context("open system clipboard")?);
+        }
+        f(self.clipboard.as_mut().unwrap())
     }
 
     fn push_failure(&mut self, name: String, detail: String) {
@@ -2309,6 +2314,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         ctx_estimated: true,
         balance: deps.balance.clone(),
         activity: None,
+        clipboard: None,
     };
     app.dialog_ask_tx = Some(dialog_ans_tx);
 
