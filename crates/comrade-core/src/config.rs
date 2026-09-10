@@ -549,6 +549,31 @@ mod tests {
     }
 
     #[test]
+    fn preset_lookup_covers_mistral() {
+        assert_eq!(
+            provider_base_url("mistral"),
+            Some("https://api.mistral.ai/v1")
+        );
+        assert_eq!(
+            provider_base_url("Mistral"),
+            Some("https://api.mistral.ai/v1")
+        );
+    }
+
+    #[test]
+    fn mistral_provider_fills_base_url() {
+        let p = write_tmp(
+            "[llm]\nprovider = \"mistral\"\napi_key = \"sk-mistral\"\nmodel = \"mistral-large-latest\"\n",
+        );
+        let c = Config::load(Some(&p)).unwrap().config;
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(c.llm.base_url, "https://api.mistral.ai/v1");
+        assert_eq!(c.llm.api_key.as_deref(), Some("sk-mistral"));
+        assert_eq!(c.llm.model, "mistral-large-latest");
+        assert_eq!(c.llm.display(), "mistral/mistral-large-latest");
+    }
+
+    #[test]
     fn mcp_defaults_to_no_servers() {
         let c = Config::default();
         assert!(c.mcp.servers.is_empty());

@@ -732,6 +732,19 @@ fn heuristic_context(model: &str) -> Option<usize> {
     if m.contains("gpt-4o") {
         return Some(128_000);
     }
+    // Mistral AI models: the `/models` endpoint advertises max_context_length,
+    // but fall back to the family default when the probe is unavailable.
+    if m.contains("codestral") {
+        return Some(32_768); // Codestral (2405): 32K
+    }
+    if m.contains("mistral")
+        || m.contains("devstral")
+        || m.contains("pixtral")
+        || m.contains("ministral")
+        || m.contains("magistral")
+    {
+        return Some(131_072); // 128K (Large/Medium/Small, Devstral, Nemo, ...)
+    }
     None
 }
 
@@ -1113,6 +1126,16 @@ mod heuristic_tests {
     #[test]
     fn unknown_models_return_none() {
         assert_eq!(heuristic_context("totally-unknown-model"), None);
+    }
+
+    #[test]
+    fn mistral_family_gets_128k() {
+        assert_eq!(heuristic_context("mistral-large-latest"), Some(131_072));
+        assert_eq!(heuristic_context("mistral-small-latest"), Some(131_072));
+        assert_eq!(heuristic_context("devstral-small-2507"), Some(131_072));
+        assert_eq!(heuristic_context("pixtral-large-latest"), Some(131_072));
+        assert_eq!(heuristic_context("ministral-8b-latest"), Some(131_072));
+        assert_eq!(heuristic_context("codestral-latest"), Some(32_768));
     }
 }
 
