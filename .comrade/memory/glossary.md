@@ -34,6 +34,16 @@ Reuses the Autonomy enum (ask/auto/deny). Delegates with ask/deny are annotated 
 **Notes:**
 Replaces the former unconditional "no approval" wording.
 
+## ask_user dialog
+> The TUI modal shown for a `UserPrompt::Question` (from the `ask_user` tool) and for a `UserPrompt::Confirm` (permission/approval of mutating tools). Rendered by `draw_dialog`.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs (draw_dialog ~line 5499, wrap_plain ~line 5633)`
+- `crates/comrade-tool-session/src/lib.rs (ASK_USER_SPEC ~line 562)`
+
+**Notes:**
+The dialog wraps its body/options to the popup's real inner width (popup = min(area.width-2, 100) wide, minus 2 border cols), sizes its height to `body.len() + 4` (2 borders + input row + hint row) clamped to the terminal, and anchors the body to the TOP so the question/action is never scrolled out of view. Option text wraps via `wrap_plain` and continuation lines are space-padded under the number. Because space is limited, the `ask_user` tool spec instructs the model to ask a single short question with at most 4 short options.
+
 ## delegate sub-chat
 > The chat rows authored by a delegate model (its tool cards and its reply), rendered indented 2 columns under a "| " rule in the delegate's agent color with a dim per-agent background band, visually nested under the parent's delegate tool call.
 
