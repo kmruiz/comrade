@@ -5499,7 +5499,12 @@ fn draw_mcp_servers(view: &McpServersView, frame: &mut Frame) {
 fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     let area = frame.area();
 
-    // Build the body lines for the kind of prompt.
+    // Size the popup first so the body can wrap to its real inner width (the
+    // block borders shave two columns off the popup).
+    let w = area.width.saturating_sub(2).min(100).max(20);
+    let inner_w = w.saturating_sub(2).max(10) as usize;
+
+    // Build the body lines for the kind of prompt, wrapped to the popup width.
     let (kind_label, is_question, options, mut body) = match &dialog.prompt {
         UserPrompt::Question { prompt, options } => {
             let text = if options.is_empty() {
@@ -5507,16 +5512,28 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
             } else {
                 prompt.clone()
             };
-            let mut lines = preview_lines(&text, 96);
+            let mut lines = preview_lines(&text, inner_w);
             for (i, o) in options.iter().enumerate() {
-                let mut spans = vec![Span::styled(
-                    format!("{}. ", i + 1),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )];
-                spans.push(Span::styled(o.clone(), Style::default().fg(Color::Cyan)));
-                lines.push(Line::from(spans));
+                let num = format!("{}. ", i + 1);
+                let num_style = Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+                let wrapped = wrap_plain(o, inner_w.saturating_sub(num.len()));
+                if wrapped.is_empty() {
+                    lines.push(Line::from(Span::styled(num, num_style)));
+                    continue;
+                }
+                for (j, chunk) in wrapped.into_iter().enumerate() {
+                    let mut spans: Vec<Span<'static>> = Vec::new();
+                    if j == 0 {
+                        spans.push(Span::styled(num.clone(), num_style));
+                    } else {
+                        // Align continuation lines under the option text.
+                        spans.push(Span::raw(" ".repeat(num.len())));
+                    }
+                    spans.push(Span::styled(chunk, Style::default().fg(Color::Cyan)));
+                    lines.push(Line::from(spans));
+                }
             }
             (" question ", true, options.clone(), lines)
         }
@@ -5524,17 +5541,17 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
             let mut lines = Vec::new();
             // The actual action (e.g. the shell command) goes on top so the
             // human always sees exactly what they are approving.
-            lines.extend(preview_lines(title, 96));
+            lines.extend(preview_lines(title, inner_w));
             if let Some(d) = diff {
                 if !d.trim().is_empty() {
                     lines.push(Line::from(""));
-                    lines.extend(preview_lines(d, 96));
+                    lines.extend(preview_lines(d, inner_w));
                 }
             }
             if !app.dialog_conv.is_empty() {
                 lines.push(Line::from(""));
                 let conv = app.dialog_conv.join("\n");
-                lines.extend(preview_lines(&conv, 96));
+                lines.extend(preview_lines(&conv, inner_w));
             }
             (" confirm  [y/n] ", false, Vec::new(), lines)
         }
@@ -5543,11 +5560,12 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
         body.push(Line::from(""));
     }
 
-    // Size the popup to fit, up to almost the whole terminal.
-    let w = area.width.saturating_sub(2).min(100);
-    let max_h = area.height.saturating_sub(2);
-    let content_h = body.len() as u16 + 3; // body + input + hint
-    let h = content_h.clamp(5, max_h.max(5));
+    // Fit the popup to the whole body: 2 border rows + body + input + hint.
+    // The body is anchored at the top, so growing the popup is what keeps the
+    // question visible instead of scrolling its first lines out of view.
+    let max_h = area.height.saturating_sub(2).max(5);
+    let needed = body.len() as u16 + 4;
+    let h = needed.clamp(5, max_h);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -5570,7 +5588,6 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let inner_w = inner.width.saturating_sub(2) as usize;
     let row_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -5580,10 +5597,9 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
         ])
         .split(inner);
 
-    // Body, scrollable if it does not fit.
-    let body_view = row_layout[0].height as usize;
-    let scroll = body.len().saturating_sub(body_view) as u16;
-    frame.render_widget(Paragraph::new(body).scroll((scroll, 0)), row_layout[0]);
+    // Body, anchored at the top so the question/action is always visible even
+    // when it is taller than the popup.
+    frame.render_widget(Paragraph::new(body), row_layout[0]);
 
     // Input row.
     let input_prompt = if app.dialog_ask { "? " } else { "> " };
@@ -5612,7 +5628,37 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
         row_layout[2],
     );
     let _ = app;
-    let _ = inner_w;
+}
+
+/// Greedy word-wrap of plain text into lines of at most `width` columns.
+/// Over-long words are hard-split. Used to fit the dialog's option text.
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split('\n') {
+        let mut cur = String::new();
+        for word in raw.split_whitespace() {
+            if cur.is_empty() {
+                cur = word.to_string();
+            } else if cur.chars().count() + 1 + word.chars().count() <= width {
+                cur.push(' ');
+                cur.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut cur));
+                cur = word.to_string();
+            }
+            while cur.chars().count() > width {
+                let head: String = cur.chars().take(width).collect();
+                out.push(head);
+                cur = cur.chars().skip(width).collect();
+            }
+        }
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 /// Pretty-print a free-form preview (approval diff bodies). Highlights
@@ -7174,13 +7220,16 @@ mod tests {
     fn result_rows_falls_back_to_single_colour() {
         let rows = result_rows("ok\nnothing here", true, 80);
         assert!(!rows.is_empty());
-        assert!(rows
-            .iter()
-            .all(|r| r.iter().all(|s| s.style.fg == Some(Color::Green))));
+        assert!(
+            rows.iter()
+                .all(|r| r.iter().all(|s| s.style.fg == Some(Color::Green)))
+        );
         let failed = result_rows("boom", false, 80);
-        assert!(failed
-            .iter()
-            .all(|r| r.iter().all(|s| s.style.fg == Some(Color::Red))));
+        assert!(
+            failed
+                .iter()
+                .all(|r| r.iter().all(|s| s.style.fg == Some(Color::Red)))
+        );
     }
 
     #[test]
@@ -8263,5 +8312,25 @@ mod plan_step_tests {
             plan_glyph(&PlanStatus::InProgress, 0),
             plan_glyph(&PlanStatus::InProgress, 100)
         );
+    }
+
+    #[test]
+    fn wrap_plain_wraps_within_width() {
+        let w = wrap_plain("alpha beta gamma delta epsilon", 12);
+        assert!(w.iter().all(|l| l.chars().count() <= 12), "{w:?}");
+        assert_eq!(w.join(" "), "alpha beta gamma delta epsilon");
+    }
+
+    #[test]
+    fn wrap_plain_hard_splits_long_words() {
+        let w = wrap_plain("supercalifragilistic", 8);
+        assert!(w.iter().all(|l| l.chars().count() <= 8), "{w:?}");
+        assert_eq!(w.join(""), "supercalifragilistic");
+    }
+
+    #[test]
+    fn wrap_plain_keeps_explicit_newlines() {
+        let w = wrap_plain("one\ntwo", 40);
+        assert_eq!(w, vec!["one".to_string(), "two".to_string()]);
     }
 }

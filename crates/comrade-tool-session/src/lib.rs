@@ -562,15 +562,15 @@ struct AskUser;
 static ASK_USER_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "ask_user".into(),
-    description: "Ask the human a question and wait for their answer. Use to resolve ambiguity, request confirmation, or let them pick between options. Prefer over guessing when a choice materially matters.".into(),
+    description: "Ask the human a single, concise question and wait for their answer. The dialog that shows this is small, so ask exactly one short question and keep it brief. Optionally supply up to 4 short answer options (each a brief phrase) so the human can pick instead of typing; omit options for free-form input. Use to resolve ambiguity, request confirmation, or let them pick between options. Prefer over guessing when a choice materially matters.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "question": { "type": "string", "description": "The question." },
+            "question": { "type": "string", "description": "A single short question (the dialog space is limited)." },
             "options": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Optional predefined answers; omit for free-form input."
+                "description": "Optional predefined answers: at most 4 short options (brief phrases). Omit for free-form input."
             }
         },
         "required": ["question"],
