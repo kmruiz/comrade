@@ -108,6 +108,9 @@ mod tests {
         run(&root, &["init", "-q", "-b", "main"]);
         run(&root, &["config", "user.email", "t@example.com"]);
         run(&root, &["config", "user.name", "t"]);
+        // Never inherit the developer's global commit signing (e.g. 1Password),
+        // which would fail/block a scratch-repo commit.
+        run(&root, &["config", "commit.gpgsign", "false"]);
 
         std::fs::write(root.join("keep.txt"), "k\n").unwrap();
         std::fs::write(root.join("dirty.txt"), "a\n").unwrap();

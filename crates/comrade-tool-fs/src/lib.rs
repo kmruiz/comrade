@@ -1182,6 +1182,9 @@ mod tests {
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.email", "t@example.com"]);
         git(&root, &["config", "user.name", "t"]);
+        // Never inherit the developer's global commit signing (e.g. 1Password),
+        // which would fail/block a scratch-repo commit.
+        git(&root, &["config", "commit.gpgsign", "false"]);
         std::fs::write(root.join("untouched.rs"), "fn u() {}\n").unwrap();
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-qm", "init"]);
