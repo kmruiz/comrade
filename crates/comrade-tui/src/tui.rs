@@ -23,6 +23,8 @@ use comrade_tool::{
     AGENT_MODEL, PlanStatus, PlanStep, PlanTarget, SessionControl, ToolContext, UserIo, UserPrompt,
     UserReply,
 };
+
+use crate::colors::ModelColors;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -269,10 +271,12 @@ fn chat_cache<'a>(
     width: usize,
     chat: &[Msg],
     collapsed: &[bool],
+    delegates: &[DelegateCfg],
+    colors: &ModelColors,
 ) -> &'a ChatRowsCache {
     let stale = !matches!(cache, Some(c) if c.epoch == epoch && c.width == width);
     if stale {
-        let (rows, owner, ranges) = layout_chat_rows(chat, collapsed, "", width);
+        let (rows, owner, ranges) = layout_chat_rows(chat, collapsed, "", width, delegates, colors);
         *cache = Some(ChatRowsCache {
             width,
             epoch,
@@ -671,6 +675,10 @@ struct App {
     /// Cached row layout of `chat`, reused across frames while nothing that
     /// affects the layout changed (see [`ChatRowsCache`]).
     chat_rows_cache: Option<ChatRowsCache>,
+    /// Per-model agent colors, assigned once at start (main model + delegates):
+    /// they tint each delegate's name, its sub-chat band in the chat window,
+    /// the model panel and the model-pick overlay.
+    model_colors: ModelColors,
     /// Org-style section (one exchange per user turn) collapse state, indexed
     /// by section ordinal = the turn's rank among `MsgKind::User` messages.
     /// User messages are only ever appended (run-digest folds splice only
@@ -1320,6 +1328,14 @@ impl App {
         self.cfg = Arc::new(cfg);
         self.client = Arc::new(client);
         self.tools = Arc::new(tools);
+        // Pick up any newly-configured delegate: assign it a color the first
+        // time it is seen (existing agents keep theirs) and refresh the chat
+        // layout so the model panel and bands repaint.
+        let mut agent_names: Vec<String> =
+            self.cfg.delegates.iter().map(|d| d.name.clone()).collect();
+        agent_names.push(self.cfg.llm.display());
+        self.model_colors.assign(&agent_names);
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
     }
 
     /// M-x list-mcp-servers: open the modal showing every server configured
@@ -2250,6 +2266,13 @@ pub async fn run(deps: &Deps) -> Result<()> {
     let user = Arc::new(TuiUserIo { tx: asks_tx });
     let (bundle, events_tx, events_rx) = new_session(deps, user);
 
+    // Assign a stable color to each agent (main model + delegates) once, at
+    // start: the chat's delegate sub-chats and the model windows use it.
+    let mut model_colors = ModelColors::new();
+    let mut agent_names: Vec<String> = deps.cfg.delegates.iter().map(|d| d.name.clone()).collect();
+    agent_names.push(deps.cfg.llm.display());
+    model_colors.assign(&agent_names);
+
     let mut app = App {
         cfg: deps.cfg.clone(),
         client: deps.client.clone(),
@@ -2283,6 +2306,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         chat: Vec::new(),
         chat_epoch: 0,
         chat_rows_cache: None,
+        model_colors,
         section_collapsed: Vec::new(),
         stream: String::new(),
         input: Editor::new(),
@@ -3300,6 +3324,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
     // keeping the no-delegate layout unchanged at 6.)
     let delegate_rows = delegate_panel_rows(
         &app.cfg.delegates,
+        &app.model_colors,
         usize::from(cols[1].width.saturating_sub(2)).max(1),
     );
     let delegate_h = delegate_rows.as_ref().map_or(0, |r| r.len() as u16 - 1);
@@ -3398,7 +3423,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
         draw_dialog(app, d, frame);
     }
     if let Some(p) = &app.pick {
-        draw_model_pick(p, frame);
+        draw_model_pick(p, &app.model_colors, frame);
     }
     if let Some(v) = &app.mcp_view {
         draw_mcp_servers(v, frame);
@@ -3626,6 +3651,7 @@ fn render_row_line(
     in_match: bool,
     band: Option<Color>,
     width: usize,
+    sub: Option<Color>,
 ) -> Line<'static> {
     let prefix_style = |bg: Option<Color>, fg: Option<Color>| {
         let mut s = Style::default();
@@ -3637,22 +3663,29 @@ fn render_row_line(
         }
         s
     };
-    let prefix = if sel {
-        Span::styled(
+    let mut spans: Vec<Span> = Vec::with_capacity(r.spans.len() + 2);
+    if sel {
+        spans.push(Span::styled(
             "> ",
             prefix_style(band, Some(Color::Yellow)).add_modifier(Modifier::BOLD),
-        )
+        ));
+    } else if let Some(color) = sub {
+        // Delegate sub-chat: its own color as a left rule plus a 2-column
+        // indent that sets the delegate's conversation apart from the parent's.
+        spans.push(Span::styled(
+            "| ",
+            prefix_style(band, Some(color)).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("  ", prefix_style(band, None)));
     } else {
         match r.rule {
-            Some(color) => Span::styled(
+            Some(color) => spans.push(Span::styled(
                 "| ",
                 prefix_style(band, Some(color)).add_modifier(Modifier::BOLD),
-            ),
-            None => Span::styled("  ", prefix_style(band, None)),
+            )),
+            None => spans.push(Span::styled("  ", prefix_style(band, None))),
         }
-    };
-    let mut spans: Vec<Span> = Vec::with_capacity(r.spans.len() + 1);
-    spans.push(prefix);
+    }
     for s in &r.spans {
         let bg = if in_match { Some(Color::Yellow) } else { band };
         match bg {
@@ -3703,6 +3736,8 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
         width,
         &app.chat,
         &app.section_collapsed,
+        &app.cfg.delegates,
+        &app.model_colors,
     );
 
     // The live streaming preview is transient: laid out fresh every frame.
@@ -3750,16 +3785,29 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
         if row < chat_rows {
             let r = &cache.rows[row];
             let in_match = search_hl.is_some_and(|(start, len)| row >= start && row < start + len);
-            let band = cache.owner[row]
-                .and_then(|i| app.chat.get(i))
-                .filter(|m| m.kind == MsgKind::User)
-                .map(|_| user_band_bg());
+            // Band + sub-chat tint by the row's owning message: user turns get
+            // the lifted user band; delegate rows are tinted in their agent's
+            // dim color and indented under the parent.
+            let owner = cache.owner[row].and_then(|i| app.chat.get(i));
+            let sub_author =
+                owner.and_then(|m| subchat_model(m.author.as_deref(), &app.cfg.delegates));
+            let sub = sub_author.map(|a| app.model_colors.name_color(a));
+            let band = match owner {
+                Some(m) if m.kind == MsgKind::User => Some(user_band_bg()),
+                _ => sub_author.map(|a| app.model_colors.band_color(a)),
+            };
+            let row_width = if sub.is_some() {
+                width.saturating_sub(2)
+            } else {
+                width
+            };
             lines.push(render_row_line(
                 r,
                 Some(row) == sel_start,
                 in_match,
                 band,
-                width,
+                row_width,
+                sub,
             ));
         } else {
             // Streaming preview row: un-owned, never banded/selected.
@@ -3783,6 +3831,8 @@ fn layout_chat_rows(
     collapsed: &[bool],
     stream: &str,
     width: usize,
+    delegates: &[DelegateCfg],
+    colors: &ModelColors,
 ) -> (Vec<RenderRow>, Vec<Option<usize>>, Vec<(usize, usize)>) {
     let mut out = Vec::new();
     let mut owner: Vec<Option<usize>> = Vec::new();
@@ -3796,6 +3846,15 @@ fn layout_chat_rows(
     while i < chat.len() {
         let msg = &chat[i];
         let start = out.len();
+        // Rows authored by a delegate form its sub-chat: laid out two columns
+        // narrower than the parent so the render prefix can indent them, and
+        // tinted in the delegate's color.
+        let sub = subchat_model(msg.author.as_deref(), delegates);
+        let w = if sub.is_some() {
+            width.saturating_sub(2)
+        } else {
+            width
+        };
         match msg.kind {
             MsgKind::User => {
                 // A new exchange begins: recompute this section's visibility.
@@ -3853,7 +3912,7 @@ fn layout_chat_rows(
             }
             MsgKind::Run => layout_run(&mut out, i, &msg.children),
             MsgKind::Failure => layout_failure(&mut out, i, msg.fail.as_ref().unwrap(), width),
-            MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), width),
+            MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), w),
             MsgKind::Reasoning => layout_reasoning(
                 &mut out,
                 i,
@@ -3887,14 +3946,11 @@ fn layout_chat_rows(
                 }
             }
             MsgKind::Delegate => {
-                author_header(
-                    &mut out,
-                    msg.author.as_deref().unwrap_or("delegate"),
-                    Color::Magenta,
-                    width,
-                );
-                let rule = Some(Color::Magenta);
-                for spans in md_to_lines(&msg.text, width) {
+                let author = msg.author.as_deref().unwrap_or("delegate");
+                let color = sub.map(|m| colors.name_color(m)).unwrap_or(Color::Magenta);
+                author_header(&mut out, author, color, w);
+                let rule = Some(color);
+                for spans in md_to_lines(&msg.text, w) {
                     out.push(RenderRow {
                         rule,
                         spans,
@@ -4307,6 +4363,13 @@ fn arg_lines(args: &str) -> Vec<String> {
     lines
 }
 
+/// The delegate model behind `author`, when `author` is one of the configured
+/// delegates: rows authored by a delegate form its sub-chat (indented, tinted
+/// in the delegate's color) in the chat window.
+fn subchat_model<'a>(author: Option<&'a str>, delegates: &[DelegateCfg]) -> Option<&'a str> {
+    author.filter(|a| delegates.iter().any(|d| d.name == *a))
+}
+
 /// A one-row author tag ("you", the main model's label, or a delegate name)
 /// rendered above a content block so the transcript shows *who* produced it.
 fn author_header(out: &mut Vec<RenderRow>, author: &str, color: Color, width: usize) {
@@ -4706,7 +4769,11 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
 /// (or off the screen on a narrow terminal). `None` when no delegate is
 /// configured. Mirrors the plan panel: long names/models/descriptions are
 /// collapsed to single spaces and word-wrapped.
-fn delegate_panel_rows(delegates: &[DelegateCfg], width: usize) -> Option<Vec<Line<'static>>> {
+fn delegate_panel_rows(
+    delegates: &[DelegateCfg],
+    colors: &ModelColors,
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
     if delegates.is_empty() {
         return None;
     }
@@ -4719,17 +4786,21 @@ fn delegate_panel_rows(delegates: &[DelegateCfg], width: usize) -> Option<Vec<Li
     // Reserve two columns of left indent for the wrapped body.
     let body_width = width.saturating_sub(2).max(1);
     for d in delegates {
-        let label = if d.name == d.llm.model {
+        let name = if d.name == d.llm.model {
             d.name.clone()
         } else {
             format!("{} ({})", d.name, d.llm.model)
         };
-        let mut text = label;
+        // The delegate's name carries its assigned agent color, so the panel
+        // matches the color used for its sub-chat and author tags.
+        let name_style = Style::default()
+            .fg(colors.name_color(&d.name))
+            .add_modifier(Modifier::BOLD);
+        let mut toks = vec![tok(flat(&name), name_style)];
         if !d.description.trim().is_empty() {
-            text.push_str(" — ");
-            text.push_str(d.description.trim());
+            toks.push(tok(format!(" — {}", flat(d.description.trim())), dim));
         }
-        for wrapped in wrap_toks(&[tok(flat(&text), dim)], body_width) {
+        for wrapped in wrap_toks(&toks, body_width) {
             let mut spans = vec![Span::styled("  ", dim)];
             spans.extend(
                 wrapped
@@ -4828,7 +4899,7 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
     // Configured delegates ([[delegates]]) shown in the leftover space under
     // the model gauge; word-wrapped to the panel width so long names or
     // descriptions never spill past the right edge.
-    if let Some(delegate_rows) = delegate_panel_rows(&app.cfg.delegates, width) {
+    if let Some(delegate_rows) = delegate_panel_rows(&app.cfg.delegates, &app.model_colors, width) {
         frame.render_widget(Paragraph::new(delegate_rows), rows[3]);
     }
     let _ = rows;
@@ -5015,7 +5086,7 @@ fn collapsed_done_toks(step: &PlanStep, width: usize) -> Vec<Tok> {
 
 /// The Ctrl-A "assign a model" overlay: choose a plan step (pending/blocked
 /// only), then choose which model runs it.
-fn draw_model_pick(pick: &ModelPick, frame: &mut Frame) {
+fn draw_model_pick(pick: &ModelPick, colors: &ModelColors, frame: &mut Frame) {
     let area = frame.area();
     let w = area.width.saturating_sub(2).min(92);
     let max_h = area.height.saturating_sub(2);
@@ -5038,7 +5109,11 @@ fn draw_model_pick(pick: &ModelPick, frame: &mut Frame) {
         lines.push(Line::from(""));
         for (i, m) in pick.models.iter().enumerate() {
             let selected = pick.model_sel == Some(i);
-            let mut st = Style::default().fg(if selected { Color::White } else { Color::Cyan });
+            let mut st = Style::default().fg(if selected {
+                Color::White
+            } else {
+                colors.name_color(m)
+            });
             if selected {
                 st = st.add_modifier(Modifier::BOLD);
             }
@@ -6367,12 +6442,35 @@ mod tests {
             spans: vec![Span::raw("hi")],
             tool_header: None,
         };
-        let line = render_row_line(&row, false, false, Some(Color::Rgb(1, 2, 3)), 10);
+        let line = render_row_line(&row, false, false, Some(Color::Rgb(1, 2, 3)), 10, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         // prefix "| " + "hi" + pad to the span-area width (10): 12 cells total,
         // which equals the chat area width for rows with a 2-cell gutter.
         assert_eq!(flat, "| hi        ", "{flat}");
         assert_eq!(flat.chars().count(), 12);
+    }
+
+    #[test]
+    fn subchat_row_indents_and_uses_agent_rule() {
+        let row = RenderRow {
+            rule: None,
+            spans: vec![Span::raw("hi")],
+            tool_header: None,
+        };
+        let line = render_row_line(
+            &row,
+            false,
+            false,
+            Some(Color::Rgb(9, 9, 9)),
+            8,
+            Some(Color::Rgb(1, 2, 3)),
+        );
+        let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        // "| " rule + a 2-column indent + "hi" + pad to width 8 = 12 cells.
+        assert!(flat.starts_with("|   hi"), "{flat}");
+        assert_eq!(flat.chars().count(), 12);
+        // The rule span is drawn in the delegate's agent color.
+        assert_eq!(line.spans[0].style.fg, Some(Color::Rgb(1, 2, 3)));
     }
 
     #[test]
@@ -6382,7 +6480,7 @@ mod tests {
             spans: vec![Span::raw("hi")],
             tool_header: None,
         };
-        let line = render_row_line(&row, false, false, None, 10);
+        let line = render_row_line(&row, false, false, None, 10, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(flat, "  hi", "{flat}");
     }
@@ -6394,7 +6492,7 @@ mod tests {
             spans: vec![Span::raw("hi")],
             tool_header: None,
         };
-        let line = render_row_line(&row, true, false, None, 10);
+        let line = render_row_line(&row, true, false, None, 10, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(flat, "> hi", "{flat}");
     }
@@ -6918,7 +7016,8 @@ mod tests {
         d.llm.model = "ollama/mistral:7b".into();
         d.description =
             "Cheap and fast, good for basic coding tasks and summarising long outputs.".into();
-        let rows = delegate_panel_rows(&[d], 24).expect("rows for a configured delegate");
+        let rows = delegate_panel_rows(&[d], &ModelColors::new(), 24)
+            .expect("rows for a configured delegate");
         assert_eq!(rows[0].width(), 10); // "delegates:"
         let joined: String = rows[1..]
             .iter()
@@ -6947,7 +7046,7 @@ mod tests {
             );
         }
         // No delegate configured → the panel keeps its legacy fixed height.
-        assert!(delegate_panel_rows(&[], 24).is_none());
+        assert!(delegate_panel_rows(&[], &ModelColors::new(), 24).is_none());
     }
 
     #[test]
@@ -7677,7 +7776,8 @@ mod section_tests {
 
     #[test]
     fn user_turn_renders_as_prompt_echo_heading() {
-        let (rows, owner, ranges) = layout_chat_rows(&two_exchanges(), &[], "", 60);
+        let (rows, owner, ranges) =
+            layout_chat_rows(&two_exchanges(), &[], "", 60, &[], &ModelColors::new());
         // The user turn is a single "> first ask" row (heading, no "you" bar).
         assert_eq!(row_text(&rows[0]), "> first ask");
         assert_eq!(owner[0], Some(0));
@@ -7694,7 +7794,14 @@ mod section_tests {
 
     #[test]
     fn collapsed_section_hides_interior_but_keeps_flat_ranges() {
-        let (rows, owner, ranges) = layout_chat_rows(&two_exchanges(), &[true, false], "", 60);
+        let (rows, owner, ranges) = layout_chat_rows(
+            &two_exchanges(),
+            &[true, false],
+            "",
+            60,
+            &[],
+            &ModelColors::new(),
+        );
         let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
         // Exchange 0 collapsed: only its echo + a "… N more" marker show.
         assert!(all.contains("> first ask"), "{all}");
@@ -7717,10 +7824,24 @@ mod section_tests {
 
     #[test]
     fn expanding_a_section_restores_its_body() {
-        let (rows, _, _) = layout_chat_rows(&two_exchanges(), &[true, false], "", 60);
+        let (rows, _, _) = layout_chat_rows(
+            &two_exchanges(),
+            &[true, false],
+            "",
+            60,
+            &[],
+            &ModelColors::new(),
+        );
         let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
         assert!(!all.contains("secret reply 0"), "{all}");
-        let (rows, _, _) = layout_chat_rows(&two_exchanges(), &[false, false], "", 60);
+        let (rows, _, _) = layout_chat_rows(
+            &two_exchanges(),
+            &[false, false],
+            "",
+            60,
+            &[],
+            &ModelColors::new(),
+        );
         let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
         assert!(all.contains("secret reply 0"), "{all}");
         assert!(!all.contains("··· 1 more"), "{all}");
@@ -7730,7 +7851,7 @@ mod section_tests {
     fn wrapped_user_echo_indents_continuation_rows() {
         let text = "abcdefghijkl mnopqrstuvwxyz 1234567890";
         let chat = vec![Msg::authored(MsgKind::User, "you", text)];
-        let (rows, _, ranges) = layout_chat_rows(&chat, &[false], "", 12);
+        let (rows, _, ranges) = layout_chat_rows(&chat, &[false], "", 12, &[], &ModelColors::new());
         assert!(
             rows.len() >= 2,
             "expected wrapping into rows, got {}",
@@ -7811,11 +7932,11 @@ mod section_tests {
         let chat = two_exchanges();
         // First call builds the layout; a second call with the same epoch and
         // width must reuse it unchanged (the row layout is frame-stable).
-        let c = chat_cache(&mut cache, 7, 60, &chat, &[]);
+        let c = chat_cache(&mut cache, 7, 60, &chat, &[], &[], &ModelColors::new());
         let ranges = c.ranges.clone();
         let owner = c.owner.clone();
         let rows = c.rows.len();
-        let c2 = chat_cache(&mut cache, 7, 60, &chat, &[]);
+        let c2 = chat_cache(&mut cache, 7, 60, &chat, &[], &[], &ModelColors::new());
         assert_eq!(c2.ranges, ranges);
         assert_eq!(c2.owner, owner);
         assert_eq!(c2.rows.len(), rows);
@@ -7825,18 +7946,27 @@ mod section_tests {
     fn chat_cache_relayouts_on_width_change_and_epoch_bump() {
         let mut cache: Option<ChatRowsCache> = None;
         let chat = two_exchanges();
-        chat_cache(&mut cache, 1, 60, &chat, &[]);
+        chat_cache(&mut cache, 1, 60, &chat, &[], &[], &ModelColors::new());
         // A narrower terminal width re-wraps text: the row count must change.
-        let narrow = chat_cache(&mut cache, 1, 12, &chat, &[]);
+        let narrow = chat_cache(&mut cache, 1, 12, &chat, &[], &[], &ModelColors::new());
         let narrow_rows = narrow.rows.len();
         // An epoch bump (any chat/collapse mutation) must also rebuild.
-        let collapsed = chat_cache(&mut cache, 2, 12, &chat, &[true, false]);
+        let collapsed = chat_cache(
+            &mut cache,
+            2,
+            12,
+            &chat,
+            &[true, false],
+            &[],
+            &ModelColors::new(),
+        );
         assert!(
             collapsed.rows.len() < narrow_rows,
             "collapsing exchange 0 must shrink the layout"
         );
         // The rebuilt cache equals a fresh pure layout of the same inputs.
-        let (rows, owner, ranges) = layout_chat_rows(&chat, &[true, false], "", 12);
+        let (rows, owner, ranges) =
+            layout_chat_rows(&chat, &[true, false], "", 12, &[], &ModelColors::new());
         assert_eq!(collapsed.rows.len(), rows.len());
         assert_eq!(collapsed.owner, owner);
         assert_eq!(collapsed.ranges, ranges);

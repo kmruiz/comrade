@@ -1,5 +1,6 @@
 //! Comrade cockpit: headless runner and ratatui TUI.
 
+mod colors;
 mod editor;
 mod headless;
 mod tui;
