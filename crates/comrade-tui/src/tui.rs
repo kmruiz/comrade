@@ -4597,6 +4597,140 @@ fn layout_run(out: &mut Vec<RenderRow>, msg_idx: usize, children: &[Msg]) {
     });
 }
 
+/// Styled parts of one parsed code-location line: (text, style, space_before).
+/// `space_before` says whether a separating space precedes this part, so
+/// `crates/a.rs`, `:` and `42` stay glued while a snippet part is spaced off.
+type StyledPart = (String, Style, bool);
+
+/// Split a `path:line[:col] snippet` line into (path, line, snippet), or None
+/// when the line is not a code location. The path must look like a file (carry
+/// a '/' or '.') so prose such as `note: 5` is never mistaken for a location.
+fn split_path_line(line: &str) -> Option<(&str, &str, &str)> {
+    let colon = line.find(':')?;
+    let path = &line[..colon];
+    if path.is_empty() || path.contains(' ') || !(path.contains('/') || path.contains('.')) {
+        return None;
+    }
+    let after = &line[colon + 1..];
+    let nl = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if nl == 0 {
+        return None;
+    }
+    let num = &after[..nl];
+    let mut rest = &after[nl..];
+    if let Some(r) = rest.strip_prefix(':') {
+        let cl = r.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if cl > 0 {
+            rest = &r[cl..];
+        }
+    }
+    if !(rest.is_empty() || rest.starts_with(':') || rest.starts_with(' ')) {
+        return None;
+    }
+    Some((path, num, rest.trim_start_matches([':', ' ', '\t'])))
+}
+
+/// Parse a tool-result line that names a code location into styled parts.
+/// Handles the shapes Comrade tools emit:
+///   * `path:line: snippet` / `path:line:col  snippet` (fs_rgrep, ts_find_references)
+///   * `kind name | signature @ line` (ts_find_symbol, ts_list_symbols, ...)
+fn loc_parts(line: &str) -> Option<Vec<StyledPart>> {
+    let bold = |c: Color| Style::default().fg(c).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    if let Some((path, num, snippet)) = split_path_line(line) {
+        let mut parts: Vec<StyledPart> = vec![
+            (path.to_string(), bold(Color::Cyan), false),
+            (":".to_string(), dim, false),
+            (num.to_string(), bold(Color::Yellow), false),
+        ];
+        if !snippet.is_empty() {
+            parts.push((snippet.to_string(), Style::default().fg(Color::White), true));
+        }
+        return Some(parts);
+    }
+    // `... @ line` — the line number sits at the very end.
+    if let Some(idx) = line.rfind(" @ ") {
+        let after = &line[idx + 3..];
+        let dn = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if dn > 0 && after[dn..].trim().is_empty() {
+            let head = line[..idx].trim_start();
+            let mut parts: Vec<StyledPart> = Vec::new();
+            if !head.is_empty() {
+                parts.push((head.to_string(), Style::default().fg(Color::White), false));
+            }
+            parts.push(("@".to_string(), dim, true));
+            parts.push((after[..dn].to_string(), bold(Color::Yellow), true));
+            return Some(parts);
+        }
+    }
+    None
+}
+
+/// Wrap styled parts into rows of at most `width` columns, breaking on spaces
+/// and inserting a single space wherever a part asked for one. Parts that do not
+/// (`crates/a.rs`, `:`, `42`) stay glued together.
+fn wrap_styled(parts: &[StyledPart], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_len = 0usize;
+    for (text, style, space_before) in parts {
+        for (k, word) in text.split(' ').enumerate() {
+            if word.is_empty() {
+                continue;
+            }
+            let before = if k == 0 { *space_before } else { true };
+            if !cur.is_empty() && cur_len + usize::from(before) + word.chars().count() > width {
+                rows.push(std::mem::take(&mut cur));
+                cur_len = 0;
+            }
+            if !cur.is_empty() && before {
+                cur.push(Span::styled(" ".to_string(), Style::default()));
+                cur_len += 1;
+            }
+            cur.push(Span::styled(word.to_string(), *style));
+            cur_len += word.chars().count();
+        }
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows
+}
+
+/// Render a tool result as styled chat rows: code-location lines get their file
+/// name and line number emphasised (bold cyan path, bold yellow number) while
+/// every other line keeps the legacy single-colour wrapped rendering.
+fn result_rows(result: &str, ok: bool, width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let fallback = if ok { Color::Green } else { Color::Red };
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    for line in result.split('\n') {
+        if let Some(name) = line
+            .trim_end()
+            .strip_prefix("== ")
+            .and_then(|s| s.strip_suffix(" =="))
+        {
+            rows.push(vec![Span::styled(
+                format!("== {name} =="),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]);
+        } else if let Some(parts) = loc_parts(line) {
+            rows.extend(wrap_styled(&parts, width));
+        } else {
+            for s in plain_wrap(line, width) {
+                rows.push(vec![Span::styled(s, Style::default().fg(fallback))]);
+            }
+        }
+    }
+    rows
+}
+
 fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width: usize) {
     let (icon, accent) = tool_icon(&card.name);
     // Reading/search tools are the chat's filler; dim them so prose and the
@@ -4754,10 +4888,10 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             spans: vec![Span::styled("result:", Style::default().fg(color))],
             tool_header: None,
         });
-        for s in plain_wrap(result, width) {
+        for row in result_rows(result, card.ok, width) {
             out.push(RenderRow {
                 rule: None,
-                spans: vec![Span::styled(s, Style::default().fg(color))],
+                spans: row,
                 tool_header: None,
             });
         }
@@ -6987,6 +7121,74 @@ mod tests {
         // A fix round uses the very same envelope.
         let fix = format!("delegate mistral (mistral) replied:\n{out}");
         assert_eq!(parse_delegate_reply(&fix).unwrap().0, "mistral");
+    }
+
+    #[test]
+    fn loc_parts_styles_path_and_line() {
+        let parts = loc_parts("crates/a.rs:42: let x = 1;").unwrap();
+        // path, ':', number, snippet
+        assert_eq!(parts[0].0, "crates/a.rs");
+        assert_eq!(parts[0].1.fg, Some(Color::Cyan));
+        assert_eq!(parts[1].0, ":");
+        assert_eq!(parts[2].0, "42");
+        assert_eq!(parts[2].1.fg, Some(Color::Yellow));
+        assert_eq!(parts[3].0, "let x = 1;");
+    }
+
+    #[test]
+    fn loc_parts_handles_column_and_double_space() {
+        // ts_find_references: `file:line:col  context`
+        let parts = loc_parts("crates/a.rs:12:7  let y = 2;").unwrap();
+        assert_eq!(parts[0].0, "crates/a.rs");
+        assert_eq!(parts[2].0, "12");
+        assert_eq!(parts[3].0, "let y = 2;");
+    }
+
+    #[test]
+    fn loc_parts_handles_at_line_form() {
+        let parts = loc_parts("fn build | pub fn build(x: u32) @ 42").unwrap();
+        assert_eq!(parts[parts.len() - 1].0, "42");
+        assert_eq!(parts[parts.len() - 1].1.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn loc_parts_rejects_prose() {
+        assert!(loc_parts("just some text").is_none());
+        assert!(loc_parts("note: 5").is_none());
+        assert!(loc_parts("test result: ok. 5 passed; 0 failed").is_none());
+    }
+
+    #[test]
+    fn result_rows_glues_location_and_styles_snippet() {
+        let rows = result_rows("crates/a.rs:42: let x = 1;", true, 80);
+        let flat: String = rows
+            .iter()
+            .map(|r| r.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        assert!(flat.contains("crates/a.rs:42"));
+        assert!(rows[0].iter().any(|s| s.style.fg == Some(Color::Cyan)));
+        assert!(rows[0].iter().any(|s| s.style.fg == Some(Color::Yellow)));
+    }
+
+    #[test]
+    fn result_rows_falls_back_to_single_colour() {
+        let rows = result_rows("ok\nnothing here", true, 80);
+        assert!(!rows.is_empty());
+        assert!(rows
+            .iter()
+            .all(|r| r.iter().all(|s| s.style.fg == Some(Color::Green))));
+        let failed = result_rows("boom", false, 80);
+        assert!(failed
+            .iter()
+            .all(|r| r.iter().all(|s| s.style.fg == Some(Color::Red))));
+    }
+
+    #[test]
+    fn result_rows_styles_file_header() {
+        let rows = result_rows("== crates/a.rs ==", false, 80);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].content.as_ref(), "== crates/a.rs ==");
+        assert_eq!(rows[0][0].style.fg, Some(Color::Cyan));
     }
 
     #[test]
