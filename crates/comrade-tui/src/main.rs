@@ -214,6 +214,34 @@ fn advise_registry() -> ToolRegistry {
     reg
 }
 
+/// An agent event tagged with the id of the session that produced it. The TUI
+/// keeps several sessions open at once (each with its own run-facing channel)
+/// and routes every event to the session that owns it.
+pub(crate) type TaggedEvent = (u64, comrade_core::AgentEvent);
+
+/// Spawn the relay task for one session: a bounded run-facing channel whose
+/// events are forwarded, tagged with `id`, into the UI's central unbounded
+/// queue. The run task streams into the returned bounded sender and awaits each
+/// send, so the bounded side must always be drained on its own task (freeze
+/// notes #25/#29: a wedged repaint filling the channel parked the run mid-turn).
+/// The central unbounded queue cannot exert back-pressure, and it is the single
+/// queue the UI drains at its own pace.
+pub(crate) fn spawn_tagged_relay(
+    id: u64,
+    central: tokio::sync::mpsc::UnboundedSender<TaggedEvent>,
+) -> tokio::sync::mpsc::Sender<comrade_core::AgentEvent> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<comrade_core::AgentEvent>(512);
+    tokio::spawn(async move {
+        let mut rx = rx;
+        while let Some(ev) = rx.recv().await {
+            if central.send((id, ev)).is_err() {
+                break; // UI is gone; drop the rest.
+            }
+        }
+    });
+    tx
+}
+
 /// Session state + undo log wired to a fresh event channel. The caller chooses
 /// how to drive `user` (TUI dialogs or headless stdin/policy).
 struct SessionBundle {
@@ -221,27 +249,14 @@ struct SessionBundle {
     ctx_base: ToolContext,
 }
 
-fn new_session(
+/// Wire a fresh [`comrade_core::AgentSession`] + [`ToolContext`] to `tx`, the
+/// session's own run-facing event sender (see [`spawn_tagged_relay`]).
+pub(crate) fn session_bundle(
     deps: &Deps,
     user: Arc<dyn comrade_tool::UserIo>,
-) -> (
-    SessionBundle,
-    tokio::sync::mpsc::Sender<comrade_core::AgentEvent>,
-    tokio::sync::mpsc::UnboundedReceiver<comrade_core::AgentEvent>,
-) {
-    // The run task streams AgentEvents into `tx` (cap 512) and awaits each
-    // send, so a slow UI must never be able to back-pressure the run (freeze
-    // notes #25/#29: a wedged repaint filled the channel and parked the run
-    // at turn end, making the app look dead). A dedicated relay task drains
-    // `tx` and hands events to the UI over an unbounded channel, so the run
-    // always makes progress; the UI consumes the unbounded side at its own
-    // pace (repaint capping, not queue back-pressure, throttles it). All
-    // channel operations that can wait now run on background tasks/threads,
-    // never on the UI event loop.
-    let (tx, rx) = tokio::sync::mpsc::channel(512);
-    let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
-    spawn_event_relay(rx, ui_tx);
-    let session = Arc::new(comrade_core::AgentSession::new(tx.clone()));
+    tx: tokio::sync::mpsc::Sender<comrade_core::AgentEvent>,
+) -> SessionBundle {
+    let session = Arc::new(comrade_core::AgentSession::new(tx));
     let undo = Arc::new(MemoryUndo::new(deps.root.clone()));
     let ctx_base = ToolContext {
         project_root: deps.root.clone(),
@@ -255,7 +270,21 @@ fn new_session(
         steer: None,
         stop: None,
     };
-    (SessionBundle { session, ctx_base }, tx, ui_rx)
+    SessionBundle { session, ctx_base }
+}
+
+fn new_session(
+    deps: &Deps,
+    user: Arc<dyn comrade_tool::UserIo>,
+) -> (
+    SessionBundle,
+    tokio::sync::mpsc::Sender<comrade_core::AgentEvent>,
+    tokio::sync::mpsc::UnboundedReceiver<comrade_core::AgentEvent>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(512);
+    let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_event_relay(rx, ui_tx);
+    (session_bundle(deps, user, tx.clone()), tx, ui_rx)
 }
 
 #[tokio::main]
@@ -305,5 +334,23 @@ mod tests {
             received += 1;
         }
         assert_eq!(received, total, "every sent event must reach the UI queue");
+    }
+
+    /// Each session's relay tags its events with that session's id, so the TUI
+    /// can route an event to the session that produced it (even a background
+    /// one running while another session is on screen).
+    #[tokio::test]
+    async fn tagged_relay_stamps_events_with_the_session_id() {
+        let (central_tx, mut central_rx) = tokio::sync::mpsc::unbounded_channel::<TaggedEvent>();
+        let tx = spawn_tagged_relay(7, central_tx);
+        tx.send(comrade_core::AgentEvent::RunStart).await.unwrap();
+        let (id, ev) = central_rx.recv().await.unwrap();
+        assert_eq!(id, 7);
+        assert!(matches!(ev, comrade_core::AgentEvent::RunStart));
+        // Order is preserved across the relay.
+        tx.send(comrade_core::AgentEvent::RunEnd).await.unwrap();
+        let (id, ev) = central_rx.recv().await.unwrap();
+        assert_eq!(id, 7);
+        assert!(matches!(ev, comrade_core::AgentEvent::RunEnd));
     }
 }

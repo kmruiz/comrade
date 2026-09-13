@@ -49,7 +49,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::editor::{Editor, LayoutRow, cursor_col, cursor_row, wrap_rows};
 use crate::session_store::SessionFile;
-use crate::{Deps, new_session};
+use crate::{Deps, TaggedEvent, session_bundle, spawn_tagged_relay};
 
 /// Width of the `"> "` gutter on the prompt line (also used as the indent
 /// for continuation rows).
@@ -569,7 +569,7 @@ impl MxCommand {
             MxCommand::MoveBlockUp => "move to the previous chat block",
             MxCommand::MoveUserDown => "jump to the next message you sent",
             MxCommand::MoveUserUp => "jump to the previous message you sent",
-            MxCommand::NewSession => "start a fresh session (clears the chat, plan and context)",
+            MxCommand::NewSession => "open a new session (the current one keeps running)",
             MxCommand::QueuePrompt => "hold the prompt and submit it when the current run ends",
             MxCommand::Quit => "quit the cockpit",
             MxCommand::ReloadConfig => "reload the config file without restarting",
@@ -660,16 +660,60 @@ fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
     &a[..a.char_indices().nth(n).map_or(a.len(), |(i, _)| i)]
 }
 
-/// One session opened in this run. The active session's live state lives in the
-/// App's own fields; every other slot keeps a serialized snapshot so it can be
-/// switched back to (Ctrl-x C-b / `switch-session`).
+/// One session opened in this run. Every non-active slot owns its whole live
+/// state ([`LiveState`]); the active slot's state lives in the App's own fields.
+///
+/// A session can keep running in the background: its slot's [`LiveState`] holds
+/// the run handle, the chat, the context metrics, and the session's own
+/// run-facing event sender, so events keep arriving and are routed back to it
+/// even while another session is on screen.
 struct OpenSession {
+    /// Stable identity used to route [`crate::TaggedEvent`]s to this session.
+    id: u64,
     /// Display name (the session's title) shown in the switcher.
     title: String,
     /// Path the session was last saved to or loaded from, when known.
     file: Option<std::path::PathBuf>,
-    /// Saved snapshot of a non-active session (None for the active slot).
-    state: Option<Box<SessionFile>>,
+    /// Parked live state of a non-active session (None for the active slot).
+    live: Option<Box<LiveState>>,
+}
+
+/// The per-session half of the App's state: everything that belongs to one
+/// session and is swapped in and out of the App's own fields when the active
+/// session changes (or when an event for a background session must be applied).
+///
+/// Keeping this as a swappable struct lets a session keep running while parked:
+/// its run task holds clones of the Arcs it needs, and its events are applied by
+/// temporarily swapping its `LiveState` into the App.
+struct LiveState {
+    session: Arc<AgentSession>,
+    ctx_base: ToolContext,
+    /// Rolling conversation history for this session.
+    history: Arc<tokio::sync::Mutex<ContextManager>>,
+    /// This session's run-facing (bounded) event sender; its relay tags events
+    /// with the session id and forwards them to the App's central queue.
+    run_tx: mpsc::Sender<AgentEvent>,
+    stop: Option<CancellationToken>,
+    run_handle: Option<tokio::task::JoinHandle<()>>,
+    running: bool,
+    steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    queued_prompt: Option<String>,
+    run_cancelled: bool,
+    chat: Vec<Msg>,
+    section_collapsed: Vec<bool>,
+    chat_epoch: u64,
+    chat_rows_cache: Option<ChatRowsCache>,
+    stream: String,
+    ctx_tokens: usize,
+    ctx_budget: usize,
+    ctx_estimated: bool,
+    activity: Option<String>,
+    session_file: Option<std::path::PathBuf>,
+    sel: Option<usize>,
+    scroll_top: usize,
+    follow: bool,
+    was_at_bottom: bool,
+    search: Option<Search>,
 }
 
 /// What a save/load session path prompt does once confirmed.
@@ -718,8 +762,13 @@ struct App {
     /// automatically as it approaches the token budget.
     history: Arc<tokio::sync::Mutex<ContextManager>>,
 
-    events_tx: mpsc::Sender<AgentEvent>,
-    events_rx: mpsc::UnboundedReceiver<AgentEvent>,
+    /// Central, UI-facing event queue: every session's relay pushes
+    /// `(session_id, event)` here (see [`crate::spawn_tagged_relay`]).
+    events_tx: mpsc::UnboundedSender<TaggedEvent>,
+    events_rx: mpsc::UnboundedReceiver<TaggedEvent>,
+    /// Run-facing event sender of the ACTIVE session (moved here from its
+    /// [`LiveState`]); the run task and the AgentSession stream into it.
+    run_tx: mpsc::Sender<AgentEvent>,
     asks_rx: mpsc::Receiver<PendingAsk>,
 
     stop: Option<CancellationToken>,
@@ -819,10 +868,16 @@ struct App {
     clipboard: Option<Clipboard>,
 
     /// Sessions opened in this run; the active one's live state is in the App
-    /// fields above, the others keep a saved snapshot (see [`OpenSession`]).
+    /// fields above, the others keep their own [`LiveState`] (see [`OpenSession`]).
     open_sessions: Vec<OpenSession>,
     /// Index of the active session within `open_sessions`.
     active: usize,
+    /// Next session id to hand out (0 is the session opened at startup).
+    next_session_id: u64,
+    /// While an event for a background session is being applied, the index of
+    /// that slot (so handlers like [`App::refresh_active_slot`] write to the
+    /// right session). None = handling the active session.
+    handling_bg: Option<usize>,
     /// Path the active session was last saved to or loaded from (Save default).
     session_file: Option<std::path::PathBuf>,
     /// True between a Ctrl-x prefix key and the key that selects the command.
@@ -1241,8 +1296,8 @@ impl App {
         // One conversation per session: every task appends to the same history,
         // which the agent compacts itself as it approaches the token budget.
         let history = self.history.clone();
-        let tx = self.events_tx.clone();
-        let balance_tx = self.events_tx.clone();
+        let tx = self.run_tx.clone();
+        let balance_tx = self.run_tx.clone();
         let stop = CancellationToken::new();
         self.stop = Some(stop.clone());
         self.running = true;
@@ -1289,6 +1344,7 @@ impl App {
         const GRACE: Duration = Duration::from_millis(1500);
         if let Some(handle) = self.run_handle.take() {
             let tx = self.events_tx.clone();
+            let id = self.active_id();
             tokio::spawn(async move {
                 let deadline = tokio::time::Instant::now() + GRACE;
                 loop {
@@ -1301,7 +1357,7 @@ impl App {
                         // The aborted task never sends RunEnd; synthesize it so
                         // the UI clears the running state. Duplicate RunEnds are
                         // harmless (see on_agent_event).
-                        let _ = tx.send(AgentEvent::RunEnd).await;
+                        let _ = tx.send((id, AgentEvent::RunEnd));
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1601,64 +1657,22 @@ impl App {
     }
 
     /// Open a new empty session and switch to it, keeping the current one open
-    /// and switchable — the emacs `C-x b <new-name>` scratch-buffer behaviour:
-    /// a brand-new [`AgentSession`] (plan/status/title reset), a new undo log
-    /// and tool context, a clean rolling conversation history, and an empty chat
-    /// transcript. The current session is stashed into its slot first, so
-    /// nothing is lost. Only applies while idle.
+    /// and switchable — the emacs `C-x b <new-name>` scratch-buffer behaviour.
+    /// The current session is parked in its slot (live state intact); if it has
+    /// a run in flight, that run keeps running in the background and its events
+    /// keep arriving into its own chat, so switching back shows the result.
     fn new_session(&mut self) {
-        if self.running {
-            self.push_meta("cannot start a new session while a run is in flight");
-            return;
-        }
-        // Preserve the current session in its slot before opening a new one.
-        self.stash_active();
-        let user = self.ctx_base.user.clone();
-        let undo = Arc::new(comrade_core::MemoryUndo::new(self.root.clone()));
-        let session = Arc::new(AgentSession::new(self.events_tx.clone()));
-        let ctx_base = ToolContext {
-            project_root: self.root.clone(),
-            cwd: self.root.clone(),
-            session: session.clone().as_control(),
-            user,
-            undo,
-            auto_approve: self.cfg.auto_approve(),
-            approval: Default::default(),
-            events: Arc::new(comrade_tool::NoopEvents),
-            steer: None,
-            stop: None,
-        };
-        self.session = session;
-        self.ctx_base = ctx_base;
-        self.history = Arc::new(tokio::sync::Mutex::new(build_session_context(
-            &self.cfg,
-            &self.root.to_string_lossy(),
-            &self.tools,
-        )));
-        // Clear the transcript and everything derived from it; push_meta below
-        // bumps chat_epoch so the row-layout cache is invalidated.
-        self.chat.clear();
-        self.section_collapsed.clear();
-        self.chat_rows_cache = None;
-        self.stream.clear();
-        self.search = None;
-        self.sel = None;
-        self.scroll_top = 0;
-        self.follow = true;
-        self.was_at_bottom = true;
-        self.ctx_tokens = 0;
-        self.ctx_estimated = true;
-        self.steer_tx = None;
-        self.queued_prompt = None;
-        self.run_cancelled = false;
-        // Open a fresh slot and make it the active session.
+        let id = self.next_id();
+        let incoming = self.fresh_live(id);
+        let outgoing = self.swap_live(incoming);
+        self.open_sessions[self.active].live = Some(Box::new(outgoing));
         self.open_sessions.push(OpenSession {
+            id,
             title: "New session".to_string(),
             file: None,
-            state: None,
+            live: None,
         });
         self.active = self.open_sessions.len() - 1;
-        self.session_file = None;
         self.ctrl_x = false;
         self.path_prompt = None;
         self.session_pick = None;
@@ -1666,11 +1680,12 @@ impl App {
     }
 
     /// Close the active session (emacs `C-x k`): discard its slot and activate a
-    /// neighbour. Refuses to close the only open session, so there is always a
-    /// session to work in.
+    /// neighbour (swapping the neighbour's live state in). Refuses to close the
+    /// only open session, or one with a run in flight, so there is always a
+    /// session to work in and no run is silently dropped.
     fn kill_session(&mut self) {
         if self.running {
-            self.push_meta("cannot close a session while a run is in flight");
+            self.push_meta("cannot close a session while its run is in flight");
             return;
         }
         if self.open_sessions.len() <= 1 {
@@ -1681,13 +1696,10 @@ impl App {
         self.open_sessions.remove(self.active);
         let idx = self.active.min(self.open_sessions.len() - 1);
         self.active = idx;
-        // Every non-active slot carries a snapshot (the live state was the one
-        // we just dropped), so activating the neighbour restores its state.
-        let file = self.open_sessions[idx].file.clone();
-        let title = self.open_sessions[idx].title.clone();
-        if let Some(state) = self.open_sessions[idx].state.take() {
-            self.apply_session(*state, file);
-            self.open_sessions[idx].title = title;
+        if let Some(incoming) = self.open_sessions[idx].live.take() {
+            // Swapping the neighbour in drops the killed session's live state.
+            let _killed = self.swap_live(*incoming);
+            self.chat_rows_cache = None;
         }
         self.push_meta(format!("closed session \"{killed}\""));
     }
@@ -1716,74 +1728,237 @@ impl App {
         }
     }
 
-    /// Replace the active session's live state with a loaded snapshot.
-    fn apply_session(&mut self, file: SessionFile, path: Option<std::path::PathBuf>) {
-        let user = self.ctx_base.user.clone();
-        let undo = Arc::new(comrade_core::MemoryUndo::new(self.root.clone()));
-        let session = Arc::new(AgentSession::new(self.events_tx.clone()));
-        let ctx_base = ToolContext {
+    /// Hand out the next session id.
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_session_id;
+        self.next_session_id += 1;
+        id
+    }
+
+    /// id of the active session.
+    fn active_id(&self) -> u64 {
+        self.open_sessions[self.active].id
+    }
+
+    /// True while ANY open session has a run in flight (the active one or a
+    /// background one), so the plan spinner keeps ticking.
+    fn any_running(&self) -> bool {
+        self.running
+            || self
+                .open_sessions
+                .iter()
+                .any(|s| s.live.as_ref().is_some_and(|l| l.running))
+    }
+
+    /// Slot index of the session with `id`, if it is still open.
+    fn session_index(&self, id: u64) -> Option<usize> {
+        self.open_sessions.iter().position(|s| s.id == id)
+    }
+
+    /// Build an empty live session: a fresh [`AgentSession`], undo log, tool
+    /// context, rolling history and blank transcript, wired to its own tagged
+    /// event relay.
+    fn fresh_live(&self, id: u64) -> LiveState {
+        let run_tx = spawn_tagged_relay(id, self.events_tx.clone());
+        let session = Arc::new(AgentSession::new(run_tx.clone()));
+        let ctx_base = self.make_ctx_base(
+            session.clone(),
+            Arc::new(comrade_core::MemoryUndo::new(self.root.clone())),
+        );
+        let history = Arc::new(tokio::sync::Mutex::new(build_session_context(
+            &self.cfg,
+            &self.root.to_string_lossy(),
+            &self.tools,
+        )));
+        LiveState {
+            session,
+            ctx_base,
+            history,
+            run_tx,
+            stop: None,
+            run_handle: None,
+            running: false,
+            steer_tx: None,
+            queued_prompt: None,
+            run_cancelled: false,
+            chat: Vec::new(),
+            section_collapsed: Vec::new(),
+            chat_epoch: 0,
+            chat_rows_cache: None,
+            stream: String::new(),
+            ctx_tokens: 0,
+            ctx_budget: self
+                .cfg
+                .llm
+                .context_window
+                .unwrap_or(self.cfg.context.budget_tokens),
+            ctx_estimated: true,
+            activity: None,
+            session_file: None,
+            sel: None,
+            scroll_top: 0,
+            follow: true,
+            was_at_bottom: true,
+            search: None,
+        }
+    }
+
+    /// Build a [`ToolContext`] for a session from the shared per-app bits.
+    fn make_ctx_base(
+        &self,
+        session: Arc<AgentSession>,
+        undo: Arc<comrade_core::MemoryUndo>,
+    ) -> ToolContext {
+        ToolContext {
             project_root: self.root.clone(),
             cwd: self.root.clone(),
-            session: session.clone().as_control(),
-            user,
+            session: session.as_control(),
+            user: self.ctx_base.user.clone(),
             undo,
             auto_approve: self.cfg.auto_approve(),
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             stop: None,
-        };
+        }
+    }
+
+    /// Build a live session from a loaded/forked [`SessionFile`].
+    fn live_from_file(
+        &self,
+        id: u64,
+        file: SessionFile,
+        path: Option<std::path::PathBuf>,
+    ) -> LiveState {
+        let run_tx = spawn_tagged_relay(id, self.events_tx.clone());
+        let session = Arc::new(AgentSession::new(run_tx.clone()));
+        let ctx_base = self.make_ctx_base(
+            session.clone(),
+            Arc::new(comrade_core::MemoryUndo::new(self.root.clone())),
+        );
         let delegated: HashSet<u64> = file.delegated.iter().copied().collect();
         let budget = file.ctx_budget.max(1);
         session.restore(file.title, file.status, file.plan, delegated, file.finished);
-        let history = ContextManager::from_parts(
+        let history = Arc::new(tokio::sync::Mutex::new(ContextManager::from_parts(
             budget,
             self.cfg.context.max_tool_output_chars,
             file.history,
             file.rollup,
             file.evicted,
-        );
-        self.session = session;
-        self.ctx_base = ctx_base;
-        self.history = Arc::new(tokio::sync::Mutex::new(history));
-        self.chat = file.chat;
-        self.section_collapsed = file.section_collapsed;
-        self.chat_rows_cache = None;
-        self.chat_epoch = self.chat_epoch.wrapping_add(1);
-        self.stream.clear();
-        self.search = None;
-        self.sel = None;
-        self.scroll_top = 0;
-        self.follow = true;
-        self.was_at_bottom = true;
-        self.ctx_tokens = file.ctx_tokens;
-        self.ctx_budget = budget;
-        self.ctx_estimated = file.ctx_estimated;
-        self.steer_tx = None;
-        self.queued_prompt = None;
-        self.run_cancelled = false;
-        self.session_file = path;
+        )));
+        LiveState {
+            session,
+            ctx_base,
+            history,
+            run_tx,
+            stop: None,
+            run_handle: None,
+            running: false,
+            steer_tx: None,
+            queued_prompt: None,
+            run_cancelled: false,
+            chat: file.chat,
+            section_collapsed: file.section_collapsed,
+            chat_epoch: 0,
+            chat_rows_cache: None,
+            stream: String::new(),
+            ctx_tokens: file.ctx_tokens,
+            ctx_budget: budget,
+            ctx_estimated: file.ctx_estimated,
+            activity: None,
+            session_file: path,
+            sel: None,
+            scroll_top: 0,
+            follow: true,
+            was_at_bottom: true,
+            search: None,
+        }
     }
 
-    /// Refresh the active slot's title/file from the live session.
+    /// Swap the per-session fields between the App and `incoming`, returning the
+    /// App's previous live state. Every field is moved (O(1)), so swapping is
+    /// cheap enough to do per background event.
+    fn swap_live(&mut self, mut incoming: LiveState) -> LiveState {
+        std::mem::swap(&mut self.session, &mut incoming.session);
+        std::mem::swap(&mut self.ctx_base, &mut incoming.ctx_base);
+        std::mem::swap(&mut self.history, &mut incoming.history);
+        std::mem::swap(&mut self.run_tx, &mut incoming.run_tx);
+        std::mem::swap(&mut self.stop, &mut incoming.stop);
+        std::mem::swap(&mut self.run_handle, &mut incoming.run_handle);
+        std::mem::swap(&mut self.running, &mut incoming.running);
+        std::mem::swap(&mut self.steer_tx, &mut incoming.steer_tx);
+        std::mem::swap(&mut self.queued_prompt, &mut incoming.queued_prompt);
+        std::mem::swap(&mut self.run_cancelled, &mut incoming.run_cancelled);
+        std::mem::swap(&mut self.chat, &mut incoming.chat);
+        std::mem::swap(&mut self.section_collapsed, &mut incoming.section_collapsed);
+        std::mem::swap(&mut self.chat_epoch, &mut incoming.chat_epoch);
+        std::mem::swap(&mut self.chat_rows_cache, &mut incoming.chat_rows_cache);
+        std::mem::swap(&mut self.stream, &mut incoming.stream);
+        std::mem::swap(&mut self.ctx_tokens, &mut incoming.ctx_tokens);
+        std::mem::swap(&mut self.ctx_budget, &mut incoming.ctx_budget);
+        std::mem::swap(&mut self.ctx_estimated, &mut incoming.ctx_estimated);
+        std::mem::swap(&mut self.activity, &mut incoming.activity);
+        std::mem::swap(&mut self.session_file, &mut incoming.session_file);
+        std::mem::swap(&mut self.sel, &mut incoming.sel);
+        std::mem::swap(&mut self.scroll_top, &mut incoming.scroll_top);
+        std::mem::swap(&mut self.follow, &mut incoming.follow);
+        std::mem::swap(&mut self.was_at_bottom, &mut incoming.was_at_bottom);
+        std::mem::swap(&mut self.search, &mut incoming.search);
+        incoming
+    }
+
+    /// Park the active session into its slot and swap the session at `idx` in.
+    fn activate(&mut self, idx: usize) {
+        if idx == self.active || idx >= self.open_sessions.len() {
+            return;
+        }
+        let Some(incoming) = self.open_sessions[idx].live.take() else {
+            return;
+        };
+        let outgoing = self.swap_live(*incoming);
+        self.open_sessions[self.active].live = Some(Box::new(outgoing));
+        self.active = idx;
+        self.chat_rows_cache = None;
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
+    }
+
+    /// The session that now owns `id` is not the active one: swap it in, apply
+    /// the event to it, and swap it back, so its chat/metrics/plan keep updating
+    /// while it runs in the background.
+    fn on_agent_event_for(&mut self, id: u64, event: AgentEvent) {
+        if id == self.active_id() {
+            self.on_agent_event(event);
+            return;
+        }
+        let Some(idx) = self.session_index(id) else {
+            return; // session was closed; drop the event
+        };
+        let Some(incoming) = self.open_sessions[idx].live.take() else {
+            return;
+        };
+        self.handling_bg = Some(idx);
+        let active_live = self.swap_live(*incoming);
+        self.on_agent_event(event);
+        let bg = self.swap_live(active_live);
+        self.open_sessions[idx].live = Some(Box::new(bg));
+        // Keep the switcher's title in sync with the background session.
+        self.open_sessions[idx].title = self.open_sessions[idx]
+            .live
+            .as_ref()
+            .unwrap()
+            .session
+            .title();
+        self.handling_bg = None;
+    }
+
+    /// Refresh the ACTIVE slot's (or, while a background event is handled, that
+    /// slot's) title/file from the live session.
     fn refresh_active_slot(&mut self) {
-        if let Some(slot) = self.open_sessions.get_mut(self.active) {
+        let idx = self.handling_bg.unwrap_or(self.active);
+        if let Some(slot) = self.open_sessions.get_mut(idx) {
             slot.title = self.session.title();
             slot.file = self.session_file.clone();
         }
-    }
-
-    /// Stash the active session's live state into its slot (before switching).
-    fn stash_active(&mut self) {
-        if self.active >= self.open_sessions.len() {
-            return;
-        }
-        let state = self.session_snapshot();
-        let file = self.session_file.clone();
-        let slot = &mut self.open_sessions[self.active];
-        slot.title = state.title.clone();
-        slot.file = file;
-        slot.state = Some(Box::new(state));
     }
 
     /// Switch the active session to the slot at `idx`.
@@ -1791,18 +1966,9 @@ impl App {
         if idx == self.active || idx >= self.open_sessions.len() {
             return;
         }
-        self.stash_active();
-        let file = self.open_sessions[idx].file.clone();
         let title = self.open_sessions[idx].title.clone();
-        match self.open_sessions[idx].state.take() {
-            Some(state) => {
-                self.active = idx;
-                self.apply_session(*state, file);
-                self.open_sessions[idx].title = title.clone();
-                self.push_meta(format!("switched to session \"{title}\""));
-            }
-            None => self.push_meta("session has no saved state yet"),
-        }
+        self.activate(idx);
+        self.push_meta(format!("switched to session \"{title}\""));
     }
 
     /// Write the active session to `path`.
@@ -1818,11 +1984,12 @@ impl App {
         }
     }
 
-    /// Read a session from `path` and make it the active session.
+    /// Read a session from `path` and make it the active session (the current
+    /// one is parked, live state intact).
     fn load_from(&mut self, path: std::path::PathBuf) {
         match crate::session_store::load(&path) {
             Ok(file) => {
-                self.stash_active();
+                let mut file = file;
                 let mut title = file.title.clone();
                 if title.trim().is_empty() {
                     title = path
@@ -1830,15 +1997,19 @@ impl App {
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_else(|| "session".to_string());
                 }
-                let mut file = file;
                 file.title = title.clone();
-                self.apply_session(file, Some(path.clone()));
+                let id = self.next_id();
+                let incoming = self.live_from_file(id, file, Some(path.clone()));
+                let outgoing = self.swap_live(incoming);
+                self.open_sessions[self.active].live = Some(Box::new(outgoing));
                 self.open_sessions.push(OpenSession {
+                    id,
                     title: title.clone(),
                     file: Some(path.clone()),
-                    state: None,
+                    live: None,
                 });
                 self.active = self.open_sessions.len() - 1;
+                self.chat_rows_cache = None;
                 self.push_meta(format!(
                     "loaded session \"{title}\" from {}",
                     path.display()
@@ -1850,29 +2021,39 @@ impl App {
 
     /// Fork the active session into an independent, immediately-active copy.
     fn fork_session(&mut self) {
+        // Forking snapshots the active session; its rolling history is locked
+        // while it runs, so refuse then (a background run does not block a fork
+        // of the idle active session).
         if self.running {
-            self.push_meta("cannot fork a session while a run is in flight");
+            self.push_meta("cannot fork the active session while its run is in flight");
             return;
         }
         let mut fork = self.session_snapshot();
-        self.stash_active();
         let orig = fork.title.clone();
         let title = format!("{orig} (fork)");
         fork.title = title.clone();
+        let id = self.next_id();
+        let incoming = self.live_from_file(id, fork, None);
+        let outgoing = self.swap_live(incoming);
+        self.open_sessions[self.active].live = Some(Box::new(outgoing));
         self.open_sessions.push(OpenSession {
+            id,
             title: title.clone(),
             file: None,
-            state: None,
+            live: None,
         });
         self.active = self.open_sessions.len() - 1;
-        self.apply_session(fork, None);
+        self.chat_rows_cache = None;
         self.push_meta(format!("forked session \"{orig}\" as \"{title}\""));
     }
 
     /// Open the path prompt to save the active session (Ctrl-x C-s).
     fn save_session_prompt(&mut self) {
+        // Saving snapshots the active session; its rolling history is locked
+        // while it runs, so refuse then (a background run does not block saving
+        // the idle active session).
         if self.running {
-            self.push_meta("cannot save a session while a run is in flight");
+            self.push_meta("cannot save the active session while its run is in flight");
             return;
         }
         let default = self
@@ -1887,10 +2068,6 @@ impl App {
 
     /// Open the path prompt to load a session (Ctrl-x C-f).
     fn load_session_prompt(&mut self) {
-        if self.running {
-            self.push_meta("cannot load a session while a run is in flight");
-            return;
-        }
         let default = self
             .session_file
             .clone()
@@ -1903,15 +2080,10 @@ impl App {
 
     /// Open the session switcher overlay (Ctrl-x C-b).
     fn switch_session(&mut self) {
-        if self.running {
-            self.push_meta("cannot switch sessions while a run is in flight");
-            return;
-        }
         if self.open_sessions.len() <= 1 {
             self.push_meta("only one session is open");
             return;
         }
-        self.stash_active();
         self.session_pick = Some(SessionPick { sel: self.active });
     }
 
@@ -2704,12 +2876,20 @@ fn mcp_clamp(sel: usize, rows: usize) -> usize {
 // entry
 // ---------------------------------------------------------------------------
 
-pub async fn run(deps: &Deps) -> Result<()> {
-    let (asks_tx, asks_rx) = mpsc::channel::<PendingAsk>(16);
-    let (dialog_ans_tx, mut dialog_ans_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let (git_tx, git_rx) = mpsc::channel::<GitBarInfo>(4);
+/// Assemble the App: one open session (id 0) wired to its own tagged event
+/// relay, plus the shared UI plumbing (input, git bar, dialogs, colors).
+fn build_app(
+    deps: &Deps,
+    events_tx: mpsc::UnboundedSender<TaggedEvent>,
+    events_rx: mpsc::UnboundedReceiver<TaggedEvent>,
+    run_tx: mpsc::Sender<AgentEvent>,
+    asks_tx: mpsc::Sender<PendingAsk>,
+    asks_rx: mpsc::Receiver<PendingAsk>,
+    git_tx: mpsc::Sender<GitBarInfo>,
+    git_rx: mpsc::Receiver<GitBarInfo>,
+) -> App {
     let user = Arc::new(TuiUserIo { tx: asks_tx });
-    let (bundle, events_tx, events_rx) = new_session(deps, user);
+    let bundle = session_bundle(deps, user, run_tx.clone());
 
     // Assign a stable color to each agent (main model + delegates) once, at
     // start: the chat's delegate sub-chats and the model windows use it.
@@ -2718,7 +2898,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
     agent_names.push(deps.cfg.llm.display());
     model_colors.assign(&agent_names);
 
-    let mut app = App {
+    App {
         cfg: deps.cfg.clone(),
         client: deps.client.clone(),
         tools: deps.tools.clone(),
@@ -2734,6 +2914,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
         ))),
         events_tx,
         events_rx,
+        run_tx,
         asks_rx,
         stop: None,
         run_handle: None,
@@ -2783,16 +2964,32 @@ pub async fn run(deps: &Deps) -> Result<()> {
         activity: None,
         clipboard: None,
         open_sessions: vec![OpenSession {
+            id: 0,
             title: "New session".to_string(),
             file: None,
-            state: None,
+            live: None,
         }],
         active: 0,
+        next_session_id: 1,
+        handling_bg: None,
         session_file: None,
         ctrl_x: false,
         path_prompt: None,
         session_pick: None,
-    };
+    }
+}
+
+pub async fn run(deps: &Deps) -> Result<()> {
+    let (asks_tx, asks_rx) = mpsc::channel::<PendingAsk>(16);
+    let (dialog_ans_tx, mut dialog_ans_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (git_tx, git_rx) = mpsc::channel::<GitBarInfo>(4);
+    // One central, UI-facing queue for every session's events, plus the first
+    // session (id 0) with its own run-facing sender that tags events with 0.
+    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<TaggedEvent>();
+    let run_tx = spawn_tagged_relay(0, events_tx.clone());
+    let mut app = build_app(
+        deps, events_tx, events_rx, run_tx, asks_tx, asks_rx, git_tx, git_rx,
+    );
     app.dialog_ask_tx = Some(dialog_ans_tx);
 
     let mut terminal = ratatui::init();
@@ -2848,7 +3045,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
             }
             ae = app.events_rx.recv() => {
                 match ae {
-                    Some(e) => app.on_agent_event(e),
+                    Some((id, e)) => app.on_agent_event_for(id, e),
                     None => break Err(anyhow::anyhow!("agent event channel closed")),
                 }
             }
@@ -2893,7 +3090,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
                     None => break Err(anyhow::anyhow!("git refresh channel closed")),
                 }
             }
-            _ = spin.tick(), if app.running => {
+            _ = spin.tick(), if app.any_running() => {
                 // Spinner wake-up only: the redraw below re-renders the plan
                 // panel with the next glyph frame.
             }
@@ -5805,12 +6002,24 @@ fn draw_session_pick(pick: &SessionPick, app: &App, frame: &mut Frame) {
     for (i, s) in app.open_sessions.iter().enumerate() {
         let selected = i == pick.sel;
         let marker = if i == app.active { "*" } else { " " };
+        // A session with a run in flight is marked, whether it is the active one
+        // or running in the background.
+        let running = if i == app.active {
+            app.running
+        } else {
+            s.live.as_ref().is_some_and(|l| l.running)
+        };
         let file = s
             .file
             .as_ref()
             .map(|f| format!("  {}", f.display()))
             .unwrap_or_default();
-        let mut text = format!("{marker} {} {}", if selected { ">" } else { " " }, s.title);
+        let mut text = format!(
+            "{marker} {} {}{}",
+            if selected { ">" } else { " " },
+            s.title,
+            if running { "  [running]" } else { "" }
+        );
         text.push_str(&file);
         let style = if selected {
             Style::default()
@@ -7945,6 +8154,91 @@ mod tests {
             flattened.contains("est"),
             "missing est marker in {flattened}"
         );
+    }
+
+    /// A minimal App wired to offline defaults, for session tests.
+    fn test_app() -> App {
+        let cfg = Arc::new(
+            comrade_core::Config::load(None)
+                .expect("default config")
+                .config,
+        );
+        let client = Arc::new(comrade_core::LlmClient::new(&cfg.llm).expect("llm client"));
+        let tools = Arc::new(comrade_tool::ToolRegistry::new());
+        let deps = Deps {
+            cfg,
+            client,
+            tools,
+            root: std::env::temp_dir(),
+            balance: None,
+            config_source: None,
+            auto_forced: false,
+        };
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<TaggedEvent>();
+        let run_tx = spawn_tagged_relay(0, events_tx.clone());
+        let (asks_tx, asks_rx) = mpsc::channel::<PendingAsk>(4);
+        let (git_tx, git_rx) = mpsc::channel::<GitBarInfo>(4);
+        build_app(
+            &deps, events_tx, events_rx, run_tx, asks_tx, asks_rx, git_tx, git_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn new_session_parks_a_running_session_and_routes_its_events() {
+        let mut app = test_app();
+        let first_id = app.active_id();
+        // A run is in flight on the first session when the user opens a new one.
+        app.running = true;
+        app.new_session();
+        assert_eq!(app.open_sessions.len(), 2);
+        assert_ne!(app.active_id(), first_id);
+        assert!(!app.running);
+        let parked_running = |app: &App| {
+            app.open_sessions
+                .iter()
+                .find(|s| s.id == first_id)
+                .and_then(|s| s.live.as_ref())
+                .is_some_and(|l| l.running)
+        };
+        assert!(parked_running(&app), "the parked session keeps its run");
+        let active_chat = app.chat.len();
+        // An event tagged with the parked session updates ITS chat, not the active one.
+        app.on_agent_event_for(first_id, AgentEvent::RunEnd);
+        assert!(!parked_running(&app), "RunEnd lands on the parked session");
+        assert_eq!(app.chat.len(), active_chat, "active session chat untouched");
+    }
+
+    #[tokio::test]
+    async fn switching_back_restores_the_parked_session_chat() {
+        let mut app = test_app();
+        let first_id = app.active_id();
+        app.push_meta("marker-one");
+        let first_len = app.chat.len();
+        app.new_session();
+        let second_id = app.active_id();
+        assert_ne!(first_id, second_id);
+        assert_eq!(app.chat.len(), 1); // just the "opened a new session" note
+        let idx = app.session_index(first_id).unwrap();
+        app.activate(idx);
+        assert_eq!(app.active_id(), first_id);
+        assert_eq!(app.chat.len(), first_len);
+        assert!(app.chat.iter().any(|m| m.text == "marker-one"));
+        let idx = app.session_index(second_id).unwrap();
+        app.activate(idx);
+        assert_eq!(app.active_id(), second_id);
+        assert_eq!(app.chat.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn kill_closes_the_active_session_and_activates_a_neighbour() {
+        let mut app = test_app();
+        let first_id = app.active_id();
+        app.new_session();
+        let second_id = app.active_id();
+        app.kill_session();
+        assert_eq!(app.open_sessions.len(), 1);
+        assert_eq!(app.active_id(), first_id);
+        assert!(app.session_index(second_id).is_none());
     }
 
     #[test]
