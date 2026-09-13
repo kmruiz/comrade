@@ -3,3 +3,5 @@
 .fastembed_cache/
 # Isolated delegate worktrees (see comrade_core::Worktree).
 .comrade/worktrees/
+# Full command output saved by the `summarise` tool.
+.comrade/artifacts/

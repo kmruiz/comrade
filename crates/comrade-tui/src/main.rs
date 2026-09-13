@@ -14,7 +14,7 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use comrade_core::{
     AskAdviseTool, Config, DelegateLimits, DelegateParallelTool, DelegateTool, LlmClient,
-    MemoryUndo,
+    MemoryUndo, SummariseTool,
 };
 use comrade_tool::{ToolContext, ToolRegistry};
 
@@ -182,6 +182,13 @@ fn build_tools(cfg: &Config, root: &std::path::Path) -> Result<ToolRegistry> {
         },
     )? {
         reg.register(Box::new(advise));
+    }
+    // The same [[delegates]] back the `summarise` tool: run a command and get a
+    // delegate-written summary of its output instead of the raw text, so a huge
+    // log never floods the tech lead's context (the full output is saved to
+    // .comrade/artifacts/).
+    if let Some(summarise) = SummariseTool::new(&cfg.delegates)? {
+        reg.register(Box::new(summarise));
     }
     Ok(reg)
 }

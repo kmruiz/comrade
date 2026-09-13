@@ -18,6 +18,7 @@ pub mod llm;
 pub mod react;
 pub mod redact;
 pub mod session;
+pub mod summarise;
 pub mod undo;
 pub mod worktree;
 
@@ -35,5 +36,6 @@ pub use instructions::load_project_instructions;
 pub use llm::{ChatMessage, LlmClient, Role};
 pub use redact::Redactor;
 pub use session::{AgentEvent, AgentSession};
+pub use summarise::SummariseTool;
 pub use undo::MemoryUndo;
 pub use worktree::Worktree;
