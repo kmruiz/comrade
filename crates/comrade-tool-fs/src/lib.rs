@@ -87,9 +87,9 @@ fn clamp(mut s: String) -> String {
 
 /// 1-based file line containing byte offset `byte` in `text`.
 fn line_of(text: &str, byte: usize) -> usize {
-    1 + text[..byte.min(text.len())]
-        .bytes()
-        .filter(|&b| b == b'\n')
+    1 + text.as_bytes()[..byte.min(text.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
         .count()
 }
 
@@ -999,6 +999,31 @@ mod tests {
         assert_eq!(line_of("a\nb\nc", 2), 2);
         assert_eq!(line_of("a\nb\nc", 4), 3);
         assert_eq!(line_of("", 0), 1);
+    }
+
+    #[test]
+    fn line_of_handles_multibyte_offsets() {
+        // A byte offset landing inside a multi-byte UTF-8 char must not panic:
+        // 'é' is 2 bytes, so offset 2 is its second byte.
+        assert_eq!(line_of("é\nx", 2), 1);
+        // Emoji (4 bytes) followed by a newline: offset 3 is mid-char.
+        assert_eq!(line_of("😀\nz", 3), 1);
+        // Mid-char offset on the second line still counts the first newline.
+        assert_eq!(line_of("a\né b", 3), 2);
+        // Offset past the end clamps to the whole string.
+        assert_eq!(line_of("a\né", 99), 2);
+    }
+
+    #[test]
+    fn edit_location_survives_multibyte_ends() {
+        // old/new end with a multi-byte char; the last-byte offsets land
+        // mid-char, which used to panic inside line_of.
+        let before = "cé\nla\nsuite\n";
+        let loc = edit_location(before, "cé\n", "ç\n");
+        assert_eq!(loc, "@@ -1,1 +1,1 @@");
+        let before = "x\n😀\n";
+        let loc = edit_location(before, "😀", "🙂");
+        assert_eq!(loc, "@@ -2,1 +2,1 @@");
     }
 
     #[test]
