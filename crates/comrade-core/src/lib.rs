@@ -12,11 +12,14 @@ pub mod compact;
 pub mod config;
 pub mod context;
 pub mod delegate;
+pub mod hooks;
 pub mod instructions;
 pub mod llm;
 pub mod react;
+pub mod redact;
 pub mod session;
 pub mod undo;
+pub mod worktree;
 
 pub use advise::AskAdviseTool;
 pub use agent::{build_session_context, run_agent, run_agent_with_history};
@@ -27,7 +30,10 @@ pub use config::{
 };
 pub use context::{ContextManager, estimate_tokens};
 pub use delegate::{DelegateLimits, DelegateParallelTool, DelegateTool};
+pub use hooks::Hooks;
 pub use instructions::load_project_instructions;
 pub use llm::{ChatMessage, LlmClient, Role};
+pub use redact::Redactor;
 pub use session::{AgentEvent, AgentSession};
 pub use undo::MemoryUndo;
+pub use worktree::Worktree;

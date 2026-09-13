@@ -965,6 +965,11 @@ impl DelegateParallelTool {
             "same files. For a single task use `delegate`; for a plan step use `delegate` with `step`",
             "(this tool never touches the plan). A delegate configured `approval = \"ask\"` pauses for",
             "each of its jobs before the batch starts; `approval = \"deny\"` refuses it.",
+            "",
+            "Set a job's `isolate = true` to run it in its own git worktree (a detached checkout under",
+            ".comrade/worktrees/) when two jobs would edit the same files: the job's tools then operate",
+            "in that worktree, and its changes are left there for you to review (or removed if it made",
+            "none). Requires the project to be a git repository.",
         ]
         .join("\n");
         let description = format!("{body}\n\nConfigured delegates:\n{listing}");
@@ -981,7 +986,8 @@ impl DelegateParallelTool {
                         "properties": {
                             "model": { "type": "string", "enum": names, "description": "Configured delegate model for this job." },
                             "task": { "type": "string", "description": "Self-contained job for the delegate: paths, code, expected output." },
-                            "context": { "type": "string", "description": "Optional background for the delegate." }
+                            "context": { "type": "string", "description": "Optional background for the delegate." },
+                            "isolate": { "type": "boolean", "default": false, "description": "Run this job in its own git worktree so parallel jobs cannot clobber each other's files (needs a git repo)." }
                         },
                         "required": ["model", "task"],
                         "additionalProperties": false
@@ -1017,6 +1023,8 @@ impl Tool for DelegateParallelTool {
             task: String,
             #[serde(default)]
             context: String,
+            #[serde(default)]
+            isolate: bool,
         }
         #[derive(Deserialize)]
         struct Args {
@@ -1036,6 +1044,7 @@ impl Tool for DelegateParallelTool {
             display: String,
             native: bool,
             prompt: String,
+            isolate: bool,
         }
         let mut prepared: Vec<Prepared> = Vec::new();
         for (i, job) in args.jobs.iter().enumerate() {
@@ -1071,6 +1080,7 @@ impl Tool for DelegateParallelTool {
                 display: target.cfg.llm.display(),
                 native: target.cfg.llm.protocol.native_enabled(),
                 prompt,
+                isolate: job.isolate,
             });
         }
 
@@ -1086,18 +1096,37 @@ impl Tool for DelegateParallelTool {
             .await?;
         }
 
-        let root = ctx.project_root.to_string_lossy().to_string();
         let results = join_all(prepared.iter().map(|p| {
             let target = &self.targets[p.idx];
             let tools = &self.tools;
             let limits = &self.limits;
-            let root = root.clone();
+            let isolated = p.isolate;
             async move {
+                // An isolating job runs in its own worktree; its tools, cwd and
+                // system prompt are rooted there so parallel edits cannot clash.
+                let worktree = if isolated {
+                    Some(
+                        crate::worktree::Worktree::create(&ctx.project_root, next_worktree_id())
+                            .await
+                            .with_context(|| format!("isolating delegate {} ", p.model))?,
+                    )
+                } else {
+                    None
+                };
+                let (job_ctx, root) = match &worktree {
+                    Some(w) => {
+                        let mut c = ctx.clone();
+                        c.project_root = w.path().to_path_buf();
+                        c.cwd = w.path().to_path_buf();
+                        (c, w.path().to_string_lossy().to_string())
+                    }
+                    None => (ctx.clone(), ctx.project_root.to_string_lossy().to_string()),
+                };
                 let system = delegate_system_prompt(&root, tools, p.native);
-                run_delegate_subagent(
+                let reply = run_delegate_subagent(
                     &target.client,
                     tools,
-                    ctx,
+                    &job_ctx,
                     system,
                     p.prompt.clone(),
                     &p.model,
@@ -1106,7 +1135,8 @@ impl Tool for DelegateParallelTool {
                     DELEGATE_READ_NUDGE,
                 )
                 .await
-                .with_context(|| format!("delegate {} ({}) failed", p.model, p.display))
+                .with_context(|| format!("delegate {} ({}) failed", p.model, p.display))?;
+                Ok::<_, anyhow::Error>((reply, worktree))
             }
         }))
         .await;
@@ -1114,8 +1144,24 @@ impl Tool for DelegateParallelTool {
         let mut out = format!("{} parallel delegate job(s):\n", prepared.len());
         for (i, (p, res)) in prepared.iter().zip(results).enumerate() {
             match res {
-                Ok(reply) => {
+                Ok((reply, worktree)) => {
                     out.push_str(&format!("\n=== job {} ({}) ===\n{reply}\n", i + 1, p.model));
+                    if let Some(w) = worktree {
+                        if w.has_changes().await {
+                            out.push_str(&format!(
+                                "[job {} isolated in worktree {} — review with `git -C {} diff`]\n",
+                                i + 1,
+                                w.path().display(),
+                                w.path().display()
+                            ));
+                        } else {
+                            let _ = w.remove().await;
+                            out.push_str(&format!(
+                                "[job {} isolated in a worktree; it made no changes, so it was removed]\n",
+                                i + 1
+                            ));
+                        }
+                    }
                 }
                 Err(err) => out.push_str(&format!(
                     "\n=== job {} ({}) FAILED ===\nERROR: {err:#}\n",
@@ -1126,6 +1172,13 @@ impl Tool for DelegateParallelTool {
         }
         Ok(out)
     }
+}
+
+/// Monotonic id for isolated delegate worktrees (unique within this process).
+fn next_worktree_id() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    ((std::process::id() as u64) << 20) | n
 }
 
 #[cfg(test)]
@@ -2758,6 +2811,109 @@ mod tests {
         assert!(out.contains("reply-from-beta"), "{out}");
         assert!(out.contains("job 1 (alpha)"), "{out}");
         assert!(out.contains("job 2 (beta)"), "{out}");
+    }
+
+    /// A stub `fs_write_file` that really writes into `ctx.project_root`, so an
+    /// isolating job's write lands in its worktree (not the main repo).
+    struct WriteIntoRoot;
+    #[async_trait]
+    impl Tool for WriteIntoRoot {
+        fn spec(&self) -> &ToolSpec {
+            &STUB_WRITE_SPEC
+        }
+        async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("out.txt");
+            let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+            std::fs::write(ctx.project_root.join(path), content)?;
+            Ok(format!("wrote {path}"))
+        }
+    }
+
+    fn scratch_git_repo() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "comrade-delegate-wt-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("readme.txt"), "hi\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        root
+    }
+
+    #[tokio::test]
+    async fn isolated_parallel_job_runs_in_its_own_worktree() {
+        let root = scratch_git_repo();
+        let tool_call_turn = json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "fs_write_file",
+                            "arguments": "{\"path\":\"out.txt\",\"content\":\"hi\"}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let final_turn =
+            json!({"choices": [{"message": {"content": "wrote out.txt"}}]}).to_string();
+        let base = scripted_server(vec![tool_call_turn, final_turn]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(WriteIntoRoot));
+        let cfg = vec![delegate("alpha", &base)];
+        let tool = DelegateParallelTool::new(&cfg, registry, DelegateLimits::default())
+            .unwrap()
+            .unwrap();
+        let mut ctx = test_ctx();
+        ctx.project_root = root.clone();
+        ctx.cwd = root.clone();
+
+        let out = tool
+            .invoke(
+                &ctx,
+                json!({"jobs": [{"model": "alpha", "task": "write out.txt", "isolate": true}]}),
+            )
+            .await
+            .unwrap();
+
+        assert!(out.contains("wrote out.txt"), "{out}");
+        assert!(out.contains("worktree"), "{out}");
+        // The write landed in the worktree, never in the main repo root.
+        assert!(
+            !root.join("out.txt").exists(),
+            "an isolated job must not write into the main tree"
+        );
+        let worktrees = root.join(".comrade").join("worktrees");
+        assert!(worktrees.exists(), "a worktree should have been created");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

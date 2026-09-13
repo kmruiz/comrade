@@ -25,3 +25,6 @@ Embedding cost now scales with project code size on the first code search; the i
 
 ## Note
 Default scope changed from `memory` to `all`: an omitted `scope` now searches BOTH memory and source code. Agents narrow with `scope=memory` or `scope=code` when they only want one side. Updated the spec `default`, the tool description and the runtime fallback in crates/comrade-tool-memory/src/semantic.rs.
+
+## Note
+Follow-up (deferred, requested by the human): `semantic_search` is too slow in practice — the flat per-project cosine index is scanned linearly and memory+code indexes are rebuilt/loaded per query. A proper index is needed (e.g. an ANN structure such as HNSW/usearch, an embedding cache keyed by content hash, and a persisted+memory-mapped index that is loaded once rather than per call). Do this as a dedicated task, not part of the current safety/hooks/timeouts batch.

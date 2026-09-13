@@ -281,6 +281,9 @@ pub(crate) fn session_bundle(
 ) -> SessionBundle {
     let session = Arc::new(comrade_core::AgentSession::new(tx));
     let undo = Arc::new(MemoryUndo::new(deps.root.clone()));
+    // Install the configured filesystem/shell guardrails process-wide so the fs
+    // and shell tools honour `[security] extra_roots`/`shell_allow`/`shell_deny`.
+    comrade_tool::set_policy(deps.cfg.security.to_policy(&deps.root));
     let ctx_base = ToolContext {
         project_root: deps.root.clone(),
         cwd: deps.root.clone(),

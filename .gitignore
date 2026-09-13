@@ -1,3 +1,5 @@
 /target
 /logs.txt
 .fastembed_cache/
+# Isolated delegate worktrees (see comrade_core::Worktree).
+.comrade/worktrees/

@@ -132,17 +132,29 @@ struct FunctionDef<'a> {
     parameters: &'a Value,
 }
 
+/// Anthropic/OpenRouter-style prompt-cache marker. Providers that do not
+/// support it ignore the unknown field, so it is safe to send when enabled.
+#[derive(Debug, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+const EPHEMERAL: CacheControl = CacheControl { kind: "ephemeral" };
+
 #[derive(Debug, Serialize)]
 struct ToolDef<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     function: FunctionDef<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
     model: String,
-    messages: &'a [ChatMessage],
+    messages: Vec<Value>,
     temperature: f32,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,17 +177,41 @@ impl<'a> ChatRequest<'a> {
         stream: bool,
         tools: Option<&'a [ToolSpec]>,
         temperature: f32,
+        prompt_caching: bool,
     ) -> Self {
+        // Serialize messages as loose JSON so an opt-in `cache_control` marker
+        // can be added to the (stable, large) system message without touching
+        // the wire format otherwise.
+        let mut messages: Vec<Value> = messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+            .collect();
+        if prompt_caching
+            && let Some(sys) = messages
+                .iter_mut()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+            && let Some(obj) = sys.as_object_mut()
+        {
+            obj.insert(
+                "cache_control".into(),
+                serde_json::to_value(EPHEMERAL).unwrap_or(Value::Null),
+            );
+        }
+
+        let count = tools.map(<[ToolSpec]>::len).unwrap_or(0);
         let tools = tools.map(|specs| {
             specs
                 .iter()
-                .map(|spec| ToolDef {
+                .enumerate()
+                .map(|(i, spec)| ToolDef {
                     kind: "function",
                     function: FunctionDef {
                         name: &spec.name,
                         description: &spec.description,
                         parameters: &spec.json_schema,
                     },
+                    // Cache the tool block up to and including its last entry.
+                    cache_control: (prompt_caching && i + 1 == count).then_some(EPHEMERAL),
                 })
                 .collect()
         });
@@ -549,7 +585,14 @@ impl LlmClient {
 
     /// Send the whole conversation (non-streaming) and return the reply text.
     pub async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
-        let body = ChatRequest::new(&self.cfg.model, messages, false, None, self.cfg.temperature);
+        let body = ChatRequest::new(
+            &self.cfg.model,
+            messages,
+            false,
+            None,
+            self.cfg.temperature,
+            self.cfg.prompt_caching,
+        );
         let resp = self.send_with_retry(&body).await?;
 
         let parsed: ChatResponse = resp.json().await.context("malformed llm response")?;
@@ -579,6 +622,7 @@ impl LlmClient {
             false,
             tools,
             self.cfg.temperature,
+            self.cfg.prompt_caching,
         );
         let resp = self.send_with_retry(&body).await?;
 
@@ -629,7 +673,14 @@ impl LlmClient {
     where
         F: FnMut(&str) + Send,
     {
-        let body = ChatRequest::new(&self.cfg.model, messages, true, tools, self.cfg.temperature);
+        let body = ChatRequest::new(
+            &self.cfg.model,
+            messages,
+            true,
+            tools,
+            self.cfg.temperature,
+            self.cfg.prompt_caching,
+        );
         let mut on_delta = on_delta;
         let mut attempt = 0;
         loop {
@@ -1018,6 +1069,45 @@ mod tests {
         let json = serde_json::to_value(&tool).unwrap();
         assert_eq!(json["role"], "tool");
         assert_eq!(json["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn prompt_caching_marks_the_system_message_and_last_tool_only() {
+        let msgs = vec![
+            ChatMessage::new(Role::System, "sys"),
+            ChatMessage::new(Role::User, "hi"),
+        ];
+        let tools = vec![
+            ToolSpec {
+                name: "a".into(),
+                description: "".into(),
+                json_schema: serde_json::json!({}),
+            },
+            ToolSpec {
+                name: "b".into(),
+                description: "".into(),
+                json_schema: serde_json::json!({}),
+            },
+        ];
+
+        let off = serde_json::to_value(ChatRequest::new(
+            "m",
+            &msgs,
+            false,
+            Some(&tools),
+            0.2,
+            false,
+        ))
+        .unwrap();
+        assert!(off["messages"][0].get("cache_control").is_none());
+        assert!(off["tools"][1].get("cache_control").is_none());
+
+        let on = serde_json::to_value(ChatRequest::new("m", &msgs, false, Some(&tools), 0.2, true))
+            .unwrap();
+        assert_eq!(on["messages"][0]["cache_control"]["type"], "ephemeral");
+        assert!(on["messages"][1].get("cache_control").is_none());
+        assert_eq!(on["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert!(on["tools"][0].get("cache_control").is_none());
     }
 }
 

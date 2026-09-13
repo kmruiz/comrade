@@ -5,7 +5,7 @@
 //! first write into the undo log so changes can be rolled back.
 
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
@@ -45,28 +45,16 @@ pub fn all() -> Vec<Box<dyn Tool>> {
 }
 
 /// Resolve a user-supplied path relative to the project root, rejecting any
-/// traversal that escapes the root.
+/// traversal that escapes the allowed roots (the project root plus any
+/// `[security] extra_roots`, with symlinks resolved — see
+/// [`comrade_tool::confine`]).
 pub fn resolve(ctx: &ToolContext, user_path: &str) -> Result<PathBuf> {
-    let raw = Path::new(user_path);
-    let joined = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        ctx.cwd.join(raw)
-    };
-    let mut normalized = PathBuf::new();
-    for comp in joined.components() {
-        match comp {
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::CurDir => {}
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    if !normalized.starts_with(&ctx.project_root) {
-        anyhow::bail!("path {user_path:?} escapes the project root");
-    }
-    Ok(normalized)
+    comrade_tool::confine(
+        &ctx.project_root,
+        &ctx.cwd,
+        user_path,
+        &comrade_tool::policy(),
+    )
 }
 
 fn display_path(ctx: &ToolContext, path: &Path) -> String {
@@ -1687,5 +1675,97 @@ mod patch_tests {
         assert_eq!(patches.len(), 2);
         assert_eq!(patches[0].path, "one.txt");
         assert_eq!(patches[1].path, "two.txt");
+    }
+}
+
+#[cfg(test)]
+mod confine_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use comrade_tool::{
+        PlanStatus, PlanStep, PlanTarget, SessionControl, UndoLog, UserIo, UserPrompt, UserReply,
+    };
+
+    use super::*;
+
+    struct StubSession;
+    impl SessionControl for StubSession {
+        fn set_title(&self, _t: &str) {}
+        fn title(&self) -> String {
+            "test".into()
+        }
+        fn set_plan(&self, _s: Vec<comrade_tool::PlanStepDraft>) {}
+        fn plan(&self) -> Vec<PlanStep> {
+            Vec::new()
+        }
+        fn update_plan(&self, _t: PlanTarget, _s: PlanStatus, _n: Option<String>) -> bool {
+            false
+        }
+        fn finish_plan(&self, _s: Option<String>) {}
+        fn set_status(&self, _s: &str) {}
+        fn status(&self) -> String {
+            String::new()
+        }
+    }
+    struct StubUser;
+    #[async_trait]
+    impl UserIo for StubUser {
+        async fn ask(&self, _p: UserPrompt) -> Result<UserReply> {
+            Ok(UserReply::Answer("yes".into()))
+        }
+    }
+    struct StubUndo;
+    #[async_trait]
+    impl UndoLog for StubUndo {
+        async fn capture(&self, _p: &str, _b: String) -> Result<()> {
+            Ok(())
+        }
+        async fn undo_last(&self) -> Result<usize> {
+            Ok(0)
+        }
+        async fn is_empty(&self) -> bool {
+            true
+        }
+        async fn len(&self) -> usize {
+            0
+        }
+    }
+
+    fn ctx_for(root: &std::path::Path) -> ToolContext {
+        ToolContext {
+            project_root: root.to_path_buf(),
+            cwd: root.to_path_buf(),
+            session: Arc::new(StubSession),
+            user: Arc::new(StubUser),
+            undo: Arc::new(StubUndo),
+            auto_approve: true,
+            approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            compact: None,
+            stop: None,
+        }
+    }
+
+    #[test]
+    fn resolve_confines_to_the_project_root() {
+        let root = std::env::temp_dir().join(format!(
+            "comrade-fs-confine-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let ctx = ctx_for(&root);
+
+        let ok = resolve(&ctx, "src/lib.rs").unwrap();
+        assert!(ok.starts_with(&root));
+
+        let err = resolve(&ctx, "../../etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("escapes"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

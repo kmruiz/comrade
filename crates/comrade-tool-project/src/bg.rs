@@ -294,6 +294,7 @@ impl Tool for RunBg {
         if command.is_empty() {
             anyhow::bail!("`command` must not be empty");
         }
+        comrade_tool::check_command(command, &comrade_tool::policy())?;
         ctx.confirm(format!("Start background job: {command}"), None)
             .await?;
         let id = self.hub.start(command);

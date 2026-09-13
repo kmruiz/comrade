@@ -686,6 +686,7 @@ enum MxCommand {
     SwitchSession,
     ToggleAutoAccept,
     ToggleToolCard,
+    Undo,
 }
 
 impl MxCommand {
@@ -723,6 +724,7 @@ impl MxCommand {
         MxCommand::SwitchSession,
         MxCommand::ToggleAutoAccept,
         MxCommand::ToggleToolCard,
+        MxCommand::Undo,
     ];
 
     fn name(self) -> &'static str {
@@ -759,6 +761,7 @@ impl MxCommand {
             MxCommand::SwitchSession => "switch-session",
             MxCommand::ToggleAutoAccept => "toggle-auto-accept",
             MxCommand::ToggleToolCard => "toggle-tool-card",
+            MxCommand::Undo => "undo",
         }
     }
 
@@ -800,6 +803,8 @@ impl MxCommand {
             MxCommand::SwitchSession => Some("C-x C-b"),
             MxCommand::ToggleAutoAccept => Some("C-SPC"),
             MxCommand::ToggleToolCard => Some("tab"),
+            // Palette-only: restores files from the undo log (no default key).
+            MxCommand::Undo => None,
         }
     }
 
@@ -843,6 +848,7 @@ impl MxCommand {
             MxCommand::ToggleToolCard => {
                 "expand or collapse the selected tool card (or a whole user-turn section)"
             }
+            MxCommand::Undo => "restore files from the undo log (the last mutating writes)",
         }
     }
 }
@@ -2949,8 +2955,27 @@ impl App {
                 }
             }
             MxCommand::FocusMode => self.toggle_focus_mode(),
+            MxCommand::Undo => self.undo_last_write(),
         }
         false
+    }
+
+    /// Restore files from the undo log (M-x `undo`): roll back the most recent
+    /// batch of first writes captured by the mutating tools, in a background
+    /// task, and report how many files were restored.
+    fn undo_last_write(&mut self) {
+        let undo = self.ctx_base.undo.clone();
+        let tx = self.events_tx.clone();
+        let id = self.active_id();
+        self.push_meta("undoing the last mutating write...");
+        tokio::spawn(async move {
+            let event = match undo.undo_last().await {
+                Ok(0) => AgentEvent::Notice("undo: nothing to undo".into()),
+                Ok(n) => AgentEvent::Notice(format!("undo: restored {n} file(s)")),
+                Err(e) => AgentEvent::Error(format!("undo failed: {e:#}")),
+            };
+            let _ = tx.send((id, event));
+        });
     }
 
     /// Auto-accept the confirmation currently on top of the dialog stack

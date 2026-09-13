@@ -8,8 +8,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::context::ContextManager;
+use crate::hooks::Hooks;
 use crate::llm::{ChatMessage, LlmClient, Role, Usage};
 use crate::react::{build_system_prompt, parse_turn, render_observation};
+use crate::redact::Redactor;
 use crate::session::AgentEvent;
 
 /// Total real tokens a request cost, when the endpoint reported any usage.
@@ -386,6 +388,10 @@ pub async fn run_agent_with_history(
 ) -> Result<AgentOutcome> {
     let _ = tx.send(AgentEvent::RunStart).await;
 
+    // Install the configured filesystem/shell guardrails for this run (they are
+    // read back by the tool crates through `comrade_tool::policy`).
+    comrade_tool::set_policy(cfg.security.to_policy(&ctx.project_root));
+
     if ctx.session.title().is_empty() || ctx.session.title() == "New session" {
         let mut t = user_input.trim().to_string();
         if t.chars().count() > 60 {
@@ -430,6 +436,23 @@ async fn run_agent_loop(
 
     let max_iterations = cfg.agent.max_iterations;
     let mut iterations = 0usize;
+    // Pre/post hooks, a per-tool timeout and output redaction, applied to every
+    // tool call this run makes (see `Dispatch`).
+    let hooks = Hooks::from_cfg(&cfg.hooks);
+    let redactor = if cfg.security.redact_secrets {
+        Redactor::from_env()
+    } else {
+        Redactor::none()
+    };
+    let dispatch = Dispatch {
+        cfg,
+        hooks: &hooks,
+        redactor: &redactor,
+    };
+    // Optional wall-clock budget for the whole run (checked at each rest point).
+    let deadline = (cfg.agent.run_timeout_secs > 0).then(|| {
+        std::time::Instant::now() + std::time::Duration::from_secs(cfg.agent.run_timeout_secs)
+    });
     let mut tracker = LoopTracker::default();
     // We nudge the model once per run to open with a plan.
     let mut plan_nudged = false;
@@ -449,6 +472,19 @@ async fn run_agent_loop(
         }
         if iterations >= max_iterations {
             bail!("reached max_iterations ({max_iterations}) without a final answer");
+        }
+        if let Some(d) = deadline
+            && std::time::Instant::now() >= d
+        {
+            let msg = format!(
+                "run stopped: exceeded the {}s time budget",
+                cfg.agent.run_timeout_secs
+            );
+            let _ = tx.send(AgentEvent::FinalAnswer(msg.clone())).await;
+            return Ok(AgentOutcome {
+                final_answer: msg,
+                iterations,
+            });
         }
         iterations += 1;
 
@@ -665,6 +701,7 @@ async fn run_agent_loop(
                 &ctx,
                 &mut tracker,
                 &mut consecutive_reads,
+                dispatch,
                 turn,
             )
             .await?;
@@ -718,7 +755,7 @@ async fn run_agent_loop(
             });
         };
 
-        let Some(tool) = tools.get(&tool_call.name) else {
+        let Some(_tool) = tools.get(&tool_call.name) else {
             let msg = format!(
                 "unknown tool {:?}; choose from the listed tools",
                 tool_call.name
@@ -870,10 +907,9 @@ async fn run_agent_loop(
             })
             .await;
 
-        let output = match tool.invoke(&ctx, tool_call.args.clone()).await {
-            Ok(out) => out,
-            Err(err) => format!("ERROR: {err:#}"),
-        };
+        let output = dispatch
+            .run(tools, &ctx, &tool_call.name, tool_call.args.clone())
+            .await;
         let ok = !output.starts_with("ERROR:");
         let clamped = ctxm.truncate_observation(&output);
         let _ = tx
@@ -895,6 +931,65 @@ async fn run_agent_loop(
     }
 }
 
+/// Shared tool dispatch used by both the ReAct and native paths: it runs the
+/// configured pre/post hooks around the call, applies an optional per-tool
+/// timeout, and redacts secret-looking values out of the result before it is
+/// fed back to the model or shown in the transcript.
+#[derive(Clone, Copy)]
+struct Dispatch<'a> {
+    cfg: &'a Config,
+    hooks: &'a Hooks,
+    redactor: &'a Redactor,
+}
+
+impl Dispatch<'_> {
+    async fn run(
+        &self,
+        tools: &ToolRegistry,
+        ctx: &ToolContext,
+        name: &str,
+        args: serde_json::Value,
+    ) -> String {
+        if !self.hooks.is_empty()
+            && let Err(e) = self.hooks.pre(&ctx.project_root, name, &args).await
+        {
+            return format!("ERROR: {e:#}");
+        }
+        let Some(tool) = tools.get(name) else {
+            return format!("ERROR: unknown tool {name:?}");
+        };
+        let fut = tool.invoke(ctx, args.clone());
+        let res = if self.cfg.agent.tool_timeout_secs > 0 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(self.cfg.agent.tool_timeout_secs),
+                fut,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "tool `{name}` timed out after {}s and was killed",
+                    self.cfg.agent.tool_timeout_secs
+                )),
+            }
+        } else {
+            fut.await
+        };
+        let mut out = self.redactor.redact(&match res {
+            Ok(o) => o,
+            Err(e) => format!("ERROR: {e:#}"),
+        });
+        if !self.hooks.is_empty() {
+            let ok = !out.starts_with("ERROR:");
+            if let Some(warn) = self.hooks.post(&ctx.project_root, name, &args, ok).await {
+                out.push_str("\n\n");
+                out.push_str(&warn);
+            }
+        }
+        out
+    }
+}
+
 /// Dispatch a turn's native function calls. The assistant message with all
 /// `tool_calls` is recorded first; each call then gets a `Role::Tool` result.
 /// Approval-gated calls require `justification` in their arguments.
@@ -906,6 +1001,7 @@ async fn run_native_calls(
     ctx: &ToolContext,
     tracker: &mut LoopTracker,
     consecutive_reads: &mut usize,
+    dispatch: Dispatch<'_>,
     turn: crate::llm::LlmTurn,
 ) -> Result<()> {
     if !turn.content.trim().is_empty() {
@@ -1045,7 +1141,7 @@ async fn run_native_calls(
             continue;
         }
 
-        let Some(tool) = tools.get(&p.name) else {
+        let Some(_tool) = tools.get(&p.name) else {
             let msg = format!("unknown tool {:?}; choose from the listed tools", p.name);
             let _ = tx
                 .send(AgentEvent::ToolResult {
@@ -1073,10 +1169,7 @@ async fn run_native_calls(
                 args: args_pretty,
             })
             .await;
-        let output = match tool.invoke(ctx, p.args.clone()).await {
-            Ok(out) => out,
-            Err(err) => format!("ERROR: {err:#}"),
-        };
+        let output = dispatch.run(tools, ctx, &p.name, p.args.clone()).await;
         let ok = !output.starts_with("ERROR:");
         let clamped = ctxm.truncate_observation(&output);
         let _ = tx
@@ -1114,23 +1207,19 @@ async fn run_native_calls(
                 })
                 .await;
         }
-        let futures: Vec<Pin<Box<dyn Future<Output = Result<String>> + Send + '_>>> = deferred
+        let futures: Vec<Pin<Box<dyn Future<Output = String> + Send + '_>>> = deferred
             .iter()
             .map(|p| {
                 let ctx = ctx.clone();
                 let args = p.args.clone();
-                let tool = tools.get(&p.name).expect("delegate tool checked above");
-                let fut: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
-                    Box::pin(async move { tool.invoke(&ctx, args).await });
+                let name = p.name.clone();
+                let fut: Pin<Box<dyn Future<Output = String> + Send + '_>> =
+                    Box::pin(async move { dispatch.run(tools, &ctx, &name, args).await });
                 fut
             })
             .collect();
         let results = join_all(futures).await;
-        for (p, res) in deferred.into_iter().zip(results) {
-            let output = match res {
-                Ok(out) => out,
-                Err(err) => format!("ERROR: {err:#}"),
-            };
+        for (p, output) in deferred.into_iter().zip(results) {
             let ok = !output.starts_with("ERROR:");
             let clamped = ctxm.truncate_observation(&output);
             let _ = tx
@@ -1893,6 +1982,202 @@ mod tests {
             }
         }
         assert!(saw_refusal, "expected an approval-gated refusal");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A tool that never returns in time, to exercise the per-tool timeout.
+    struct SlowTool;
+    #[async_trait]
+    impl comrade_tool::Tool for SlowTool {
+        fn spec(&self) -> &comrade_tool::ToolSpec {
+            static SPEC: std::sync::LazyLock<comrade_tool::ToolSpec> =
+                std::sync::LazyLock::new(|| comrade_tool::ToolSpec {
+                    name: "slow_tool".into(),
+                    description: "sleeps (test)".into(),
+                    json_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                });
+            &SPEC
+        }
+        async fn invoke(
+            &self,
+            _ctx: &ToolContext,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok("never seen".into())
+        }
+    }
+
+    /// A tool whose output carries a token-shaped secret.
+    struct SecretEcho;
+    #[async_trait]
+    impl comrade_tool::Tool for SecretEcho {
+        fn spec(&self) -> &comrade_tool::ToolSpec {
+            static SPEC: std::sync::LazyLock<comrade_tool::ToolSpec> =
+                std::sync::LazyLock::new(|| comrade_tool::ToolSpec {
+                    name: "echo_secret".into(),
+                    description: "echoes a secret (test)".into(),
+                    json_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                });
+            &SPEC
+        }
+        async fn invoke(
+            &self,
+            _ctx: &ToolContext,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            Ok("export API_TOKEN=sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ".into())
+        }
+    }
+
+    fn policy_registry() -> ToolRegistry {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(SlowTool));
+        tools.register(Box::new(SecretEcho));
+        tools
+    }
+
+    async fn drain_events(mut events: mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await
+        {
+            let end = matches!(ev, AgentEvent::RunEnd);
+            out.push(ev);
+            if end {
+                break;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_slow_tool_is_killed_by_the_per_tool_timeout() {
+        let port = spawn_model_with(&["Thought: try it\nTool: slow_tool\nArgs: {}", "All done."]);
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "fake".into();
+        cfg.agent.tool_timeout_secs = 1;
+
+        let (tx, events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        comrade_tool::SessionControl::set_plan(
+            &*session,
+            vec![comrade_tool::PlanStepDraft {
+                goal: "do it".into(),
+                verification: "verifies".into(),
+                model: "".into(),
+                context: "".into(),
+            }],
+        );
+        let root = std::env::temp_dir().join(format!("comrade-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: Arc::new(MemoryUndo::new(root.clone())),
+            auto_approve: true,
+            approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            compact: None,
+            stop: None,
+        };
+        let tools = policy_registry();
+        let client = LlmClient::new(&cfg.llm).unwrap();
+
+        let outcome = run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            "do it".to_string(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.final_answer, "All done.");
+
+        let mut saw_timeout = false;
+        for ev in drain_events(events).await {
+            if let AgentEvent::ToolResult { output, ok, .. } = ev
+                && !ok
+                && output.contains("timed out")
+            {
+                saw_timeout = true;
+            }
+        }
+        assert!(saw_timeout, "a slow tool must be reported as timed out");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn tool_output_is_redacted_before_it_reaches_the_model() {
+        let port = spawn_model_with(&[
+            "Thought: read env\nTool: echo_secret\nArgs: {}",
+            "All done.",
+        ]);
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "fake".into();
+
+        let (tx, events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        comrade_tool::SessionControl::set_plan(
+            &*session,
+            vec![comrade_tool::PlanStepDraft {
+                goal: "do it".into(),
+                verification: "verifies".into(),
+                model: "".into(),
+                context: "".into(),
+            }],
+        );
+        let root = std::env::temp_dir().join(format!("comrade-redact-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: Arc::new(MemoryUndo::new(root.clone())),
+            auto_approve: true,
+            approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            compact: None,
+            stop: None,
+        };
+        let tools = policy_registry();
+        let client = LlmClient::new(&cfg.llm).unwrap();
+
+        run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            "do it".to_string(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut saw_redaction = false;
+        for ev in drain_events(events).await {
+            if let AgentEvent::ToolResult { output, .. } = ev {
+                assert!(
+                    !output.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+                    "the secret leaked: {output}"
+                );
+                if output.contains("«redacted»") {
+                    saw_redaction = true;
+                }
+            }
+        }
+        assert!(saw_redaction, "the tool output must be redacted");
         let _ = std::fs::remove_dir_all(&root);
     }
 

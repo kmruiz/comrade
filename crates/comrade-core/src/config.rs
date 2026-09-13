@@ -73,6 +73,11 @@ pub struct LlmCfg {
     /// Optional display identity/version string detected from the provider
     /// (e.g. Ollama "7B (Q4_K_M)").
     pub model_version: Option<String>,
+    /// Send an Anthropic-style `cache_control: ephemeral` marker on the system
+    /// message and the last tool definition, so a provider that supports prompt
+    /// caching can reuse the (large, stable) prefix across turns. Providers that
+    /// do not support it ignore the unknown field.
+    pub prompt_caching: bool,
 }
 
 impl Default for LlmCfg {
@@ -89,6 +94,7 @@ impl Default for LlmCfg {
             protocol: Protocol::Auto,
             context_window: None,
             model_version: None,
+            prompt_caching: false,
         }
     }
 }
@@ -150,11 +156,21 @@ impl Default for DelegateCfg {
 #[serde(default)]
 pub struct AgentCfg {
     pub max_iterations: usize,
+    /// Kill a single tool invocation after this many seconds (0 = no limit).
+    /// The tool's future is dropped when the timeout fires.
+    pub tool_timeout_secs: u64,
+    /// Stop a whole agent run after this many seconds of wall-clock time
+    /// (0 = no limit). Checked at each rest point, so the run ends gracefully.
+    pub run_timeout_secs: u64,
 }
 
 impl Default for AgentCfg {
     fn default() -> Self {
-        Self { max_iterations: 30 }
+        Self {
+            max_iterations: 30,
+            tool_timeout_secs: 0,
+            run_timeout_secs: 0,
+        }
     }
 }
 
@@ -185,12 +201,38 @@ impl Default for CtxCfg {
 #[serde(default)]
 pub struct SecurityCfg {
     pub autonomy: Autonomy,
+    /// Scrub secret-looking values (env-var secrets, `sk-…`/`ghp_…` tokens)
+    /// out of tool output before it reaches the model or the transcript.
+    pub redact_secrets: bool,
+    /// Extra directories (absolute, or relative to the project root) the
+    /// filesystem tools may read/write, beyond the project root itself.
+    pub extra_roots: Vec<String>,
+    /// When non-empty, a `shell`/`run_bg` command must START WITH one of these.
+    pub shell_allow: Vec<String>,
+    /// `shell`/`run_bg` commands CONTAINING any of these are always refused.
+    pub shell_deny: Vec<String>,
 }
 
 impl Default for SecurityCfg {
     fn default() -> Self {
         Self {
             autonomy: Autonomy::Ask,
+            redact_secrets: true,
+            extra_roots: Vec::new(),
+            shell_allow: Vec::new(),
+            shell_deny: Vec::new(),
+        }
+    }
+}
+
+impl SecurityCfg {
+    /// Build the process-wide [`comrade_tool::SecurityPolicy`] this config
+    /// describes, resolving relative extra roots against `root`.
+    pub fn to_policy(&self, root: &std::path::Path) -> comrade_tool::SecurityPolicy {
+        comrade_tool::SecurityPolicy {
+            extra_roots: self.extra_roots.iter().map(|r| root.join(r)).collect(),
+            shell_allow: self.shell_allow.clone(),
+            shell_deny: self.shell_deny.clone(),
         }
     }
 }
@@ -207,6 +249,29 @@ pub struct Config {
     pub delegates: Vec<DelegateCfg>,
     /// External MCP servers whose tools are bridged into the agent.
     pub mcp: McpConfig,
+    /// Pre/post-tool shell hooks run around every tool invocation.
+    pub hooks: HooksCfg,
+}
+
+/// Shell hooks run before and/or after a tool call. See [`HookCfg`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct HooksCfg {
+    /// Run before the tool executes. A non-zero exit aborts the call.
+    pub pre_tool: Vec<HookCfg>,
+    /// Run after the tool executes. A non-zero exit only warns.
+    pub post_tool: Vec<HookCfg>,
+}
+
+/// One hook: when to fire (`on`) and the shell command to run (`run`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookCfg {
+    /// Match expression: `*` (every tool), an exact tool name (`fs_edit`), or a
+    /// prefix with a trailing `*` (`fs_*`).
+    pub on: String,
+    /// Shell command run via `bash -c`. The tool name and its JSON arguments
+    /// are exported as `COMRADE_TOOL` and `COMRADE_ARGS`.
+    pub run: String,
 }
 
 /// Configuration for the built-in MCP (Model Context Protocol) client.
@@ -461,6 +526,57 @@ mod tests {
 
         let loaded = Config::load(Some(&write_tmp("[context]\nauto_compact = false\n"))).unwrap();
         assert!(!loaded.config.context.auto_compact);
+    }
+
+    #[test]
+    fn new_safety_and_agent_knobs_have_sane_defaults_and_parse() {
+        let d = Config::load(Some(&write_tmp(""))).unwrap().config;
+        assert_eq!(d.agent.tool_timeout_secs, 0);
+        assert_eq!(d.agent.run_timeout_secs, 0);
+        assert!(d.security.redact_secrets);
+        assert!(d.security.extra_roots.is_empty());
+        assert!(!d.llm.prompt_caching);
+        assert!(d.hooks.pre_tool.is_empty() && d.hooks.post_tool.is_empty());
+
+        let raw = r#"
+[llm]
+prompt_caching = true
+
+[agent]
+tool_timeout_secs = 120
+run_timeout_secs = 900
+
+[security]
+redact_secrets = false
+extra_roots = ["../shared"]
+shell_allow = ["cargo "]
+shell_deny = ["rm -rf /"]
+
+[[hooks.pre_tool]]
+on = "fs_edit"
+run = "echo pre"
+
+[[hooks.post_tool]]
+on = "fs_*"
+run = "echo post"
+"#;
+        let c = Config::load(Some(&write_tmp(raw))).unwrap().config;
+        assert!(c.llm.prompt_caching);
+        assert_eq!(c.agent.tool_timeout_secs, 120);
+        assert_eq!(c.agent.run_timeout_secs, 900);
+        assert!(!c.security.redact_secrets);
+        assert_eq!(c.security.extra_roots, vec!["../shared".to_string()]);
+        assert_eq!(c.hooks.pre_tool.len(), 1);
+        assert_eq!(c.hooks.pre_tool[0].on, "fs_edit");
+        assert_eq!(c.hooks.post_tool[0].on, "fs_*");
+
+        let policy = c.security.to_policy(std::path::Path::new("/repo"));
+        assert_eq!(
+            policy.extra_roots,
+            vec![std::path::PathBuf::from("/repo/../shared")]
+        );
+        assert_eq!(policy.shell_allow, vec!["cargo ".to_string()]);
+        assert_eq!(policy.shell_deny, vec!["rm -rf /".to_string()]);
     }
 
     #[test]

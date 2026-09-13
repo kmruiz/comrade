@@ -427,6 +427,8 @@ impl Tool for Shell {
         if args.command.trim().is_empty() {
             anyhow::bail!("command must not be empty");
         }
+        // Policy gate BEFORE approval: a denied command never even prompts.
+        comrade_tool::check_command(&args.command, &comrade_tool::policy())?;
         let cwd = match &args.dir {
             Some(dir) => {
                 let dir = dir.trim_end_matches('/');
@@ -545,5 +547,92 @@ Compiling foo
         assert_eq!(total, 2);
         assert_eq!(all.len(), 2);
         assert_eq!(all[1], "src/lib.rs:9:1: error: mismatched types");
+    }
+
+    fn scratch_ctx(root: &std::path::Path) -> ToolContext {
+        use comrade_tool::{
+            PlanStatus, PlanStep, PlanTarget, SessionControl, UndoLog, UserIo, UserPrompt,
+            UserReply,
+        };
+        use std::sync::Arc;
+        struct S;
+        impl SessionControl for S {
+            fn set_title(&self, _t: &str) {}
+            fn title(&self) -> String {
+                "t".into()
+            }
+            fn set_plan(&self, _s: Vec<comrade_tool::PlanStepDraft>) {}
+            fn plan(&self) -> Vec<PlanStep> {
+                Vec::new()
+            }
+            fn update_plan(&self, _t: PlanTarget, _s: PlanStatus, _n: Option<String>) -> bool {
+                false
+            }
+            fn finish_plan(&self, _s: Option<String>) {}
+            fn set_status(&self, _s: &str) {}
+            fn status(&self) -> String {
+                String::new()
+            }
+        }
+        struct U;
+        #[async_trait]
+        impl UserIo for U {
+            async fn ask(&self, _p: UserPrompt) -> anyhow::Result<UserReply> {
+                Ok(UserReply::Answer("yes".into()))
+            }
+        }
+        struct L;
+        #[async_trait]
+        impl UndoLog for L {
+            async fn capture(&self, _p: &str, _b: String) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn undo_last(&self) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+            async fn is_empty(&self) -> bool {
+                true
+            }
+            async fn len(&self) -> usize {
+                0
+            }
+        }
+        ToolContext {
+            project_root: root.to_path_buf(),
+            cwd: root.to_path_buf(),
+            session: Arc::new(S),
+            user: Arc::new(U),
+            undo: Arc::new(L),
+            auto_approve: true,
+            approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            compact: None,
+            stop: None,
+        }
+    }
+
+    #[test]
+    fn shell_refuses_a_command_on_the_policy_deny_list() {
+        let dir = std::env::temp_dir().join(format!("comrade-shellpolicy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = scratch_ctx(&dir);
+        comrade_tool::set_policy(comrade_tool::SecurityPolicy {
+            shell_deny: vec!["curl ".into()],
+            ..Default::default()
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(Shell.invoke(&ctx, json!({ "command": "curl https://evil" })))
+            .unwrap_err();
+        assert!(err.to_string().contains("deny list"), "{err}");
+
+        // Reset the global policy so other tests are unaffected.
+        comrade_tool::set_policy(comrade_tool::SecurityPolicy::default());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -164,6 +164,13 @@ Each job's approval policy is enforced before any run starts; it never touches t
 **Notes:**
 Defined via a `FieldKind::DiffChoice { options: Vec<DiffOption> }` variant; seeded with the first option's label (or the field's `recommended`). In the TUI, left/right cycle the options and the selected option's `diff` is shown under the field; typing is ignored.
 
+## Dispatch (tool)
+> `agent::Dispatch{cfg,hooks,redactor}` in crates/comrade-core/src/agent.rs: the single wrapper every main-agent tool call goes through (ReAct path, native path, and the deferred parallel-delegate batch). It runs pre-hooks, applies the optional per-tool timeout (`cfg.agent.tool_timeout_secs`), redacts output, and runs post-hooks. Replaced the three raw `tool.invoke(...)` sites.
+
+**References:**
+- `crates/comrade-core/src/agent.rs`
+- `.comrade/memory/0037-tool-dispatch-prepost-hooks-per-tool-timeout-per-run-budget.md`
+
 ## Ecosystem (pom_*)
 > The trait (crates/comrade-tool-project/src/ecosystem.rs) backing the `pom_*` tools. A backend knows its manifest, the project model, how to map a logical verb to a command, the check command, and how to parse diagnostics/test output. `detect(root)` returns `Box<dyn Ecosystem>` (Cargo today, keyed on `Cargo.toml`).
 
@@ -207,6 +214,14 @@ Deflating the ~35 MB of assets saves ~10 MB of binary; the workspace [profile.re
 **References:**
 - `crates/comrade-tool/src/form.rs`
 
+## Hooks (pre/post-tool)
+> `crates/comrade-core/src/hooks.rs`: user-configured shell commands run around a tool call. Configured as `[[hooks.pre_tool]]` / `[[hooks.post_tool]]` with `on` (match: `*`, exact name, or `name*` prefix) and `run` (bash -c). Exposes COMRADE_TOOL, COMRADE_ARGS, and (post only) COMRADE_OK. A failing pre-hook aborts the tool; a failing post-hook warns. Invoked from `agent::Dispatch`.
+
+**References:**
+- `crates/comrade-core/src/hooks.rs`
+- `crates/comrade-core/src/agent.rs`
+- `.comrade/memory/0037-tool-dispatch-prepost-hooks-per-tool-timeout-per-run-budget.md`
+
 ## LangId
 > A source language the tree-sitter tools understand: Rust, JavaScript, TypeScript, Tsx, Css, Html. engine.rs maps a file extension to a LangId (`lang_of`), a LangId to its tree-sitter grammar (`grammar`), to the node kinds counted as identifier occurrences (`ident_kinds`), and to a declaration-kind -> short-label table (`decl_label`), plus `container_body` (which declarations nest others) and `decl_name` (display name). Non-Rust files are walked via `walk_sources` over `SUPPORTED_EXTS`.
 
@@ -245,6 +260,13 @@ Redesigned to be compact: previously 3 inner rows (name / gauge / usage) plus a 
 
 **Notes:**
 Runs with `--message-format=json`; `parse_check_json`/`format_diagnostic` parse it. Falls back to human-readable error lines when no JSON diagnostics parse. `tasks::exec` returns uncapped output so parsing sees the whole stream.
+
+## prompt caching
+> `[llm] prompt_caching` (default false): when on, `ChatRequest` sends a non-standard `cache_control: {"type":"ephemeral"}` marker on the serialized system message and the last tool definition so cache-aware (Anthropic/OpenRouter-style) providers can reuse the stable prefix. Providers that don't support it ignore the unknown field.
+
+**References:**
+- `crates/comrade-core/src/llm.rs`
+- `.comrade/memory/0039-opt-in-prompt-caching-m-x-undo-command.md`
 
 ## provider preset
 > A named provider in `LlmCfg.provider` (ollama, openai, deepseek, mistral, openrouter, groq, together) that resolves to a preset base URL via `provider_base_url()` when the config omits an explicit `base_url`. All providers are spoken to through the single OpenAI-compatible `LlmClient` (Bearer auth, `/chat/completions` with native tool calls).
@@ -303,6 +325,13 @@ Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; othe
 - `crates/comrade-tui/src/headless.rs`
 - `crates/comrade-core/prompts/tools-intro.md`
 
+## Redactor
+> `crates/comrade-core/src/redact.rs`: scrubs credential-looking values out of tool output before it is truncated and shown to the model/transcript. `Redactor::from_env()` harvests env vars whose NAME looks secret (TOKEN/SECRET/PASSWORD/*_KEY/*_AUTH …) with value len>=8; `with_secrets`/`none` are explicit. `redact(text)` replaces values plus inline `sk-`/`ghp_`/`AKIA`-shaped tokens (len>=16 tail) with `«redacted»`. Enabled by `[security] redact_secrets` (default true).
+
+**References:**
+- `crates/comrade-core/src/redact.rs`
+- `.comrade/memory/0036-process-wide-securitypolicy-fs-confinement-shell-allowdeny-secret-redaction.md`
+
 ## retryable provider error
 > A provider request failure the LLM client retries rather than surfacing: a transport error (reqwest timeout/connect/request/body, e.g. connection reset/refused) or an HTTP status in 408|425|429|500|502|503|504|529. Classified by `is_retryable`/`is_retryable_status` in crates/comrade-core/src/llm.rs; a non-success status is carried as the typed `LlmHttpError`. Retried with exponential backoff (`[llm] max_retries`, `retry_backoff_ms`); mid-stream failures after the first emitted delta are NOT retried.
 
@@ -322,6 +351,18 @@ Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; othe
 
 **Notes:**
 Adopted in ADR #6. Prompt sources: crates/comrade-core/prompts/*.md (assembled by react::build_system_prompt and delegate::render_subagent_system) and the ToolSpec.description strings in every comrade-tool-* crate. Known follow-ups: comrade-core delegate/ask_advise tool descriptions and json_schema per-property descriptions are still verbose.
+
+## SecurityPolicy
+> The process-wide filesystem + shell guardrail in `crates/comrade-tool/src/policy.rs`: `{ extra_roots: Vec<PathBuf>, shell_allow: Vec<String>, shell_deny: Vec<String> }`. Stored in a `OnceLock<RwLock<..>>`, built from `[security]` via `SecurityCfg::to_policy` and installed with `comrade_tool::set_policy` at run/startup. Read back through `comrade_tool::policy()`. `confine(root, base, path, policy)` is the symlink-safe path check (fs tools use it via `comrade-tool-fs::resolve`); `check_command(cmd, policy)` is the shell allow/deny check used by `shell`/`run_bg`.
+
+**References:**
+- `crates/comrade-tool/src/policy.rs`
+- `crates/comrade-core/src/config.rs`
+- `crates/comrade-tool-fs/src/lib.rs`
+- `.comrade/memory/0036-process-wide-securitypolicy-fs-confinement-shell-allowdeny-secret-redaction.md`
+
+**Notes:**
+Added by ADR #36. deny wins over allow: any command containing a deny string is refused; a non-empty allow list requires a prefix match. Redaction (Redactor) is configured by the same `[security] redact_secrets` flag but lives in comrade-core.
 
 ## semantic_search
 > Memory tool (comrade-tool-memory, `semantic_search`) that finds ADRs/glossary terms by MEANING using a locally run embedding model, complementing the keyword tools find_adr/find_glossary.
@@ -424,4 +465,12 @@ Practical consequence: a full-suite `pom_run_tests` output is often truncated by
 
 **References:**
 - `crates/comrade-tui/src/tui.rs (fn session_status_marker, fn session_counts_label, fn draw_session_pick, struct TuiUserIo, struct Dialog)`
+
+## Worktree (delegate isolation)
+> `crates/comrade-core/src/worktree.rs`: a detached git worktree at `<repo>/.comrade/worktrees/<id>` (`git worktree add --detach`). Created per `delegate_parallel` job with `isolate: true` so concurrent delegates cannot clobber each other's files; the job's ToolContext root points at the worktree. Kept when the job changed files (review with `git -C <path> diff`), removed when unchanged.
+
+**References:**
+- `crates/comrade-core/src/worktree.rs`
+- `crates/comrade-core/src/delegate.rs`
+- `.comrade/memory/0038-isolate-delegate-parallel-jobs-in-git-worktrees.md`
 
