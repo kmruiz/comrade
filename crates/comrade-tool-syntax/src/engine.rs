@@ -312,7 +312,7 @@ pub fn split_kind_prefix(input: &str) -> (Option<&'static str>, &str) {
 
 /// One-line "head" of a declaration node: text up to the opening `{`, whitespace
 /// collapsed, capped.
-fn signature_of(node: &tree_sitter::Node, text: &str) -> String {
+pub(crate) fn signature_of(node: &tree_sitter::Node, text: &str) -> String {
     let seg = &text[node.start_byte()..node.end_byte()];
     let head = match seg.find('{') {
         Some(i) => &seg[..i],
@@ -681,7 +681,7 @@ fn collect_files(
     Ok(out)
 }
 
-fn short_kind(kind: &str) -> &'static str {
+pub(crate) fn short_kind(kind: &str) -> &'static str {
     match kind {
         "function_item" => "fn",
         "struct_item" => "struct",

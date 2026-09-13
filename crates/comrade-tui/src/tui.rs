@@ -677,6 +677,7 @@ enum MxCommand {
     NewSession,
     QueuePrompt,
     Quit,
+    ReindexSemanticSearch,
     ReloadConfig,
     SaveSession,
     SearchChat,
@@ -713,6 +714,7 @@ impl MxCommand {
         MxCommand::NewSession,
         MxCommand::QueuePrompt,
         MxCommand::Quit,
+        MxCommand::ReindexSemanticSearch,
         MxCommand::ReloadConfig,
         MxCommand::SaveSession,
         MxCommand::SearchChat,
@@ -748,6 +750,7 @@ impl MxCommand {
             MxCommand::NewSession => "new-session",
             MxCommand::QueuePrompt => "queue-prompt",
             MxCommand::Quit => "quit",
+            MxCommand::ReindexSemanticSearch => "reindex-semantic-search",
             MxCommand::ReloadConfig => "reload-config",
             MxCommand::SaveSession => "save-session",
             MxCommand::SearchChat => "search-chat-history",
@@ -787,6 +790,8 @@ impl MxCommand {
             MxCommand::LoadSession => Some("C-x C-f"),
             MxCommand::QueuePrompt => Some("C-<return>"),
             MxCommand::Quit => Some("C-c"),
+            // Palette-only: rebuilds the semantic indexes (no default key).
+            MxCommand::ReindexSemanticSearch => None,
             MxCommand::ReloadConfig => Some("C-r"),
             MxCommand::SaveSession => Some("C-x C-s"),
             MxCommand::SearchChat => Some("C-s"),
@@ -825,6 +830,9 @@ impl MxCommand {
             MxCommand::NewSession => "open a new session (the current one keeps running)",
             MxCommand::QueuePrompt => "hold the prompt and submit it when the current run ends",
             MxCommand::Quit => "quit the cockpit",
+            MxCommand::ReindexSemanticSearch => {
+                "rebuild the semantic search indexes (memory + code)"
+            }
             MxCommand::ReloadConfig => "reload the config file without restarting",
             MxCommand::SaveSession => "save the current session to a file",
             MxCommand::SearchChat => "search the chat history",
@@ -1682,6 +1690,26 @@ impl App {
                     ));
                 }
             }
+        });
+    }
+
+    /// Force a full rebuild of the semantic indexes (M-x
+    /// `reindex-semantic-search`): re-embeds every memory document and every code
+    /// chunk in a background task and reports the result in the chat.
+    fn reindex_semantic_search(&mut self) {
+        self.push_meta("reindexing semantic search...");
+        let root = self.root.clone();
+        let tx = self.events_tx.clone();
+        let id = self.active_id();
+        tokio::spawn(async move {
+            let res =
+                tokio::task::spawn_blocking(move || comrade_tool_memory::reindex(&root)).await;
+            let event = match res {
+                Ok(Ok(report)) => AgentEvent::Notice(report),
+                Ok(Err(e)) => AgentEvent::Error(format!("reindex failed: {e:#}")),
+                Err(e) => AgentEvent::Error(format!("reindex panicked: {e}")),
+            };
+            let _ = tx.send((id, event));
         });
     }
 
@@ -2714,6 +2742,7 @@ impl App {
                 self.activity = None;
                 self.push_meta(format!("error: {e}"));
             }
+            AgentEvent::Notice(text) => self.push_meta(text),
             AgentEvent::TitleChanged => self.refresh_active_slot(),
             AgentEvent::StatusChanged | AgentEvent::PlanChanged => {}
             AgentEvent::PlanFinished(s) => match s {
@@ -2906,6 +2935,7 @@ impl App {
             MxCommand::NewSession => self.new_session(),
             MxCommand::QueuePrompt => self.queue_prompt(),
             MxCommand::Quit => return true,
+            MxCommand::ReindexSemanticSearch => self.reindex_semantic_search(),
             MxCommand::ReloadConfig => self.reload_config(),
             MxCommand::SaveSession => self.save_session_prompt(),
             MxCommand::SearchChat => self.search = Some(Search::new()),

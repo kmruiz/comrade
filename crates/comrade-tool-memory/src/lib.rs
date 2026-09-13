@@ -20,6 +20,7 @@
 //! - `read_glossary` returns one term's entry, or the whole file without a
 //!   term argument.
 
+mod git;
 mod glossary;
 mod semantic;
 mod store;
@@ -32,6 +33,7 @@ use comrade_tool::{Tool, ToolContext, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+pub use semantic::reindex;
 pub use store::{list, read as read_entry, search};
 
 pub fn all() -> Vec<Box<dyn Tool>> {

@@ -496,6 +496,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "comrade-tool",
+ "comrade-tool-syntax",
  "fastembed",
  "flate2",
  "serde",

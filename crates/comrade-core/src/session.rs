@@ -49,6 +49,9 @@ pub enum AgentEvent {
     FinalAnswer(String),
     /// A non-fatal error surfaced during the run.
     Error(String),
+    /// A free-form informational notice to show in the chat (e.g. the result of
+    /// an M-x command that ran in the background).
+    Notice(String),
     /// The run finished (success or not).
     RunEnd,
     /// Provider account balance refreshed after a run finished.

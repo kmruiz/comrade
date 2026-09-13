@@ -30,6 +30,7 @@ fn main() {
         let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
         enc.write_all(&raw).expect("deflate asset");
         let deflated = enc.finish().expect("finish deflate");
-        std::fs::write(dst.join(format!("{name}.deflate")), &deflated).expect("write deflated asset");
+        std::fs::write(dst.join(format!("{name}.deflate")), &deflated)
+            .expect("write deflated asset");
     }
 }

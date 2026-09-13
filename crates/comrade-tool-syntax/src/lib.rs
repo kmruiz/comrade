@@ -1,6 +1,9 @@
 //! Tree-sitter powered code tools.
 
+mod chunks;
 mod engine;
+
+pub use chunks::{CodeChunk, chunks_of_file, code_chunks};
 
 use engine::KIND_LABELS;
 

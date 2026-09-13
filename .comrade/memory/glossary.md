@@ -87,6 +87,13 @@ Children run with `kill_on_drop(true)`; output is captured into a 200 KB bounded
 **References:**
 - `crates/comrade-tui/src/tui.rs`
 
+## code chunk
+> An indexable unit of source produced by the tree-sitter chunker: for Rust, one declaration (fn/struct/enum/…, recursing into impl/mod/trait so a method is its own chunk with its container head as text context), else a 40-line window. Each chunk carries file + 1-based line (the declaration's line, or the window's first line) and kind/name, so an embedding hit is a location.
+
+**References:**
+- `crates/comrade-tool-syntax/src/chunks.rs`
+- `crates/comrade-tool-memory/src/semantic.rs`
+
 ## CommandLine (Program/Shell)
 > `tasks::CommandLine` in crates/comrade-tool-project/src/tasks.rs: how a resolved task runs. `Program { program, args }` (e.g. cargo, npm, mvn) or `Shell { script }` (run with bash -c). Generalized from the old cargo-only variant so a non-Cargo Ecosystem emits its own tool.
 
