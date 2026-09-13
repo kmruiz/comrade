@@ -251,7 +251,12 @@ impl Tool for GitLog {
         }
         let args: Args = serde_json::from_value(args)?;
         let nstr = args.n.to_string();
-        let mut git_args: Vec<String> = vec!["log".to_string(), "--oneline".to_string(), "-n".to_string(), nstr];
+        let mut git_args: Vec<String> = vec![
+            "log".to_string(),
+            "--oneline".to_string(),
+            "-n".to_string(),
+            nstr,
+        ];
         if let Some(s) = &args.search {
             git_args.push(format!("-S{s}"));
         }
@@ -573,7 +578,10 @@ impl Tool for GitCheckout {
             }
             (None, false) => {
                 ctx.confirm(
-                    format!("Restore {} file(s) from HEAD (discards local changes)", paths.len()),
+                    format!(
+                        "Restore {} file(s) from HEAD (discards local changes)",
+                        paths.len()
+                    ),
                     Some(paths.join("\n")),
                 )
                 .await?;
@@ -656,7 +664,10 @@ mod tests {
     #[test]
     fn diff_args_defaults_to_head_and_honours_rev_and_path() {
         assert_eq!(diff_args(None, false, None), vec!["diff", "HEAD"]);
-        assert_eq!(diff_args(None, false, Some("main".into())), vec!["diff", "main"]);
+        assert_eq!(
+            diff_args(None, false, Some("main".into())),
+            vec!["diff", "main"]
+        );
         assert_eq!(
             diff_args(Some("a.rs".into()), true, None),
             vec!["diff", "--cached", "HEAD", "--", "a.rs"]
@@ -669,7 +680,10 @@ mod tests {
 
     #[test]
     fn blame_args_carry_rev_and_line_range() {
-        assert_eq!(blame_args("a.rs", None, None, None), vec!["blame", "--date=short", "--", "a.rs"]);
+        assert_eq!(
+            blame_args("a.rs", None, None, None),
+            vec!["blame", "--date=short", "--", "a.rs"]
+        );
         assert_eq!(
             blame_args("a.rs", Some(10), Some(20), Some("HEAD~1".into())),
             vec!["blame", "--date=short", "HEAD~1", "-L10,20", "--", "a.rs"]

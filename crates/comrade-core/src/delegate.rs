@@ -1130,12 +1130,12 @@ impl Tool for DelegateParallelTool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::Arc;
     use comrade_tool::PlanStepDraft;
     use comrade_tool::ToolContext;
     use comrade_tool::tool::{UserIo, UserPrompt, UserReply};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
 
     use super::*;
     use crate::MemoryUndo;
@@ -2774,7 +2774,10 @@ mod tests {
             .invoke(&ctx, json!({"jobs": [{"model": "nope", "task": "x"}]}))
             .await
             .unwrap_err();
-        assert!(unknown.to_string().contains("unknown delegate model"), "{unknown}");
+        assert!(
+            unknown.to_string().contains("unknown delegate model"),
+            "{unknown}"
+        );
     }
 
     #[test]

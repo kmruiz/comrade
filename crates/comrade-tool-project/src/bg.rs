@@ -417,19 +417,18 @@ struct BgKill {
     hub: Arc<BgHub>,
 }
 
-static BG_KILL_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
-    ToolSpec {
-        name: "bg_kill".into(),
-        description: "Stop a running background job started with run_bg (request its child be killed).".into(),
-        json_schema: json!({
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "description": "Job id, e.g. bg-1." }
-            },
-            "required": ["id"],
-            "additionalProperties": false
-        }),
-    }
+static BG_KILL_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| ToolSpec {
+    name: "bg_kill".into(),
+    description: "Stop a running background job started with run_bg (request its child be killed)."
+        .into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "description": "Job id, e.g. bg-1." }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    }),
 });
 
 #[async_trait]

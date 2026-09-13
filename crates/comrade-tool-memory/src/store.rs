@@ -430,12 +430,7 @@ fn title_of(body: &str) -> String {
 /// Merge `sources` into `target`: append each source's body under a
 /// `## Merged from #NNNN - title` heading and mark the source `superseded`.
 /// Returns a one-line summary of what happened.
-pub fn merge(
-    root: &Path,
-    target: u32,
-    sources: &[u32],
-    note: Option<&str>,
-) -> Result<String> {
+pub fn merge(root: &Path, target: u32, sources: &[u32], note: Option<&str>) -> Result<String> {
     if !path_for(root, target)?.exists() {
         anyhow::bail!("no decision #{target}");
     }

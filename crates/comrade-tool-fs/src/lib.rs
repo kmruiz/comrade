@@ -680,7 +680,10 @@ impl Tool for FsRgrep {
             }
         }
         if shown > args.max_lines {
-            out.push_str(&format!("... and {} more line(s)\n", shown - args.max_lines));
+            out.push_str(&format!(
+                "... and {} more line(s)\n",
+                shown - args.max_lines
+            ));
         }
         Ok(clamp(out))
     }
@@ -741,14 +744,8 @@ fn grep(
         Ok(g)
     }
     let glob = validate(glob)?;
-    let include: Vec<String> = include
-        .iter()
-        .map(|g| validate(g))
-        .collect::<Result<_>>()?;
-    let exclude: Vec<String> = exclude
-        .iter()
-        .map(|g| validate(g))
-        .collect::<Result<_>>()?;
+    let include: Vec<String> = include.iter().map(|g| validate(g)).collect::<Result<_>>()?;
+    let exclude: Vec<String> = exclude.iter().map(|g| validate(g)).collect::<Result<_>>()?;
 
     let mut files = Vec::new();
     walk(root, &mut files);
@@ -1226,9 +1223,7 @@ mod tests {
         std::fs::write(root.join("tests/c.rs"), "fn alpha() {}\n").unwrap();
 
         // Regex over include globs, excluding tests/.
-        let re = super::Matcher::Regex(Box::new(
-            regex::Regex::new(r"fn \w+").unwrap(),
-        ));
+        let re = super::Matcher::Regex(Box::new(regex::Regex::new(r"fn \w+").unwrap()));
         let (hits, total) = super::grep(
             &root,
             "**/*",
@@ -1248,16 +1243,7 @@ mod tests {
             needle: "beta".into(),
             lower: false,
         };
-        let (hits, total) = super::grep(
-            &root,
-            "**/*.rs",
-            &[],
-            &[],
-            &lit,
-            1,
-            None,
-        )
-        .unwrap();
+        let (hits, total) = super::grep(&root, "**/*.rs", &[], &[], &lit, 1, None).unwrap();
         assert_eq!(total, 1);
         assert_eq!(hits.len(), 3, "beta line + one context each side: {hits:?}");
         let beta = hits.iter().find(|h| h.is_match).unwrap();

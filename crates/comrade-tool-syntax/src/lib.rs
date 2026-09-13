@@ -672,7 +672,13 @@ impl Tool for TsTestImpact {
                 continue;
             };
             // Symbol-matched tests first, then same-crate ones.
-            affected.push((hits.is_empty(), t.file.clone(), t.line, t.name.clone(), reason));
+            affected.push((
+                hits.is_empty(),
+                t.file.clone(),
+                t.line,
+                t.name.clone(),
+                reason,
+            ));
         }
         affected.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
 
@@ -687,7 +693,9 @@ impl Tool for TsTestImpact {
             out.push_str(&format!("  changed: {c}\n"));
         }
         if total == 0 {
-            out.push_str("(no tests reference the changed symbols; run the changed crate's suite)\n");
+            out.push_str(
+                "(no tests reference the changed symbols; run the changed crate's suite)\n",
+            );
             return Ok(clamp(out));
         }
         out.push('\n');
@@ -1177,7 +1185,10 @@ mod tests {
 
     #[test]
     fn crate_paths_and_ignored_symbols() {
-        assert_eq!(crate_of("crates/comrade-core/src/agent.rs"), "crates/comrade-core");
+        assert_eq!(
+            crate_of("crates/comrade-core/src/agent.rs"),
+            "crates/comrade-core"
+        );
         assert_eq!(crate_of("README.md"), "README.md");
         assert!(ignored_symbol("new"));
         assert!(ignored_symbol("id"));

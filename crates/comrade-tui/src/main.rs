@@ -12,7 +12,10 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use comrade_core::{AskAdviseTool, Config, DelegateLimits, DelegateParallelTool, DelegateTool, LlmClient, MemoryUndo};
+use comrade_core::{
+    AskAdviseTool, Config, DelegateLimits, DelegateParallelTool, DelegateTool, LlmClient,
+    MemoryUndo,
+};
 use comrade_tool::{ToolContext, ToolRegistry};
 
 #[derive(Parser, Debug)]

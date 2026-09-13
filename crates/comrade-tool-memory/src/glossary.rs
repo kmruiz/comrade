@@ -513,7 +513,13 @@ mod tests {
         assert!(delete(&root, "Beta").unwrap());
         assert!(!delete(&root, "Beta").unwrap());
         // The surviving term kept its body.
-        assert!(read_term(&root, "Gamma").unwrap().unwrap().body.contains("first meaning"));
+        assert!(
+            read_term(&root, "Gamma")
+                .unwrap()
+                .unwrap()
+                .body
+                .contains("first meaning")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

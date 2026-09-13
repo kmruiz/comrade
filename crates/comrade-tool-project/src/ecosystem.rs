@@ -238,7 +238,9 @@ fn parse_check_json(raw: &str, max: usize) -> (Vec<String>, usize) {
         if v.get("reason").and_then(Value::as_str) != Some("compiler-message") {
             continue;
         }
-        let Some(msg) = v.get("message") else { continue };
+        let Some(msg) = v.get("message") else {
+            continue;
+        };
         if msg.get("level").and_then(Value::as_str) != Some("error") {
             continue;
         }
@@ -265,7 +267,11 @@ fn format_diagnostic(msg: &Value) -> String {
         .and_then(|spans| {
             spans
                 .iter()
-                .find(|s| s.get("is_primary").and_then(Value::as_bool).unwrap_or(false))
+                .find(|s| {
+                    s.get("is_primary")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
                 .or_else(|| spans.first())
         })
         .map(|s| {
@@ -402,7 +408,10 @@ Compiling foo
         let (errors, total) = Cargo.parse_diagnostics(raw, 1);
         assert_eq!(total, 2);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0], "src/main.rs:3:5: error[E0425]: cannot find value `a`");
+        assert_eq!(
+            errors[0],
+            "src/main.rs:3:5: error[E0425]: cannot find value `a`"
+        );
 
         let (all, total) = Cargo.parse_diagnostics(raw, 10);
         assert_eq!(total, 2);

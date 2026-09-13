@@ -2,10 +2,11 @@
 //!
 //! `semantic_search` finds memory by MEANING, not keywords: it embeds every
 //! decision and glossary term with a small, locally-run model and ranks them by
-//! cosine similarity to the query. Both halves are embedded — there is no
-//! server: the model is a quantized ONNX bundle run in-process by `fastembed`
-//! (downloaded once to the user cache), and the vector store is a persisted
-//! flat index under the user cache dir keyed by the project root.
+//! cosine similarity to the query. Everything is embedded — there is no server
+//! and no download: the model is an int8-quantized ONNX bundle compiled into
+//! the binary with `include_bytes!` and run in-process by `fastembed`, and the
+//! vector store is a persisted flat index under the user cache dir keyed by the
+//! project root.
 //!
 //! Why a flat index and not HNSW: a project's memory is tens to a few hundred
 //! documents, where exact cosine over all vectors is instantaneous and needs no
@@ -19,18 +20,26 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use comrade_tool::{Tool, ToolContext, ToolSpec};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{
+    InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// Small, quantized retrieval model (~30 MB): strong quality-per-size for
-/// short documents and English text, and fast enough to embed a whole memory
-/// on the first call.
-const EMBED_MODEL: EmbeddingModel = EmbeddingModel::BGESmallENV15Q;
+/// The int8-quantized BGE-small-en-v1.5 ONNX graph (~34 MB), compiled into the
+/// binary so there is no download, no network and no model cache to manage.
+const MODEL_ONNX: &[u8] = include_bytes!("../assets/bge-small-en-v1.5-int8/model_quantized.onnx");
+/// The tokenizer and its config files, embedded alongside the graph.
+const MODEL_TOKENIZER: &[u8] = include_bytes!("../assets/bge-small-en-v1.5-int8/tokenizer.json");
+const MODEL_CONFIG: &[u8] = include_bytes!("../assets/bge-small-en-v1.5-int8/config.json");
+const MODEL_SPECIAL_TOKENS: &[u8] =
+    include_bytes!("../assets/bge-small-en-v1.5-int8/special_tokens_map.json");
+const MODEL_TOKENIZER_CONFIG: &[u8] =
+    include_bytes!("../assets/bge-small-en-v1.5-int8/tokenizer_config.json");
 
 /// Human-readable model id stored with the index so a model change invalidates
 /// cached vectors.
-const MODEL_ID: &str = "bge-small-en-v1.5-q";
+const MODEL_ID: &str = "bge-small-en-v1.5-int8";
 
 /// A document to index: one ADR or one glossary term.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,11 +143,7 @@ fn documents(root: &Path) -> Result<Vec<Doc>> {
 /// Rebuild `existing` against `docs`, re-embedding only new/changed documents.
 fn refresh(docs: &[Doc], existing: &Store, embedder: &dyn Embedder) -> Result<Store> {
     let stale_model = existing.model != MODEL_ID;
-    let old: HashMap<&str, &StoredDoc> = existing
-        .docs
-        .iter()
-        .map(|d| (d.id.as_str(), d))
-        .collect();
+    let old: HashMap<&str, &StoredDoc> = existing.docs.iter().map(|d| (d.id.as_str(), d)).collect();
 
     let mut slots: Vec<Option<StoredDoc>> = Vec::with_capacity(docs.len());
     let mut todo: Vec<(usize, &Doc)> = Vec::new();
@@ -223,8 +228,8 @@ fn rank<'a>(
 }
 
 /// The user cache dir Comrade owns: `$XDG_CACHE_HOME/comrade` (fallback
-/// `~/.cache/comrade`, else the temp dir). Keeps model and index files out of
-/// the repo.
+/// `~/.cache/comrade`, else the temp dir). The vector index is cached here so
+/// machine-specific data stays out of the repo.
 fn cache_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -259,29 +264,33 @@ fn save_store(path: &Path, store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// The in-process model, loaded (and downloaded, once) on first use.
+/// The in-process model, built from the embedded assets on first use.
 static MODEL: OnceLock<Result<Mutex<TextEmbedding>, String>> = OnceLock::new();
 
-/// The real embedder: a lazily-loaded local ONNX model.
+/// The real embedder: the embedded int8 model run in-process via ONNX Runtime.
 struct FastEmbedder;
 
 impl Embedder for FastEmbedder {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let cell = MODEL.get_or_init(|| {
-            TextEmbedding::try_new(
-                InitOptions::new(EMBED_MODEL)
-                    .with_cache_dir(cache_dir().join("models"))
-                    .with_show_download_progress(false),
-            )
-            .map(Mutex::new)
-            .map_err(|e| e.to_string())
+            let tokenizer = TokenizerFiles {
+                tokenizer_file: MODEL_TOKENIZER.to_vec(),
+                config_file: MODEL_CONFIG.to_vec(),
+                special_tokens_map_file: MODEL_SPECIAL_TOKENS.to_vec(),
+                tokenizer_config_file: MODEL_TOKENIZER_CONFIG.to_vec(),
+            };
+            // BGE-small uses CLS pooling (matches fastembed's own model config).
+            let model = UserDefinedEmbeddingModel::new(MODEL_ONNX.to_vec(), tokenizer)
+                .with_pooling(Pooling::Cls);
+            TextEmbedding::try_new_from_user_defined(model, InitOptionsUserDefined::new())
+                .map(Mutex::new)
+                .map_err(|e| e.to_string())
         });
         let model = cell
             .as_ref()
             .map_err(|e| anyhow::anyhow!("embedding model unavailable: {e}"))?;
         let mut guard = model.lock().unwrap_or_else(|e| e.into_inner());
-        let owned: Vec<String> = texts.to_vec();
-        guard.embed(owned, Some(16))
+        guard.embed(texts, Some(16))
     }
 }
 
@@ -434,7 +443,11 @@ mod tests {
 
         // A second refresh with the same text embeds nothing new.
         let again = refresh(&docs, &store, &emb).unwrap();
-        assert_eq!(emb.calls.load(Ordering::SeqCst), 1, "unchanged docs re-embedded");
+        assert_eq!(
+            emb.calls.load(Ordering::SeqCst),
+            1,
+            "unchanged docs re-embedded"
+        );
         assert_eq!(again.docs.len(), 2);
 
         // Ranking prefers the doc whose meaning matches the query (a separate
@@ -452,7 +465,8 @@ mod tests {
     }
 
     #[test]
-    fn rank_filters_by_kind() {        let mut a = doc("term:X", "alpha glossary");
+    fn rank_filters_by_kind() {
+        let mut a = doc("term:X", "alpha glossary");
         a.kind = "glossary".into();
         let docs = vec![doc("adr:0001", "alpha adr"), a];
         let emb = StubEmbedder::default();
@@ -463,16 +477,18 @@ mod tests {
         assert_eq!(only_glossary[0].1.kind, "glossary");
     }
 
-    /// End-to-end check with the real model: downloads ~30 MB on first run, so
-    /// it is ignored by default. Run with `cargo test -p comrade-tool-memory -- --ignored`.
+    /// Sanity check of the real (embedded) model: related sentences must be
+    /// closer than unrelated ones.
     #[test]
-    #[ignore = "downloads the embedding model; run with --ignored"]
     fn real_model_embeds_and_ranks_by_meaning() {
         let emb = FastEmbedder;
         let v = emb.embed(&["hello world".into()]).unwrap();
         assert_eq!(v.len(), 1);
         assert!(v[0].len() >= 128, "unexpected dim {}", v[0].len());
-        let cat = emb.embed(&["the cat sat on the mat".into()]).unwrap().remove(0);
+        let cat = emb
+            .embed(&["the cat sat on the mat".into()])
+            .unwrap()
+            .remove(0);
         let kitten = emb
             .embed(&["a small kitten rests on a rug".into()])
             .unwrap()
@@ -484,6 +500,35 @@ mod tests {
         assert!(
             cosine(&cat, &kitten) > cosine(&cat, &physics),
             "semantic similarity did not beat the unrelated sentence"
+        );
+    }
+
+    /// End-to-end check on REAL data: build the index from this repo's own
+    /// `.comrade/memory` and confirm a natural-language query surfaces the
+    /// matching ADR. Skips itself when there is no memory to read.
+    #[test]
+    fn embedded_model_ranks_this_repos_memory() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let docs = match documents(&root) {
+            Ok(d) => d,
+            Err(_) => return, // no .comrade/memory in this checkout
+        };
+        if docs.iter().filter(|d| d.kind == "adr").count() < 5 {
+            return; // not enough memory to be meaningful
+        }
+        let store = refresh(&docs, &Store::default(), &FastEmbedder).unwrap();
+        assert_eq!(store.docs.len(), docs.len());
+        let query = FastEmbedder
+            .embed(&["finding a past decision by meaning rather than keywords".into()])
+            .unwrap()
+            .remove(0);
+        let hits = rank(&store, &query, 5, None);
+        let ids: Vec<String> = hits.iter().map(|(_, d)| d.id.clone()).collect();
+        assert!(!hits.is_empty(), "no hits");
+        assert!(
+            hits.iter()
+                .any(|(_, d)| d.title.to_lowercase().contains("semantic")),
+            "expected a semantic-search ADR among {ids:?}"
         );
     }
 }

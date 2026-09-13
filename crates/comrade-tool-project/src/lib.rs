@@ -289,8 +289,12 @@ impl Tool for PomCheck {
             .map(|s| s.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default();
         let eco = ecosystem::detect(&ctx.project_root)?;
-        let Some(line) =
-            eco.check_command(&ctx.project_root, &args.subproject, args.all_targets, &extra)?
+        let Some(line) = eco.check_command(
+            &ctx.project_root,
+            &args.subproject,
+            args.all_targets,
+            &extra,
+        )?
         else {
             anyhow::bail!(
                 "the {} ecosystem has no separate check step; use pom_run_tests or pom_run_task",
@@ -497,7 +501,10 @@ Compiling foo
         let (errors, total) = ecosystem::Cargo.parse_diagnostics(raw, 1);
         assert_eq!(total, 2);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0], "src/main.rs:3:5: error[E0425]: cannot find value `a`");
+        assert_eq!(
+            errors[0],
+            "src/main.rs:3:5: error[E0425]: cannot find value `a`"
+        );
 
         let (all, total) = ecosystem::Cargo.parse_diagnostics(raw, 10);
         assert_eq!(total, 2);

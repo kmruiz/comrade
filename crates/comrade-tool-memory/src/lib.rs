@@ -562,7 +562,11 @@ impl Tool for ListAdr {
         }
         let mut out = format!("{total} decision(s):\n");
         for m in rows {
-            let when = m.date.as_deref().map(|d| format!(" {d}")).unwrap_or_default();
+            let when = m
+                .date
+                .as_deref()
+                .map(|d| format!(" {d}"))
+                .unwrap_or_default();
             let ex = m.excerpt();
             let tail = if ex.is_empty() {
                 String::new()
@@ -673,7 +677,10 @@ impl Tool for RenameGlossary {
         }
         capture_file(ctx, ".comrade/memory/glossary.md").await?;
         glossary::rename(&ctx.project_root, &args.term, &args.to)?;
-        Ok(format!("Renamed glossary term {:?} -> {:?}.", args.term, args.to))
+        Ok(format!(
+            "Renamed glossary term {:?} -> {:?}.",
+            args.term, args.to
+        ))
     }
 }
 
