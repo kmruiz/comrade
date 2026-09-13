@@ -281,6 +281,13 @@ Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; othe
 - `crates/comrade-tui/src/headless.rs`
 - `crates/comrade-core/prompts/tools-intro.md`
 
+## retryable provider error
+> A provider request failure the LLM client retries rather than surfacing: a transport error (reqwest timeout/connect/request/body, e.g. connection reset/refused) or an HTTP status in 408|425|429|500|502|503|504|529. Classified by `is_retryable`/`is_retryable_status` in crates/comrade-core/src/llm.rs; a non-success status is carried as the typed `LlmHttpError`. Retried with exponential backoff (`[llm] max_retries`, `retry_backoff_ms`); mid-stream failures after the first emitted delta are NOT retried.
+
+**References:**
+- `crates/comrade-core/src/llm.rs`
+- `.comrade/memory/0029-retry-transient-provider-failures-in-the-llm-client.md`
+
 ## runbook-style prompt
 > The convention that all model-facing prompt text in Comrade must be terse, imperative runbook prose (numbered steps, one idea per line, short sentences, exact tool names in backticks), so that small models can act as the tech lead. Applies to the tech-lead prompt sections, the delegate/advisor sub-agent system bodies, and ToolSpec descriptions.
 

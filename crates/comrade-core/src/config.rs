@@ -59,6 +59,12 @@ pub struct LlmCfg {
     pub temperature: f32,
     /// Seconds to wait for a response.
     pub timeout_secs: u64,
+    /// How many times to retry a request that fails transiently (a connection
+    /// reset/refused, a timeout, or a 408/425/429/5xx status) before giving up.
+    pub max_retries: u32,
+    /// Base delay in milliseconds for the retry backoff. It doubles per attempt
+    /// and is capped at 8s, so a flaky provider is not hammered.
+    pub retry_backoff_ms: u64,
     /// Tool-calling protocol: auto | native | react.
     pub protocol: Protocol,
     /// Model context window in tokens. When `None` the app tries to detect it
@@ -78,6 +84,8 @@ impl Default for LlmCfg {
             provider: None,
             temperature: 0.2,
             timeout_secs: 600,
+            max_retries: 2,
+            retry_backoff_ms: 500,
             protocol: Protocol::Auto,
             context_window: None,
             model_version: None,
