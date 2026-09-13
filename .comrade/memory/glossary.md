@@ -414,6 +414,14 @@ SessionFile is the on-disk JSON form (version/title/status/plan/delegated/finish
 **Notes:**
 Frontmatter is parsed by hand (no YAML crate in the workspace). Discovery/parse live in crates/comrade-tool-skill (parse_skill_md, discover_in, discover, all); the TUI registers the tools in main.rs build_tools/delegate_registry/advise_registry, which now take the project root.
 
+## summarise
+> A tech-lead-only tool (crates/comrade-core/src/summarise.rs, `SummariseTool`) that runs ONE shell command whose output is expected to be large/noisy and returns a DELEGATE-WRITTEN summary of that output instead of the raw text, so the bulk never enters the tech lead's context. Runs the command behind the same policy + approval gate as `shell` (comrade_tool::check_command + ctx.confirm), captures stdout+stderr uncapped, saves the full output to `<root>/.comrade/artifacts/<secs>-<slug>.txt` (gitignored) and returns its path, then asks a [[delegates]] model (per-call `model` arg, default = first enabled delegate; an `approval = \"deny\"` delegate is refused) for a concise summary via one LlmClient::chat round-trip. Optional `focus` steers the summary. Denied for delegates (in DENIED_FOR_DELEGATES) because it spawns an extra model chat.
+
+**References:**
+- `crates/comrade-core/src/summarise.rs`
+- `crates/comrade-tui/src/main.rs (build_tools)`
+- `.comrade/memory/0042-add-a-summarise-tool-that-returns-a-delegate-written-summary-of-a-commands-output.md`
+
 ## TaggedEvent
 > TaggedEvent = (u64, AgentEvent) (crates/comrade-tui/src/main.rs): an agent event tagged with the id of the session that produced it. Each session has its own bounded run-facing sender relayed by spawn_tagged_relay, which forwards (id, event) into the App's single central unbounded queue (App::events_rx); the select loop dispatches via App::on_agent_event_for(id, ev).
 
