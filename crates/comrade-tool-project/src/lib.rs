@@ -127,13 +127,13 @@ impl Tool for PomRunTask {
 /// the literal `test` verb and aliases that expand to it). Tests belong to the
 /// dedicated `pom_run_tests` tool, whose output is a compact failure summary.
 fn ensure_not_test_run(line: &tasks::CommandLine) -> anyhow::Result<()> {
-    if let tasks::CommandLine::Cargo { args } = line {
-        if args.first().map(String::as_str) == Some("test") {
-            anyhow::bail!(
-                "running tests through pom_run_task is disabled - use the pom_run_tests tool instead \
-                 (it returns only failing tests and costs far less context)"
-            );
-        }
+    if let tasks::CommandLine::Cargo { args } = line
+        && args.first().map(String::as_str) == Some("test")
+    {
+        anyhow::bail!(
+            "running tests through pom_run_task is disabled - use the pom_run_tests tool instead \
+             (it returns only failing tests and costs far less context)"
+        );
     }
     Ok(())
 }
@@ -248,10 +248,10 @@ fn simplify_test_output(raw: &str) -> String {
             continue;
         }
         // skip individual passing tests ("test foo ... ok")
-        if let Some(rest) = t.strip_prefix("test ") {
-            if rest.ends_with(" ... ok") {
-                continue;
-            }
+        if let Some(rest) = t.strip_prefix("test ")
+            && rest.ends_with(" ... ok")
+        {
+            continue;
         }
         out.push_str(line);
         out.push('\n');

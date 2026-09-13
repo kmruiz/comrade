@@ -61,11 +61,11 @@ pub async fn search(query: &str, max_results: usize) -> Result<Vec<WebResult>> {
 
     // 1) Bing (reliable from datacenter IPs).
     let bing = bing_search(&client, query).await;
-    if let Ok(mut results) = bing {
-        if !results.is_empty() {
-            results.truncate(max_results.max(1));
-            return Ok(results);
-        }
+    if let Ok(mut results) = bing
+        && !results.is_empty()
+    {
+        results.truncate(max_results.max(1));
+        return Ok(results);
     }
 
     // 2) DuckDuckGo HTML fallback.
@@ -171,14 +171,14 @@ fn is_external(url: &str) -> bool {
 /// Bing organic results point at `bing.com/ck/a?...&u=<base64url>`; decode the
 /// `u` param to the real destination.
 fn resolve_bing_url(href: &str) -> String {
-    if href.contains("bing.com/ck/a") || href.starts_with("https://www.bing.com/ck/a") {
-        if let Ok(parsed) = url::Url::parse(href.trim()) {
-            for (key, value) in parsed.query_pairs() {
-                if key == "u" {
-                    if let Some(decoded) = decode_base64_url(&value) {
-                        return decoded;
-                    }
-                }
+    if (href.contains("bing.com/ck/a") || href.starts_with("https://www.bing.com/ck/a"))
+        && let Ok(parsed) = url::Url::parse(href.trim())
+    {
+        for (key, value) in parsed.query_pairs() {
+            if key == "u"
+                && let Some(decoded) = decode_base64_url(&value)
+            {
+                return decoded;
             }
         }
     }
@@ -194,12 +194,11 @@ fn decode_base64_url(encoded: &str) -> Option<String> {
         let decoded = URL_SAFE_NO_PAD
             .decode(slice)
             .or_else(|_| URL_SAFE.decode(slice));
-        if let Ok(decoded) = decoded {
-            if let Ok(s) = String::from_utf8(decoded) {
-                if s.starts_with("http") {
-                    return Some(s);
-                }
-            }
+        if let Ok(decoded) = decoded
+            && let Ok(s) = String::from_utf8(decoded)
+            && s.starts_with("http")
+        {
+            return Some(s);
         }
     }
     None

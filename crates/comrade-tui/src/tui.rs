@@ -296,6 +296,7 @@ struct ChatRowsCache {
 /// Return the chat row layout for `(epoch, width)`, rebuilding it from
 /// `chat`/`collapsed` via [`layout_chat_rows`] when the cache is stale or
 /// absent, and reusing it otherwise.
+#[allow(clippy::too_many_arguments)]
 fn chat_cache<'a>(
     cache: &'a mut Option<ChatRowsCache>,
     epoch: u64,
@@ -1007,24 +1008,22 @@ impl App {
     /// Record the elapsed wall time of a delegate's `name` card once its result
     /// arrives.
     fn stamp_delegate_taken(&mut self, name: &str, model: &str) {
-        if let Some(card) = self.last_delegate_tool_mut(name, model) {
-            if card.taken_ms.is_none() {
-                if let Some(started) = card.started {
-                    card.taken_ms = Some(started.elapsed().as_millis());
-                }
-            }
+        if let Some(card) = self.last_delegate_tool_mut(name, model)
+            && card.taken_ms.is_none()
+            && let Some(started) = card.started
+        {
+            card.taken_ms = Some(started.elapsed().as_millis());
         }
     }
 
     /// Record the elapsed wall time of the last `name` card once its result
     /// arrives (a no-op for cards that never started or already got stamped).
     fn stamp_taken(&mut self, name: &str) {
-        if let Some(card) = self.last_tool_mut(name) {
-            if card.taken_ms.is_none() {
-                if let Some(started) = card.started {
-                    card.taken_ms = Some(started.elapsed().as_millis());
-                }
-            }
+        if let Some(card) = self.last_tool_mut(name)
+            && card.taken_ms.is_none()
+            && let Some(started) = card.started
+        {
+            card.taken_ms = Some(started.elapsed().as_millis());
         }
     }
 
@@ -1055,10 +1054,7 @@ impl App {
             self.toggle_section_at(idx);
             return;
         }
-        let is_run = match self.chat.get(idx).map(|m| m.kind) {
-            Some(MsgKind::Run) => true,
-            _ => false,
-        };
+        let is_run = matches!(self.chat.get(idx).map(|m| m.kind), Some(MsgKind::Run));
         if is_run {
             // Toggling a folded digest unfolds it back into its messages.
             self.expand_run(idx);
@@ -1119,7 +1115,7 @@ impl App {
                 if s > start && s < start + len {
                     s = start;
                 } else if s >= start + len {
-                    s = s - (len - 1);
+                    s -= len - 1;
                 }
             }
             self.sel = (s < self.chat.len()).then_some(s);
@@ -1318,10 +1314,7 @@ impl App {
         // A match hiding inside a collapsed exchange must unfold its section
         // first, or the jump would land on an invisible row.
         self.expand_section_at(idx);
-        let folded = match self.chat.get(idx).map(|m| m.kind) {
-            Some(MsgKind::Run) => true,
-            _ => false,
-        };
+        let folded = matches!(self.chat.get(idx).map(|m| m.kind), Some(MsgKind::Run));
         if folded {
             let anchor = idx;
             unfold_run(&mut self.chat, idx);
@@ -2599,21 +2592,19 @@ impl App {
             "ask_advise" => parse_advice_reply(output),
             _ => None,
         };
-        if ok {
-            if let Some((model, reply)) = parsed {
-                if let Some(card) = self.last_tool_mut(tool) {
-                    card.ok = true;
-                    card.open = false;
-                    card.result = Some(format!("replied ({} chars)", reply.chars().count()));
-                }
-                if !reply.trim().is_empty() {
-                    // The sub-agent stretch (reads + the tool call) is done:
-                    // fold it so the reply reads as a clean block.
-                    self.fold_completed();
-                    self.push_msg(Msg::authored(MsgKind::Delegate, model, reply));
-                }
-                return;
+        if ok && let Some((model, reply)) = parsed {
+            if let Some(card) = self.last_tool_mut(tool) {
+                card.ok = true;
+                card.open = false;
+                card.result = Some(format!("replied ({} chars)", reply.chars().count()));
             }
+            if !reply.trim().is_empty() {
+                // The sub-agent stretch (reads + the tool call) is done:
+                // fold it so the reply reads as a clean block.
+                self.fold_completed();
+                self.push_msg(Msg::authored(MsgKind::Delegate, model, reply));
+            }
+            return;
         }
         // Unparseable or failed hand-off: keep the plain tool-card behaviour so
         // the error/raw text is still visible.
@@ -2711,14 +2702,14 @@ impl App {
         if !is_confirm || self.dialog_ask {
             return;
         }
-        if let Some(d) = self.dialogs.first() {
-            if let UserPrompt::Confirm { title, .. } = &d.prompt {
-                let action = one_line(title, 80);
-                self.push_msg(Msg::text(
-                    MsgKind::Meta,
-                    format!("auto-accept on → approved: {action}"),
-                ));
-            }
+        if let Some(d) = self.dialogs.first()
+            && let UserPrompt::Confirm { title, .. } = &d.prompt
+        {
+            let action = one_line(title, 80);
+            self.push_msg(Msg::text(
+                MsgKind::Meta,
+                format!("auto-accept on → approved: {action}"),
+            ));
         }
         self.answer_top(UserReply::Answer("yes".into()));
     }
@@ -2924,19 +2915,19 @@ impl App {
                 }
             }
             KeyCode::Left | KeyCode::Backspace => {
-                if let Some(p) = &mut self.pick {
-                    if p.model_sel.is_some() {
-                        p.model_sel = None;
-                    }
+                if let Some(p) = &mut self.pick
+                    && p.model_sel.is_some()
+                {
+                    p.model_sel = None;
                 }
             }
             KeyCode::Char(c)
                 if !ctrl && self.pick.as_ref().is_some_and(|p| p.model_sel.is_some()) =>
             {
-                if let Some(d) = c.to_digit(10) {
-                    if d >= 1 {
-                        self.apply_pick_to_index(d as usize - 1);
-                    }
+                if let Some(d) = c.to_digit(10)
+                    && d >= 1
+                {
+                    self.apply_pick_to_index(d as usize - 1);
                 }
             }
             _ => {}
@@ -3047,6 +3038,7 @@ fn mcp_clamp(sel: usize, rows: usize) -> usize {
 
 /// Assemble the App: one open session (id 0) wired to its own tagged event
 /// relay, plus the shared UI plumbing (input, git bar, dialogs, colors).
+#[allow(clippy::too_many_arguments)]
 fn build_app(
     deps: &Deps,
     events_tx: mpsc::UnboundedSender<TaggedEvent>,
@@ -3191,10 +3183,10 @@ pub async fn run(deps: &Deps) -> Result<()> {
             if event::poll(Duration::from_millis(100)).ok() != Some(true) {
                 continue;
             }
-            if let Ok(ev) = event::read() {
-                if kev_tx.blocking_send(ev).is_err() {
-                    break;
-                }
+            if let Ok(ev) = event::read()
+                && kev_tx.blocking_send(ev).is_err()
+            {
+                break;
             }
         }
     });
@@ -3405,61 +3397,61 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
             }
             // Emacs-style chat navigation. Plain Ctrl+p/n move block to block;
             // Ctrl+Shift and Alt variants (P/N) jump between user messages.
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                if let KeyCode::Char(ch) = key.code {
-                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                    let ctrl_p = ch.eq_ignore_ascii_case(&'p');
-                    let ctrl_n = ch.eq_ignore_ascii_case(&'n');
-                    if ctrl_p && shift {
-                        app.move_user(-1);
-                        return false;
-                    }
-                    if ctrl_n && shift {
-                        app.move_user(1);
-                        return false;
-                    }
-                    if ctrl_p {
-                        app.move_block(-1);
-                        return false;
-                    }
-                    if ctrl_n {
-                        app.move_block(1);
-                        return false;
-                    }
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && let KeyCode::Char(ch) = key.code
+            {
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                let ctrl_p = ch.eq_ignore_ascii_case(&'p');
+                let ctrl_n = ch.eq_ignore_ascii_case(&'n');
+                if ctrl_p && shift {
+                    app.move_user(-1);
+                    return false;
+                }
+                if ctrl_n && shift {
+                    app.move_user(1);
+                    return false;
+                }
+                if ctrl_p {
+                    app.move_block(-1);
+                    return false;
+                }
+                if ctrl_n {
+                    app.move_block(1);
+                    return false;
                 }
             }
-            if key.modifiers.contains(KeyModifiers::ALT) {
-                if let KeyCode::Char(ch) = key.code {
-                    if ch.eq_ignore_ascii_case(&'x') {
-                        // M-x: open the command palette.
-                        app.mx = Some(Mx::open());
-                        return false;
-                    }
-                    if ch.eq_ignore_ascii_case(&'p') {
-                        app.move_user(-1);
-                        return false;
-                    }
-                    if ch.eq_ignore_ascii_case(&'n') {
-                        app.move_user(1);
-                        return false;
-                    }
-                    if ch.eq_ignore_ascii_case(&'w') {
-                        // M-w: Emacs-style "copy". Every terminal forwards
-                        // Alt+W, so this works even where Ctrl+Shift+C is
-                        // claimed by the terminal emulator itself.
-                        app.copy_prompt_or_block();
-                        return false;
-                    }
-                    if ch.eq_ignore_ascii_case(&'f') {
-                        // M-f: toggle focus mode.
-                        app.toggle_focus_mode();
-                        return false;
-                    }
-                    if ch.eq_ignore_ascii_case(&'c') {
-                        // M-c: compact the context (summarise and replace it).
-                        app.compact_context();
-                        return false;
-                    }
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && let KeyCode::Char(ch) = key.code
+            {
+                if ch.eq_ignore_ascii_case(&'x') {
+                    // M-x: open the command palette.
+                    app.mx = Some(Mx::open());
+                    return false;
+                }
+                if ch.eq_ignore_ascii_case(&'p') {
+                    app.move_user(-1);
+                    return false;
+                }
+                if ch.eq_ignore_ascii_case(&'n') {
+                    app.move_user(1);
+                    return false;
+                }
+                if ch.eq_ignore_ascii_case(&'w') {
+                    // M-w: Emacs-style "copy". Every terminal forwards
+                    // Alt+W, so this works even where Ctrl+Shift+C is
+                    // claimed by the terminal emulator itself.
+                    app.copy_prompt_or_block();
+                    return false;
+                }
+                if ch.eq_ignore_ascii_case(&'f') {
+                    // M-f: toggle focus mode.
+                    app.toggle_focus_mode();
+                    return false;
+                }
+                if ch.eq_ignore_ascii_case(&'c') {
+                    // M-c: compact the context (summarise and replace it).
+                    app.compact_context();
+                    return false;
                 }
             }
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -3608,18 +3600,15 @@ fn handle_mx_key(app: &mut App, key: KeyEvent) -> MxKeyOutcome {
                     // pick) take over the screen; the hint would just sit in
                     // front of them, so close the palette instead.
                     let overlay_open = app.search.is_some() || app.pick.is_some();
-                    match (overlay_open, cmd.keys()) {
-                        (false, Some(keys)) => {
-                            // Stay open in hint mode: the row tells the user
-                            // how to run the command directly next time.
-                            app.mx = Some(Mx {
-                                query: String::new(),
-                                matches: Vec::new(),
-                                sel: 0,
-                                done: Some(format!("you can run this command with {keys}")),
-                            });
-                        }
-                        _ => {}
+                    if let (false, Some(keys)) = (overlay_open, cmd.keys()) {
+                        // Stay open in hint mode: the row tells the user
+                        // how to run the command directly next time.
+                        app.mx = Some(Mx {
+                            query: String::new(),
+                            matches: Vec::new(),
+                            sel: 0,
+                            done: Some(format!("you can run this command with {keys}")),
+                        });
                     }
                 }
                 // Nothing matched: stay in the palette so the user can edit.
@@ -4047,13 +4036,13 @@ fn home_path(root: &std::path::Path) -> String {
 /// [`home_path`] with the home directory passed in, so it can be tested
 /// without touching process-global env vars.
 fn home_path_with(root: &std::path::Path, home: Option<&std::path::Path>) -> String {
-    if let Some(home) = home {
-        if let Ok(rel) = root.strip_prefix(home) {
-            if rel.as_os_str().is_empty() {
-                return "~".to_string();
-            }
-            return format!("~/{}", rel.to_string_lossy());
+    if let Some(home) = home
+        && let Ok(rel) = root.strip_prefix(home)
+    {
+        if rel.as_os_str().is_empty() {
+            return "~".to_string();
         }
+        return format!("~/{}", rel.to_string_lossy());
     }
     root.to_string_lossy().into_owned()
 }
@@ -4794,6 +4783,10 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
 /// a heading ("prompt echo") and the exchange under it — every message up to
 /// the next user turn — is its body. A collapsed section renders only its
 /// heading plus a "… N more" marker, so the exchange folds to one tinted block.
+/// Return shape of [`layout_chat_rows`]: the render rows plus, per row, the
+/// owning chat-message index and that message's `(start row, height)` span.
+type ChatRowLayout = (Vec<RenderRow>, Vec<Option<usize>>, Vec<(usize, usize)>);
+
 fn layout_chat_rows(
     chat: &[Msg],
     collapsed: &[bool],
@@ -4802,7 +4795,7 @@ fn layout_chat_rows(
     delegates: &[DelegateCfg],
     colors: &ModelColors,
     focus: bool,
-) -> (Vec<RenderRow>, Vec<Option<usize>>, Vec<(usize, usize)>) {
+) -> ChatRowLayout {
     let mut out = Vec::new();
     let mut owner: Vec<Option<usize>> = Vec::new();
     let mut ranges = Vec::new();
@@ -5055,10 +5048,7 @@ fn fold_completed_runs(chat: &mut Vec<Msg>) -> Vec<(usize, usize)> {
 /// Replace one folded [`MsgKind::Run`] digest with its original children, in
 /// place, so every child becomes a normal selectable/searchable message again.
 fn unfold_run(chat: &mut Vec<Msg>, idx: usize) {
-    let is_run = match chat.get(idx).map(|m| m.kind) {
-        Some(MsgKind::Run) => true,
-        _ => false,
-    };
+    let is_run = matches!(chat.get(idx).map(|m| m.kind), Some(MsgKind::Run));
     if !is_run {
         return;
     }
@@ -5310,7 +5300,7 @@ fn arg_lines(args: &str) -> Vec<String> {
         Value::Object(m) => m,
         Value::String(s) => return vec![cap(&s, 300)],
         _ => {
-            return vec![cap(&args.trim(), 300)];
+            return vec![cap(args.trim(), 300)];
         }
     };
     if let Some(inner) = map.remove("args").and_then(|a| match a {
@@ -5486,13 +5476,13 @@ fn fmt_dur_ms(ms: u128) -> String {
     }
     if ms < 60_000 {
         let s = ms / 1_000;
-        if ms % 1_000 == 0 {
+        if ms.is_multiple_of(1_000) {
             return format!("{s}s");
         }
         return format!("{s}.{}s", ms % 1_000 / 100);
     }
     let total_s = ms / 1_000;
-    if total_s % 60 == 0 {
+    if total_s.is_multiple_of(60) {
         format!("{}m", total_s / 60)
     } else {
         format!("{}m {}s", total_s / 60, total_s % 60)
@@ -5818,13 +5808,13 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             Style::default().fg(Color::DarkGray),
         ));
     }
-    if card.open {
-        if let Some(tok) = card.tokens {
-            spans.push(Span::styled(
-                format!("  · {} tok", fmt_tokens(tok)),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
+    if card.open
+        && let Some(tok) = card.tokens
+    {
+        spans.push(Span::styled(
+            format!("  · {} tok", fmt_tokens(tok)),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     out.push(RenderRow {
         rule: None,
@@ -5902,21 +5892,19 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
     // duplication. Every other card (edits, reads, test runs, failures, ...)
     // still shows its result text.
     let result_is_diff = card.name == "git_diff" && diff_sides.is_some();
-    if !result_is_diff {
-        if let Some(result) = &card.result {
-            let color = if card.ok { Color::Green } else { Color::Red };
+    if !result_is_diff && let Some(result) = &card.result {
+        let color = if card.ok { Color::Green } else { Color::Red };
+        out.push(RenderRow {
+            rule: None,
+            spans: vec![Span::styled("result:", Style::default().fg(color))],
+            tool_header: None,
+        });
+        for row in result_rows(result, card.ok, width) {
             out.push(RenderRow {
                 rule: None,
-                spans: vec![Span::styled("result:", Style::default().fg(color))],
+                spans: row,
                 tool_header: None,
             });
-            for row in result_rows(result, card.ok, width) {
-                out.push(RenderRow {
-                    rule: None,
-                    spans: row,
-                    tool_header: None,
-                });
-            }
         }
     }
 }
@@ -6073,18 +6061,19 @@ fn label_line(
     let model_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     let balance_style = Style::default().fg(Color::DarkGray);
 
-    if let Some(bal) = balance {
-        if !bal.is_empty() {
-            let label_len = model_label.chars().count();
-            let bal_len = bal.chars().count();
-            if label_len + bal_len < width {
-                let pad = width - label_len - bal_len;
-                let mut spans = Vec::new();
-                spans.push(Span::styled(model_label, model_style));
-                spans.push(Span::raw(" ".repeat(pad)));
-                spans.push(Span::styled(bal.to_string(), balance_style));
-                return Line::from(spans);
-            }
+    if let Some(bal) = balance
+        && !bal.is_empty()
+    {
+        let label_len = model_label.chars().count();
+        let bal_len = bal.chars().count();
+        if label_len + bal_len < width {
+            let pad = width - label_len - bal_len;
+            let spans = vec![
+                Span::styled(model_label, model_style),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(bal.to_string(), balance_style),
+            ];
+            return Line::from(spans);
         }
     }
 
@@ -6215,7 +6204,7 @@ fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
         let verify = step.verification.trim();
         if !verify.is_empty() {
             let verify_toks = vec![tok(
-                format!("verify: {}", flat(&verify)),
+                format!("verify: {}", flat(verify)),
                 Style::default().fg(Color::DarkGray),
             )];
             for line in wrap_toks(&verify_toks, width) {
@@ -6656,7 +6645,7 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
 
     // Size the popup first so the body can wrap to its real inner width (the
     // block borders shave two columns off the popup).
-    let w = area.width.saturating_sub(2).min(100).max(20);
+    let w = area.width.saturating_sub(2).clamp(20, 100);
     let inner_w = w.saturating_sub(2).max(10) as usize;
 
     // Build the body lines for the kind of prompt, wrapped to the popup width.
@@ -6697,11 +6686,11 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
             // The actual action (e.g. the shell command) goes on top so the
             // human always sees exactly what they are approving.
             lines.extend(preview_lines(title, inner_w));
-            if let Some(d) = diff {
-                if !d.trim().is_empty() {
-                    lines.push(Line::from(""));
-                    lines.extend(preview_lines(d, inner_w));
-                }
+            if let Some(d) = diff
+                && !d.trim().is_empty()
+            {
+                lines.push(Line::from(""));
+                lines.extend(preview_lines(d, inner_w));
             }
             if !app.dialog_conv.is_empty() {
                 lines.push(Line::from(""));
@@ -7142,7 +7131,7 @@ fn table_block_toks(
                 if i > 0 {
                     line.push(joiner.clone());
                 }
-                let chunk = chunks[i].get(d).cloned().unwrap_or_else(|| String::new());
+                let chunk = chunks[i].get(d).cloned().unwrap_or_else(String::new);
                 line.push(tok(pad_to(&chunk, widths[i], aligns[i]), style));
             }
             out.push(line);
@@ -7300,7 +7289,7 @@ fn md_to_lines(md: &str, width: usize) -> Vec<Vec<Span<'static>>> {
 
 fn heading_level(s: &str) -> Option<usize> {
     let level = s.chars().take_while(|&c| c == '#').count();
-    if level >= 1 && level <= 6 && s.len() > level && s.as_bytes()[level] == b' ' {
+    if (1..=6).contains(&level) && s.len() > level && s.as_bytes()[level] == b' ' {
         Some(level)
     } else {
         None
@@ -7988,29 +7977,27 @@ mod tests {
         let collapsed = &[false];
 
         // With focus=true, only User/Reasoning/Assistant should produce rows
-        let (rows_focus, owners_focus, _) =
+        let (_rows_focus, owners_focus, _) =
             layout_chat_rows(&chat, collapsed, "", 80, &[], &ModelColors::default(), true);
         // Only indices 0 (User), 2 (Reasoning), 3 (Assistant) should have rows
         // Tool (idx 1), Meta (idx 4), Failure (idx 5) should be hidden
-        for owner in &owners_focus {
-            if let Some(idx) = owner {
-                let kind = chat[*idx].kind;
-                assert_ne!(
-                    kind,
-                    MsgKind::Tool,
-                    "Tool message should be hidden in focus mode"
-                );
-                assert_ne!(
-                    kind,
-                    MsgKind::Meta,
-                    "Meta message should be hidden in focus mode"
-                );
-                assert_ne!(
-                    kind,
-                    MsgKind::Failure,
-                    "Failure message should be hidden in focus mode"
-                );
-            }
+        for idx in owners_focus.iter().flatten() {
+            let kind = chat[*idx].kind;
+            assert_ne!(
+                kind,
+                MsgKind::Tool,
+                "Tool message should be hidden in focus mode"
+            );
+            assert_ne!(
+                kind,
+                MsgKind::Meta,
+                "Meta message should be hidden in focus mode"
+            );
+            assert_ne!(
+                kind,
+                MsgKind::Failure,
+                "Failure message should be hidden in focus mode"
+            );
         }
         // The visible messages (User, Reasoning, Assistant) should have rows
         let visible_indices: std::collections::HashSet<_> = owners_focus.iter().flatten().collect();
@@ -8075,7 +8062,7 @@ mod tests {
         // The digest has no summary row of its own, but the reasoning it keeps
         // is attributed to the digest so it stays selectable as one block.
         assert!(
-            owners.iter().any(|&o| o == Some(1)),
+            owners.contains(&Some(1)),
             "the folded reasoning should be owned by the digest index"
         );
     }
@@ -8557,8 +8544,10 @@ mod tests {
     fn spoken_blocks_are_banded_by_their_model() {
         let mut colors = ModelColors::new();
         colors.assign(&["main".to_string(), "dev".to_string()]);
-        let mut dev = DelegateCfg::default();
-        dev.name = "dev".into();
+        let dev = DelegateCfg {
+            name: "dev".into(),
+            ..Default::default()
+        };
         let delegates = vec![dev];
         // Reasoning is banded with its model's dimmed colour.
         let r = Msg::reasoning("main", "think");
@@ -8715,11 +8704,13 @@ mod tests {
     fn delegate_panel_rows_wrap_inside_the_panel_width() {
         // A delegate whose label + model + description is far wider than the
         // model panel must be wrapped, never left to spill past the edge.
-        let mut d = DelegateCfg::default();
-        d.name = "mistral".into();
+        let mut d = DelegateCfg {
+            name: "mistral".into(),
+            description:
+                "Cheap and fast, good for basic coding tasks and summarising long outputs.".into(),
+            ..Default::default()
+        };
         d.llm.model = "ollama/mistral:7b".into();
-        d.description =
-            "Cheap and fast, good for basic coding tasks and summarising long outputs.".into();
         let rows = delegate_panel_rows(&[d], &ModelColors::new(), 24)
             .expect("rows for a configured delegate");
         assert_eq!(rows[0].width(), 10); // "delegates:"
@@ -8744,7 +8735,7 @@ mod tests {
         }
         for row in &rows {
             assert!(
-                usize::from(row.width()) <= 24,
+                row.width() <= 24,
                 "delegate row wider than the panel: {:?}",
                 row
             );
@@ -8755,10 +8746,12 @@ mod tests {
 
     #[test]
     fn disabled_delegate_is_flagged_in_the_panel() {
-        let mut d = DelegateCfg::default();
-        d.name = "off".into();
+        let mut d = DelegateCfg {
+            name: "off".into(),
+            enabled: false,
+            ..Default::default()
+        };
         d.llm.model = "off".into();
-        d.enabled = false;
         let rows = delegate_panel_rows(&[d], &ModelColors::new(), 24)
             .expect("rows for a configured delegate");
         let joined: String = rows
@@ -9012,10 +9005,10 @@ fn edit_diff_label(name: &str, args_json: &str, result: Option<&str>) -> String 
     let pick_path = |keys: &[&str]| -> Option<String> {
         let map = value.as_ref()?.as_object()?;
         for k in keys {
-            if let Some(s) = map.get(*k).and_then(serde_json::Value::as_str) {
-                if !s.trim().is_empty() {
-                    return Some(s.trim().to_string());
-                }
+            if let Some(s) = map.get(*k).and_then(serde_json::Value::as_str)
+                && !s.trim().is_empty()
+            {
+                return Some(s.trim().to_string());
             }
         }
         None
@@ -9093,10 +9086,10 @@ fn extract_diff_sides(
             for line in diff.lines() {
                 if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
                     continue;
-                } else if line.starts_with('+') {
-                    added.push(line[1..].to_string());
-                } else if line.starts_with('-') {
-                    removed.push(line[1..].to_string());
+                } else if let Some(stripped) = line.strip_prefix('+') {
+                    added.push(stripped.to_string());
+                } else if let Some(stripped) = line.strip_prefix('-') {
+                    removed.push(stripped.to_string());
                 }
             }
         }
@@ -9823,7 +9816,7 @@ mod section_tests {
         // (idx 1) keeps a zero-length range and owns no rendered row.
         assert_eq!(ranges[0], (0, 2));
         assert_eq!(ranges[1], (2, 0));
-        assert!(!owner.iter().any(|o| *o == Some(1)), "{owner:?}");
+        assert!(!owner.contains(&Some(1)), "{owner:?}");
         assert_eq!(owner[0], Some(0));
         assert_eq!(owner[1], Some(0));
         assert_eq!(owner[2], Some(2));

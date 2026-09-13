@@ -308,11 +308,11 @@ impl ToolContext {
         let body = match notes {
             Some(notes) => {
                 let mut text = notes.render();
-                if let Some(d) = diff {
-                    if !d.is_empty() {
-                        text.push_str("\n\n");
-                        text.push_str(&d);
-                    }
+                if let Some(d) = diff
+                    && !d.is_empty()
+                {
+                    text.push_str("\n\n");
+                    text.push_str(&d);
                 }
                 Some(text)
             }

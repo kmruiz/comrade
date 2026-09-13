@@ -45,12 +45,12 @@ async fn question_on_stdin(question: &str, options: &[String]) -> Result<String>
     }
     msg.push_str("\n> ");
     let answer = read_line(&msg).await?;
-    if !options.is_empty() {
-        if let Ok(n) = answer.trim().parse::<usize>() {
-            if n >= 1 && n <= options.len() {
-                return Ok(options[n - 1].clone());
-            }
-        }
+    if !options.is_empty()
+        && let Ok(n) = answer.trim().parse::<usize>()
+        && n >= 1
+        && n <= options.len()
+    {
+        return Ok(options[n - 1].clone());
     }
     Ok(answer)
 }

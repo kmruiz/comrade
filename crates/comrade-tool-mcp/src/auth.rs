@@ -217,15 +217,15 @@ async fn capture_redirect_code(
                 Some((k.to_string(), decoded))
             })
             .collect();
-        if pairs.get("state").map(String::as_str) == Some(state) {
-            if let Some(code) = pairs.get("code") {
-                respond_http(
+        if pairs.get("state").map(String::as_str) == Some(state)
+            && let Some(code) = pairs.get("code")
+        {
+            respond_http(
                     socket,
                     "<html><body><p>Comrade received the code. You can close this tab.</p></body></html>",
                 )
                 .await;
-                return Ok(code.clone());
-            }
+            return Ok(code.clone());
         }
         respond_http(socket, "<html><body>unexpected callback</body></html>").await;
     }
@@ -476,9 +476,7 @@ mod tests {
                             if payload.contains("code_verifier=")
                                 && payload.contains("code=auth-code-1")
                             {
-                                body = format!(
-                                    r#"{{"access_token":"access-123","token_type":"Bearer","expires_in":3600,"refresh_token":"refresh-456"}}"#
-                                );
+                                body = r#"{"access_token":"access-123","token_type":"Bearer","expires_in":3600,"refresh_token":"refresh-456"}"#.to_string();
                             } else {
                                 status = "400 Bad Request";
                                 body = r#"{"error":"invalid_grant"}"#.to_string();

@@ -392,7 +392,7 @@ fn readiness_verdict(reply: &str) -> Readiness {
         let value = rest
             .split_once(':')
             .map(|(k, v)| (k.trim(), Some(v.trim())))
-            .or_else(|| Some((rest, None)));
+            .or(Some((rest, None)));
         let Some((kind, extra)) = value else {
             continue;
         };
@@ -559,22 +559,22 @@ mod tests {
             let mut tmp = [0u8; 2048];
             let mut body_len: Option<usize> = None;
             let mut header_end: Option<usize> = None;
-            while body_len.map_or(true, |len| header_end.unwrap_or(0) + 4 + len > data.len()) {
+            while body_len.is_none_or(|len| header_end.unwrap_or(0) + 4 + len > data.len()) {
                 let n = stream.read(&mut tmp).unwrap();
                 if n == 0 {
                     break;
                 }
                 data.extend_from_slice(&tmp[..n]);
-                if header_end.is_none() {
-                    if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-                        header_end = Some(p);
-                        let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
-                        body_len = head.lines().find_map(|l| {
-                            l.trim()
-                                .strip_prefix("content-length:")
-                                .and_then(|v| v.trim().parse().ok())
-                        });
-                    }
+                if header_end.is_none()
+                    && let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    header_end = Some(p);
+                    let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
+                    body_len = head.lines().find_map(|l| {
+                        l.trim()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse().ok())
+                    });
                 }
             }
             let body = match (header_end, body_len) {

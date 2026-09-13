@@ -452,9 +452,11 @@ mod tests {
 
     #[test]
     fn display_label_prefers_provider_qualified_form() {
-        let mut cfg = LlmCfg::default();
-        cfg.provider = Some("ollama".into());
-        cfg.model = "devstral-small-2".into();
+        let mut cfg = LlmCfg {
+            provider: Some("ollama".into()),
+            model: "devstral-small-2".into(),
+            ..Default::default()
+        };
         assert_eq!(cfg.display(), "ollama/devstral-small-2");
         cfg.provider = None;
         assert_eq!(cfg.display(), "devstral-small-2");

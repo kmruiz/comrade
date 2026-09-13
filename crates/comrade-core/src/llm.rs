@@ -321,10 +321,10 @@ pub struct LlmClient {
 /// outbound request (chat and provider probes alike) authenticates the same way.
 fn auth_headers(cfg: &LlmCfg) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(key) = &cfg.api_key {
-        if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
-            headers.insert(reqwest::header::AUTHORIZATION, value);
-        }
+    if let Some(key) = &cfg.api_key
+        && let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+    {
+        headers.insert(reqwest::header::AUTHORIZATION, value);
     }
     headers
 }
@@ -369,9 +369,7 @@ impl LlmClient {
             return None;
         }
         let origin = origin_of(&self.cfg.base_url)?;
-        let Some(short) = probe_client(&self.cfg) else {
-            return None;
-        };
+        let short = probe_client(&self.cfg)?;
         let body = serde_json::json!({ "name": self.cfg.model });
         let resp = short
             .post(format!("{origin}/api/show"))
@@ -386,14 +384,6 @@ impl LlmClient {
         model_version_from_ollama_show(&text)
     }
 
-    /// Try to detect the model's context window (tokens). Best effort:
-    /// 1. OpenAI-compatible `GET /models` (`context_length`/`context_window`),
-    ///    sent with the configured API key so authenticated providers (e.g.
-    ///    DeepSeek) don't reject the probe with 401;
-    /// 2. Ollama's native `GET /api/show` (`model_info...context_length`) -
-    ///    only probed when the endpoint actually looks like Ollama;
-    /// 3. a model-name heuristic (e.g. deepseek-chat -> 128K).
-    /// Returns `None` only if nothing is known.
     /// True when the configured endpoint is DeepSeek (provider preset or host).
     pub fn is_deepseek(&self) -> bool {
         if let Some(p) = self.cfg.provider.as_deref() {
@@ -420,6 +410,15 @@ impl LlmClient {
         parse_balance(&text)
     }
 
+    /// Try to detect the model's context window (tokens). Best effort:
+    /// 1. OpenAI-compatible `GET /models` (`context_length`/`context_window`),
+    ///    sent with the configured API key so authenticated providers (e.g.
+    ///    DeepSeek) don't reject the probe with 401;
+    /// 2. Ollama's native `GET /api/show` (`model_info...context_length`) -
+    ///    only probed when the endpoint actually looks like Ollama;
+    /// 3. a model-name heuristic (e.g. deepseek-chat -> 128K).
+    ///
+    /// Returns `None` only if nothing is known.
     pub async fn fetch_context_window(&self) -> Option<usize> {
         let Some(short) = probe_client(&self.cfg) else {
             return heuristic_context(&self.cfg.model);
@@ -427,29 +426,25 @@ impl LlmClient {
         // 1) OpenAI-compatible models list.
         let base = self.cfg.base_url.trim_end_matches('/');
         let models_url = format!("{base}/models");
-        if let Ok(resp) = short.get(&models_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    if let Some(n) = model_context_from_openai(&text, &self.cfg.model) {
-                        return Some(n);
-                    }
-                }
-            }
+        if let Ok(resp) = short.get(&models_url).send().await
+            && resp.status().is_success()
+            && let Ok(text) = resp.text().await
+            && let Some(n) = model_context_from_openai(&text, &self.cfg.model)
+        {
+            return Some(n);
         }
         // 2) Ollama native show (only for real Ollama endpoints).
-        if self.is_ollama() {
-            if let Some(origin) = origin_of(&self.cfg.base_url) {
-                let show_url = format!("{origin}/api/show");
-                let body = serde_json::json!({ "name": self.cfg.model });
-                if let Ok(resp) = short.post(&show_url).json(&body).send().await {
-                    if resp.status().is_success() {
-                        if let Ok(text) = resp.text().await {
-                            if let Some(n) = model_context_from_ollama_show(&text) {
-                                return Some(n);
-                            }
-                        }
-                    }
-                }
+        if self.is_ollama()
+            && let Some(origin) = origin_of(&self.cfg.base_url)
+        {
+            let show_url = format!("{origin}/api/show");
+            let body = serde_json::json!({ "name": self.cfg.model });
+            if let Ok(resp) = short.post(&show_url).json(&body).send().await
+                && resp.status().is_success()
+                && let Ok(text) = resp.text().await
+                && let Some(n) = model_context_from_ollama_show(&text)
+            {
+                return Some(n);
             }
         }
         // 3) Name-based heuristic fallback for cloud providers.
@@ -618,12 +613,12 @@ impl LlmClient {
                                 let index = tc.index.unwrap_or(0);
                                 let entry = tool_acc.entry(index).or_default();
                                 if let Some(id) = tc.id {
-                                    entry.id.get_or_insert_with(|| id);
+                                    entry.id.get_or_insert(id);
                                 }
                                 if let Some(name) =
                                     tc.function.as_ref().and_then(|f| f.name.clone())
                                 {
-                                    entry.name.get_or_insert_with(|| name);
+                                    entry.name.get_or_insert(name);
                                 }
                                 if let Some(args) =
                                     tc.function.as_ref().and_then(|f| f.arguments.clone())
@@ -647,8 +642,8 @@ fn finish_turn(
     usage: Option<Usage>,
 ) -> LlmTurn {
     let tool_calls = tool_acc
-        .into_iter()
-        .filter_map(|(_, acc)| {
+        .into_values()
+        .filter_map(|acc| {
             let id = acc.id?;
             let name = acc.name?;
             Some(ModelToolCall {
@@ -688,10 +683,7 @@ impl SseDecoder {
     fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
-        loop {
-            let Some(newline) = self.buffer.iter().position(|&b| b == b'\n') else {
-                break;
-            };
+        while let Some(newline) = self.buffer.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buffer.drain(..=newline).collect();
             let line = String::from_utf8_lossy(&line);
             let line = line.trim_end_matches(['\n', '\r']);
@@ -794,10 +786,10 @@ fn model_context_from_openai(json: &str, model: &str) -> Option<usize> {
             "max_model_len",
             "context_size",
         ] {
-            if let Some(n) = entry.get(key).and_then(Value::as_u64) {
-                if n > 0 {
-                    return Some(n as usize);
-                }
+            if let Some(n) = entry.get(key).and_then(Value::as_u64)
+                && n > 0
+            {
+                return Some(n as usize);
             }
         }
     }
@@ -811,17 +803,16 @@ fn model_context_from_ollama_show(json: &str) -> Option<usize> {
     let info = value
         .get("model_info")
         .or_else(|| value.get("model"))
-        .or_else(|| Some(&value))?;
+        .or(Some(&value))?;
     let mut found: Option<usize> = None;
     fn walk(v: &Value, last_key: Option<&str>, out: &mut Option<usize>) {
         match v {
             Value::Number(n) => {
-                if last_key.is_some_and(|k| k.ends_with("context_length")) {
-                    if let Some(u) = n.as_u64() {
-                        if u > 0 {
-                            *out = Some(u as usize);
-                        }
-                    }
+                if last_key.is_some_and(|k| k.ends_with("context_length"))
+                    && let Some(u) = n.as_u64()
+                    && u > 0
+                {
+                    *out = Some(u as usize);
                 }
             }
             Value::Object(map) => {
@@ -1218,10 +1209,12 @@ mod probe_tests {
         // probe must send the configured key or it is 401ed and the advertised
         // context window can never be read from the provider API.
         let (addr, server) = serve_once_reply();
-        let mut cfg = LlmCfg::default();
-        cfg.base_url = format!("http://{addr}/v1");
-        cfg.api_key = Some("sk-test".into());
-        cfg.model = "deepseek-chat".into();
+        let cfg = LlmCfg {
+            base_url: format!("http://{addr}/v1"),
+            api_key: Some("sk-test".into()),
+            model: "deepseek-chat".into(),
+            ..Default::default()
+        };
         let client = LlmClient::new(&cfg).unwrap();
         assert_eq!(client.fetch_context_window().await, Some(131_072));
         assert!(server.join().unwrap(), "probe request was unauthenticated");

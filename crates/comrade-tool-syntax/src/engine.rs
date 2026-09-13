@@ -65,9 +65,9 @@ fn language_for(ext: &str) -> Option<tree_sitter::Language> {
 }
 
 /// Find every identifier occurrence of `symbol` in a single source text.
-fn occurrences_in_text<'t>(
+fn occurrences_in_text(
     lang: &tree_sitter::Language,
-    text: &'t str,
+    text: &str,
     symbol: &str,
 ) -> Vec<(usize, usize)> {
     let mut parser = tree_sitter::Parser::new();
@@ -90,16 +90,12 @@ fn occurrences_in_text<'t>(
         if descend && cursor.goto_first_child() {
             continue;
         }
-        loop {
-            if cursor.goto_next_sibling() {
-                descend = true;
-                break;
-            }
-            if !cursor.goto_parent() {
-                return spans;
-            }
+        if cursor.goto_next_sibling() {
+            descend = true;
+        } else if !cursor.goto_parent() {
+            return spans;
+        } else {
             descend = false;
-            break;
         }
     }
 }
@@ -260,16 +256,12 @@ fn find_decl(
             if descend && cursor.goto_first_child() {
                 continue;
             }
-            loop {
-                if cursor.goto_next_sibling() {
-                    descend = true;
-                    break;
-                }
-                if !cursor.goto_parent() {
-                    return Ok(None);
-                }
+            if cursor.goto_next_sibling() {
+                descend = true;
+            } else if !cursor.goto_parent() {
+                return Ok(None);
+            } else {
                 descend = false;
-                break;
             }
         }
     }
@@ -634,14 +626,13 @@ fn collect_files(
             // A directory scope: map every supported source under it. The
             // git-modified (`only`) filter is applied per file afterwards.
             let mut paths = Vec::new();
-            for ext in ["rs"] {
-                walk_files(&abs, ext, &mut paths);
-            }
+            // only Rust is supported for now
+            walk_files(&abs, "rs", &mut paths);
             for sub in paths {
-                if let Ok(meta) = sub.metadata() {
-                    if meta.len() > MAX_FILE_BYTES {
-                        continue;
-                    }
+                if let Ok(meta) = sub.metadata()
+                    && meta.len() > MAX_FILE_BYTES
+                {
+                    continue;
                 }
                 let rel = sub
                     .strip_prefix(root)
@@ -650,23 +641,22 @@ fn collect_files(
                 files.push((rel, sub));
             }
         } else {
-            if let Some(set) = only {
-                if !set.contains(&abs) {
-                    return Ok(Vec::new());
-                }
+            if let Some(set) = only
+                && !set.contains(&abs)
+            {
+                return Ok(Vec::new());
             }
             files.push((p.trim_start_matches('/').to_string(), abs));
         }
     } else {
         let mut paths = Vec::new();
-        for ext in ["rs"] {
-            walk_files(root, ext, &mut paths);
-        }
+        // only Rust is supported for now
+        walk_files(root, "rs", &mut paths);
         for abs in paths {
-            if let Ok(meta) = abs.metadata() {
-                if meta.len() > MAX_FILE_BYTES {
-                    continue;
-                }
+            if let Ok(meta) = abs.metadata()
+                && meta.len() > MAX_FILE_BYTES
+            {
+                continue;
             }
             let rel = abs
                 .strip_prefix(root)

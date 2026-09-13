@@ -91,14 +91,14 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
 
     // Detect the model's real context window and display identity (unless
     // configured explicitly) so the model gauge is accurate.
-    if cfg.llm.context_window.is_none() {
-        if let Some(window) = client.fetch_context_window().await {
-            cfg.llm.context_window = Some(window);
-            eprintln!(
-                "[comrade] model {} context window: {window} tokens",
-                cfg.llm.model
-            );
-        }
+    if cfg.llm.context_window.is_none()
+        && let Some(window) = client.fetch_context_window().await
+    {
+        cfg.llm.context_window = Some(window);
+        eprintln!(
+            "[comrade] model {} context window: {window} tokens",
+            cfg.llm.model
+        );
     }
     if cfg.llm.model_version.is_none() {
         cfg.llm.model_version = client.fetch_model_version().await;

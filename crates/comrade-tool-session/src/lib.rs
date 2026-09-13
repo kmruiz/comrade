@@ -244,19 +244,20 @@ impl Tool for SelfUpdatePlan {
                 PlanTarget::Id(id) => s.id == *id,
                 PlanTarget::Text(text) => s.goal.contains(text.as_str()),
             });
-            if let Some(step) = matched {
-                if is_delegate_model(&step.model) && !ctx.session.step_was_delegated(step.id) {
-                    anyhow::bail!(
-                        "plan step {} is assigned to delegate {:?}, but the `delegate` tool \
-                         has never run it — the tech lead cannot complete a delegated step \
-                         itself. Run the step with the delegate tool (pass `step` = {}), verify \
-                         the result, then mark it done. To do the step yourself instead, replace \
-                         the plan with `self_set_plan` naming your own model ({AGENT_MODEL:?}).",
-                        step.id,
-                        step.model.trim(),
-                        step.id
-                    );
-                }
+            if let Some(step) = matched
+                && is_delegate_model(&step.model)
+                && !ctx.session.step_was_delegated(step.id)
+            {
+                anyhow::bail!(
+                    "plan step {} is assigned to delegate {:?}, but the `delegate` tool \
+                     has never run it — the tech lead cannot complete a delegated step \
+                     itself. Run the step with the delegate tool (pass `step` = {}), verify \
+                     the result, then mark it done. To do the step yourself instead, replace \
+                     the plan with `self_set_plan` naming your own model ({AGENT_MODEL:?}).",
+                    step.id,
+                    step.model.trim(),
+                    step.id
+                );
             }
         }
 

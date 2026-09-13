@@ -290,10 +290,10 @@ impl LoopTracker {
         self.recent.push_back((sig, self.mutation_seq));
         if self.recent.len() > LOOP_WINDOW {
             let dropped = self.recent.pop_front().map(|(s, _)| s);
-            if let Some(dropped) = dropped {
-                if !self.recent.iter().any(|(s, _)| *s == dropped) {
-                    self.refusals.remove(&dropped);
-                }
+            if let Some(dropped) = dropped
+                && !self.recent.iter().any(|(s, _)| *s == dropped)
+            {
+                self.refusals.remove(&dropped);
             }
         }
     }
@@ -385,6 +385,7 @@ pub async fn run_agent(
 /// that processes many tasks retains the earlier conversation; the manager
 /// compacts it automatically as it approaches the budget. Exactly one task
 /// runs at a time against the manager.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_with_history(
     cfg: &Config,
     client: &LlmClient,
@@ -626,10 +627,7 @@ async fn run_agent_loop(
                             ok: false,
                         })
                         .await;
-                    ctxm.push(ChatMessage::new(
-                        Role::User,
-                        render_observation(first, &msg),
-                    ));
+                    ctxm.push(ChatMessage::new(Role::User, render_observation(first, msg)));
                     continue;
                 }
             }
@@ -773,7 +771,7 @@ async fn run_agent_loop(
                     .await;
                 ctxm.push(ChatMessage::new(
                     Role::User,
-                    render_observation(&tool_call.name, &msg),
+                    render_observation(&tool_call.name, msg),
                 ));
                 continue;
             }
@@ -892,6 +890,7 @@ async fn run_agent_loop(
 /// Dispatch a turn's native function calls. The assistant message with all
 /// `tool_calls` is recorded first; each call then gets a `Role::Tool` result.
 /// Approval-gated calls require `justification` in their arguments.
+#[allow(clippy::too_many_arguments)]
 async fn run_native_calls(
     ctxm: &mut ContextManager,
     tx: &mpsc::Sender<AgentEvent>,
@@ -1326,22 +1325,21 @@ mod tests {
                 let mut tmp = [0u8; 8192];
                 let mut body_len: Option<usize> = None;
                 let mut header_end: Option<usize> = None;
-                while body_len.map_or(true, |len| header_end.unwrap_or(0) + 4 + len > data.len()) {
+                while body_len.is_none_or(|len| header_end.unwrap_or(0) + 4 + len > data.len()) {
                     match stream.read(&mut tmp) {
                         Ok(0) => break,
                         Ok(r) => {
                             data.extend_from_slice(&tmp[..r]);
-                            if header_end.is_none() {
-                                if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-                                    header_end = Some(p);
-                                    let head =
-                                        String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
-                                    body_len = head.lines().find_map(|l| {
-                                        l.trim()
-                                            .strip_prefix("content-length:")
-                                            .and_then(|v| v.trim().parse().ok())
-                                    });
-                                }
+                            if header_end.is_none()
+                                && let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                header_end = Some(p);
+                                let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
+                                body_len = head.lines().find_map(|l| {
+                                    l.trim()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse().ok())
+                                });
                             }
                         }
                         Err(_) => break,
@@ -1469,22 +1467,21 @@ mod tests {
                 let mut tmp = [0u8; 8192];
                 let mut body_len: Option<usize> = None;
                 let mut header_end: Option<usize> = None;
-                while body_len.map_or(true, |len| header_end.unwrap_or(0) + 4 + len > data.len()) {
+                while body_len.is_none_or(|len| header_end.unwrap_or(0) + 4 + len > data.len()) {
                     match stream.read(&mut tmp) {
                         Ok(0) => break,
                         Ok(r) => {
                             data.extend_from_slice(&tmp[..r]);
-                            if header_end.is_none() {
-                                if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-                                    header_end = Some(p);
-                                    let head =
-                                        String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
-                                    body_len = head.lines().find_map(|l| {
-                                        l.trim()
-                                            .strip_prefix("content-length:")
-                                            .and_then(|v| v.trim().parse().ok())
-                                    });
-                                }
+                            if header_end.is_none()
+                                && let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                header_end = Some(p);
+                                let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
+                                body_len = head.lines().find_map(|l| {
+                                    l.trim()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse().ok())
+                                });
                             }
                         }
                         Err(_) => break,
@@ -2201,10 +2198,11 @@ mod tests {
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
         {
-            if let AgentEvent::ToolResult { output, ok, .. } = &ev {
-                if !ok && output.contains("approval-gated") {
-                    saw_refusal = true;
-                }
+            if let AgentEvent::ToolResult { output, ok, .. } = &ev
+                && !ok
+                && output.contains("approval-gated")
+            {
+                saw_refusal = true;
             }
             if let AgentEvent::RunEnd = ev {
                 break;
@@ -2344,10 +2342,11 @@ mod loop_tests {
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
         {
-            if let AgentEvent::ToolResult { output, ok, .. } = &ev {
-                if !ok && output.contains("could not be parsed") {
-                    saw_feedback = true;
-                }
+            if let AgentEvent::ToolResult { output, ok, .. } = &ev
+                && !ok
+                && output.contains("could not be parsed")
+            {
+                saw_feedback = true;
             }
             if let AgentEvent::RunEnd = ev {
                 break;
@@ -2385,7 +2384,7 @@ mod loop_tests {
     fn different_arguments_are_not_a_loop() {
         let mut t = LoopTracker::default();
         t.record("fs_read_file", "fs_read_file a".to_string());
-        assert_eq!(t.check(&"fs_read_file b".to_string()), None);
+        assert_eq!(t.check("fs_read_file b"), None);
     }
 }
 

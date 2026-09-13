@@ -130,10 +130,8 @@ pub fn slugify(text: &str) -> String {
     for c in text.to_lowercase().chars() {
         if c.is_alphanumeric() {
             out.push(c);
-        } else if c.is_whitespace() || c == '-' || c == '_' {
-            if !out.ends_with('-') {
-                out.push('-');
-            }
+        } else if (c.is_whitespace() || c == '-' || c == '_') && !out.ends_with('-') {
+            out.push('-');
         }
     }
     out.trim_matches('-').to_string()
@@ -142,10 +140,10 @@ pub fn slugify(text: &str) -> String {
 /// Read the memory file for an id.
 fn path_for(root: &Path, id: u32) -> Result<PathBuf> {
     for entry in list_files(root)? {
-        if let Some(meta) = read_meta(&entry) {
-            if meta.id == id {
-                return Ok(entry);
-            }
+        if let Some(meta) = read_meta(&entry)
+            && meta.id == id
+        {
+            return Ok(entry);
         }
     }
     anyhow::bail!("no decision #{id} found in {}", dir(root).display());
@@ -180,7 +178,7 @@ pub fn list(root: &Path) -> Result<Vec<EntryMeta>> {
         .iter()
         .filter_map(|p| read_meta(p))
         .collect();
-    metas.sort_by(|a, b| b.id.cmp(&a.id));
+    metas.sort_by_key(|b| std::cmp::Reverse(b.id));
     Ok(metas)
 }
 
@@ -391,10 +389,10 @@ pub fn search(
         let Some(meta) = parse_file(&file_name, &text) else {
             continue;
         };
-        if let Some(tags) = tags {
-            if !tags.iter().all(|t| meta.tags.iter().any(|m| m == t)) {
-                continue;
-            }
+        if let Some(tags) = tags
+            && !tags.iter().all(|t| meta.tags.iter().any(|m| m == t))
+        {
+            continue;
         }
         if words.is_empty() {
             scored.push((0, meta));

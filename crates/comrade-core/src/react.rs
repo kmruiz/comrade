@@ -216,7 +216,7 @@ fn find_marker(text: &str, marker: &str) -> Option<usize> {
 }
 
 /// Return the balanced `{...}` substring starting at `open` (an index into `s`).
-fn balanced_object<'a>(s: &'a str, open: usize) -> Result<&'a str> {
+fn balanced_object(s: &str, open: usize) -> Result<&str> {
     let bytes = s.as_bytes();
     let mut depth = 0i32;
     for i in open..bytes.len() {
@@ -310,9 +310,7 @@ fn replace_single_quotes(text: &str) -> String {
                     out.push('"');
                     i = j + 1;
                 } else {
-                    for k in i..n {
-                        out.push(chars[k]);
-                    }
+                    out.extend(chars[i..n].iter().copied());
                     break;
                 }
             }

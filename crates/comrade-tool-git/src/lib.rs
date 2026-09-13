@@ -291,10 +291,11 @@ impl Tool for GitCommit {
         git(ctx, &refs).await?;
         let message_file = write_message_file(&args.message).await?;
         let msg_arg = message_file.to_str().unwrap_or("/dev/null").to_string();
-        let result = git(ctx, &["commit", "-F", &msg_arg]).await.map_err(|e| {
-            let _ = std::fs::remove_file(&message_file);
-            e
-        })?;
+        let result = git(ctx, &["commit", "-F", &msg_arg])
+            .await
+            .inspect_err(|_e| {
+                let _ = std::fs::remove_file(&message_file);
+            })?;
         let _ = std::fs::remove_file(&message_file);
         Ok(result)
     }

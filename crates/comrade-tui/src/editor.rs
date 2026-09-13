@@ -128,7 +128,7 @@ impl Editor {
         }
         let cur = self.cur;
         match self.buf[cur..].find('\n') {
-            Some(rel) if rel == 0 => {
+            Some(0) => {
                 // Cursor sits at the end of a line: cut the newline itself.
                 self.buf.remove(cur);
                 self.anchor = None;

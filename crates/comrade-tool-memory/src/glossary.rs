@@ -193,10 +193,10 @@ fn render_section(
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
     let body_lines: Vec<&str> = meaning.lines().map(str::trim_end).collect();
-    if let Some(first) = body_lines.first() {
-        if !first.trim().is_empty() {
-            lines.push(format!("> {first}"));
-        }
+    if let Some(first) = body_lines.first()
+        && !first.trim().is_empty()
+    {
+        lines.push(format!("> {first}"));
     }
     let rest: Vec<&str> = body_lines
         .iter()
@@ -351,7 +351,7 @@ mod tests {
                 "adr",
                 "Updated meaning.",
                 &["docs/adr.md".into()],
-                Some("case-insensitive dedupe".into()),
+                Some("case-insensitive dedupe"),
             )
             .unwrap()
         );

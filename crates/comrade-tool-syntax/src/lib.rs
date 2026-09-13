@@ -445,13 +445,13 @@ impl Tool for TsReadSymbol {
         // Kind keywords in the input are a filter, not part of the identifier:
         // report the bare name and hand the engine the stripped identifier.
         let (pfx, bare) = engine::split_kind_prefix(&args.symbol);
-        if let (Some(p), Some(k)) = (pfx, kind) {
-            if !p.eq_ignore_ascii_case(k) {
-                anyhow::bail!(
-                    "symbol {:?} already names kind {p:?}, which conflicts with the type filter {k:?}",
-                    bare
-                );
-            }
+        if let (Some(p), Some(k)) = (pfx, kind)
+            && !p.eq_ignore_ascii_case(k)
+        {
+            anyhow::bail!(
+                "symbol {:?} already names kind {p:?}, which conflicts with the type filter {k:?}",
+                bare
+            );
         }
         let scope = changed_scope(ctx, args.git_modified_only)?;
         guard_path_scope(ctx, &args.path, &scope)?;

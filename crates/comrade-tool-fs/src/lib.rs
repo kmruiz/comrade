@@ -227,13 +227,13 @@ impl Tool for FsReadFile {
         let args: Args = serde_json::from_value(args)?;
         let changed = changed_scope(ctx, args.git_modified_only)?;
         let file = resolve(ctx, &args.path)?;
-        if let Some(set) = &changed {
-            if !set.contains(&file) {
-                anyhow::bail!(
-                    "{rel} is not modified (git_modified_only)",
-                    rel = display_path(ctx, &file)
-                );
-            }
+        if let Some(set) = &changed
+            && !set.contains(&file)
+        {
+            anyhow::bail!(
+                "{rel} is not modified (git_modified_only)",
+                rel = display_path(ctx, &file)
+            );
         }
         let bytes = tokio::fs::read(&file)
             .await
@@ -472,10 +472,7 @@ impl Tool for FsWriteFile {
         let args: Args = serde_json::from_value(args)?;
         let file = resolve(ctx, &args.path)?;
         let rel = display_path(ctx, &file);
-        let before = match tokio::fs::read_to_string(&file).await {
-            Ok(text) => text,
-            Err(_) => String::new(),
-        };
+        let before: String = tokio::fs::read_to_string(&file).await.unwrap_or_default();
         if before != args.content {
             ctx.undo.capture(&rel, before.clone()).await?;
             ctx.confirm(
@@ -551,10 +548,10 @@ impl Tool for FsListFiles {
 
         let mut matches = Vec::new();
         for file in files {
-            if let Some(set) = &changed {
-                if !set.contains(&file) {
-                    continue;
-                }
+            if let Some(set) = &changed
+                && !set.contains(&file)
+            {
+                continue;
             }
             let rel = file
                 .strip_prefix(&ctx.project_root)
@@ -677,10 +674,10 @@ fn search_files(
 
     let mut out = Vec::new();
     for file in files {
-        if let Some(set) = only {
-            if !set.contains(&file) {
-                continue;
-            }
+        if let Some(set) = only
+            && !set.contains(&file)
+        {
+            continue;
         }
         let rel = file
             .strip_prefix(root)
@@ -790,10 +787,8 @@ fn glob_at(p: &[u8], pi: usize, t: &[u8], ti: usize) -> bool {
             }
             // `*` must not cross a '/'; `**` may. Try each suffix position.
             for k in ti..=t.len() {
-                if is_double || no_sep(&t[ti..k]) {
-                    if glob_at(p, j, t, k) {
-                        return true;
-                    }
+                if (is_double || no_sep(&t[ti..k])) && glob_at(p, j, t, k) {
+                    return true;
                 }
             }
             false

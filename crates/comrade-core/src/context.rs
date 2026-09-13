@@ -6,7 +6,7 @@ pub fn estimate_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    (text.chars().count() + 3) / 4 + 4
+    text.chars().count().div_ceil(4) + 4
 }
 
 /// Holds the rolling message history and enforces a token budget.

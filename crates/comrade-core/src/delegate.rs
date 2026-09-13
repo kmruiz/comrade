@@ -676,6 +676,7 @@ const DELEGATE_READ_NUDGE: &str = "You have performed {count} reads in a row wit
 ///
 /// `read_nudge` customises the read-guard refusal for the kind of sub-agent
 /// being run (see [`refuse_reading`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_delegate_subagent(
     client: &LlmClient,
     tools: &ToolRegistry,
@@ -711,10 +712,10 @@ pub(crate) async fn run_delegate_subagent(
     let stop = parent_ctx.stop.clone();
 
     for _ in 0..limits.max_iterations {
-        if let Some(stop) = &stop {
-            if stop.is_cancelled() {
-                bail!("delegate interrupted: the run was cancelled");
-            }
+        if let Some(stop) = &stop
+            && stop.is_cancelled()
+        {
+            bail!("delegate interrupted: the run was cancelled");
         }
         // A steer typed while the delegate owned the loop reaches the delegate's
         // own conversation at its next rest point (drained from the shared bus
@@ -1032,22 +1033,22 @@ mod tests {
             let mut body_len: Option<usize> = None;
             let mut header_end: Option<usize> = None;
             // Read until the whole body (per Content-Length) is buffered.
-            while body_len.map_or(true, |len| header_end.unwrap_or(0) + 4 + len > data.len()) {
+            while body_len.is_none_or(|len| header_end.unwrap_or(0) + 4 + len > data.len()) {
                 let n = stream.read(&mut tmp).unwrap();
                 if n == 0 {
                     break;
                 }
                 data.extend_from_slice(&tmp[..n]);
-                if header_end.is_none() {
-                    if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-                        header_end = Some(p);
-                        let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
-                        body_len = head.lines().find_map(|l| {
-                            l.trim()
-                                .strip_prefix("content-length:")
-                                .and_then(|v| v.trim().parse().ok())
-                        });
-                    }
+                if header_end.is_none()
+                    && let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    header_end = Some(p);
+                    let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
+                    body_len = head.lines().find_map(|l| {
+                        l.trim()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse().ok())
+                    });
                 }
             }
             let body = match (header_end, body_len) {
@@ -1270,7 +1271,7 @@ mod tests {
             one_of.iter().any(|o| {
                 o["required"]
                     .as_array()
-                    .map_or(false, |r| r.iter().any(|v| v.as_str() == Some(needle)))
+                    .is_some_and(|r| r.iter().any(|v| v.as_str() == Some(needle)))
             })
         };
         assert!(requires("step"));
@@ -2341,22 +2342,22 @@ mod tests {
                 let mut tmp = [0u8; 8192];
                 let mut body_len: Option<usize> = None;
                 let mut header_end: Option<usize> = None;
-                while body_len.map_or(true, |len| header_end.unwrap_or(0) + 4 + len > data.len()) {
+                while body_len.is_none_or(|len| header_end.unwrap_or(0) + 4 + len > data.len()) {
                     let n = stream.read(&mut tmp).unwrap();
                     if n == 0 {
                         break;
                     }
                     data.extend_from_slice(&tmp[..n]);
-                    if header_end.is_none() {
-                        if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-                            header_end = Some(p);
-                            let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
-                            body_len = head.lines().find_map(|l| {
-                                l.trim()
-                                    .strip_prefix("content-length:")
-                                    .and_then(|v| v.trim().parse().ok())
-                            });
-                        }
+                    if header_end.is_none()
+                        && let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        header_end = Some(p);
+                        let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
+                        body_len = head.lines().find_map(|l| {
+                            l.trim()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        });
                     }
                 }
                 let body = match (header_end, body_len) {

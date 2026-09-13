@@ -254,14 +254,13 @@ async fn find_cargo() -> Option<PathBuf> {
         .args(["-lc", "command -v cargo"])
         .output()
         .await
+        && out.status.success()
     {
-        if out.status.success() {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !path.is_empty() {
-                let p = PathBuf::from(path);
-                if p.is_file() {
-                    return Some(p);
-                }
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !path.is_empty() {
+            let p = PathBuf::from(path);
+            if p.is_file() {
+                return Some(p);
             }
         }
     }
