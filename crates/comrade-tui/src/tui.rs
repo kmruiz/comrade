@@ -997,6 +997,8 @@ enum PathIntent {
 struct PathPrompt {
     intent: PathIntent,
     input: String,
+    /// Candidate names from the last Tab completion (empty = none shown).
+    matches: Vec<String>,
 }
 
 /// The Ctrl-x C-b session switcher overlay.
@@ -1012,6 +1014,101 @@ fn expand_tilde(input: &str) -> String {
         return format!("{home}/{rest}");
     }
     input.to_string()
+}
+
+/// Split a typed path at its final `/` into the directory part (kept verbatim,
+/// trailing slash included) and the partial file name after it. No slash at all
+/// means an empty directory part: completion starts from the project root.
+fn split_dir_prefix(input: &str) -> (&str, &str) {
+    match input.rfind('/') {
+        Some(i) => (&input[..=i], &input[i + 1..]),
+        None => ("", input),
+    }
+}
+
+/// Longest common prefix of a set of names (empty when there is no common head).
+fn longest_common_prefix<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    names
+        .reduce(|acc, name| common_prefix(acc, name))
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+/// Result of one path-completion step.
+struct PathCompletion {
+    /// The input after extending the partial name (unchanged when nothing matches).
+    input: String,
+    /// Matching entry names (directories get a trailing `/`), for display.
+    matches: Vec<String>,
+}
+
+/// Pure completion: extend `prefix` over `entries` (`(name, is_dir)` pairs).
+/// A single match completes to its whole name (plus `/` when it is a
+/// directory); several matches extend only to their longest common prefix. The
+/// filtered names are returned for display.
+fn complete_names(dir_part: &str, prefix: &str, entries: &[(String, bool)]) -> PathCompletion {
+    let hits: Vec<&(String, bool)> = entries
+        .iter()
+        .filter(|(name, _)| name.starts_with(prefix))
+        .collect();
+    let matches: Vec<String> = hits
+        .iter()
+        .map(|(name, is_dir)| {
+            if *is_dir {
+                format!("{name}/")
+            } else {
+                name.clone()
+            }
+        })
+        .collect();
+    if hits.is_empty() {
+        return PathCompletion {
+            input: format!("{dir_part}{prefix}"),
+            matches,
+        };
+    }
+    let ext = if hits.len() == 1 {
+        matches[0].clone()
+    } else {
+        longest_common_prefix(hits.iter().map(|(name, _)| name.as_str()))
+    };
+    PathCompletion {
+        input: format!("{dir_part}{ext}"),
+        matches,
+    }
+}
+
+/// Read a directory's entries as `(name, is_dir)`, sorted; an unreadable or
+/// missing directory yields no entries.
+fn read_dir_entries(dir: &std::path::Path) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            out.push((name, is_dir));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Tab completion for the session path prompt: extend `input` against the
+/// filesystem (a path with no directory part is read from `base`).
+fn complete_path(input: &str, base: &std::path::Path) -> PathCompletion {
+    let (dir_part, prefix) = split_dir_prefix(input);
+    let typed = expand_tilde(dir_part);
+    let dir = if typed.is_empty() {
+        base.to_path_buf()
+    } else {
+        let p = std::path::Path::new(&typed);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base.join(p)
+        }
+    };
+    complete_names(dir_part, prefix, &read_dir_entries(&dir))
 }
 
 struct App {
@@ -2463,6 +2560,7 @@ impl App {
         self.path_prompt = Some(PathPrompt {
             intent: PathIntent::Save,
             input: default.to_string_lossy().to_string(),
+            matches: Vec::new(),
         });
     }
 
@@ -2475,6 +2573,7 @@ impl App {
         self.path_prompt = Some(PathPrompt {
             intent: PathIntent::Load,
             input: default.to_string_lossy().to_string(),
+            matches: Vec::new(),
         });
     }
 
@@ -2545,14 +2644,23 @@ impl App {
                     PathIntent::Load => self.load_from(path),
                 }
             }
+            KeyCode::Tab => {
+                if let Some(p) = &mut self.path_prompt {
+                    let done = complete_path(&p.input, &self.root);
+                    p.input = done.input;
+                    p.matches = done.matches;
+                }
+            }
             KeyCode::Backspace if !ctrl => {
                 if let Some(p) = &mut self.path_prompt {
                     p.input.pop();
+                    p.matches.clear();
                 }
             }
             KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
                 if let Some(p) = &mut self.path_prompt {
                     p.input.push(c);
+                    p.matches.clear();
                 }
             }
             _ => {}
@@ -4683,11 +4791,12 @@ fn draw(app: &mut App, frame: &mut Frame) {
             Span::raw(p.input.clone()),
             Span::styled("_", Style::default().fg(Color::Cyan)),
             Span::styled(
-                "  enter:confirm  esc:cancel",
+                "  enter:confirm  tab:complete  esc:cancel",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
         frame.render_widget(Paragraph::new(line), rows[1]);
+        draw_path_matches(p, frame, rows[1]);
     } else if let Some(s) = &app.search {
         // Search bar replaces the prompt line while Ctrl-S is active.
         let total = s.matches.len();
@@ -4817,6 +4926,63 @@ fn draw_mx_list(mx: &Mx, frame: &mut Frame, prompt_area: Rect) {
         "type to filter · {} of {} shown · ctrl-p/n or ↑/↓ move · enter runs · tab completes",
         shown,
         mx.matches.len()
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
+}
+
+/// The completion popup shown above the session path minibuffer after a Tab:
+/// the candidate names in the typed directory, up to eight of them.
+fn draw_path_matches(prompt: &PathPrompt, frame: &mut Frame, prompt_area: Rect) {
+    if prompt.matches.is_empty() {
+        return;
+    }
+    let area = frame.area();
+    let w = area.width.saturating_sub(2).min(96);
+    let shown = prompt.matches.len().min(8);
+    let h = shown as u16 + 3; // two border rows + one hint row
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = prompt_area.y.saturating_sub(h).max(area.y);
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" completions ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let text_w = usize::from(inner.width.saturating_sub(2)).max(8);
+
+    let lines: Vec<Line> = prompt
+        .matches
+        .iter()
+        .take(8)
+        .map(|name| {
+            let disp: String = name.chars().take(text_w).collect();
+            Line::from(Span::styled(
+                disp,
+                Style::default().fg(if name.ends_with('/') {
+                    Color::Cyan
+                } else {
+                    Color::White
+                }),
+            ))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), rows[0]);
+    let hint = format!(
+        "{} shown · tab extends · enter confirms",
+        prompt.matches.len()
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -8167,6 +8333,75 @@ mod tests {
         assert_eq!(mx.matches.len(), 1);
         mx.complete();
         assert_eq!(mx.query, "move-block-down");
+    }
+
+    #[test]
+    fn split_dir_prefix_splits_at_last_slash() {
+        assert_eq!(split_dir_prefix("a/b/c"), ("a/b/", "c"));
+        assert_eq!(
+            split_dir_prefix("/root/session.json"),
+            ("/root/", "session.json")
+        );
+        assert_eq!(split_dir_prefix("session"), ("", "session"));
+        assert_eq!(split_dir_prefix("a/"), ("a/", ""));
+    }
+
+    #[test]
+    fn complete_names_single_file_fills_full_name() {
+        let entries = vec![
+            ("session.json".to_string(), false),
+            ("other.json".to_string(), false),
+        ];
+        let c = complete_names("/root/", "sess", &entries);
+        assert_eq!(c.input, "/root/session.json");
+        assert_eq!(c.matches, vec!["session.json".to_string()]);
+    }
+
+    #[test]
+    fn complete_names_directory_match_gets_trailing_slash() {
+        let entries = vec![("sessions".to_string(), true)];
+        let c = complete_names("", "sess", &entries);
+        assert_eq!(c.input, "sessions/");
+        assert_eq!(c.matches, vec!["sessions/".to_string()]);
+    }
+
+    #[test]
+    fn complete_names_several_matches_extend_to_common_prefix() {
+        let entries = vec![
+            ("session-1.json".to_string(), false),
+            ("session-2.json".to_string(), false),
+            ("note.txt".to_string(), false),
+        ];
+        let c = complete_names("/r/", "ses", &entries);
+        assert_eq!(c.input, "/r/session-");
+        assert_eq!(c.matches.len(), 2);
+    }
+
+    #[test]
+    fn complete_names_no_match_keeps_input() {
+        let entries = vec![("a.json".to_string(), false)];
+        let c = complete_names("/r/", "zzz", &entries);
+        assert_eq!(c.input, "/r/zzz");
+        assert!(c.matches.is_empty());
+    }
+
+    #[test]
+    fn complete_path_reads_directory_entries() {
+        let dir = std::env::temp_dir().join("comrade_path_complete_test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session-a.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        let input = format!("{}/sess", dir.display());
+        let c = complete_path(&input, std::path::Path::new("/"));
+        // Both entries share "session"; "-a.json" vs "s" diverge, so Tab extends
+        // only to the common prefix and lists the candidates.
+        assert_eq!(c.input, format!("{}/session", dir.display()));
+        assert_eq!(
+            c.matches,
+            vec!["session-a.json".to_string(), "sessions/".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
