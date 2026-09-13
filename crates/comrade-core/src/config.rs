@@ -165,6 +165,10 @@ pub struct CtxCfg {
     pub budget_tokens: usize,
     /// Hard cap on how many characters of a tool result are injected back.
     pub max_tool_output_chars: usize,
+    /// When true, the agent loop summarises the history automatically once it
+    /// grows into the budget headroom (instead of letting the lossy
+    /// stub/evict trim run first). Disable to keep compaction manual (M-c).
+    pub auto_compact: bool,
 }
 
 impl Default for CtxCfg {
@@ -172,6 +176,7 @@ impl Default for CtxCfg {
         Self {
             budget_tokens: 6000,
             max_tool_output_chars: 5000,
+            auto_compact: true,
         }
     }
 }
@@ -444,6 +449,18 @@ mod tests {
         ));
         std::fs::write(&p, toml).unwrap();
         p
+    }
+
+    #[test]
+    fn auto_compact_defaults_on_and_can_be_disabled() {
+        let loaded = Config::load(Some(&write_tmp(""))).unwrap();
+        assert!(
+            loaded.config.context.auto_compact,
+            "auto-compaction is on by default"
+        );
+
+        let loaded = Config::load(Some(&write_tmp("[context]\nauto_compact = false\n"))).unwrap();
+        assert!(!loaded.config.context.auto_compact);
     }
 
     #[test]

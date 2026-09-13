@@ -435,6 +435,13 @@ async fn run_agent_loop(
     let mut plan_nudged = false;
     // Consecutive read-only calls since the last state change (read guard).
     let mut consecutive_reads = 0usize;
+    // Automatic compaction is armed once per over-budget episode: when the
+    // history crosses into the budget headroom we summarise it once, then wait
+    // until it has been trimmed back under the threshold before summarising
+    // again. This stops a persistently over-budget history (e.g. a budget
+    // smaller than the system prompt) from firing a summariser call on every
+    // iteration.
+    let mut auto_compact_armed = true;
 
     loop {
         if stop.is_cancelled() {
@@ -486,6 +493,41 @@ async fn run_agent_loop(
                         .await;
                 }
             }
+        } else if cfg.context.auto_compact
+            && auto_compact_armed
+            && ctxm.messages().iter().any(|m| m.role == Role::Assistant)
+            && ctxm.needs_auto_compaction()
+        {
+            // Automatic compaction: rather than let `enforce_budget` silently
+            // stub and evict the history, ask the model for a summary of what
+            // has been done so far and replace the history with it. Armed once
+            // per over-budget episode (see `auto_compact_armed` above) and never
+            // before the model has taken a turn, so a fresh prompt is never
+            // folded away into a summary of itself.
+            auto_compact_armed = false;
+            match crate::compact::compact_history(client, ctxm).await {
+                Ok(rep) => {
+                    let _ = tx
+                        .send(AgentEvent::ContextCompacted {
+                            before_messages: rep.before_messages,
+                            after_messages: ctxm.messages().len(),
+                            before_tokens: rep.before_tokens,
+                            after_tokens: rep.after_tokens,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AgentEvent::Error(format!(
+                            "context compaction failed: {e:#}"
+                        )))
+                        .await;
+                }
+            }
+        } else if !ctxm.needs_auto_compaction() {
+            // Back under the threshold: re-arm so the next over-budget episode
+            // summarises again.
+            auto_compact_armed = true;
         }
 
         ctxm.enforce_budget();
@@ -1185,11 +1227,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::config::Config;
+    use crate::context::ContextManager;
     use crate::llm::LlmClient;
     use crate::session::{AgentEvent, AgentSession};
     use crate::undo::MemoryUndo;
 
-    use super::run_agent;
+    use super::{run_agent, run_agent_with_history};
 
     struct FakeUser;
     #[async_trait]
@@ -1524,6 +1567,147 @@ mod tests {
         assert!(
             first.contains("Conversation so far:"),
             "first request must be the summariser: {first}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fake model for the auto-compaction test: streaming requests
+    /// (`chat_turn`) get the next scripted agent reply as SSE, non-streaming
+    /// requests (the summariser's `chat`) get a JSON summary. Every request body
+    /// is forwarded to the channel.
+    fn spawn_auto_compact_spy(responses: &[&str]) -> (u16, std::sync::mpsc::Receiver<String>) {
+        let responses: Vec<String> = responses.iter().map(|s| s.to_string()).collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let stream_calls = Arc::new(AtomicUsize::new(0));
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut data = Vec::new();
+                let mut tmp = [0u8; 8192];
+                let mut body_len: Option<usize> = None;
+                let mut header_end: Option<usize> = None;
+                while body_len.is_none_or(|len| header_end.unwrap_or(0) + 4 + len > data.len()) {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(r) => {
+                            data.extend_from_slice(&tmp[..r]);
+                            if header_end.is_none()
+                                && let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                header_end = Some(p);
+                                let head = String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
+                                body_len = head.lines().find_map(|l| {
+                                    l.trim()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse().ok())
+                                });
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let body = match (header_end, body_len) {
+                    (Some(he), Some(len)) => {
+                        let start = he + 4;
+                        let end = (start + len).min(data.len());
+                        String::from_utf8_lossy(&data[start..end]).into_owned()
+                    }
+                    _ => String::new(),
+                };
+                let streaming = body.contains("\"stream\":true");
+                let _ = tx.send(body);
+                let resp = if streaming {
+                    let n = stream_calls.fetch_add(1, Ordering::SeqCst);
+                    let content = responses.get(n).map(String::as_str).unwrap_or("All done.");
+                    let payload = format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":{content:?}}}}}]}}\n\n\
+                         data: [DONE]\n\n"
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                } else {
+                    let payload = "{\"choices\":[{\"message\":{\"content\":\"did X\"}}]}";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                };
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (port, rx)
+    }
+
+    /// With a budget small enough that the history crosses into the headroom
+    /// mid-run, the loop summarises it automatically (with no `CompactRequest`):
+    /// the turn after the model has spoken issues a summariser request and the
+    /// run still finishes normally.
+    #[tokio::test]
+    async fn over_budget_history_is_auto_compacted() {
+        let (port, bodies) = spawn_auto_compact_spy(&[
+            "Thought: try a tool\nTool: no_such_tool\nArgs: {\"x\": 1}",
+            "All done.",
+        ]);
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "fake".into();
+
+        let (tx, _events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        let root = std::env::temp_dir().join(format!("comrade-agent-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let undo = Arc::new(MemoryUndo::new(root.clone()));
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: undo.clone(),
+            auto_approve: true,
+            approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            compact: None,
+            stop: None,
+        };
+        let tools = ToolRegistry::new();
+        let client = LlmClient::new(&cfg.llm).unwrap();
+
+        // A tiny budget: after the model's first (tool-calling) turn, the history
+        // is over the cap, so the next rest point summarises it.
+        let mut history = ContextManager::with_system("test system", 40, 5000);
+
+        let outcome = run_agent_with_history(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            "do the thing".to_string(),
+            &mut history,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.final_answer, "All done.");
+
+        // The run has finished, so every request it made is already buffered: at
+        // least one must be the non-streaming summariser carrying the transcript.
+        let mut summarised = false;
+        while let Ok(b) = bodies.try_recv() {
+            if b.contains("Conversation so far:") {
+                summarised = true;
+            }
+        }
+        assert!(
+            summarised,
+            "an over-budget history must be auto-summarised without a CompactRequest"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -237,6 +237,15 @@ impl ContextManager {
         self.total_tokens() > self.trim_target()
     }
 
+    /// `true` when the history has grown into the budget headroom, i.e. the very
+    /// point at which [`enforce_budget`](Self::enforce_budget) would begin its
+    /// lossy trimming (stubbing and evicting). The agent loop uses this to prefer
+    /// a model-written compaction (a summary of what has been done) over silently
+    /// degrading the history.
+    pub fn needs_auto_compaction(&self) -> bool {
+        self.over_budget()
+    }
+
     /// Index of the oldest large tool observation that is outside the protected
     /// recent window, if any.
     fn oldest_stubbable_observation(&self) -> Option<usize> {
@@ -497,6 +506,17 @@ mod tests {
         ));
         cm.enforce_budget();
         assert_eq!(cm.evicted, 0);
+    }
+
+    #[test]
+    fn needs_auto_compaction_tracks_the_trim_target() {
+        // A 10_000-token budget trims at 9_000 (a tenth reserved as headroom).
+        let mut cm = ContextManager::new(10_000, 100_000);
+        cm.push(ChatMessage::new(Role::System, "sys"));
+        assert!(!cm.needs_auto_compaction());
+        // ~4 chars/token: 40_000 chars ≈ 10_004 tokens, past the trim target.
+        cm.push(ChatMessage::new(Role::User, "x".repeat(40_000)));
+        assert!(cm.needs_auto_compaction());
     }
 }
 

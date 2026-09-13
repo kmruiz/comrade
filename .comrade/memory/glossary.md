@@ -114,16 +114,17 @@ Children run with `kill_on_drop(true)`; output is captured into a 200 KB bounded
 Carried on `ToolContext.compact: Option<CompactRequest>`; mirrors the `Steer` control pipe. `None` in headless runs and tests.
 
 ## Context compaction
-> A user-triggered action (M-c / MxCommand `compact-context`) that asks the model to summarise what has been done and REPLACES the running `ContextManager` history with that summary, instead of the automatic, lossy budget trimming.
+> Replacing the running `ContextManager` history with a model-written summary instead of the automatic, lossy budget trimming. Two paths: (1) user-triggered (M-c / M-x compact-context) via `comrade_tool::CompactRequest`; (2) AUTOMATIC — `run_agent_loop` calls `compact_history` when `cfg.context.auto_compact` is on (default) and `ContextManager::needs_auto_compaction()` is true (over the trim target) and the model has taken at least one turn, at most once per over-budget episode (`auto_compact_armed`).
 
 **References:**
 - `crates/comrade-core/src/compact.rs`
 - `crates/comrade-core/src/context.rs`
 - `crates/comrade-core/src/agent.rs`
-- `crates/comrade-tui/src/tui.rs`
+- `crates/comrade-core/src/config.rs`
+- `.comrade/memory/0034-auto-compaction-in-the-agent-loop-ctxcfgauto-compact-default-on.md`
 
 **Notes:**
-Mid-run it is requested via `comrade_tool::CompactRequest` and honoured by `run_agent_loop` at its rest point before `enforce_budget()`; while idle the TUI runs `compact_history` in a background task. `ContextManager::compact` keeps the system message and folds the summary into the "Earlier context (compacted)" rollup.
+Mid-run it is requested via `comrade_tool::CompactRequest` and honoured by `run_agent_loop` at its rest point before `enforce_budget()`; while idle the TUI runs `compact_history` in a background task. `ContextManager::compact` keeps the system message and folds the summary into the "Earlier context (compacted)" rollup. The automatic path was added in ADR #34; disable with `[context] auto_compact = false`.
 
 ## delegate sub-chat
 > The chat rows authored by a delegate model (its tool cards and its reply), rendered indented 2 columns under a "| " rule in the delegate's agent color with a dim per-agent background band, visually nested under the parent's delegate tool call.
