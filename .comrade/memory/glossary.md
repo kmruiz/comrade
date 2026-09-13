@@ -87,6 +87,15 @@ Children run with `kill_on_drop(true)`; output is captured into a 200 KB bounded
 **References:**
 - `crates/comrade-tui/src/tui.rs`
 
+## CommandLine (Program/Shell)
+> `tasks::CommandLine` in crates/comrade-tool-project/src/tasks.rs: how a resolved task runs. `Program { program, args }` (e.g. cargo, npm, mvn) or `Shell { script }` (run with bash -c). Generalized from the old cargo-only variant so a non-Cargo Ecosystem emits its own tool.
+
+**References:**
+- `crates/comrade-tool-project/src/tasks.rs`
+
+**Notes:**
+`CommandLine::describe()` renders the header line. `tasks::exec`/`run` execute it; the `find_cargo` PATH fallback only triggers for `Program { program == "cargo" }`.
+
 ## CompactRequest
 > A cheap, clonable one-shot flag (`Arc<AtomicBool>`) the UI uses to ask the running agent loop to compact the context at its next rest point. `request()` sets it, `take()` consumes it once.
 
@@ -139,6 +148,17 @@ Each job's approval policy is enforced before any run starts; it never touches t
 
 **Notes:**
 Defined via a `FieldKind::DiffChoice { options: Vec<DiffOption> }` variant; seeded with the first option's label (or the field's `recommended`). In the TUI, left/right cycle the options and the selected option's `diff` is shown under the field; typing is ignored.
+
+## Ecosystem (pom_*)
+> The trait (crates/comrade-tool-project/src/ecosystem.rs) backing the `pom_*` tools. A backend knows its manifest, the project model, how to map a logical verb to a command, the check command, and how to parse diagnostics/test output. `detect(root)` returns `Box<dyn Ecosystem>` (Cargo today, keyed on `Cargo.toml`).
+
+**References:**
+- `crates/comrade-tool-project/src/ecosystem.rs`
+- `crates/comrade-tool-project/src/lib.rs`
+- `.comrade/memory/0026-ecosystem-seam-for-the-pom-tools-cargo-backend-npmmavengo-later.md`
+
+**Notes:**
+Defaults let a minimal backend implement only model/resolve/format_command: `check_command` defaults to None, `parse_diagnostics` to the generic error-line scan, `simplify_tests` to passthrough, `is_test_command` to false. Adding npm/Maven/Go = implement the trait + one arm in `detect`. See ADR #26.
 
 ## enabled (delegate)
 > Per-[[delegates]] boolean (default true). `enabled = false` keeps the entry in config.toml but removes the model from the `delegate`/`ask_advise` targets, their `model` enum and advertised listing (and from the TUI Ctrl-A picker), so it cannot be delegated to; it still shows dimmed with ` (disabled)` in the model panel. Unlike `approval = "deny"` (listed but refused at run time), a disabled delegate is invisible to the tech lead.
