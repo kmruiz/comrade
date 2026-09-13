@@ -33,7 +33,7 @@ jobs:
           - os: windows-latest
             platform: windows-x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -57,7 +57,7 @@ jobs:
           Copy-Item "target/release/$env:BIN.exe" "dist/$env:BIN.exe"
           Compress-Archive -Path "dist/$env:BIN.exe" -DestinationPath "$env:BIN-${{ github.ref_name }}-${{ matrix.platform }}.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ env.BIN }}-${{ matrix.platform }}
           path: |
@@ -70,13 +70,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # Full history so `gh release create --generate-notes` can diff
           # against the previous release.
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
@@ -90,4 +90,5 @@ jobs:
             --title "${{ github.ref_name }}" \
             --target "${{ github.sha }}" \
             --generate-notes \
+            --notes-file .github/release-notes-header.md \
             dist/*
