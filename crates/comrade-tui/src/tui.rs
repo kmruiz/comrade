@@ -423,6 +423,7 @@ enum MxCommand {
     ForkSession,
     ForwardWord,
     InsertNewline,
+    KillSession,
     KillWord,
     ListMcpServers,
     LoadSession,
@@ -456,6 +457,7 @@ impl MxCommand {
         MxCommand::ForkSession,
         MxCommand::ForwardWord,
         MxCommand::InsertNewline,
+        MxCommand::KillSession,
         MxCommand::KillWord,
         MxCommand::ListMcpServers,
         MxCommand::LoadSession,
@@ -488,6 +490,7 @@ impl MxCommand {
             MxCommand::ForkSession => "fork-session",
             MxCommand::ForwardWord => "forward-word",
             MxCommand::InsertNewline => "insert-newline",
+            MxCommand::KillSession => "kill-session",
             MxCommand::KillWord => "kill-word",
             MxCommand::ListMcpServers => "list-mcp-servers",
             MxCommand::LoadSession => "load-session",
@@ -522,6 +525,7 @@ impl MxCommand {
             MxCommand::ForkSession => Some("C-x C-w"),
             MxCommand::ForwardWord => Some("M-<right>"),
             MxCommand::InsertNewline => Some("S-<return>"),
+            MxCommand::KillSession => Some("C-x C-k"),
             MxCommand::KillWord => Some("M-<delete>"),
             MxCommand::MoveBlockDown => Some("C-n"),
             MxCommand::MoveBlockUp => Some("C-p"),
@@ -557,6 +561,7 @@ impl MxCommand {
             MxCommand::ForkSession => "fork the current session into an independent copy",
             MxCommand::ForwardWord => "move the prompt cursor forward one word",
             MxCommand::InsertNewline => "insert a newline in the prompt",
+            MxCommand::KillSession => "close the active session",
             MxCommand::KillWord => "delete the word after the prompt cursor",
             MxCommand::ListMcpServers => "view and toggle MCP server tools",
             MxCommand::LoadSession => "load a session from a file",
@@ -1595,17 +1600,19 @@ impl App {
         self.mcp_clamp_sel();
     }
 
-    /// Start a fresh session in place, replacing the current one: a brand-new
-    /// [`AgentSession`] (plan/status/title reset), a new undo log and tool
-    /// context, a clean rolling conversation history, and an empty chat
-    /// transcript. The human channel (ask dialogs) and the agent-event channel
-    /// are reused, so the UI event loop keeps working untouched. Only applies
-    /// while idle: a run in flight keeps the session it started with.
+    /// Open a new empty session and switch to it, keeping the current one open
+    /// and switchable — the emacs `C-x b <new-name>` scratch-buffer behaviour:
+    /// a brand-new [`AgentSession`] (plan/status/title reset), a new undo log
+    /// and tool context, a clean rolling conversation history, and an empty chat
+    /// transcript. The current session is stashed into its slot first, so
+    /// nothing is lost. Only applies while idle.
     fn new_session(&mut self) {
         if self.running {
-            self.push_meta("cannot start a fresh session while a run is in flight");
+            self.push_meta("cannot start a new session while a run is in flight");
             return;
         }
+        // Preserve the current session in its slot before opening a new one.
+        self.stash_active();
         let user = self.ctx_base.user.clone();
         let undo = Arc::new(comrade_core::MemoryUndo::new(self.root.clone()));
         let session = Arc::new(AgentSession::new(self.events_tx.clone()));
@@ -1644,17 +1651,45 @@ impl App {
         self.steer_tx = None;
         self.queued_prompt = None;
         self.run_cancelled = false;
-        self.open_sessions = vec![OpenSession {
+        // Open a fresh slot and make it the active session.
+        self.open_sessions.push(OpenSession {
             title: "New session".to_string(),
             file: None,
             state: None,
-        }];
-        self.active = 0;
+        });
+        self.active = self.open_sessions.len() - 1;
         self.session_file = None;
         self.ctrl_x = false;
         self.path_prompt = None;
         self.session_pick = None;
-        self.push_meta("started a fresh session");
+        self.push_meta("opened a new session");
+    }
+
+    /// Close the active session (emacs `C-x k`): discard its slot and activate a
+    /// neighbour. Refuses to close the only open session, so there is always a
+    /// session to work in.
+    fn kill_session(&mut self) {
+        if self.running {
+            self.push_meta("cannot close a session while a run is in flight");
+            return;
+        }
+        if self.open_sessions.len() <= 1 {
+            self.push_meta("cannot close the only open session");
+            return;
+        }
+        let killed = self.open_sessions[self.active].title.clone();
+        self.open_sessions.remove(self.active);
+        let idx = self.active.min(self.open_sessions.len() - 1);
+        self.active = idx;
+        // Every non-active slot carries a snapshot (the live state was the one
+        // we just dropped), so activating the neighbour restores its state.
+        let file = self.open_sessions[idx].file.clone();
+        let title = self.open_sessions[idx].title.clone();
+        if let Some(state) = self.open_sessions[idx].state.take() {
+            self.apply_session(*state, file);
+            self.open_sessions[idx].title = title;
+        }
+        self.push_meta(format!("closed session \"{killed}\""));
     }
 
     /// Snapshot the active session's observable state into a serializable form.
@@ -2141,7 +2176,8 @@ impl App {
                 self.activity = None;
                 self.push_meta(format!("error: {e}"));
             }
-            AgentEvent::TitleChanged | AgentEvent::StatusChanged | AgentEvent::PlanChanged => {}
+            AgentEvent::TitleChanged => self.refresh_active_slot(),
+            AgentEvent::StatusChanged | AgentEvent::PlanChanged => {}
             AgentEvent::PlanFinished(s) => match s {
                 Some(s) => self.push_meta(format!("plan finished: {s}")),
                 None => self.push_meta("plan finished"),
@@ -2297,6 +2333,7 @@ impl App {
             MxCommand::ForkSession => self.fork_session(),
             MxCommand::ForwardWord => self.input.move_word_right(false),
             MxCommand::InsertNewline => self.input.insert('\n'),
+            MxCommand::KillSession => self.kill_session(),
             MxCommand::KillWord => self.input.delete_word(),
             MxCommand::ListMcpServers => self.list_mcp_servers(),
             MxCommand::LoadSession => self.load_session_prompt(),
@@ -2929,6 +2966,7 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                     KeyCode::Char('b') => app.switch_session(),
                     KeyCode::Char('s') => app.save_session_prompt(),
                     KeyCode::Char('f') => app.load_session_prompt(),
+                    KeyCode::Char('k') => app.kill_session(),
                     KeyCode::Char('w') => app.fork_session(),
                     _ => {}
                 }
@@ -8935,23 +8973,27 @@ mod plan_step_tests {
         assert!(MxCommand::ALL.contains(&MxCommand::LoadSession));
         assert!(MxCommand::ALL.contains(&MxCommand::SwitchSession));
         assert!(MxCommand::ALL.contains(&MxCommand::ForkSession));
+        assert!(MxCommand::ALL.contains(&MxCommand::KillSession));
 
         // Names match the expected Emacs-style identifiers.
         assert_eq!(MxCommand::SaveSession.name(), "save-session");
         assert_eq!(MxCommand::LoadSession.name(), "load-session");
         assert_eq!(MxCommand::SwitchSession.name(), "switch-session");
         assert_eq!(MxCommand::ForkSession.name(), "fork-session");
+        assert_eq!(MxCommand::KillSession.name(), "kill-session");
 
         // Keybindings are as configured.
         assert_eq!(MxCommand::SaveSession.keys(), Some("C-x C-s"));
         assert_eq!(MxCommand::LoadSession.keys(), Some("C-x C-f"));
         assert_eq!(MxCommand::SwitchSession.keys(), Some("C-x C-b"));
         assert_eq!(MxCommand::ForkSession.keys(), Some("C-x C-w"));
+        assert_eq!(MxCommand::KillSession.keys(), Some("C-x C-k"));
 
         // Descriptions are non-empty.
         assert!(!MxCommand::SaveSession.desc().is_empty());
         assert!(!MxCommand::LoadSession.desc().is_empty());
         assert!(!MxCommand::SwitchSession.desc().is_empty());
         assert!(!MxCommand::ForkSession.desc().is_empty());
+        assert!(!MxCommand::KillSession.desc().is_empty());
     }
 }

@@ -22,3 +22,6 @@ Covers the TUI session lifecycle only. Does not add per-session model/autonomy, 
 ## Impact
 New dependency serde (derive) on comrade-tui; new serde derives across comrade-tool/comrade-core message types. Switch/save/load/fork refuse while a run is in flight. Transient UI state (stream/search/selection/scroll) is reset on switch. Follow-ups: optional auto-save, session listing/completion in the M-x palette, and persisting per-session model choice.
 
+
+## Note
+New-session is non-destructive (emacs C-x b <new-name> / scratch-buffer): M-x new-session now stashes the current session into its slot and opens a fresh empty slot as the active session, instead of wiping the current one in place. Added M-x kill-session (Ctrl-x C-k) to close the active session and activate a neighbour; it refuses to close the only open session. The session switcher title is refreshed on AgentEvent::TitleChanged so slots show the live title.
