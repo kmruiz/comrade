@@ -1,23 +1,26 @@
 //! Ecosystem abstraction for the `pom_*` tools.
 //!
-//! The project tools were Cargo-only. They now go through an [`Ecosystem`]
-//! backend so the SAME tools work for Cargo today and other build ecosystems
-//! (npm, Maven, Go, ...) later. A backend knows:
+//! The project tools go through an [`Ecosystem`] backend so the SAME tools work
+//! for every supported build system: Cargo (Rust) and npm (Node/TypeScript)
+//! today, others (Maven, Go, ...) later. A backend knows:
 //!
-//! - its manifest (the discriminator [`detect`] uses),
+//! - its manifest (the discriminator [`detect_all`]/[`detect`] use),
 //! - how to render a compact project model (`pom_model`),
 //! - how to map a logical verb (`build`/`check`/`test`/`fmt`/...) to a command,
 //! - how to type-check (`check_command`), parse diagnostics
 //!   (`parse_diagnostics`) and summarize test output (`simplify_tests`).
 //!
-//! Adding a new ecosystem means implementing this trait and one arm in
-//! [`detect`]; no `pom_*` tool needs to change.
+//! A repository may host several ecosystems at once (e.g. a Rust workspace with
+//! a `package.json` frontend); [`detect_all`] returns all of them and [`pick`]
+//! chooses one. Adding a new ecosystem means implementing this trait and one
+//! arm in [`detect_all`]; no `pom_*` tool needs to change.
 
 use std::path::Path;
 
 use anyhow::Result;
 use serde_json::Value;
 
+use crate::node;
 use crate::pom;
 use crate::tasks::{self, CommandLine, Resolved};
 
@@ -79,13 +82,30 @@ pub trait Ecosystem: Send + Sync {
 /// Pick the [`Ecosystem`] for `root`. Cargo is the only backend today; the
 /// presence of its manifest is the discriminator. New backends are added here
 /// in priority order (e.g. `package.json`, `pom.xml`, `go.mod`).
+/// Every [`Ecosystem`] present at `root`, in priority order (Cargo first). A
+/// repository may host several at once — e.g. a Rust workspace with a
+/// `package.json` for its frontend — so this returns ALL matching backends; a
+/// caller picks one via [`pick`] when more than one is present.
+pub fn detect_all(root: &Path) -> Vec<Box<dyn Ecosystem>> {
+    let mut out: Vec<Box<dyn Ecosystem>> = Vec::new();
+    if root.join(Cargo.manifest()).is_file() {
+        out.push(Box::new(Cargo));
+    }
+    if root.join(Node.manifest()).is_file() {
+        out.push(Box::new(Node));
+    }
+    out
+}
+
+/// The default ambient [`Ecosystem`] for `root`, erroring when the directory
+/// belongs to no supported build system. When several are present the first
+/// (highest priority) wins; use [`pick`] to choose explicitly or by verb.
 pub fn detect(root: &Path) -> Result<Box<dyn Ecosystem>> {
-    let eco = Cargo;
-    if root.join(eco.manifest()).is_file() {
-        return Ok(Box::new(eco));
+    if let Some(eco) = detect_all(root).into_iter().next() {
+        return Ok(eco);
     }
     anyhow::bail!(
-        "unsupported project at {}: no Cargo.toml (supported ecosystems: {})",
+        "unsupported project at {}: no manifest found (looked for Cargo.toml, package.json; supported ecosystems: {})",
         root.display(),
         supported().join(", ")
     )
@@ -93,7 +113,60 @@ pub fn detect(root: &Path) -> Result<Box<dyn Ecosystem>> {
 
 /// The list of supported ecosystems, for error messages.
 pub fn supported() -> &'static [&'static str] {
-    &["cargo"]
+    &["cargo", "npm"]
+}
+
+/// Choose the [`Ecosystem`] for `root` to run `verb`, resolving a polyglot
+/// (multi-ecosystem) repository unambiguously:
+///
+/// - `ecosystem`, when given, names the backend (`"cargo"`/`"npm"`); an unknown
+///   or absent name errors with the available list.
+/// - otherwise, when the project has exactly one backend, that one is used;
+/// - otherwise the single backend that `supports` `verb` wins; if several do (or
+///   none), the error asks the caller to pass `ecosystem` explicitly.
+pub fn pick(root: &Path, ecosystem: Option<&str>, verb: &str) -> Result<Box<dyn Ecosystem>> {
+    let all = detect_all(root);
+    if all.is_empty() {
+        anyhow::bail!(
+            "unsupported project at {}: no manifest found (looked for Cargo.toml, package.json; supported ecosystems: {})",
+            root.display(),
+            supported().join(", ")
+        );
+    }
+    if let Some(name) = ecosystem.map(str::trim).filter(|n| !n.is_empty()) {
+        return all
+            .into_iter()
+            .find(|e| e.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                let have: Vec<&str> = detect_all(root).iter().map(|e| e.name()).collect();
+                anyhow::anyhow!(
+                    "ecosystem {name:?} is not present at this project; available: {}",
+                    have.join(", ")
+                )
+            });
+    }
+    if all.len() == 1 {
+        return Ok(all.into_iter().next().unwrap());
+    }
+    let supporting: Vec<Box<dyn Ecosystem>> =
+        all.into_iter().filter(|e| e.supports(root, verb)).collect();
+    match supporting.len() {
+        0 => {
+            let have: Vec<&str> = detect_all(root).iter().map(|e| e.name()).collect();
+            anyhow::bail!(
+                "no ecosystem at this project supports task {verb:?}; available: {}",
+                have.join(", ")
+            );
+        }
+        1 => Ok(supporting.into_iter().next().unwrap()),
+        _ => {
+            let names: Vec<&str> = supporting.iter().map(|e| e.name()).collect();
+            anyhow::bail!(
+                "task {verb:?} is ambiguous across ecosystems ({}); pass ecosystem = \"cargo\" or \"npm\"",
+                names.join(", ")
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +267,264 @@ impl Ecosystem for Cargo {
             CommandLine::Program { program, args }
                 if program == "cargo" && args.first().map(String::as_str) == Some("test")
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Node / npm backend
+// ---------------------------------------------------------------------------
+
+/// The Node/npm backend (`package.json` + npm scripts). Maps a logical verb onto
+/// an existing npm script and runs it with `npm run <script>`.
+pub struct Node;
+
+/// The npm script a logical verb should run: a script literally named the verb
+/// wins, otherwise a small set of conventional aliases.
+fn npm_script_for(m: &node::NodeModel, verb: &str) -> Option<String> {
+    let has = |name: &str| m.root_package.scripts.iter().any(|s| s.name == name);
+    if has(verb) {
+        return Some(verb.to_string());
+    }
+    let candidates: &[&str] = match verb {
+        "run" => &["start", "dev", "serve"],
+        "build" => &["build", "compile"],
+        "test" => &["test"],
+        "check" => &["typecheck", "check", "lint"],
+        "fmt" => &["format", "fmt", "prettier"],
+        "doc" => &["doc", "docs"],
+        "bench" => &["bench", "benchmark"],
+        "release" => &["release", "publish"],
+        "clippy" => &["lint", "typecheck"],
+        _ => &[],
+    };
+    candidates.iter().find(|c| has(c)).map(|c| (*c).to_string())
+}
+
+fn script_names(m: &node::NodeModel) -> String {
+    let names: Vec<&str> = m
+        .root_package
+        .scripts
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    if names.is_empty() {
+        "(none)".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+impl Ecosystem for Node {
+    fn name(&self) -> &'static str {
+        "npm"
+    }
+
+    fn manifest(&self) -> &'static str {
+        "package.json"
+    }
+
+    fn model(&self, root: &Path) -> Result<String> {
+        Ok(node::render(&node::load(root)?))
+    }
+
+    fn supports(&self, root: &Path, verb: &str) -> bool {
+        if verb == "test" {
+            return true;
+        }
+        let Ok(m) = node::load(root) else {
+            return false;
+        };
+        npm_script_for(&m, verb).is_some()
+    }
+
+    fn resolve(
+        &self,
+        root: &Path,
+        verb: &str,
+        subproject: &Option<String>,
+        extra: &[String],
+    ) -> Result<Resolved> {
+        let m = node::load(root)?;
+        let script = npm_script_for(&m, verb).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no npm script for task {verb:?}; runnable scripts: {}",
+                script_names(&m)
+            )
+        })?;
+        let mut args: Vec<String> = Vec::new();
+        if let Some(dir) = subproject {
+            let dir = dir.trim_end_matches('/');
+            if dir.contains("..") {
+                anyhow::bail!("subproject {dir:?} escapes the project root");
+            }
+            args.push("--prefix".to_string());
+            args.push(dir.to_string());
+        }
+        args.push("run".to_string());
+        args.push(script);
+        if !extra.is_empty() {
+            args.push("--".to_string());
+            args.extend(extra.iter().cloned());
+        }
+        let line = CommandLine::Program {
+            program: "npm".to_string(),
+            args,
+        };
+        let describe = line.describe();
+        Ok(Resolved {
+            cwd: root.to_path_buf(),
+            line,
+            describe,
+        })
+    }
+
+    fn format_command(&self, root: &Path) -> Result<Resolved> {
+        let line = CommandLine::Program {
+            program: "npx".to_string(),
+            args: vec![
+                "--no-install".to_string(),
+                "prettier".to_string(),
+                "--write".to_string(),
+                ".".to_string(),
+            ],
+        };
+        let describe = line.describe();
+        Ok(Resolved {
+            cwd: root.to_path_buf(),
+            line,
+            describe,
+        })
+    }
+
+    fn check_command(
+        &self,
+        root: &Path,
+        subproject: &Option<String>,
+        all_targets: bool,
+        extra: &[String],
+    ) -> Result<Option<CommandLine>> {
+        let _ = (subproject, all_targets);
+        if !root.join("tsconfig.json").is_file() {
+            return Ok(None);
+        }
+        let mut args = vec![
+            "--no-install".to_string(),
+            "tsc".to_string(),
+            "--noEmit".to_string(),
+        ];
+        args.extend(extra.iter().cloned());
+        Ok(Some(CommandLine::Program {
+            program: "npx".to_string(),
+            args,
+        }))
+    }
+
+    fn parse_diagnostics(&self, raw: &str, max: usize) -> (Vec<String>, usize) {
+        parse_tsc_diagnostics(raw, max)
+    }
+
+    fn simplify_tests(&self, raw: &str) -> String {
+        simplify_js_tests(raw)
+    }
+
+    fn is_test_command(&self, line: &CommandLine) -> bool {
+        match line {
+            CommandLine::Program { program, args } if program == "npm" => {
+                if args.iter().any(|a| a == "test") {
+                    return true;
+                }
+                args.iter()
+                    .position(|a| a == "run")
+                    .and_then(|i| args.get(i + 1))
+                    .map(|s| s == "test")
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Parse `tsc --noEmit` output (`path(line,col): error TSxxxx: msg`) into
+/// `path:line:col: error[TSxxxx]: msg`, capped at `max`. Falls back to a plain
+/// error-line scan when nothing matches.
+fn parse_tsc_diagnostics(raw: &str, max: usize) -> (Vec<String>, usize) {
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for line in raw.lines() {
+        if let Some(d) = format_tsc_line(line.trim_end()) {
+            total += 1;
+            if out.len() < max {
+                out.push(d);
+            }
+        }
+    }
+    if total == 0 {
+        return generic_error_lines(raw, max);
+    }
+    (out, total)
+}
+
+/// Format one tsc diagnostic line, or `None` when it is not a located error.
+fn format_tsc_line(line: &str) -> Option<String> {
+    let idx = line.find("): error ")?;
+    let left = &line[..idx + 1]; // "path(line,col)"
+    let rest = &line[idx + 1..]; // ": error TSxxxx: message"
+    let open = left.rfind('(')?;
+    let path = left[..open].trim();
+    let inner = &left[open + 1..left.len() - 1];
+    let (l, c) = inner.split_once(',').unwrap_or((inner, "0"));
+    if path.is_empty() {
+        return None;
+    }
+    Some(format!("{path}:{l}:{c}{rest}"))
+}
+
+/// Reduce raw jest/vitest/mocha output to a readable summary: the summary lines,
+/// failing-test markers and key errors, capped. When nothing is recognizable the
+/// last non-empty lines are returned instead.
+fn simplify_js_tests(raw: &str) -> String {
+    const KEYS: &[&str] = &[
+        "tests:",
+        "test suites:",
+        "test files",
+        "passed",
+        "failed",
+        "pending",
+        "skipped",
+        "snapshots:",
+        "duration",
+        "passing",
+        "failing",
+        "✕",
+        "✗",
+        "✘",
+        "×",
+        "assertionerror",
+        "error:",
+        "expect(",
+    ];
+    let mut out: Vec<&str> = Vec::new();
+    for line in raw.lines() {
+        let l = line.to_lowercase();
+        if KEYS.iter().any(|k| l.contains(k)) {
+            out.push(line.trim_end());
+        }
+    }
+    if out.is_empty() {
+        let mut tail: Vec<&str> = raw
+            .lines()
+            .rev()
+            .filter(|l| !l.trim().is_empty())
+            .take(20)
+            .collect();
+        tail.reverse();
+        return tail.join("\n");
+    }
+    let joined = out.join("\n");
+    if joined.chars().count() > 6000 {
+        joined.chars().take(6000).collect()
+    } else {
+        joined
     }
 }
 
@@ -452,5 +783,138 @@ test result: FAILED. 11 passed; 1 failed; 0 ignored
         assert!(out.contains("panicked at"));
         assert!(!out.contains("Compiling"));
         assert!(!out.contains("Finished"));
+    }
+
+    fn node_scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("comrade-eco-node-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn detect_all_finds_both_ecosystems_in_a_mixed_repo() {
+        let dir = node_scratch("mixed");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{ "name": "x", "scripts": { "build": "tsc" } }"#,
+        )
+        .unwrap();
+        let names: Vec<&str> = detect_all(&dir).iter().map(|e| e.name()).collect();
+        assert_eq!(names, vec!["cargo", "npm"]);
+        // detect() keeps the highest priority (cargo).
+        assert_eq!(detect(&dir).unwrap().name(), "cargo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_resolves_build_to_npm_run() {
+        let dir = node_scratch("resolve");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{ "name": "x", "scripts": { "build": "tsc", "test": "jest", "dev": "vite" } }"#,
+        )
+        .unwrap();
+        let eco = Node;
+        assert_eq!(eco.name(), "npm");
+        assert!(eco.supports(&dir, "build"));
+        assert!(eco.supports(&dir, "test"));
+        assert!(!eco.supports(&dir, "doc"));
+        let r = eco.resolve(&dir, "build", &None, &[]).unwrap();
+        match r.line {
+            CommandLine::Program { program, args } => {
+                assert_eq!(program, "npm");
+                assert_eq!(args, vec!["run", "build"]);
+            }
+            _ => panic!("expected a program command"),
+        }
+        // "run" maps onto the conventional `dev` script.
+        let r = eco.resolve(&dir, "run", &None, &[]).unwrap();
+        assert_eq!(r.describe, "npm run dev");
+        // A subproject runs through --prefix; extra args pass after `--`.
+        let r = eco
+            .resolve(&dir, "test", &Some("apps/web".into()), &["--watch".into()])
+            .unwrap();
+        assert_eq!(r.describe, "npm --prefix apps/web run test -- --watch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_tsc_diagnostics() {
+        let raw = "src/App.tsx(12,5): error TS2322: Type 'string' is not assignable to type 'number'.\nsrc/x.ts(1,1): error TS1005: ';' expected.\nFound 2 errors in the same file.\n";
+        let (errors, total) = Node.parse_diagnostics(raw, 1);
+        assert_eq!(total, 2);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0],
+            "src/App.tsx:12:5: error TS2322: Type 'string' is not assignable to type 'number'."
+        );
+        // No located diagnostics -> generic fallback.
+        let (g, t) = Node.parse_diagnostics("error: something broke\n", 5);
+        assert_eq!(t, 1);
+        assert!(g[0].contains("error: something broke"));
+    }
+
+    #[test]
+    fn node_is_test_command_and_simplifies_tests() {
+        let eco = Node;
+        assert!(eco.is_test_command(&CommandLine::Program {
+            program: "npm".into(),
+            args: vec!["test".into()],
+        }));
+        assert!(eco.is_test_command(&CommandLine::Program {
+            program: "npm".into(),
+            args: vec!["run".into(), "test".into()],
+        }));
+        assert!(!eco.is_test_command(&CommandLine::Program {
+            program: "npm".into(),
+            args: vec!["run".into(), "build".into()],
+        }));
+        let raw = "PASS src/a.test.ts\n  ✓ adds (2 ms)\nTest Suites: 1 passed, 1 total\nTests:       1 passed, 1 total\nrandom noise\n";
+        let s = eco.simplify_tests(raw);
+        assert!(s.contains("Test Suites: 1 passed"), "{s}");
+        assert!(s.contains("Tests:       1 passed"), "{s}");
+        assert!(!s.contains("random noise"), "{s}");
+    }
+
+    #[test]
+    fn pick_resolves_polyglot_repos() {
+        let dir = node_scratch("pick");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{ "name": "x", "scripts": { "build": "tsc" } }"#,
+        )
+        .unwrap();
+        // Explicit selection wins.
+        assert_eq!(pick(&dir, Some("npm"), "build").unwrap().name(), "npm");
+        assert_eq!(pick(&dir, Some("cargo"), "build").unwrap().name(), "cargo");
+        // An unknown ecosystem name errors.
+        assert!(pick(&dir, Some("maven"), "build").is_err());
+        // `build` is supported by both -> ambiguous without an explicit choice.
+        assert!(pick(&dir, None, "build").is_err());
+        // A verb only cargo supports resolves automatically.
+        assert_eq!(pick(&dir, None, "clippy").unwrap().name(), "cargo");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A single-ecosystem project needs no verb match.
+        let cargo_only = node_scratch("pick2");
+        std::fs::write(
+            cargo_only.join("Cargo.toml"),
+            "[package]\nname = \"y\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        assert_eq!(pick(&cargo_only, None, "build").unwrap().name(), "cargo");
+        let _ = std::fs::remove_dir_all(&cargo_only);
     }
 }

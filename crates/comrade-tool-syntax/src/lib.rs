@@ -342,7 +342,7 @@ struct TsStructuralMap;
 static TS_STRUCTURAL_MAP_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "ts_structural_map".into(),
-    description: "Build a tree-sitter structural map of the project (or one file): declarations nested under mod/impl/trait containers, with line numbers. Filter by file or declaration kind. Orient fast.".into(),
+    description: "Build a tree-sitter structural map of the project (or one file): declarations nested under their containers (Rust mod/impl/trait, JS/TS classes and namespaces), with line numbers. Filter by file or declaration kind. Orient fast.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -633,7 +633,7 @@ impl Tool for TsTestImpact {
             return Ok(format!("No changed files vs {}.", args.rev));
         }
 
-        // Symbols declared in the changed Rust files -> the file declaring them.
+        // Symbols declared in the changed source files -> the file declaring them.
         let mut symbols: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut changed_rs: Vec<String> = Vec::new();
         for f in &changed {
@@ -1139,7 +1139,8 @@ mod find_symbol_tests {
         assert_eq!(normalize_kind(Some("fn")).unwrap(), Some("fn"));
         assert_eq!(normalize_kind(Some("Struct")).unwrap(), Some("struct"));
         assert_eq!(normalize_kind(Some("  fn  ")).unwrap(), Some("fn"));
-        assert!(normalize_kind(Some("method")).is_err());
+        assert!(normalize_kind(Some("bogus")).is_err());
+        assert_eq!(normalize_kind(Some("Method")).unwrap(), Some("method"));
         assert_eq!(normalize_kind(Some("  ")).unwrap(), None);
     }
 

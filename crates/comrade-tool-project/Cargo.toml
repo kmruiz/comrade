@@ -1,6 +1,6 @@
 [package]
 name = "comrade-tool-project"
-description = "Project object model (POM) and task runner for Cargo projects."
+description = "Project object model (POM) and task runner for Cargo and npm projects."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -146,6 +146,13 @@ Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by rende
 **Notes:**
 Each job's approval policy is enforced before any run starts; it never touches the plan; it is DENIED_FOR_DELEGATES so a delegate cannot fan out recursively. See ADR #23.
 
+## detect_all / pick (ecosystem selection)
+> A repository may host several build systems (a Cargo.toml AND a package.json). ecosystem::detect_all(root) returns every present backend in priority order (Cargo, then npm); ecosystem::pick(root, ecosystem, verb) selects one: an explicit `ecosystem` name, else the sole backend, else the single backend whose `supports(root, verb)` is true, else an error asking for an explicit choice. `detect` (single) prefers Cargo. pom_model renders ALL detected ecosystems; pom_run_task/pom_run_tests/pom_check/pom_format_code take an `ecosystem` arg.
+
+**References:**
+- `crates/comrade-tool-project/src/ecosystem.rs`
+- `crates/comrade-tool-project/src/node.rs`
+
 ## diff_choice
 > A `FieldKind` variant ("diff_choice") for ask_form: a pick-list whose options carry a code diff each (`DiffOption { label, diff }`). Rendered as the diffs; the answer is the chosen option's `label`. Used to let the human pick between competing patches.
 
@@ -199,6 +206,13 @@ Deflating the ~35 MB of assets saves ~10 MB of binary; the workspace [profile.re
 **References:**
 - `crates/comrade-tool/src/form.rs`
 
+## LangId
+> A source language the tree-sitter tools understand: Rust, JavaScript, TypeScript, Tsx, Css, Html. engine.rs maps a file extension to a LangId (`lang_of`), a LangId to its tree-sitter grammar (`grammar`), to the node kinds counted as identifier occurrences (`ident_kinds`), and to a declaration-kind -> short-label table (`decl_label`), plus `container_body` (which declarations nest others) and `decl_name` (display name). Non-Rust files are walked via `walk_sources` over `SUPPORTED_EXTS`.
+
+**References:**
+- `crates/comrade-tool-syntax/src/engine.rs`
+- `.comrade/memory/0030-multi-language-tree-sitter-support-and-multi-ecosystem-polyglot-pom-detection.md`
+
 ## LiveState
 > The per-session half of the TUI App state (crates/comrade-tui/src/tui.rs struct LiveState): session Arc, ctx_base, history, run_tx, stop, run_handle, running, steer_tx, queued_prompt, run_cancelled, chat, section_collapsed, chat_epoch, chat_rows_cache, stream, ctx_tokens/budget/estimated, activity, session_file, sel, scroll_top, follow, was_at_bottom, search. A parked session stores its LiveState in its OpenSession slot (Box); App::swap_live mem::swaps these fields between the App (active session) and a LiveState.
 
@@ -213,6 +227,13 @@ Deflating the ~35 MB of assets saves ~10 MB of binary; the workspace [profile.re
 
 **Notes:**
 Redesigned to be compact: previously 3 inner rows (name / gauge / usage) plus a wasted blank row; the '(api)' suffix was dropped (api is the default; only 'est' is shown).
+
+## Node ecosystem (npm)
+> The Node/npm build backend (Ecosystem impl `Node`, name "npm", manifest package.json) plus its parsed model `NodeModel`/`NodePackage`/`NodeScript` (node.rs): name/version/deps/scripts and `workspaces` globs resolved to subproject packages. Verbs map onto npm scripts (a script named the verb, else conventions like run->start/dev, check->typecheck); runs as `npm run <script>` (with `--prefix` for a subproject). check_command is `npx --no-install tsc --noEmit` when a tsconfig.json exists; format is prettier; parse_diagnostics reads tsc `path(line,col): error TSxxxx` lines; simplify_tests reduces jest/vitest/mocha output.
+
+**References:**
+- `crates/comrade-tool-project/src/node.rs`
+- `crates/comrade-tool-project/src/ecosystem.rs`
 
 ## pom_check
 > Tool (comrade-tool-project) that runs `cargo check` and returns the first N compiler errors with file:line:col plus the total count - a cheap alternative to pom_run_tests for iterating on compile errors.

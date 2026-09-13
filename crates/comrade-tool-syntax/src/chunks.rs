@@ -1,23 +1,27 @@
 //! Tree-sitter code chunking for semantic (embedding) code search.
 //!
-//! [`code_chunks`] turns a project's sources into indexable chunks. For Rust the
-//! unit is a declaration — one chunk per `fn`/`struct`/`enum`/… item, recursing
-//! through `impl`/`mod`/`trait` containers so a method becomes its own chunk
-//! labelled with its container. Everything else (and any Rust file that parses
-//! to no declaration) falls back to fixed line windows. Every chunk carries the
-//! file and the 1-based line of the declaration, so an embedding hit is directly
-//! a location (`path:line`).
+//! [`code_chunks`] turns a project's sources into indexable chunks. For every
+//! supported language (Rust, JavaScript/TypeScript/TSX, CSS, HTML) the unit is a
+//! declaration — one chunk per `fn`/`struct`/`class`/`method`/`rule`/element…,
+//! recursing through container declarations (Rust `impl`/`mod`/`trait`, JS/TS
+//! classes and namespaces) so a method becomes its own chunk labelled with its
+//! container. Everything else (and any file that parses to no declaration) falls
+//! back to fixed line windows. Every chunk carries the file and the 1-based line
+//! of the declaration, so an embedding hit is directly a location (`path:line`).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::engine::{short_kind, signature_of};
+use crate::engine::{
+    LangId, container_body, decl_label, decl_name, grammar, lang_of, signature_of,
+};
 
-/// Extensions treated as source: Rust is parsed with tree-sitter, the rest are
-/// chunked as line windows.
+/// Extensions treated as source: the tree-sitter-supported languages are parsed
+/// into declaration chunks, the rest fall back to line windows.
 const CODE_EXT: &[&str] = &[
-    "rs", "toml", "md", "py", "js", "ts", "tsx", "go", "c", "h", "cpp", "hpp", "java", "rb", "sh",
+    "rs", "toml", "md", "py", "js", "jsx", "mjs", "cjs", "ts", "mts", "cts", "tsx", "css", "html",
+    "htm", "go", "c", "h", "cpp", "hpp", "java", "rb", "sh",
 ];
 
 /// Files larger than this are skipped.
@@ -68,15 +72,17 @@ pub fn code_chunks(root: &Path) -> Result<Vec<CodeChunk>> {
     Ok(chunks)
 }
 
-/// Chunk one source file's text: Rust by declaration, everything else (or Rust
-/// that parses to no declaration) as line windows. `rel` is the project-root
-/// relative path recorded on each chunk.
+/// Chunk one source file's text by declaration when its language is supported
+/// (falling back to line windows when it parses to no declaration). `rel` is the
+/// project-root relative path recorded on each chunk.
 pub fn chunks_of_file(rel: &str, text: &str) -> Vec<CodeChunk> {
-    let is_rust = Path::new(rel).extension().and_then(|e| e.to_str()) == Some("rs");
-    let mut out = if is_rust {
-        symbol_chunks(rel, text)
-    } else {
-        Vec::new()
+    let ext = Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let mut out = match lang_of(ext) {
+        Some(l) => symbol_chunks(rel, text, l),
+        None => Vec::new(),
     };
     if out.is_empty() {
         out = window_chunks(rel, text, 1);
@@ -111,9 +117,10 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// One chunk per declaration in a Rust source, recursing through containers.
-fn symbol_chunks(rel: &str, text: &str) -> Vec<CodeChunk> {
-    let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+/// One chunk per declaration in `text`, recursing through container
+/// declarations (Rust `impl`/`mod`/`trait`, JS/TS classes and namespaces).
+fn symbol_chunks(rel: &str, text: &str, l: LangId) -> Vec<CodeChunk> {
+    let lang = grammar(l);
     let mut parser = tree_sitter::Parser::new();
     let _ = parser.set_language(&lang);
     let Some(tree) = parser.parse(text, None) else {
@@ -128,7 +135,16 @@ fn collect(scope: tree_sitter::Node, text: &str, rel: &str, ctx: &str, out: &mut
     let mut cursor = scope.walk();
     for child in scope.children(&mut cursor) {
         let kind = child.kind();
-        if matches!(kind, "impl_item" | "mod_item" | "trait_item") {
+        let Some(label) = decl_label(kind) else {
+            // Transparently descend wrapper nodes: a TS `export class` is a child
+            // of an `export_statement` / `export default`, so the declaration is
+            // one level down. Leaf declaration bodies are never traversed.
+            if child.child_count() > 0 {
+                collect(child, text, rel, ctx, out);
+            }
+            continue;
+        };
+        if let Some(body) = container_body(&child) {
             let head = signature_of(&child, text);
             let sub = if ctx.is_empty() {
                 head
@@ -136,22 +152,20 @@ fn collect(scope: tree_sitter::Node, text: &str, rel: &str, ctx: &str, out: &mut
                 format!("{ctx} / {head}")
             };
             let before = out.len();
-            // Items live inside the container's `declaration_list` body, not as
-            // direct children, so recurse into that body.
-            if let Some(body) = child.child_by_field_name("body") {
-                collect(body, text, rel, &sub, out);
-            }
+            // Items live inside the container's body, not as direct children,
+            // so recurse into that body.
+            collect(body, text, rel, &sub, out);
             if out.len() == before {
                 // A container with no nested declaration (e.g. `mod foo;`).
                 out.push(CodeChunk {
                     file: rel.to_string(),
                     line: child.start_position().row + 1,
-                    kind: short_kind(kind).to_string(),
-                    name: name_of(&child, text),
+                    kind: label.to_string(),
+                    name: decl_name(&child, text).unwrap_or_default(),
                     text: cap(join(ctx, &signature_of(&child, text))),
                 });
             }
-        } else if is_leaf_decl(kind) {
+        } else {
             emit_leaf(rel, &child, text, ctx, out);
         }
     }
@@ -169,27 +183,10 @@ fn emit_leaf(rel: &str, node: &tree_sitter::Node, text: &str, ctx: &str, out: &m
     out.push(CodeChunk {
         file: rel.to_string(),
         line,
-        kind: short_kind(node.kind()).to_string(),
-        name: name_of(node, text),
+        kind: decl_label(node.kind()).unwrap_or("item").to_string(),
+        name: decl_name(node, text).unwrap_or_default(),
         text: cap(join(ctx, body)),
     });
-}
-
-/// `true` for declaration kinds that become a single chunk (containers such as
-/// `impl`/`mod`/`trait` are handled by [`collect`] instead).
-fn is_leaf_decl(kind: &str) -> bool {
-    matches!(
-        kind,
-        "function_item" | "struct_item" | "enum_item" | "type_item" | "static_item" | "const_item"
-    )
-}
-
-/// The declaration's name, or `""` when it has none (e.g. an `impl`).
-fn name_of(node: &tree_sitter::Node, text: &str) -> String {
-    node.child_by_field_name("name")
-        .and_then(|n| n.utf8_text(text.as_bytes()).ok())
-        .unwrap_or("")
-        .to_string()
 }
 
 /// Byte offset where the declaration's doc comment / attributes start (contiguous
@@ -200,7 +197,7 @@ fn with_doc_start(node: &tree_sitter::Node) -> usize {
     while let Some(p) = prev {
         if matches!(
             p.kind(),
-            "line_comment" | "block_comment" | "attribute_item"
+            "line_comment" | "block_comment" | "comment" | "attribute_item"
         ) {
             start = p.start_byte();
             prev = p.prev_sibling();
@@ -302,6 +299,39 @@ mod tests {
             "the impl header must not be its own chunk"
         );
         assert!(chunks.iter().any(|c| c.name == "Foo" && c.kind == "struct"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunks_ts_class_and_methods_by_declaration() {
+        let dir = scratch("ts");
+        std::fs::write(
+            dir.join("m.ts"),
+            "// Widget renders a box.\nexport class Widget {\n  render(): void {}\n  update(n: number): void {}\n}\n",
+        )
+        .unwrap();
+        let chunks = code_chunks(&dir).unwrap();
+        let render = chunks
+            .iter()
+            .find(|c| c.name == "render")
+            .expect("method chunk");
+        assert_eq!(render.kind, "method");
+        assert!(
+            render.text.contains("class Widget"),
+            "container context missing: {}",
+            render.text
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.name == "update" && c.kind == "method")
+        );
+        // Like a Rust `impl`, a class header is not its own chunk when it has
+        // methods (the methods carry the container context).
+        assert!(
+            !chunks.iter().any(|c| c.kind == "class"),
+            "class header must not be its own chunk"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

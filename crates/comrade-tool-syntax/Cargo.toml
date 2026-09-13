@@ -1,6 +1,6 @@
 [package]
 name = "comrade-tool-syntax"
-description = "Tree-sitter powered code tools: find references, rename, list symbols."
+description = "Tree-sitter powered code tools for Rust/JS/TS/CSS/HTML: find references, rename, list symbols, structural map."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,3 +15,7 @@ tokio = { workspace = true, features = ["fs", "process"] }
 tree-sitter.workspace = true
 tree-sitter-language.workspace = true
 tree-sitter-rust.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-css.workspace = true
+tree-sitter-html.workspace = true

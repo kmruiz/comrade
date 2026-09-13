@@ -8,6 +8,7 @@
 
 mod bg;
 mod ecosystem;
+mod node;
 mod pom;
 mod tasks;
 
@@ -43,7 +44,7 @@ struct PomModelTool;
 static POM_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "pom_model".into(),
-    description: "Report this project's dependencies, subprojects, layout and tasks (the POM). Use INSTEAD of reading the project manifest (e.g. Cargo.toml) when asked about deps/modules/tasks. Read-only.".into(),
+    description: "Report this project's dependencies, subprojects, layout and tasks (the POM). Use INSTEAD of reading the project manifest (e.g. Cargo.toml, package.json) when asked about deps/modules/tasks. Read-only.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {},
@@ -59,8 +60,21 @@ impl Tool for PomModelTool {
     }
 
     async fn invoke(&self, ctx: &ToolContext, _args: Value) -> Result<String> {
-        let eco = ecosystem::detect(&ctx.project_root)?;
-        eco.model(&ctx.project_root)
+        let ecos = ecosystem::detect_all(&ctx.project_root);
+        if ecos.is_empty() {
+            // Reuse the canonical "unsupported project" error.
+            return ecosystem::detect(&ctx.project_root).map(|_| String::new());
+        }
+        // A repository may host several ecosystems (Cargo + npm); show them all.
+        let mut sections = Vec::new();
+        for eco in ecos {
+            sections.push(format!(
+                "Ecosystem: {}\n{}",
+                eco.name(),
+                eco.model(&ctx.project_root)?
+            ));
+        }
+        Ok(sections.join("\n"))
     }
 }
 
@@ -73,12 +87,13 @@ struct PomRunTask;
 static POM_RUN_TASK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "pom_run_task".into(),
-    description: "Run a named project task and return its output: standard project tasks (build, run, check, clippy, fmt, doc, bench, release) and configured aliases; optionally scope to a subproject. Runs directly without approval. Run tests with pom_run_tests, not here - it returns only the failure summary and costs far less context.".into(),
+    description: "Run a named project task and return its output: standard project tasks (build, run, check, clippy, fmt, doc, bench, release) and configured aliases; optionally scope to a subproject. Runs directly without approval. Works for Cargo and npm projects; in a repo with several build ecosystems pass `ecosystem` to choose one. Run tests with pom_run_tests, not here - it returns only the failure summary and costs far less context.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "task": { "type": "string", "description": "Task name, e.g. \"build\" or a configured alias. Use pom_run_tests to run tests." },
             "subproject": { "type": "string", "description": "Optional subproject directory relative to the root, e.g. \"crates/app\"." },
+            "ecosystem": { "type": "string", "description": "Which build ecosystem to use in a polyglot repo, \"cargo\" or \"npm\". Defaults to the only one present, or the one that supports the task." },
             "args": { "type": "string", "description": "Extra arguments appended to the command." },
             "timeout_secs": { "type": "integer", "minimum": 1, "default": 600, "description": "Kill the task after this many seconds." }
         },
@@ -101,6 +116,8 @@ impl Tool for PomRunTask {
             #[serde(default)]
             subproject: Option<String>,
             #[serde(default)]
+            ecosystem: Option<String>,
+            #[serde(default)]
             args: Option<String>,
             #[serde(default = "default_timeout")]
             timeout_secs: u64,
@@ -121,7 +138,11 @@ impl Tool for PomRunTask {
             .map(|s| s.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default();
 
-        let eco = ecosystem::detect(&ctx.project_root)?;
+        let eco = ecosystem::pick(
+            &ctx.project_root,
+            args.ecosystem.as_deref(),
+            args.task.trim(),
+        )?;
         if !eco.supports(&ctx.project_root, &args.task) {
             anyhow::bail!(
                 "unknown task {:?} for the {} ecosystem; known verbs: {} (plus configured aliases)",
@@ -154,10 +175,12 @@ struct PomFormatCode;
 static POM_FORMAT_CODE_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "pom_format_code".into(),
-    description: "Run the project's formatter so code is formatted deterministically instead of hand-formatting tokens. Runs directly without approval (whitespace-only rewrites).".into(),
+    description: "Run the project's formatter so code is formatted deterministically instead of hand-formatting tokens. Runs directly without approval (whitespace-only rewrites). Cargo projects use `cargo fmt`, npm projects use prettier.".into(),
     json_schema: json!({
         "type": "object",
-        "properties": {},
+        "properties": {
+            "ecosystem": { "type": "string", "description": "Which build ecosystem to use in a polyglot repo, \"cargo\" or \"npm\". Defaults to the only one present." }
+        },
         "additionalProperties": false
     }),
 }
@@ -169,10 +192,16 @@ impl Tool for PomFormatCode {
         &POM_FORMAT_CODE_SPEC
     }
 
-    async fn invoke(&self, ctx: &ToolContext, _args: Value) -> Result<String> {
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            ecosystem: Option<String>,
+        }
+        let args: Args = serde_json::from_value(args)?;
         // A deterministic, whitespace-only rewrite, so it runs
         // directly (no human approval) like pom_run_tests/pom_run_task.
-        let eco = ecosystem::detect(&ctx.project_root)?;
+        let eco = ecosystem::pick(&ctx.project_root, args.ecosystem.as_deref(), "fmt")?;
         let resolved = eco.format_command(&ctx.project_root)?;
         tasks::run(&resolved, 300).await
     }
@@ -187,11 +216,12 @@ struct PomRunTests;
 static POM_RUN_TESTS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "pom_run_tests".into(),
-    description: "Run the project's tests and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names, key error lines. Use to verify work instead of reasoning about code.".into(),
+    description: "Run the project's tests and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names, key error lines. Use to verify work instead of reasoning about code. Works for Cargo and npm projects; pass `ecosystem` in a polyglot repo.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "subproject": { "type": "string", "description": "Optional subproject directory relative to the root, e.g. \"crates/app\"." },
+            "ecosystem": { "type": "string", "description": "Which build ecosystem to use in a polyglot repo, \"cargo\" or \"npm\". Defaults to the only one present, or the one that supports the test task." },
             "args": { "type": "string", "description": "Extra test-runner arguments, e.g. \"--lib\" or a test filter." },
             "timeout_secs": { "type": "integer", "minimum": 1, "default": 600, "description": "Kill after this many seconds." }
         },
@@ -212,6 +242,8 @@ impl Tool for PomRunTests {
             #[serde(default)]
             subproject: Option<String>,
             #[serde(default)]
+            ecosystem: Option<String>,
+            #[serde(default)]
             args: Option<String>,
             #[serde(default = "default_timeout")]
             timeout_secs: u64,
@@ -225,7 +257,7 @@ impl Tool for PomRunTests {
             .as_deref()
             .map(|s| s.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default();
-        let eco = ecosystem::detect(&ctx.project_root)?;
+        let eco = ecosystem::pick(&ctx.project_root, args.ecosystem.as_deref(), "test")?;
         let resolved = eco.resolve(&ctx.project_root, "test", &args.subproject, &extra)?;
         let raw = tasks::run(&resolved, args.timeout_secs).await?;
         Ok(eco.simplify_tests(&raw))
@@ -241,11 +273,12 @@ struct PomCheck;
 static POM_CHECK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "pom_check".into(),
-    description: "Type-check the project (e.g. cargo check) and return the first `max_errors` compiler errors with their file:line:col plus the total count. Much cheaper than pom_run_tests for iterating on compile errors; pass `all_targets: true` to also check tests/examples. Uses the project's build ecosystem (Cargo today).".into(),
+    description: "Type-check the project (e.g. cargo check, or tsc --noEmit for a TypeScript npm project) and return the first `max_errors` compiler errors with their file:line:col plus the total count. Much cheaper than pom_run_tests for iterating on compile errors; pass `all_targets: true` to also check tests/examples. Uses the project's build ecosystem; pass `ecosystem` in a polyglot repo.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "subproject": { "type": "string", "description": "Optional subproject directory relative to the root, e.g. \"crates/comrade-core\"." },
+            "ecosystem": { "type": "string", "description": "Which build ecosystem to use in a polyglot repo, \"cargo\" or \"npm\". Defaults to the only one present, or the one that has a check step." },
             "all_targets": { "type": "boolean", "default": false, "description": "Also check tests, examples and benches (cargo check --all-targets)." },
             "args": { "type": "string", "description": "Extra cargo-check arguments (e.g. \"--features foo\")." },
             "max_errors": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20, "description": "Show at most this many errors." },
@@ -268,6 +301,8 @@ impl Tool for PomCheck {
             #[serde(default)]
             subproject: Option<String>,
             #[serde(default)]
+            ecosystem: Option<String>,
+            #[serde(default)]
             all_targets: bool,
             #[serde(default)]
             args: Option<String>,
@@ -288,7 +323,7 @@ impl Tool for PomCheck {
             .as_deref()
             .map(|s| s.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default();
-        let eco = ecosystem::detect(&ctx.project_root)?;
+        let eco = ecosystem::pick(&ctx.project_root, args.ecosystem.as_deref(), "check")?;
         let Some(line) = eco.check_command(
             &ctx.project_root,
             &args.subproject,
