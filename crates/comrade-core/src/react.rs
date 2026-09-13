@@ -40,6 +40,15 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
     prompt.push_str(&format!(
         "Context budget is about {budget} tokens. Be terse.\n\n"
     ));
+    // Repository-supplied instructions (AGENTS.md) come before the built-in
+    // sections so the project's own rules read first.
+    if let Some(instr) =
+        crate::instructions::load_project_instructions(std::path::Path::new(project_root))
+    {
+        prompt.push_str("## Project instructions (AGENTS.md)\n\n");
+        prompt.push_str(&instr);
+        prompt.push_str("\n\n");
+    }
     if tools.iter().any(|t| t.spec().name == "delegate") {
         prompt.push_str(DELEGATE_BY_DEFAULT);
     }
@@ -467,6 +476,29 @@ pub fn render_observation(tool_name: &str, output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_prompt_includes_agents_md() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("comrade-react-test-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "Always run cargo fmt.\n").unwrap();
+        let tools = ToolRegistry::new();
+        let prompt = build_system_prompt(&dir.to_string_lossy(), &tools, 1000);
+        assert!(prompt.contains("## Project instructions (AGENTS.md)"));
+        assert!(prompt.contains("Always run cargo fmt."));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn system_prompt_without_agents_md_has_no_section() {
+        let tools = ToolRegistry::new();
+        let prompt = build_system_prompt("/nonexistent-comrade-dir-xyz", &tools, 1000);
+        assert!(!prompt.contains("Project instructions (AGENTS.md)"));
+    }
 
     #[test]
     fn parses_canonical_tool_call() {

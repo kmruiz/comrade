@@ -1538,7 +1538,7 @@ impl App {
                 return;
             }
         };
-        let tools = match crate::build_tools(&cfg) {
+        let tools = match crate::build_tools(&cfg, &self.root) {
             Ok(t) => t,
             Err(e) => {
                 self.push_meta(format!("config reload failed: {e:#}"));

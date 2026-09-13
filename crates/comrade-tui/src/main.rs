@@ -112,7 +112,7 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
     // Connect configured MCP servers and register their tools alongside the
     // built-ins. A dead/unreachable server is skipped with a warning instead
     // of aborting startup (see connect_all).
-    let mut reg = build_tools(&cfg)?;
+    let mut reg = build_tools(&cfg, &root)?;
     reg.extend(comrade_tool_mcp::connect_all(&cfg.mcp.servers).await);
     let tools = Arc::new(reg);
     Ok(Deps {
@@ -126,7 +126,7 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
     })
 }
 
-fn build_tools(cfg: &Config) -> Result<ToolRegistry> {
+fn build_tools(cfg: &Config, root: &std::path::Path) -> Result<ToolRegistry> {
     let mut reg = ToolRegistry::new();
     reg.extend(comrade_tool_session::all());
     reg.extend(comrade_tool_project::all());
@@ -135,13 +135,16 @@ fn build_tools(cfg: &Config) -> Result<ToolRegistry> {
     reg.extend(comrade_tool_syntax::all());
     reg.extend(comrade_tool_memory::all());
     reg.extend(comrade_tool_web::all());
+    // Claude-format skills discovered under `.comrade/skills` (and the common
+    // Claude places) become one `skill_<name>` tool each.
+    reg.extend(comrade_tool_skill::all(root));
     // Delegate models configured under [[delegates]] become the `delegate`
     // tool; absent delegates mean no tool is advertised. Delegates get a
     // second, restricted registry (everything except git_commit and the
     // session/UI tools) so they can do real work without ever committing.
     if let Some(delegate) = DelegateTool::new(
         &cfg.delegates,
-        delegate_registry(),
+        delegate_registry(root),
         DelegateLimits {
             max_iterations: cfg.agent.max_iterations,
             budget_tokens: cfg.context.budget_tokens,
@@ -155,7 +158,7 @@ fn build_tools(cfg: &Config) -> Result<ToolRegistry> {
     // can ground advice in the code but never change anything.
     if let Some(advise) = AskAdviseTool::new(
         &cfg.delegates,
-        advise_registry(),
+        advise_registry(root),
         DelegateLimits {
             max_iterations: cfg.agent.max_iterations,
             budget_tokens: cfg.context.budget_tokens,
@@ -172,7 +175,7 @@ fn build_tools(cfg: &Config) -> Result<ToolRegistry> {
 /// must never see (git_commit, the session/UI tools, and `delegate` itself so
 /// it cannot recurse). `deny` is shared with comrade-core's delegate module so
 /// the tool description and this registry can never drift apart.
-fn delegate_registry() -> ToolRegistry {
+fn delegate_registry(root: &std::path::Path) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     for tool in comrade_tool_fs::all()
         .into_iter()
@@ -187,6 +190,8 @@ fn delegate_registry() -> ToolRegistry {
             reg.register(tool);
         }
     }
+    // Skills are read-only text: delegates may load them too.
+    reg.extend(comrade_tool_skill::all(root));
     reg
 }
 
@@ -196,7 +201,7 @@ fn delegate_registry() -> ToolRegistry {
 /// advice in the code but can never mutate the workspace or the session.
 /// `AskAdviseTool::read_only_for_advice` shares the main loop's read-only
 /// classification (agent.rs) so the two can never drift apart.
-fn advise_registry() -> ToolRegistry {
+fn advise_registry(root: &std::path::Path) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     for tool in comrade_tool_fs::all()
         .into_iter()
@@ -211,6 +216,8 @@ fn advise_registry() -> ToolRegistry {
             reg.register(tool);
         }
     }
+    // Skills are read-only text: advisors may load them too.
+    reg.extend(comrade_tool_skill::all(root));
     reg
 }
 

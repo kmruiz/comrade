@@ -11,6 +11,7 @@ pub mod agent;
 pub mod config;
 pub mod context;
 pub mod delegate;
+pub mod instructions;
 pub mod llm;
 pub mod react;
 pub mod session;
@@ -24,6 +25,7 @@ pub use config::{
 };
 pub use context::{ContextManager, estimate_tokens};
 pub use delegate::{DelegateLimits, DelegateTool};
+pub use instructions::load_project_instructions;
 pub use llm::{ChatMessage, LlmClient, Role};
 pub use session::{AgentEvent, AgentSession};
 pub use undo::MemoryUndo;

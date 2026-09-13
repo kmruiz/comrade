@@ -485,6 +485,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "comrade-tool-skill"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "comrade-tool",
+ "serde_json",
+]
+
+[[package]]
 name = "comrade-tool-syntax"
 version = "0.1.0"
 dependencies = [
@@ -531,6 +541,7 @@ dependencies = [
  "comrade-tool-memory",
  "comrade-tool-project",
  "comrade-tool-session",
+ "comrade-tool-skill",
  "comrade-tool-syntax",
  "comrade-tool-web",
  "crossterm",
