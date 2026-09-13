@@ -3849,6 +3849,33 @@ fn home_path_with(root: &std::path::Path, home: Option<&std::path::Path>) -> Str
     root.to_string_lossy().into_owned()
 }
 
+/// Right-aligned mode-line label counting open sessions by run status, e.g.
+/// "2 running, 1 idle". Statuses with no sessions are omitted.
+fn session_counts_label(app: &App) -> String {
+    let total = app.open_sessions.len();
+    let running = app
+        .open_sessions
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            if *i == app.active {
+                app.running
+            } else {
+                s.live.as_ref().is_some_and(|l| l.running)
+            }
+        })
+        .count();
+    let idle = total - running;
+    let mut parts = Vec::new();
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if idle > 0 {
+        parts.push(format!("{idle} idle"));
+    }
+    parts.join(", ")
+}
+
 fn draw(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
@@ -3966,12 +3993,17 @@ fn draw(app: &mut App, frame: &mut Frame) {
         ));
     }
 
-    // The bar spans the whole row; the app name is right-aligned in its own
-    // segment and drops first on narrow terminals.
+    // The bar spans the whole row; a right-aligned segment holds the per-status
+    // session counts next to the app name. Both drop out together on narrow
+    // terminals so the left-hand mode line keeps its room.
+    let counts_text = session_counts_label(app);
+    let counts_w = counts_text.chars().count() as u16;
     let tag_w = (APP_TAG.chars().count() as u16).min(rows[2].width.saturating_sub(60));
+    let gap_w = if tag_w > 0 && counts_w > 0 { 2 } else { 0 };
+    let right_w = (counts_w + gap_w + tag_w).min(rows[2].width.saturating_sub(40));
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(tag_w)])
+        .constraints([Constraint::Min(0), Constraint::Length(right_w)])
         .split(rows[2]);
     // Current directory goes leftmost on the mode line, abbreviated to ~/...
     // when it lives under $HOME (absolute otherwise).
@@ -3985,9 +4017,14 @@ fn draw(app: &mut App, frame: &mut Frame) {
         bottom[0],
     );
     if tag_w > 0 {
+        let right = vec![
+            Span::styled(counts_text, bar_style),
+            Span::raw("  "),
+            Span::styled(APP_TAG, bar_style.add_modifier(Modifier::BOLD)),
+        ];
         frame.render_widget(
-            Paragraph::new(Line::from(APP_TAG))
-                .style(bar_style.add_modifier(Modifier::BOLD))
+            Paragraph::new(Line::from(right))
+                .style(bar_style)
                 .alignment(Alignment::Right),
             bottom[1],
         );
@@ -8181,6 +8218,26 @@ mod tests {
         build_app(
             &deps, events_tx, events_rx, run_tx, asks_tx, asks_rx, git_tx, git_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn session_counts_label_counts_running_and_idle() {
+        let mut app = test_app();
+        // Single idle session.
+        assert_eq!(session_counts_label(&app), "1 idle");
+        // Two sessions, the first parked with a run in flight, the active one idle.
+        app.running = true;
+        app.new_session();
+        assert_eq!(session_counts_label(&app), "1 running, 1 idle");
+        // Second (active) session now running too.
+        app.running = true;
+        assert_eq!(session_counts_label(&app), "2 running");
+        // All idle.
+        app.running = false;
+        if let Some(s) = app.open_sessions.iter_mut().find(|s| s.live.is_some()) {
+            s.live.as_mut().unwrap().running = false;
+        }
+        assert_eq!(session_counts_label(&app), "2 idle");
     }
 
     #[tokio::test]
