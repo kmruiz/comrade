@@ -4,7 +4,7 @@ mod engine;
 
 use engine::KIND_LABELS;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -22,6 +22,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(TsStructuralMap),
         Box::new(TsReadSymbol),
         Box::new(TsFindSymbol),
+        Box::new(TsTestImpact),
     ]
 }
 
@@ -581,6 +582,212 @@ impl Tool for TsFindSymbol {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ts_test_impact
+// ---------------------------------------------------------------------------
+
+struct TsTestImpact;
+
+static TS_TEST_IMPACT_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "ts_test_impact".into(),
+    description: "Map the files changed since a revision (git diff) to the tests likely to cover them, using tree-sitter: a test is affected when it references a symbol declared in a changed file, or lives in the same crate. Use to run the smallest useful test set before the full suite.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "rev": { "type": "string", "default": "HEAD", "description": "Compare against this revision (e.g. HEAD, main, HEAD~3). Untracked files are always included." },
+            "max": { "type": "integer", "default": 100, "minimum": 1, "maximum": 500, "description": "Cap on reported tests." }
+        },
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for TsTestImpact {
+    fn spec(&self) -> &ToolSpec {
+        &TS_TEST_IMPACT_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default = "default_rev")]
+            rev: String,
+            #[serde(default = "default_max")]
+            max: usize,
+        }
+        fn default_rev() -> String {
+            "HEAD".to_string()
+        }
+        fn default_max() -> usize {
+            100
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let root = &ctx.project_root;
+        let changed = changed_files(root, &args.rev)?;
+        if changed.is_empty() {
+            return Ok(format!("No changed files vs {}.", args.rev));
+        }
+
+        // Symbols declared in the changed Rust files -> the file declaring them.
+        let mut symbols: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut changed_rs: Vec<String> = Vec::new();
+        for f in &changed {
+            if !f.ends_with(".rs") {
+                continue;
+            }
+            changed_rs.push(f.clone());
+            let Ok(text) = std::fs::read_to_string(root.join(f)) else {
+                continue;
+            };
+            for name in engine::decl_names_in_text(&text) {
+                if ignored_symbol(&name) {
+                    continue;
+                }
+                symbols.entry(name).or_default().push(f.clone());
+            }
+        }
+        let changed_crates: HashSet<String> = changed_rs.iter().map(|f| crate_of(f)).collect();
+
+        let tests = engine::test_functions(root)?;
+        let mut affected: Vec<(bool, String, usize, String, String)> = Vec::new();
+        for t in &tests {
+            let toks = engine::identifier_tokens(&t.body);
+            let mut hits: Vec<String> = symbols
+                .keys()
+                .filter(|s| toks.contains(*s))
+                .cloned()
+                .collect();
+            hits.sort();
+            hits.truncate(6);
+            let same_only = hits.is_empty()
+                && changed_crates.contains(&crate_of(&t.file))
+                && !t.file.is_empty();
+            let reason = if !hits.is_empty() {
+                format!("references {}", hits.join(", "))
+            } else if same_only {
+                "same crate as a changed file".to_string()
+            } else {
+                continue;
+            };
+            // Symbol-matched tests first, then same-crate ones.
+            affected.push((hits.is_empty(), t.file.clone(), t.line, t.name.clone(), reason));
+        }
+        affected.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+        let total = affected.len();
+        let mut out = format!(
+            "{} changed file(s) vs {}; {} test(s) likely affected:\n",
+            changed.len(),
+            args.rev,
+            total
+        );
+        for c in &changed {
+            out.push_str(&format!("  changed: {c}\n"));
+        }
+        if total == 0 {
+            out.push_str("(no tests reference the changed symbols; run the changed crate's suite)\n");
+            return Ok(clamp(out));
+        }
+        out.push('\n');
+        for (_, file, line, name, reason) in affected.iter().take(args.max) {
+            out.push_str(&format!("{file}:{line} {name}  ({reason})\n"));
+        }
+        if total > args.max {
+            out.push_str(&format!("... and {} more\n", total - args.max));
+        }
+        out.push_str("\nsuggested test runs:\n");
+        let mut crates: Vec<String> = affected
+            .iter()
+            .map(|(_, f, _, _, _)| crate_of(f))
+            .filter(|c| !c.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        crates.sort();
+        for c in crates {
+            match crate_package(root, &c) {
+                Some(pkg) => out.push_str(&format!("  cargo test -p {pkg}\n")),
+                None => out.push_str(&format!("  (cargo test in {c})\n")),
+            }
+        }
+        Ok(clamp(out))
+    }
+}
+
+/// `git diff --name-only <rev>` plus untracked files, as root-relative paths.
+fn changed_files(root: &std::path::Path, rev: &str) -> Result<Vec<String>> {
+    let run = |args: &[&str]| -> Result<String> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to run git {}: {e}", args.join(" ")))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let mut files = Vec::new();
+    for l in run(&["diff", "--name-only", rev])?.lines() {
+        let t = l.trim();
+        if !t.is_empty() {
+            files.push(t.to_string());
+        }
+    }
+    for l in run(&["ls-files", "--others", "--exclude-standard"])?.lines() {
+        let t = l.trim();
+        if !t.is_empty() {
+            files.push(t.to_string());
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+/// The crate directory of a root-relative path (`crates/foo/src/x.rs` -> `crates/foo`).
+fn crate_of(rel: &str) -> String {
+    let mut parts = rel.split('/');
+    match (parts.next(), parts.next()) {
+        (Some("crates"), Some(name)) => format!("crates/{name}"),
+        (Some(first), _) => first.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Read the `name = "..."` from a crate dir's Cargo.toml (falls back to the dir name).
+fn crate_package(root: &std::path::Path, crate_dir: &str) -> Option<String> {
+    let manifest = root.join(crate_dir).join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("name") {
+            let rest = rest.trim_start();
+            if let Some(val) = rest.strip_prefix('=') {
+                let name = val.trim().trim_matches('"').trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    crate_dir.rsplit('/').next().map(str::to_string)
+}
+
+/// Symbols too generic to be a useful impact signal.
+fn ignored_symbol(name: &str) -> bool {
+    name.len() < 3
+        || matches!(
+            name,
+            "self" | "new" | "main" | "fmt" | "from" | "into" | "default" | "test"
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -807,7 +1014,7 @@ fn main() {}
 mod find_symbol_tests {
     use std::path::PathBuf;
 
-    use super::{engine, normalize_kind};
+    use super::{crate_of, engine, ignored_symbol, normalize_kind};
 
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -923,5 +1130,58 @@ mod find_symbol_tests {
         assert_eq!(normalize_kind(Some("  fn  ")).unwrap(), Some("fn"));
         assert!(normalize_kind(Some("method")).is_err());
         assert_eq!(normalize_kind(Some("  ")).unwrap(), None);
+    }
+
+    #[test]
+    fn test_functions_finds_only_annotated_fns() {
+        let root = scratch();
+        std::fs::write(
+            root.join("lib.rs"),
+            "\
+pub fn helper() {}
+#[test]
+fn a() { assert_eq!(thing(), 1); }
+#[tokio::test]
+async fn b() {}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn inner() {}
+}
+",
+        )
+        .unwrap();
+        let fns = engine::test_functions(&root).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"a"), "{names:?}");
+        assert!(names.contains(&"b"), "{names:?}");
+        assert!(names.contains(&"inner"), "{names:?}");
+        assert!(!names.contains(&"helper"), "{names:?}");
+        let a = fns.iter().find(|f| f.name == "a").unwrap();
+        assert!(a.body.contains("thing()"), "{}", a.body);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn decl_names_and_tokens() {
+        let text = "pub struct Store {}\nfn compute(x: usize) -> usize { x }\nenum Kind { A }\n";
+        let names = engine::decl_names_in_text(text);
+        assert!(names.contains(&"Store".to_string()), "{names:?}");
+        assert!(names.contains(&"compute".to_string()), "{names:?}");
+        assert!(names.contains(&"Kind".to_string()), "{names:?}");
+        let toks = engine::identifier_tokens("let x = Store::open(compute);");
+        assert!(toks.contains("Store"));
+        assert!(toks.contains("compute"));
+        assert!(!toks.contains("="));
+    }
+
+    #[test]
+    fn crate_paths_and_ignored_symbols() {
+        assert_eq!(crate_of("crates/comrade-core/src/agent.rs"), "crates/comrade-core");
+        assert_eq!(crate_of("README.md"), "README.md");
+        assert!(ignored_symbol("new"));
+        assert!(ignored_symbol("id"));
+        assert!(!ignored_symbol("Store"));
+        assert!(!ignored_symbol("compute"));
     }
 }

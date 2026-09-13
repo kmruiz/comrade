@@ -91,6 +91,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "ts_find_symbol",
     "ts_read_symbol",
     "ts_find_references",
+    "ts_test_impact",
     "git_status",
     "git_diff",
     "git_show",

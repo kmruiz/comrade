@@ -724,3 +724,134 @@ pub fn apply_edits(root: &Path, edits: &[FileEdits], replacement: &str) -> Resul
     }
     Ok(total)
 }
+
+// ---------------------------------------------------------------------------
+// change-impact analysis (git diff + tree-sitter)
+// ---------------------------------------------------------------------------
+
+/// A test function (`#[test]` and friends) discovered by tree-sitter.
+#[derive(Debug, Clone)]
+pub struct TestFn {
+    /// Project-root relative file.
+    pub file: String,
+    /// 1-based line of the `fn` keyword.
+    pub line: usize,
+    /// Function name.
+    pub name: String,
+    /// Whole function source text (scanned for referenced identifiers).
+    pub body: String,
+}
+
+/// True when an attribute marks a test function (`#[test]`, `#[tokio::test]`,
+/// `#[async_std::test]`, `#[serial_test::serial]`, `#[test_case]`).
+fn attr_is_test(attr_text: &str) -> bool {
+    let a = attr_text.trim();
+    a.starts_with("#[test")
+        || a.starts_with("#[tokio::test")
+        || a.starts_with("#[async_std::test")
+        || a.starts_with("#[serial_test")
+        || a.starts_with("#[test_case")
+}
+
+/// Whether a `function_item` is preceded by a test attribute.
+fn has_test_attr(node: tree_sitter::Node, text: &str) -> bool {
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "attribute_item" => {
+                if attr_is_test(&text[p.byte_range()]) {
+                    return true;
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        prev = p.prev_sibling();
+    }
+    false
+}
+
+/// Every test function in the project (across all Rust sources).
+pub fn test_functions(root: &Path) -> Result<Vec<TestFn>> {
+    let mut out = Vec::new();
+    for (rel, text) in collect_files(root, None, None)? {
+        let ext = Path::new(&rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let Some(lang) = language_for(ext) else {
+            continue;
+        };
+        let mut parser = tree_sitter::Parser::new();
+        let _ = parser.set_language(&lang);
+        let Some(tree) = parser.parse(&text, None) else {
+            continue;
+        };
+        let mut stack = vec![tree.root_node()];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "function_item" && has_test_attr(n, &text) {
+                let name = n
+                    .child_by_field_name("name")
+                    .and_then(|c| c.utf8_text(text.as_bytes()).ok())
+                    .unwrap_or("?")
+                    .to_string();
+                let (line, _, _) = locate(&text, n.start_byte());
+                out.push(TestFn {
+                    file: rel.clone(),
+                    line,
+                    name,
+                    body: text[n.byte_range()].to_string(),
+                });
+            }
+            for i in 0..n.child_count() {
+                if let Some(c) = n.child(i) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Names of declarations (any depth) defined in one Rust source text.
+pub fn decl_names_in_text(text: &str) -> Vec<String> {
+    let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+    let mut parser = tree_sitter::Parser::new();
+    let _ = parser.set_language(&lang);
+    let Some(tree) = parser.parse(text, None) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if is_decl_kind(n.kind())
+            && let Some(name) = n.child_by_field_name("name")
+            && let Ok(t) = name.utf8_text(text.as_bytes())
+        {
+            out.push(t.to_string());
+        }
+        for i in 0..n.child_count() {
+            if let Some(c) = n.child(i) {
+                stack.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// The identifier tokens in `text` (word characters only), as a set.
+pub fn identifier_tokens(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            out.insert(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.insert(cur);
+    }
+    out
+}
