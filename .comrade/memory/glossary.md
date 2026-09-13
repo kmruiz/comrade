@@ -270,6 +270,16 @@ Frontmatter is parsed by hand (no YAML crate in the workspace). Discovery/parse 
 **Notes:**
 Model-facing tool names appear in: ToolSpec name in each comrade-tool-* lib.rs, comrade-core tables (MUTATING_TOOLS/APPROVAL_GATED_TOOLS/READ_ONLY_TOOLS/CODE_CHANGES in agent.rs, DENIED_FOR_DELEGATES in delegate.rs), prompts/*.md, react.rs assertions, and tui.rs name-keyed rendering.
 
+## verify-then-commit monitor
+> Guard in the agent loop (crates/comrade-core/src/agent.rs, `update_verify_state`/`verified_after_change`) that refuses a `git_commit` until a test run has gone green since the last code change. Any tool in `CODE_CHANGES` (fs_edit, fs_write_file, ts_rename, pom_format_code, shell, delegate) sets it unverified; only a `pom_run_tests`/`pom_run_task` run that succeeded AND whose output text contains the literal `test result: ok.` sets it verified again.
+
+**References:**
+- `crates/comrade-core/src/agent.rs`
+- `crates/comrade-tui/src/tui.rs`
+
+**Notes:**
+Practical consequence: a full-suite `pom_run_tests` output is often truncated by the harness and hides the `test result: ok.` line, so it does NOT clear the guard. Running `pom_format_code` after tests re-arms the guard. To satisfy the commit guard cheaply, run a NARROW filtered test (e.g. `pom_run_tests args=<test_name>`) whose short output prints `test result: ok.`, then commit without any intervening code-changing tool.
+
 ## Waiting session
 > A session whose in-flight run is paused waiting for human input (a pending ask/dialog: a tool confirmation or a question). Shown as "waiting" in BOTH places: the mode-line session-count label (e.g. "1 running, 1 waiting, 1 idle") and the Ctrl-x C-b switcher ("[waiting]"). A session is waiting iff app.dialogs holds a Dialog with that session's id; running/waiting/idle are a mutually-exclusive partition (waiting takes precedence over running). Each session's TuiUserIo is stamped with its id so PendingAsk/Dialog can be attributed (asks previously came through one shared user io). The internal local variable in session_counts_label is still named `blocked`.
 
