@@ -25,3 +25,6 @@ Releasing is `./release.sh major|minor|patch`; the workflow then publishes three
 
 ## Note
 Follow-up: the "does NOT cover a per-commit CI workflow" gap is now closed by `.github/workflows/ci.yml` — a mandatory `ci` job (name "fmt + test") running `cargo fmt --all -- --check` and `cargo test --workspace` on push to main/master and on every pull_request, with `permissions: contents: read`. Mark the `ci` job as a required status check in branch protection to make it mandatory. Uses the same toolchain/cache actions as release.yml (dtolnay/rust-toolchain@stable with the rustfmt component, Swatinem/rust-cache@v2).
+
+## Note
+Enforcement applied (kmruiz/comrade): branch protection on `main` now requires the status check context "fmt + test" (strict=false, enforce_admins=false, no PR requirement), set with `gh api -X PUT repos/kmruiz/comrade/branches/main/protection`. The required context must match the check-run name, which is the job's `name:` (not the workflow `name: ci`), hence "fmt + test". The ci.yml commit was pushed to origin/main and its run 34790172929 completed green.
