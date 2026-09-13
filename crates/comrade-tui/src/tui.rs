@@ -3875,7 +3875,7 @@ fn home_path_with(root: &std::path::Path, home: Option<&std::path::Path>) -> Str
 }
 
 /// Status of open session `i` for the mode line and the switcher:
-/// `Some("waiting")` when its run is blocked on a user dialog,
+/// `Some("waiting")` when its run is waiting on a user dialog,
 /// `Some("running")` when a run is in flight (and not waiting), else None.
 fn session_status_marker(app: &App, i: usize) -> Option<&'static str> {
     let s = app.open_sessions.get(i)?;
@@ -3891,7 +3891,7 @@ fn session_status_marker(app: &App, i: usize) -> Option<&'static str> {
 }
 
 /// Right-aligned mode-line label counting open sessions by run status, e.g.
-/// "2 running, 1 blocked, 1 idle". Statuses with no sessions are omitted.
+/// "2 running, 1 waiting, 1 idle". Statuses with no sessions are omitted.
 fn session_counts_label(app: &App) -> String {
     let total = app.open_sessions.len();
     let mut running = 0usize;
@@ -3909,7 +3909,7 @@ fn session_counts_label(app: &App) -> String {
         parts.push(format!("{running} running"));
     }
     if blocked > 0 {
-        parts.push(format!("{blocked} blocked"));
+        parts.push(format!("{blocked} waiting"));
     }
     if idle > 0 {
         parts.push(format!("{idle} idle"));
@@ -8304,9 +8304,9 @@ mod tests {
             reply: tx,
         });
         assert_eq!(session_status_marker(&app, 0), Some("waiting"));
-        assert_eq!(session_counts_label(&app), "1 blocked");
+        assert_eq!(session_counts_label(&app), "1 waiting");
         app.new_session();
-        assert_eq!(session_counts_label(&app), "1 blocked, 1 idle");
+        assert_eq!(session_counts_label(&app), "1 waiting, 1 idle");
     }
 
     #[tokio::test]
