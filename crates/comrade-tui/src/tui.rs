@@ -68,19 +68,29 @@ const APP_TAG: &str = " comrade ";
 // ---------------------------------------------------------------------------
 
 struct PendingAsk {
+    /// id of the session whose run raised this ask.
+    session: u64,
     prompt: UserPrompt,
     reply: oneshot::Sender<UserReply>,
 }
 
 struct TuiUserIo {
     tx: mpsc::Sender<PendingAsk>,
+    /// Session whose runs use this io; stamped onto every ask it sends.
+    session: u64,
 }
 
 #[async_trait]
 impl UserIo for TuiUserIo {
     async fn ask(&self, prompt: UserPrompt) -> Result<UserReply> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(PendingAsk { prompt, reply: tx }).await?;
+        self.tx
+            .send(PendingAsk {
+                session: self.session,
+                prompt,
+                reply: tx,
+            })
+            .await?;
         rx.await.context("UI closed before answering")
     }
 }
@@ -334,6 +344,8 @@ struct Dialog {
     prompt: UserPrompt,
     buf: String,
     reply: oneshot::Sender<UserReply>,
+    /// id of the session whose run is waiting on this dialog.
+    session: u64,
 }
 
 /// A plan step offered in the Ctrl-A "assign a model" overlay.
@@ -770,6 +782,9 @@ struct App {
     /// [`LiveState`]); the run task and the AgentSession stream into it.
     run_tx: mpsc::Sender<AgentEvent>,
     asks_rx: mpsc::Receiver<PendingAsk>,
+    /// Clone of the ask channel sender, used to build each session's own
+    /// [`TuiUserIo`] (see [`App::make_ctx_base`]).
+    asks_tx: mpsc::Sender<PendingAsk>,
 
     stop: Option<CancellationToken>,
     /// JoinHandle of the in-flight run task, used by the cancel watchdog to
@@ -1762,6 +1777,7 @@ impl App {
         let run_tx = spawn_tagged_relay(id, self.events_tx.clone());
         let session = Arc::new(AgentSession::new(run_tx.clone()));
         let ctx_base = self.make_ctx_base(
+            id,
             session.clone(),
             Arc::new(comrade_core::MemoryUndo::new(self.root.clone())),
         );
@@ -1806,6 +1822,7 @@ impl App {
     /// Build a [`ToolContext`] for a session from the shared per-app bits.
     fn make_ctx_base(
         &self,
+        id: u64,
         session: Arc<AgentSession>,
         undo: Arc<comrade_core::MemoryUndo>,
     ) -> ToolContext {
@@ -1813,7 +1830,10 @@ impl App {
             project_root: self.root.clone(),
             cwd: self.root.clone(),
             session: session.as_control(),
-            user: self.ctx_base.user.clone(),
+            user: Arc::new(TuiUserIo {
+                tx: self.asks_tx.clone(),
+                session: id,
+            }),
             undo,
             auto_approve: self.cfg.auto_approve(),
             approval: Default::default(),
@@ -1833,6 +1853,7 @@ impl App {
         let run_tx = spawn_tagged_relay(id, self.events_tx.clone());
         let session = Arc::new(AgentSession::new(run_tx.clone()));
         let ctx_base = self.make_ctx_base(
+            id,
             session.clone(),
             Arc::new(comrade_core::MemoryUndo::new(self.root.clone())),
         );
@@ -2888,7 +2909,10 @@ fn build_app(
     git_tx: mpsc::Sender<GitBarInfo>,
     git_rx: mpsc::Receiver<GitBarInfo>,
 ) -> App {
-    let user = Arc::new(TuiUserIo { tx: asks_tx });
+    let user = Arc::new(TuiUserIo {
+        tx: asks_tx.clone(),
+        session: 0,
+    });
     let bundle = session_bundle(deps, user, run_tx.clone());
 
     // Assign a stable color to each agent (main model + delegates) once, at
@@ -2916,6 +2940,7 @@ fn build_app(
         events_rx,
         run_tx,
         asks_rx,
+        asks_tx,
         stop: None,
         run_handle: None,
         running: false,
@@ -3070,7 +3095,7 @@ pub async fn run(deps: &Deps) -> Result<()> {
                                 },
                             ));
                         } else {
-                            app.dialogs.push(Dialog { prompt: ask.prompt, buf: String::new(), reply: ask.reply });
+                            app.dialogs.push(Dialog { prompt: ask.prompt, buf: String::new(), reply: ask.reply, session: ask.session });
                             app.dialog_ask = false;
                             app.dialog_conv.clear();
                             app.push_meta("waiting for your input");
@@ -3849,26 +3874,42 @@ fn home_path_with(root: &std::path::Path, home: Option<&std::path::Path>) -> Str
     root.to_string_lossy().into_owned()
 }
 
+/// Status of open session `i` for the mode line and the switcher:
+/// `Some("waiting")` when its run is blocked on a user dialog,
+/// `Some("running")` when a run is in flight (and not waiting), else None.
+fn session_status_marker(app: &App, i: usize) -> Option<&'static str> {
+    let s = app.open_sessions.get(i)?;
+    if app.dialogs.iter().any(|d| d.session == s.id) {
+        return Some("waiting");
+    }
+    let running = if i == app.active {
+        app.running
+    } else {
+        s.live.as_ref().is_some_and(|l| l.running)
+    };
+    running.then_some("running")
+}
+
 /// Right-aligned mode-line label counting open sessions by run status, e.g.
-/// "2 running, 1 idle". Statuses with no sessions are omitted.
+/// "2 running, 1 blocked, 1 idle". Statuses with no sessions are omitted.
 fn session_counts_label(app: &App) -> String {
     let total = app.open_sessions.len();
-    let running = app
-        .open_sessions
-        .iter()
-        .enumerate()
-        .filter(|(i, s)| {
-            if *i == app.active {
-                app.running
-            } else {
-                s.live.as_ref().is_some_and(|l| l.running)
-            }
-        })
-        .count();
-    let idle = total - running;
+    let mut running = 0usize;
+    let mut blocked = 0usize;
+    for i in 0..total {
+        match session_status_marker(app, i) {
+            Some("waiting") => blocked += 1,
+            Some("running") => running += 1,
+            _ => {}
+        }
+    }
+    let idle = total.saturating_sub(running + blocked);
     let mut parts = Vec::new();
     if running > 0 {
         parts.push(format!("{running} running"));
+    }
+    if blocked > 0 {
+        parts.push(format!("{blocked} blocked"));
     }
     if idle > 0 {
         parts.push(format!("{idle} idle"));
@@ -6047,13 +6088,7 @@ fn draw_session_pick(pick: &SessionPick, app: &App, frame: &mut Frame) {
     for (i, s) in app.open_sessions.iter().enumerate() {
         let selected = i == pick.sel;
         let marker = if i == app.active { "*" } else { " " };
-        // A session with a run in flight is marked, whether it is the active one
-        // or running in the background.
-        let running = if i == app.active {
-            app.running
-        } else {
-            s.live.as_ref().is_some_and(|l| l.running)
-        };
+        let status = session_status_marker(app, i);
         let file = s
             .file
             .as_ref()
@@ -6063,7 +6098,12 @@ fn draw_session_pick(pick: &SessionPick, app: &App, frame: &mut Frame) {
             "{marker} {} {}{}",
             if selected { ">" } else { " " },
             s.title,
-            if running { "  [running]" } else { "" }
+            match status {
+                Some("waiting") => "  [waiting]",
+                Some("running") => "  [running]",
+                Some(_) => unreachable!(),
+                None => "",
+            }
         );
         text.push_str(&file);
         let style = if selected {
@@ -8246,6 +8286,27 @@ mod tests {
             s.live.as_mut().unwrap().running = false;
         }
         assert_eq!(session_counts_label(&app), "2 idle");
+    }
+
+    #[tokio::test]
+    async fn blocked_session_counts_as_blocked_and_shows_waiting() {
+        let mut app = test_app();
+        assert_eq!(session_counts_label(&app), "1 idle");
+        assert_eq!(session_status_marker(&app, 0), None);
+        let (tx, _rx) = oneshot::channel();
+        app.dialogs.push(Dialog {
+            session: app.active_id(),
+            prompt: UserPrompt::Confirm {
+                title: "Test".to_string(),
+                diff: None,
+            },
+            buf: String::new(),
+            reply: tx,
+        });
+        assert_eq!(session_status_marker(&app, 0), Some("waiting"));
+        assert_eq!(session_counts_label(&app), "1 blocked");
+        app.new_session();
+        assert_eq!(session_counts_label(&app), "1 blocked, 1 idle");
     }
 
     #[tokio::test]

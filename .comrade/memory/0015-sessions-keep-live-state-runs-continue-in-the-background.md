@@ -22,3 +22,6 @@ Comrade TUI session lifecycle and event routing (crates/comrade-tui: tui.rs, mai
 ## Impact
 New/switch/load/kill now work while runs are in flight; a parked session keeps streaming into its own chat and shows a [running] marker in the session switcher. Save/fork of the active session still require it to be idle. Approvals for a background run surface in the shared dialog and their meta note lands in the active chat (follow-up: attribute dialogs to the owning session). Cancel (Esc) cancels the active session's run only. Adds `LiveState`, `swap_live`, `on_agent_event_for`, `spawn_tagged_relay`, `session_bundle`, `build_app`; supersedes the snapshot-only and in-flight-refusal parts of ADR 0013.
 
+
+## Note
+Follow-up implemented: dialogs/asks are now attributed to their owning session. Each session gets its own TuiUserIo (built in App::make_ctx_base with the session id; stored asks_tx on App), so PendingAsk and Dialog carry `session: u64`. A session whose run is blocked on a user dialog is shown as "waiting": the mode-line session-count label buckets open sessions into a mutually-exclusive running/blocked/idle partition via fn session_status_marker (waiting takes precedence over running), and the Ctrl-x C-b switcher appends "  [waiting]" instead of "  [running]".

@@ -50,6 +50,12 @@ The dialog wraps its body/options to the popup's real inner width (popup = min(a
 **References:**
 - `crates/comrade-tui/src/tui.rs`
 
+## Blocked session
+> A session whose in-flight run is paused waiting for human input (a pending ask/dialog: a tool confirmation or a question). Shown as "blocked" in the mode-line session-count label and "[waiting]" in the Ctrl-x C-b switcher. A session is blocked iff app.dialogs holds a Dialog with that session's id; running/blocked/idle are a mutually-exclusive partition (waiting takes precedence over running). Each session's TuiUserIo is stamped with its id so PendingAsk/Dialog can be attributed (asks previously came through one shared user io).
+
+**References:**
+- `crates/comrade-tui/src/tui.rs (fn session_status_marker, fn session_counts_label, fn draw_session_pick, struct TuiUserIo, struct Dialog)`
+
 ## delegate sub-chat
 > The chat rows authored by a delegate model (its tool cards and its reply), rendered indented 2 columns under a "| " rule in the delegate's agent color with a dim per-agent background band, visually nested under the parent's delegate tool call.
 
