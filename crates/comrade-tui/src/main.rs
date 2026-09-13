@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use comrade_core::{AskAdviseTool, Config, DelegateLimits, DelegateTool, LlmClient, MemoryUndo};
+use comrade_core::{AskAdviseTool, Config, DelegateLimits, DelegateParallelTool, DelegateTool, LlmClient, MemoryUndo};
 use comrade_tool::{ToolContext, ToolRegistry};
 
 #[derive(Parser, Debug)]
@@ -152,6 +152,19 @@ fn build_tools(cfg: &Config, root: &std::path::Path) -> Result<ToolRegistry> {
         },
     )? {
         reg.register(Box::new(delegate));
+    }
+    // The same delegates back `delegate_parallel`: a single call that fans out
+    // several independent tasks concurrently (works in both protocols).
+    if let Some(parallel) = DelegateParallelTool::new(
+        &cfg.delegates,
+        delegate_registry(root),
+        DelegateLimits {
+            max_iterations: cfg.agent.max_iterations,
+            budget_tokens: cfg.context.budget_tokens,
+            max_tool_output_chars: cfg.context.max_tool_output_chars,
+        },
+    )? {
+        reg.register(Box::new(parallel));
     }
     // The same [[delegates]] back the `ask_advise` tool: consulting one of them
     // for a second opinion. Advisors only get the read-only registry, so they

@@ -26,7 +26,7 @@ pub use config::{
     expand_env_value,
 };
 pub use context::{ContextManager, estimate_tokens};
-pub use delegate::{DelegateLimits, DelegateTool};
+pub use delegate::{DelegateLimits, DelegateParallelTool, DelegateTool};
 pub use instructions::load_project_instructions;
 pub use llm::{ChatMessage, LlmClient, Role};
 pub use session::{AgentEvent, AgentSession};

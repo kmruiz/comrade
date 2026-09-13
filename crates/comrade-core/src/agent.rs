@@ -36,6 +36,7 @@ const MUTATING_TOOLS: &[&str] = &[
     "git_branch",
     "git_checkout",
     "delegate",
+    "delegate_parallel",
     "pom_run_task",
     "record_adr",
     "amend_adr",

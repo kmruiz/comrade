@@ -1,6 +1,10 @@
 //! The `delegate` tool: hand a single, self-contained sub-task to another
 //! model — typically a cheaper or faster one on a different provider.
 //!
+//! The companion `delegate_parallel` tool fans out SEVERAL such tasks at once
+//! (a single call, so it works in both the native and ReAct protocols) and
+//! returns every reply together.
+//!
 //! The main ("tech lead") model keeps orchestrating and committing, but can
 //! offload a well-defined piece of work to a developer model configured in
 //! `config.toml` under `[[delegates]]`. Unlike plain-chat sub-agents, a
@@ -28,6 +32,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use comrade_tool::{PlanStatus, PlanTarget, Tool, ToolContext, ToolRegistry, ToolSpec};
+use futures_util::future::join_all;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent::{LoopTracker, MAX_LOOP_REFUSALS, allow_read_step, loop_refusal};
@@ -63,6 +69,7 @@ pub const DENIED_FOR_DELEGATES: &[&str] = &[
     "self_set_step_model",
     "self_set_step_context",
     "self_finish_plan",
+    "delegate_parallel",
     "run_bg",
     "bg_status",
     "bg_tail",
@@ -901,12 +908,231 @@ fn fix_rounds_in_note(note: Option<&str>, model: &str) -> u64 {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// delegate_parallel
+// ---------------------------------------------------------------------------
+
+/// Name of the parallel fan-out tool advertised to the tech lead.
+pub const TOOL_NAME_PARALLEL: &str = "delegate_parallel";
+
+/// Most jobs one `delegate_parallel` call may fan out, so a single call cannot
+/// spawn an unbounded number of concurrent sub-agent runs.
+const MAX_PARALLEL_JOBS: usize = 8;
+
+/// A tool that runs several INDEPENDENT delegate tasks at the same time and
+/// returns every reply together.
+///
+/// The main loop already parallelises a native batch that is entirely
+/// `delegate` calls; this tool gives the same fan-out in ONE call, so it also
+/// works under the ReAct protocol (one action per turn) and lets the lead split
+/// a job across models without emitting several tool calls.
+pub struct DelegateParallelTool {
+    spec: ToolSpec,
+    targets: Vec<Target>,
+    tools: ToolRegistry,
+    limits: DelegateLimits,
+}
+
+impl DelegateParallelTool {
+    /// Build the tool from the configured `[[delegates]]` entries. Returns
+    /// `Ok(None)` when no delegates are configured.
+    pub fn new(
+        delegates: &[DelegateCfg],
+        tools: ToolRegistry,
+        limits: DelegateLimits,
+    ) -> Result<Option<Self>> {
+        if delegates.is_empty() {
+            return Ok(None);
+        }
+        let targets = build_targets(delegates)?;
+        if targets.is_empty() {
+            return Ok(None);
+        }
+        let names: Vec<String> = targets.iter().map(|t| t.cfg.name.clone()).collect();
+        let listing = delegates
+            .iter()
+            .filter(|d| d.enabled)
+            .map(cfg_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = [
+            "Run SEVERAL independent delegate tasks at the SAME time and return every reply together.",
+            "Use it to fan out reviews or checks (e.g. three reviewers on the same diff) or to split a",
+            "job into independent sub-tasks across models.",
+            "",
+            "Each job runs its own delegate sub-agent WITH tools (minus git_commit); every job's `model`",
+            "must be a configured delegate. Jobs share the workspace, so do NOT point two jobs at the",
+            "same files. For a single task use `delegate`; for a plan step use `delegate` with `step`",
+            "(this tool never touches the plan). A delegate configured `approval = \"ask\"` pauses for",
+            "each of its jobs before the batch starts; `approval = \"deny\"` refuses it.",
+        ]
+        .join("\n");
+        let description = format!("{body}\n\nConfigured delegates:\n{listing}");
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "jobs": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_PARALLEL_JOBS,
+                    "description": "The independent tasks to run concurrently.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "model": { "type": "string", "enum": names, "description": "Configured delegate model for this job." },
+                            "task": { "type": "string", "description": "Self-contained job for the delegate: paths, code, expected output." },
+                            "context": { "type": "string", "description": "Optional background for the delegate." }
+                        },
+                        "required": ["model", "task"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["jobs"],
+            "additionalProperties": false
+        });
+        Ok(Some(Self {
+            spec: ToolSpec {
+                name: TOOL_NAME_PARALLEL.into(),
+                description,
+                json_schema: schema,
+            },
+            targets,
+            tools,
+            limits,
+        }))
+    }
+}
+
+#[async_trait]
+impl Tool for DelegateParallelTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Job {
+            model: String,
+            task: String,
+            #[serde(default)]
+            context: String,
+        }
+        #[derive(Deserialize)]
+        struct Args {
+            jobs: Vec<Job>,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        if args.jobs.is_empty() {
+            bail!("`jobs` must contain at least one job");
+        }
+        if args.jobs.len() > MAX_PARALLEL_JOBS {
+            bail!("at most {MAX_PARALLEL_JOBS} jobs per call");
+        }
+
+        struct Prepared {
+            idx: usize,
+            model: String,
+            display: String,
+            native: bool,
+            prompt: String,
+        }
+        let mut prepared: Vec<Prepared> = Vec::new();
+        for (i, job) in args.jobs.iter().enumerate() {
+            let model = job.model.trim();
+            if job.task.trim().is_empty() {
+                bail!("job {}: `task` must not be empty", i + 1);
+            }
+            let (idx, target) = self
+                .targets
+                .iter()
+                .enumerate()
+                .find(|(_, t)| t.cfg.name == model)
+                .ok_or_else(|| {
+                    let listed = self
+                        .targets
+                        .iter()
+                        .map(|t| cfg_line(&t.cfg))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    anyhow::anyhow!(
+                        "job {}: unknown delegate model {model:?}. Configured delegates:\n{listed}",
+                        i + 1
+                    )
+                })?;
+            let prompt = if job.context.trim().is_empty() {
+                format!("Task:\n{}", job.task)
+            } else {
+                format!("Context:\n{}\n\nTask:\n{}", job.context, job.task)
+            };
+            prepared.push(Prepared {
+                idx,
+                model: model.to_string(),
+                display: target.cfg.llm.display(),
+                native: target.cfg.llm.protocol.native_enabled(),
+                prompt,
+            });
+        }
+
+        // Gate every job up front so a single denial aborts before anything runs.
+        for (i, p) in prepared.iter().enumerate() {
+            let cfg = &self.targets[p.idx].cfg;
+            enforce_approval(
+                cfg,
+                ctx,
+                format!("Run parallel delegate job {} ({})?", i + 1, p.model),
+                Some(approval_preview(&p.prompt, "Job to delegate:")),
+            )
+            .await?;
+        }
+
+        let root = ctx.project_root.to_string_lossy().to_string();
+        let results = join_all(prepared.iter().map(|p| {
+            let target = &self.targets[p.idx];
+            let tools = &self.tools;
+            let limits = &self.limits;
+            let root = root.clone();
+            async move {
+                let system = delegate_system_prompt(&root, tools, p.native);
+                run_delegate_subagent(
+                    &target.client,
+                    tools,
+                    ctx,
+                    system,
+                    p.prompt.clone(),
+                    &p.model,
+                    p.native,
+                    limits,
+                    DELEGATE_READ_NUDGE,
+                )
+                .await
+                .with_context(|| format!("delegate {} ({}) failed", p.model, p.display))
+            }
+        }))
+        .await;
+
+        let mut out = format!("{} parallel delegate job(s):\n", prepared.len());
+        for (i, (p, res)) in prepared.iter().zip(results).enumerate() {
+            match res {
+                Ok(reply) => {
+                    out.push_str(&format!("\n=== job {} ({}) ===\n{reply}\n", i + 1, p.model));
+                }
+                Err(err) => out.push_str(&format!(
+                    "\n=== job {} ({}) FAILED ===\nERROR: {err:#}\n",
+                    i + 1,
+                    p.model
+                )),
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
-
     use comrade_tool::PlanStepDraft;
     use comrade_tool::ToolContext;
     use comrade_tool::tool::{UserIo, UserPrompt, UserReply};
@@ -2507,5 +2733,56 @@ mod tests {
 
         let out = run.await.unwrap();
         assert!(out.contains("done after the steer"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn parallel_delegates_run_every_job_and_merge_replies() {
+        let a_url = fake_chat_server("reply-from-alpha");
+        let b_url = fake_chat_server("reply-from-beta");
+        let cfg = vec![delegate("alpha", &a_url), delegate("beta", &b_url)];
+        let tool = DelegateParallelTool::new(&cfg, ToolRegistry::new(), DelegateLimits::default())
+            .unwrap()
+            .unwrap();
+        let ctx = test_ctx();
+        let out = tool
+            .invoke(
+                &ctx,
+                json!({"jobs": [
+                    {"model": "alpha", "task": "do A"},
+                    {"model": "beta", "task": "do B", "context": "some context"}
+                ]}),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("reply-from-alpha"), "{out}");
+        assert!(out.contains("reply-from-beta"), "{out}");
+        assert!(out.contains("job 1 (alpha)"), "{out}");
+        assert!(out.contains("job 2 (beta)"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn parallel_delegates_reject_unknown_model_and_empty_jobs() {
+        let url = fake_chat_server("unused");
+        let cfg = vec![delegate("alpha", &url)];
+        let tool = DelegateParallelTool::new(&cfg, ToolRegistry::new(), DelegateLimits::default())
+            .unwrap()
+            .unwrap();
+        let ctx = test_ctx();
+        let empty = tool.invoke(&ctx, json!({"jobs": []})).await.unwrap_err();
+        assert!(empty.to_string().contains("at least one job"), "{empty}");
+        let unknown = tool
+            .invoke(&ctx, json!({"jobs": [{"model": "nope", "task": "x"}]}))
+            .await
+            .unwrap_err();
+        assert!(unknown.to_string().contains("unknown delegate model"), "{unknown}");
+    }
+
+    #[test]
+    fn no_delegates_yields_no_parallel_tool() {
+        assert!(
+            DelegateParallelTool::new(&[], ToolRegistry::new(), DelegateLimits::default())
+                .unwrap()
+                .is_none()
+        );
     }
 }
