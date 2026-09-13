@@ -251,6 +251,12 @@ Redesigned to be compact: previously 3 inner rows (name / gauge / usage) plus a 
 - `crates/comrade-tool-project/src/node.rs`
 - `crates/comrade-tool-project/src/ecosystem.rs`
 
+## path completion (session prompt)
+> Emacs find-file style Tab completion in the Ctrl-x C-s / Ctrl-x C-f session path minibuffer (crates/comrade-tui/src/tui.rs). KeyCode::Tab in handle_path_prompt_key runs complete_path(input, base = app root): it splits the typed path at the last `/` (split_dir_prefix) into a verbatim directory part and a partial name, reads the resulting directory (read_dir_entries; dirs carry a trailing `/`), and extends the name via complete_names — one match completes fully, several extend to their longest common prefix (longest_common_prefix, built on common_prefix from the M-x palette). `~` expands (expand_tilde); a path with no directory part is completed relative to the project root. Matches live in PathPrompt.matches and are drawn by draw_path_matches (a popup like draw_mx_list); cleared on the next edit.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs (handle_path_prompt_key, complete_path, complete_names, split_dir_prefix, read_dir_entries, draw_path_matches)`
+
 ## pom_check
 > Tool (comrade-tool-project) that runs `cargo check` and returns the first N compiler errors with file:line:col plus the total count - a cheap alternative to pom_run_tests for iterating on compile errors.
 
