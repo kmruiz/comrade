@@ -55,7 +55,20 @@ tree-sitter-css = "0.25"
 tree-sitter-html = "0.23"
 flate2 = "1"
 
-# The release binary embeds the ~35 MB embedding model and statically links ONNX
-# Runtime; without stripping it also carries ~14 MB of symbol tables.
+# The release binary embeds the ~35 MB embedding model and statically links
+# ONNX Runtime; without stripping it also carries ~14 MB of symbol tables. The
+# profile below shrinks the remaining Rust code as far as it goes while staying
+# a fully static binary (no dynamic libraries):
+#   opt-level = "z"   -> optimise for size rather than speed
+#   lto = "fat"       -> cross-crate LTO: the most aggressive dead-code removal
+#   codegen-units = 1 -> one unit, so inlining/DCE see the whole program
+#   panic = "abort"   -> drop unwinding tables/landing pads (the codebase uses no
+#                        catch_unwind or panic hooks; `cargo test` runs under the
+#                        dev-based test profile, so tests keep unwinding)
+#   strip = true      -> drop symbols (and debuginfo) from the final binary
 [profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 strip = true
