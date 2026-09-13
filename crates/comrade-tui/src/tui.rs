@@ -4849,7 +4849,7 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             });
         }
     }
-    if let Some((old, new)) = extract_diff_sides(&card.name, &card.args) {
+    if let Some((old, new)) = extract_diff_sides(&card.name, &card.args, card.result.as_deref()) {
         out.push(RenderRow {
             rule: None,
             spans: vec![Span::styled(
@@ -7436,6 +7436,26 @@ fn edit_diff_label(name: &str, args_json: &str, result: Option<&str>) -> String 
             )
         }
         "fs_edit" => (pick_path(&["path", "file"]), result.and_then(hunk_token)),
+        "git_diff" => {
+            let diff = result.unwrap_or("");
+            let files: Vec<&str> = diff
+                .lines()
+                .filter_map(|l| l.strip_prefix("+++ b/"))
+                .map(str::trim)
+                .collect();
+            let rel = match files.as_slice() {
+                [f] => Some((*f).to_string()),
+                _ => None,
+            };
+            (
+                rel,
+                if files.len() == 1 {
+                    hunk_token(diff)
+                } else {
+                    None
+                },
+            )
+        }
         _ => (None, None),
     };
     match (rel, hunk) {
@@ -7448,7 +7468,11 @@ fn edit_diff_label(name: &str, args_json: &str, result: Option<&str>) -> String 
 
 /// Pull the changed line sequences out of an edit tool's JSON args:
 /// `(removed, added)`.
-fn extract_diff_sides(name: &str, args_json: &str) -> Option<(Vec<String>, Vec<String>)> {
+fn extract_diff_sides(
+    name: &str,
+    args_json: &str,
+    result: Option<&str>,
+) -> Option<(Vec<String>, Vec<String>)> {
     let value: serde_json::Value = serde_json::from_str(args_json).ok()?;
     let mut removed = Vec::new();
     let mut added = Vec::new();
@@ -7470,6 +7494,34 @@ fn extract_diff_sides(name: &str, args_json: &str) -> Option<(Vec<String>, Vec<S
             let new = value.get("new")?.as_str()?;
             removed.extend(old.lines().map(str::to_string));
             added.extend(new.lines().map(str::to_string));
+        }
+        "git_diff" => {
+            let diff = result?;
+            for line in diff.lines() {
+                if line.starts_with("diff --git")
+                    || line.starts_with("index ")
+                    || line.starts_with("new file mode")
+                    || line.starts_with("deleted file mode")
+                    || line.starts_with("old mode")
+                    || line.starts_with("new mode")
+                    || line.starts_with("similarity index")
+                    || line.starts_with("rename from")
+                    || line.starts_with("rename to")
+                    || line.starts_with("---")
+                    || line.starts_with("+++")
+                    || line.starts_with("@@")
+                    || line.starts_with("\\ No newline")
+                {
+                    continue;
+                } else if let Some(rest) = line.strip_prefix('+') {
+                    added.push(rest.to_string());
+                } else if let Some(rest) = line.strip_prefix('-') {
+                    removed.push(rest.to_string());
+                }
+            }
+            if removed.is_empty() && added.is_empty() {
+                return None;
+            }
         }
         _ => return None,
     }
@@ -7730,7 +7782,7 @@ mod diff_tests {
     fn fs_edit_patch_mode_extracts_sides() {
         let diff = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}\n";
         let args = serde_json::json!({ "diff": diff }).to_string();
-        let (old, new) = extract_diff_sides("fs_edit", &args).unwrap();
+        let (old, new) = extract_diff_sides("fs_edit", &args, None).unwrap();
         assert_eq!(old, vec!["fn old() {}"]);
         assert_eq!(new, vec!["fn new() {}"]);
     }
@@ -7775,7 +7827,7 @@ mod diff_tests {
             serde_json::to_string(old).unwrap(),
             serde_json::to_string(new).unwrap()
         );
-        let (removed, added) = extract_diff_sides("fs_edit", &args).unwrap();
+        let (removed, added) = extract_diff_sides("fs_edit", &args, None).unwrap();
         assert_eq!(removed, vec!["a", "b"]);
         assert_eq!(added, vec!["a", "c"]);
     }
@@ -7795,6 +7847,40 @@ mod diff_tests {
         let spans = cell_spans(Some("ok"), Some(Color::Green), 10);
         let total: usize = spans.iter().map(|s| s.width()).sum();
         assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn git_diff_result_extracts_sides() {
+        let result = "diff --git a/a.rs b/a.rs\nindex 111..222 100644\n--- a/a.rs\n+++ b/a.rs\n@@ -1,3 +1,3 @@\n fn keep() {}\n-fn old() {}\n+fn new() {}\n";
+        let (removed, added) = extract_diff_sides("git_diff", "{}", Some(result)).unwrap();
+        assert_eq!(removed, vec!["fn old() {}"]);
+        assert_eq!(added, vec!["fn new() {}"]);
+    }
+
+    #[test]
+    fn git_diff_without_result_is_none() {
+        assert!(extract_diff_sides("git_diff", "{}", None).is_none());
+    }
+
+    #[test]
+    fn git_diff_no_changes_is_none() {
+        assert!(extract_diff_sides("git_diff", "{}", Some("(no diff)")).is_none());
+    }
+
+    #[test]
+    fn git_diff_label_shows_file_and_first_hunk() {
+        let result = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -12,2 +12,3 @@\n-a\n+b\n";
+        assert_eq!(
+            edit_diff_label("git_diff", "{}", Some(result)),
+            "diff  src/lib.rs  @@ -12,2 +12,3 @@"
+        );
+    }
+
+    #[test]
+    fn git_diff_multi_file_label_omits_hunk() {
+        let result = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-x\n+y\n\
+                      diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -5 +5 @@\n-p\n+q\n";
+        assert_eq!(edit_diff_label("git_diff", "{}", Some(result)), "diff:");
     }
 }
 
