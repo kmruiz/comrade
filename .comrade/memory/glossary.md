@@ -265,6 +265,18 @@ Redesigned to be compact: previously 3 inner rows (name / gauge / usage) plus a 
 **References:**
 - `crates/comrade-tui/src/tui.rs (handle_path_prompt_key, complete_path, complete_names, split_dir_prefix, read_dir_entries, draw_path_matches)`
 
+## plan_rect
+> The last rendered Rect of the TUI plan panel, stored on App by draw_plan and used by handle_mouse to hit-test the mouse wheel so a scroll over the plan panel moves plan_scroll instead of the chat.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs`
+
+## plan_scroll
+> Per-session vertical scroll offset (u16, in rendered rows) of the TUI plan panel, held on both App (active session) and LiveState (parked session) and swapped in App::swap_live. Adjusted by App::scroll_plan(delta); clamped to the wrapped content height in draw_plan before rendering `Paragraph::new(lines).scroll((plan_scroll, 0))`.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs`
+
 ## pom_check
 > Tool (comrade-tool-project) that runs `cargo check` and returns the first N compiler errors with file:line:col plus the total count - a cheap alternative to pom_run_tests for iterating on compile errors.
 

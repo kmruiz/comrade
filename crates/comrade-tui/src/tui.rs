@@ -681,6 +681,8 @@ enum MxCommand {
     ReloadConfig,
     SaveSession,
     SearchChat,
+    ScrollPlanDown,
+    ScrollPlanUp,
     SteerPrompt,
     StopBackgroundJob,
     SubmitPrompt,
@@ -719,6 +721,8 @@ impl MxCommand {
         MxCommand::ReindexSemanticSearch,
         MxCommand::ReloadConfig,
         MxCommand::SaveSession,
+        MxCommand::ScrollPlanDown,
+        MxCommand::ScrollPlanUp,
         MxCommand::SearchChat,
         MxCommand::SteerPrompt,
         MxCommand::StopBackgroundJob,
@@ -757,6 +761,8 @@ impl MxCommand {
             MxCommand::ReindexSemanticSearch => "reindex-semantic-search",
             MxCommand::ReloadConfig => "reload-config",
             MxCommand::SaveSession => "save-session",
+            MxCommand::ScrollPlanDown => "scroll-plan-down",
+            MxCommand::ScrollPlanUp => "scroll-plan-up",
             MxCommand::SearchChat => "search-chat-history",
             MxCommand::SteerPrompt => "steer",
             MxCommand::StopBackgroundJob => "stop-background-job",
@@ -800,6 +806,8 @@ impl MxCommand {
             MxCommand::ReindexSemanticSearch => None,
             MxCommand::ReloadConfig => Some("C-r"),
             MxCommand::SaveSession => Some("C-x C-s"),
+            MxCommand::ScrollPlanDown => Some("pgdn"),
+            MxCommand::ScrollPlanUp => Some("pgup"),
             MxCommand::SearchChat => Some("C-s"),
             MxCommand::SteerPrompt => Some("<return>"),
             // Palette-only: pick a running background job to stop.
@@ -845,6 +853,8 @@ impl MxCommand {
             }
             MxCommand::ReloadConfig => "reload the config file without restarting",
             MxCommand::SaveSession => "save the current session to a file",
+            MxCommand::ScrollPlanDown => "scroll the plan panel down",
+            MxCommand::ScrollPlanUp => "scroll the plan panel up",
             MxCommand::SearchChat => "search the chat history",
             MxCommand::SteerPrompt => "send the prompt to the running agent or delegate now",
             MxCommand::StopBackgroundJob => {
@@ -989,6 +999,8 @@ struct LiveState {
     session_file: Option<std::path::PathBuf>,
     sel: Option<usize>,
     scroll_top: usize,
+    /// Vertical scroll offset of this session's plan panel.
+    plan_scroll: u16,
     follow: bool,
     was_at_bottom: bool,
     search: Option<Search>,
@@ -1229,6 +1241,10 @@ struct App {
 
     // geometry/metrics refreshed on every draw
     chat_rect: Rect,
+    /// Vertical scroll offset of the plan panel, in rendered rows.
+    plan_scroll: u16,
+    /// Last rendered rect of the plan panel, for mouse hit-testing.
+    plan_rect: Rect,
     row_targets: Vec<Option<usize>>,
     /// Owning chat-message index for each rendered row (None = live preview).
     row_msg: Vec<Option<usize>>,
@@ -2306,6 +2322,7 @@ impl App {
             session_file: None,
             sel: None,
             scroll_top: 0,
+            plan_scroll: 0,
             follow: true,
             was_at_bottom: true,
             search: None,
@@ -2385,6 +2402,7 @@ impl App {
             session_file: path,
             sel: None,
             scroll_top: 0,
+            plan_scroll: 0,
             follow: true,
             was_at_bottom: true,
             search: None,
@@ -2418,10 +2436,22 @@ impl App {
         std::mem::swap(&mut self.session_file, &mut incoming.session_file);
         std::mem::swap(&mut self.sel, &mut incoming.sel);
         std::mem::swap(&mut self.scroll_top, &mut incoming.scroll_top);
+        std::mem::swap(&mut self.plan_scroll, &mut incoming.plan_scroll);
         std::mem::swap(&mut self.follow, &mut incoming.follow);
         std::mem::swap(&mut self.was_at_bottom, &mut incoming.was_at_bottom);
         std::mem::swap(&mut self.search, &mut incoming.search);
         incoming
+    }
+
+    /// Scroll the plan panel by `delta` rows (negative scrolls up). The offset
+    /// is clamped to the content height on the next draw; saturating
+    /// arithmetic here keeps it from wrapping below zero or above `u16::MAX`.
+    fn scroll_plan(&mut self, delta: isize) {
+        if delta < 0 {
+            self.plan_scroll = self.plan_scroll.saturating_sub((-delta) as u16);
+        } else {
+            self.plan_scroll = self.plan_scroll.saturating_add(delta as u16);
+        }
     }
 
     /// Park the active session into its slot and swap the session at `idx` in.
@@ -3118,6 +3148,8 @@ impl App {
             MxCommand::ReindexSemanticSearch => self.reindex_semantic_search(),
             MxCommand::ReloadConfig => self.reload_config(),
             MxCommand::SaveSession => self.save_session_prompt(),
+            MxCommand::ScrollPlanDown => self.scroll_plan(3),
+            MxCommand::ScrollPlanUp => self.scroll_plan(-3),
             MxCommand::SearchChat => self.search = Some(Search::new()),
             MxCommand::SteerPrompt => self.submit_prompt(),
             MxCommand::StopBackgroundJob => self.open_jobs_pick(),
@@ -3575,6 +3607,8 @@ fn build_app(
         mcp_view: None,
         mx: None,
         chat_rect: Rect::default(),
+        plan_scroll: 0,
+        plan_rect: Rect::default(),
         row_targets: Vec::new(),
         row_msg: Vec::new(),
         msg_ranges: Vec::new(),
@@ -3989,6 +4023,8 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                 KeyCode::Right => app.input.move_right(shift),
                 KeyCode::Home => app.input.move_home(shift),
                 KeyCode::End => app.input.move_end(shift),
+                KeyCode::PageUp => app.scroll_plan(-3),
+                KeyCode::PageDown => app.scroll_plan(3),
                 _ => {}
             }
             false
@@ -4264,6 +4300,21 @@ fn handle_form_key(app: &mut App, code: KeyCode) -> bool {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    // The plan panel scrolls independently of the chat: a wheel event over it
+    // moves its own offset and is consumed here.
+    let in_plan = mouse.kind != MouseEventKind::Moved
+        && mouse.column >= app.plan_rect.left()
+        && mouse.column < app.plan_rect.right()
+        && mouse.row >= app.plan_rect.top()
+        && mouse.row < app.plan_rect.bottom();
+    if in_plan {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => app.scroll_plan(-3),
+            MouseEventKind::ScrollDown => app.scroll_plan(3),
+            _ => {}
+        }
+        return;
+    }
     let inside = mouse.kind != MouseEventKind::Moved
         && mouse.column >= app.chat_rect.left()
         && mouse.column < app.chat_rect.right()
@@ -6782,9 +6833,11 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
     }
 }
 
-fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
+fn draw_plan(app: &mut App, frame: &mut Frame, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" plan ");
     let inner = block.inner(area);
+    // Remember the whole panel rect so the mouse wheel can scroll it.
+    app.plan_rect = area;
     frame.render_widget(block, area);
 
     // Word-wrap every step to the panel width so long goals never overflow the
@@ -6858,7 +6911,12 @@ fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
             }
         }
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    // Scroll the plan to the requested offset, clamped to the content height so
+    // the offset can never scroll past the end.
+    let view = inner.height as usize;
+    let max = lines.len().saturating_sub(view) as u16;
+    app.plan_scroll = app.plan_scroll.min(max);
+    frame.render_widget(Paragraph::new(lines).scroll((app.plan_scroll, 0)), inner);
 }
 
 /// Collapse runs of whitespace (incl. newlines) into single spaces so a plan
@@ -9975,6 +10033,28 @@ mod tests {
         build_app(
             &deps, events_tx, events_rx, run_tx, asks_tx, asks_rx, git_tx, git_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn scroll_plan_saturates_at_zero_and_moves() {
+        let mut app = test_app();
+        app.plan_scroll = 0;
+        app.scroll_plan(-3);
+        assert_eq!(app.plan_scroll, 0, "scrolling up at the top stays at 0");
+        app.scroll_plan(3);
+        assert_eq!(app.plan_scroll, 3);
+        app.scroll_plan(2);
+        assert_eq!(app.plan_scroll, 5);
+    }
+
+    #[test]
+    fn mx_scroll_plan_commands_metadata() {
+        assert!(MxCommand::ALL.contains(&MxCommand::ScrollPlanUp));
+        assert!(MxCommand::ALL.contains(&MxCommand::ScrollPlanDown));
+        assert_eq!(MxCommand::ScrollPlanUp.name(), "scroll-plan-up");
+        assert_eq!(MxCommand::ScrollPlanDown.name(), "scroll-plan-down");
+        assert_eq!(MxCommand::ScrollPlanUp.keys(), Some("pgup"));
+        assert_eq!(MxCommand::ScrollPlanDown.keys(), Some("pgdn"));
     }
 
     #[tokio::test]
