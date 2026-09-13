@@ -66,6 +66,15 @@ The dialog wraps its body/options to the popup's real inner width (popup = min(a
 **Notes:**
 Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by render_row_line's `sub: Option<Color>` param. Folded MsgKind::Run digests keep no sub-chat styling.
 
+## focus mode
+> A chat view filter in the TUI, toggled by M-f or M-x focus-mode (same chord turns it off). When on it hides tool noise so the chat reads as pure conversation: it keeps MsgKind::User, MsgKind::Assistant, MsgKind::Delegate (advisories) and MsgKind::Reasoning, and drops MsgKind::Tool, MsgKind::Failure, MsgKind::Meta and the folded MsgKind::Run digest's summary row — but a folded Run still renders the Reasoning children inside it.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs`
+
+**Notes:**
+Implemented by the App-level field `focus_mode` (a global view toggle like auto_accept: NOT in LiveState, not swapped per session, not persisted). Visibility is decided by the free fn `focus_visible(&Msg)`. The row cache `ChatRowsCache` carries a `focus` field so toggling/switching sessions rebuilds rows without an epoch bump. `chat_visible`/`step_visible` take a trailing `focus: bool`; `collect_matches` drops focus-hidden messages.
+
 ## LiveState
 > The per-session half of the TUI App state (crates/comrade-tui/src/tui.rs struct LiveState): session Arc, ctx_base, history, run_tx, stop, run_handle, running, steer_tx, queued_prompt, run_cancelled, chat, section_collapsed, chat_epoch, chat_rows_cache, stream, ctx_tokens/budget/estimated, activity, session_file, sel, scroll_top, follow, was_at_bottom, search. A parked session stores its LiveState in its OpenSession slot (Box); App::swap_live mem::swaps these fields between the App (active session) and a LiveState.
 
