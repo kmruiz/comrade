@@ -28,3 +28,6 @@ Default scope changed from `memory` to `all`: an omitted `scope` now searches BO
 
 ## Note
 Follow-up (deferred, requested by the human): `semantic_search` is too slow in practice — the flat per-project cosine index is scanned linearly and memory+code indexes are rebuilt/loaded per query. A proper index is needed (e.g. an ANN structure such as HNSW/usearch, an embedding cache keyed by content hash, and a persisted+memory-mapped index that is loaded once rather than per call). Do this as a dedicated task, not part of the current safety/hooks/timeouts batch.
+
+## Note
+Addressed in #40: the index is now resident (loaded once per project root), written only when it changed, and the code file walk is skipped on a clean repo — the per-query disk I/O and tree walk that made semantic_search slow are gone. A binary/mmap vector blob and an ANN structure remain deferred (memmap2 is not currently a dependency).

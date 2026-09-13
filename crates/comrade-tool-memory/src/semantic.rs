@@ -12,8 +12,13 @@
 //!
 //! Why a flat index and not HNSW: a project's memory is tens to a few hundred
 //! documents, where exact cosine over all vectors is instantaneous and needs no
-//! extra native dependency or index-tuning. The index only re-embeds documents
-//! whose text hash changed, so steady-state calls cost one query embedding.
+//! extra native dependency or index-tuning. The index is loaded once and kept
+//! resident per project root (so repeated searches neither re-read nor re-parse
+//! it), is written back only when something changed, and skips the file walk
+//! entirely when the repo is clean at the recorded HEAD. The index also only
+//! re-embeds documents whose text hash changed, so steady-state calls cost one
+//! query embedding. (An ANN structure remains a future option if a project ever
+//! grows large enough that the linear scan matters.)
 //!
 //! The code index is incremental and git-driven: it records the HEAD it was
 //! built at plus a per-file stamp, and `git::dirty_files` says what changed
@@ -107,6 +112,28 @@ struct Store {
     /// The git HEAD this code index was built at, for git-driven reindexing.
     #[serde(default)]
     head: Option<String>,
+}
+
+/// A scored hit detached from the store (no vector), so a result list can be
+/// built without holding a borrow on the resident index.
+struct Hit {
+    score: f32,
+    id: String,
+    kind: String,
+    title: String,
+    preview: String,
+}
+
+impl Hit {
+    fn of(score: f32, d: &StoredDoc) -> Self {
+        Self {
+            score,
+            id: d.id.clone(),
+            kind: d.kind.clone(),
+            title: d.title.clone(),
+            preview: d.preview.clone(),
+        }
+    }
 }
 
 /// Turns text into embedding vectors. Abstracted so the index logic can be
@@ -246,7 +273,9 @@ fn code_doc(rel: &str, line: usize, kind: &str, name: &str, text: String) -> Doc
 }
 
 /// Rebuild `existing` against `docs`, re-embedding only new/changed documents.
-fn refresh(docs: &[Doc], existing: &Store, embedder: &dyn Embedder) -> Result<Store> {
+/// Returns the new store and whether it differs from `existing` (so the caller
+/// only writes the cache when something actually changed).
+fn refresh(docs: &[Doc], existing: &Store, embedder: &dyn Embedder) -> Result<(Store, bool)> {
     let stale_model = existing.model != MODEL_ID;
     let old: HashMap<&str, &StoredDoc> = existing.docs.iter().map(|d| (d.id.as_str(), d)).collect();
 
@@ -302,12 +331,16 @@ fn refresh(docs: &[Doc], existing: &Store, embedder: &dyn Embedder) -> Result<St
         .map(|d| d.vec.len())
         .max()
         .unwrap_or(existing.dim);
-    Ok(Store {
-        model: MODEL_ID.into(),
-        dim,
-        docs,
-        ..Store::default()
-    })
+    let changed = stale_model || !todo.is_empty() || docs.len() != existing.docs.len();
+    Ok((
+        Store {
+            model: MODEL_ID.into(),
+            dim,
+            docs,
+            ..Store::default()
+        },
+        changed,
+    ))
 }
 
 /// Rank documents by cosine similarity to `query`, ties broken by id,
@@ -368,6 +401,21 @@ fn load_store(path: &Path) -> Store {
         .unwrap_or_default()
 }
 
+/// The resident memory index per project root: loaded once and kept in memory,
+/// so repeated searches never re-read or re-parse the store, and only a changed
+/// index is written back.
+static MEM_STORE: OnceLock<Mutex<HashMap<PathBuf, Store>>> = OnceLock::new();
+/// The resident code index per project root (see [`MEM_STORE`]).
+static CODE_STORE: OnceLock<Mutex<HashMap<PathBuf, Store>>> = OnceLock::new();
+
+fn mem_store() -> &'static Mutex<HashMap<PathBuf, Store>> {
+    MEM_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn code_store() -> &'static Mutex<HashMap<PathBuf, Store>> {
+    CODE_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn save_store(path: &Path, store: &Store) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -383,7 +431,7 @@ fn save_store(path: &Path, store: &Store) -> Result<()> {
 /// recorded HEAD + `git::dirty_files`), falling back to per-file mtime/size;
 /// unchanged files are reused outright, and within a changed file a chunk whose
 /// text is unchanged keeps its vector.
-fn code_refresh(root: &Path, existing: &Store, embedder: &dyn Embedder) -> Result<Store> {
+fn code_refresh(root: &Path, existing: &Store, embedder: &dyn Embedder) -> Result<(Store, bool)> {
     let stale_model = existing.model != MODEL_ID;
     let old: HashMap<&str, &StoredDoc> = existing.docs.iter().map(|d| (d.id.as_str(), d)).collect();
     let dirty = crate::git::dirty_files(root, existing.head.as_deref());
@@ -391,6 +439,7 @@ fn code_refresh(root: &Path, existing: &Store, embedder: &dyn Embedder) -> Resul
     let mut files: BTreeMap<String, FileStamp> = BTreeMap::new();
     let mut docs: Vec<StoredDoc> = Vec::new();
     let mut todo: Vec<(String, String, String)> = Vec::new(); // (id, title, text)
+    let mut changed = stale_model;
 
     for (rel, abs, mtime, size) in code_files(root) {
         let reusable = !stale_model
@@ -419,6 +468,9 @@ fn code_refresh(root: &Path, existing: &Store, embedder: &dyn Embedder) -> Resul
             );
             continue;
         }
+        // A file we had to re-parse means the index is not identical to the
+        // cached one, so it must be written back.
+        changed = true;
 
         let Ok(bytes) = std::fs::read(&abs) else {
             continue;
@@ -476,22 +528,37 @@ fn code_refresh(root: &Path, existing: &Store, embedder: &dyn Embedder) -> Resul
         .map(|d| d.vec.len())
         .max()
         .unwrap_or(existing.dim);
-    Ok(Store {
-        model: MODEL_ID.into(),
-        dim,
-        docs,
-        files,
-        head: crate::git::head_sha(root),
-    })
+    // Also changed if the file set or the recorded HEAD moved.
+    let head = crate::git::head_sha(root);
+    changed = changed || files.len() != existing.files.len() || head != existing.head;
+    Ok((
+        Store {
+            model: MODEL_ID.into(),
+            dim,
+            docs,
+            files,
+            head,
+        },
+        changed,
+    ))
 }
 
 /// Force a full rebuild of both the memory and code indexes, discarding the
 /// caches. Used by the `reindex-semantic-search` command.
 pub fn reindex(root: &Path) -> Result<String> {
-    let mem = refresh(&documents(root)?, &Store::default(), &FastEmbedder)?;
+    let (mem, _) = refresh(&documents(root)?, &Store::default(), &FastEmbedder)?;
     save_store(&index_path(root), &mem)?;
-    let code = code_refresh(root, &Store::default(), &FastEmbedder)?;
+    let (code, _) = code_refresh(root, &Store::default(), &FastEmbedder)?;
     save_store(&code_index_path(root), &code)?;
+    // Drop any resident copies so the next search reloads the fresh indexes.
+    mem_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    code_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     Ok(format!(
         "Reindexed semantic search: {} memory doc(s), {} code chunk(s).",
         mem.docs.len(),
@@ -605,33 +672,56 @@ impl Tool for SemanticSearch {
         let out = tokio::task::spawn_blocking(move || -> Result<String> {
             let want_memory = scope != "code";
             let want_code = scope != "memory";
-            let mut docs: Vec<StoredDoc> = Vec::new();
             let mut any_source = false;
+
+            // Operate on the resident indexes: load once, reuse across calls,
+            // and only write the cache back when something actually changed.
+            let mut mem_guard = mem_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut code_guard = code_store().lock().unwrap_or_else(|e| e.into_inner());
 
             if want_memory {
                 let memory_docs = documents(&root)?;
                 any_source |= !memory_docs.is_empty();
                 let path = index_path(&root);
-                let existing = if rebuild {
-                    Store::default()
-                } else {
-                    load_store(&path)
-                };
-                let store = refresh(&memory_docs, &existing, &FastEmbedder)?;
-                save_store(&path, &store)?;
-                docs.extend(store.docs);
+                let entry = mem_guard
+                    .entry(root.clone())
+                    .or_insert_with(|| load_store(&path));
+                if rebuild {
+                    *entry = Store::default();
+                }
+                let (store, changed) = refresh(&memory_docs, entry, &FastEmbedder)?;
+                if rebuild || changed {
+                    save_store(&path, &store)?;
+                }
+                *entry = store;
             }
             if want_code {
                 let path = code_index_path(&root);
-                let existing = if rebuild {
-                    Store::default()
-                } else {
-                    load_store(&path)
-                };
-                let store = code_refresh(&root, &existing, &FastEmbedder)?;
-                save_store(&path, &store)?;
-                any_source |= !store.docs.is_empty();
-                docs.extend(store.docs);
+                let entry = code_guard
+                    .entry(root.clone())
+                    .or_insert_with(|| load_store(&path));
+                if rebuild {
+                    *entry = Store::default();
+                }
+                // Fast path: a clean repo whose HEAD still matches the index
+                // needs no file walk and no rewrite.
+                let clean = !rebuild
+                    && entry.model == MODEL_ID
+                    && !entry.docs.is_empty()
+                    && entry.head.is_some()
+                    && entry.head == crate::git::head_sha(&root)
+                    && matches!(
+                        crate::git::dirty_files(&root, entry.head.as_deref()),
+                        Some(files) if files.is_empty()
+                    );
+                if !clean {
+                    let (store, changed) = code_refresh(&root, entry, &FastEmbedder)?;
+                    if rebuild || changed {
+                        save_store(&path, &store)?;
+                    }
+                    *entry = store;
+                }
+                any_source |= !entry.docs.is_empty();
             }
 
             if !any_source {
@@ -648,17 +738,36 @@ impl Tool for SemanticSearch {
                 .into_iter()
                 .next()
                 .context("no query embedding")?;
-            let hits = rank(&docs, &qvec, limit, kind.as_deref());
+
+            // Rank each resident index, then merge — no vectors are cloned.
+            let mut hits: Vec<Hit> = Vec::new();
+            if want_memory {
+                for (score, d) in rank(&mem_guard[&root].docs, &qvec, limit, kind.as_deref()) {
+                    hits.push(Hit::of(score, d));
+                }
+            }
+            if want_code {
+                for (score, d) in rank(&code_guard[&root].docs, &qvec, limit, kind.as_deref()) {
+                    hits.push(Hit::of(score, d));
+                }
+            }
+            hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            hits.truncate(limit.max(1));
             if hits.is_empty() {
                 return Ok(format!("No results for {query:?} in scope {scope}."));
             }
-            let has_code = hits.iter().any(|(_, d)| d.kind == "code");
-            let has_memory = hits.iter().any(|(_, d)| d.kind != "code");
+            let has_code = hits.iter().any(|h| h.kind == "code");
+            let has_memory = hits.iter().any(|h| h.kind != "code");
             let mut s = format!("{} result(s) for {query:?}:\n", hits.len());
-            for (score, d) in hits {
+            for h in &hits {
                 s.push_str(&format!(
                     "  {:.3}  {}  {}\n         {}\n",
-                    score, d.id, d.title, d.preview
+                    h.score, h.id, h.title, h.preview
                 ));
             }
             let mut hints = Vec::new();
@@ -730,12 +839,15 @@ mod tests {
             doc("adr:0002", "the beta decision"),
         ];
         let emb = StubEmbedder::default();
-        let store = refresh(&docs, &Store::default(), &emb).unwrap();
+        let (store, changed) = refresh(&docs, &Store::default(), &emb).unwrap();
+        assert!(changed, "a fresh index changed");
         assert_eq!(store.docs.len(), 2);
         assert_eq!(emb.calls.load(Ordering::SeqCst), 1);
 
-        // A second refresh with the same text embeds nothing new.
-        let again = refresh(&docs, &store, &emb).unwrap();
+        // A second refresh with the same text embeds nothing new and reports no
+        // change (so no cache write is needed).
+        let (again, changed) = refresh(&docs, &store, &emb).unwrap();
+        assert!(!changed, "an unchanged refresh must report no change");
         assert_eq!(
             emb.calls.load(Ordering::SeqCst),
             1,
@@ -763,7 +875,7 @@ mod tests {
         a.kind = "glossary".into();
         let docs = vec![doc("adr:0001", "alpha adr"), a];
         let emb = StubEmbedder::default();
-        let store = refresh(&docs, &Store::default(), &emb).unwrap();
+        let (store, _) = refresh(&docs, &Store::default(), &emb).unwrap();
         let q = emb.embed(&["alpha".into()]).unwrap().remove(0);
         let only_glossary = rank(&store.docs, &q, 5, Some("glossary"));
         assert_eq!(only_glossary.len(), 1);
@@ -798,7 +910,7 @@ mod tests {
         )
         .unwrap();
         let emb = StubEmbedder::default();
-        let store = code_refresh(&dir, &Store::default(), &emb).unwrap();
+        let (store, _) = code_refresh(&dir, &Store::default(), &emb).unwrap();
         let greet = store
             .docs
             .iter()
@@ -826,13 +938,14 @@ mod tests {
         git(&dir, &["commit", "-qm", "init"]);
 
         let emb = StubEmbedder::default();
-        let s1 = code_refresh(&dir, &Store::default(), &emb).unwrap();
+        let (s1, _) = code_refresh(&dir, &Store::default(), &emb).unwrap();
         assert!(emb.calls.load(Ordering::SeqCst) >= 1);
         assert_eq!(s1.docs.len(), 2);
 
         // Nothing changed: no file is re-parsed or re-embedded.
         emb.calls.store(0, Ordering::SeqCst);
-        let s2 = code_refresh(&dir, &s1, &emb).unwrap();
+        let (s2, changed2) = code_refresh(&dir, &s1, &emb).unwrap();
+        assert!(!changed2, "a clean tree reports no change");
         assert_eq!(
             emb.calls.load(Ordering::SeqCst),
             0,
@@ -842,7 +955,7 @@ mod tests {
         // Editing one file re-embeds only that file's chunk.
         std::fs::write(dir.join("a.rs"), "fn alpha() { let x = 1; }\n").unwrap();
         emb.calls.store(0, Ordering::SeqCst);
-        let s3 = code_refresh(&dir, &s2, &emb).unwrap();
+        let (s3, _) = code_refresh(&dir, &s2, &emb).unwrap();
         assert_eq!(emb.calls.load(Ordering::SeqCst), 1, "only a.rs changed");
         let b2 = s2.docs.iter().find(|d| d.id.contains("b.rs")).unwrap();
         let b3 = s3.docs.iter().find(|d| d.id.contains("b.rs")).unwrap();
@@ -850,7 +963,7 @@ mod tests {
 
         // A deleted file drops out of the index.
         std::fs::remove_file(dir.join("b.rs")).unwrap();
-        let s4 = code_refresh(&dir, &s3, &emb).unwrap();
+        let (s4, _) = code_refresh(&dir, &s3, &emb).unwrap();
         assert!(!s4.files.contains_key("b.rs"));
         assert!(!s4.docs.iter().any(|d| d.id.contains("b.rs")));
         let _ = std::fs::remove_dir_all(&dir);
@@ -861,7 +974,7 @@ mod tests {
         let dir = scratch("incr-stat");
         std::fs::write(dir.join("a.rs"), "fn alpha() {}\n").unwrap();
         let emb = StubEmbedder::default();
-        let s1 = code_refresh(&dir, &Store::default(), &emb).unwrap();
+        let (s1, _) = code_refresh(&dir, &Store::default(), &emb).unwrap();
         assert!(emb.calls.load(Ordering::SeqCst) >= 1);
 
         // Same size and mtime: reused.
@@ -891,7 +1004,7 @@ mod tests {
             "fn add(a: i32, b: i32) -> i32 { a + b }\n",
         )
         .unwrap();
-        let store = code_refresh(&dir, &Store::default(), &FastEmbedder).unwrap();
+        let (store, _) = code_refresh(&dir, &Store::default(), &FastEmbedder).unwrap();
         let q = FastEmbedder
             .embed(&["a function that greets a person".into()])
             .unwrap()
@@ -944,7 +1057,7 @@ mod tests {
         if docs.iter().filter(|d| d.kind == "adr").count() < 5 {
             return; // not enough memory to be meaningful
         }
-        let store = refresh(&docs, &Store::default(), &FastEmbedder).unwrap();
+        let (store, _) = refresh(&docs, &Store::default(), &FastEmbedder).unwrap();
         assert_eq!(store.docs.len(), docs.len());
         let query = FastEmbedder
             .embed(&["finding a past decision by meaning rather than keywords".into()])

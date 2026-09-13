@@ -332,6 +332,13 @@ Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; othe
 - `crates/comrade-core/src/redact.rs`
 - `.comrade/memory/0036-process-wide-securitypolicy-fs-confinement-shell-allowdeny-secret-redaction.md`
 
+## resident semantic index
+> The resident per-project vector index for `semantic_search` (crates/comrade-tool-memory/src/semantic.rs): `MEM_STORE`/`CODE_STORE` are process-global `Mutex<HashMap<PathBuf, Store>>` maps holding the memory and code `Store` for each project root. A search loads a store from disk at most once, reuses it across calls, and writes it back only when `refresh`/`code_refresh` report a change; on a clean repo (recorded HEAD matches and `git::dirty_files` is empty) the code file walk is skipped entirely.
+
+**References:**
+- `crates/comrade-tool-memory/src/semantic.rs`
+- `.comrade/memory/0040-make-the-semantic-index-resident-load-once-write-only-on-change-skip-clean-repo-walks.md`
+
 ## retryable provider error
 > A provider request failure the LLM client retries rather than surfacing: a transport error (reqwest timeout/connect/request/body, e.g. connection reset/refused) or an HTTP status in 408|425|429|500|502|503|504|529. Classified by `is_retryable`/`is_retryable_status` in crates/comrade-core/src/llm.rs; a non-success status is carried as the typed `LlmHttpError`. Retried with exponential backoff (`[llm] max_retries`, `retry_backoff_ms`); mid-stream failures after the first emitted delta are NOT retried.
 
