@@ -411,6 +411,7 @@ dependencies = [
  "async-trait",
  "comrade-tool",
  "ignore",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

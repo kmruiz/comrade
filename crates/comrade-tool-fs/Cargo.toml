@@ -13,3 +13,4 @@ serde_json.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
 ignore = "0.4"
+regex = "1"

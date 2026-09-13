@@ -584,13 +584,18 @@ struct FsRgrep;
 static FS_RGREP_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "fs_rgrep".into(),
-    description: "Search project files for literal text (like a filtered grep); returns file:line: text. Use to find every place a string or identifier appears. `glob` restricts the files searched; substring-based; use ignore_case as needed.".into(),
+    description: "Search project files (filtered grep); returns file:line: text. Use to find every place text appears. `pattern` is literal by default or a Rust regex with `regex: true`. `include` (a file must match one) and `exclude` (skip) are glob lists; `glob` is a single-include shorthand used when `include` is empty. `context` shows surrounding lines.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "pattern": { "type": "string", "description": "Literal text to search for (not a regex)." },
-            "glob": { "type": "string", "default": "**/*", "description": "Glob restricting files to search." },
+            "pattern": { "type": "string", "description": "Text or regex to search for." },
+            "regex": { "type": "boolean", "default": false, "description": "Treat `pattern` as a Rust regex instead of literal text." },
+            "glob": { "type": "string", "default": "**/*", "description": "Glob restricting files searched (used when `include` is empty)." },
+            "include": { "type": "array", "items": { "type": "string" }, "description": "Globs a file must match (any of them). Overrides `glob` when non-empty." },
+            "exclude": { "type": "array", "items": { "type": "string" }, "description": "Globs of files to skip." },
             "ignore_case": { "type": "boolean", "default": false, "description": "Case-insensitive match." },
+            "context": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "description": "Lines of context to show before and after each match." },
+            "max_lines": { "type": "integer", "default": 300, "minimum": 1, "description": "Cap on output lines." },
             "git_modified_only": { "type": "boolean", "default": false, "description": "Only search files that differ from HEAD (staged, unstaged, untracked)." }
         },
         "required": ["pattern"],
@@ -609,70 +614,148 @@ impl Tool for FsRgrep {
         #[derive(Deserialize)]
         struct Args {
             pattern: String,
+            #[serde(default)]
+            regex: bool,
             #[serde(default = "default_glob")]
             glob: String,
             #[serde(default)]
+            include: Vec<String>,
+            #[serde(default)]
+            exclude: Vec<String>,
+            #[serde(default)]
             ignore_case: bool,
+            #[serde(default)]
+            context: usize,
+            #[serde(default = "default_max_lines")]
+            max_lines: usize,
             #[serde(default)]
             git_modified_only: bool,
         }
         fn default_glob() -> String {
             "**/*".to_string()
         }
+        fn default_max_lines() -> usize {
+            300
+        }
         let args: Args = serde_json::from_value(args)?;
         if args.pattern.is_empty() {
             anyhow::bail!("`pattern` must not be empty");
         }
+        let matcher = if args.regex {
+            let re = regex::RegexBuilder::new(&args.pattern)
+                .case_insensitive(args.ignore_case)
+                .size_limit(1 << 20)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid regex {:?}: {e}", args.pattern))?;
+            Matcher::Regex(Box::new(re))
+        } else {
+            Matcher::Literal {
+                needle: if args.ignore_case {
+                    args.pattern.to_lowercase()
+                } else {
+                    args.pattern.clone()
+                },
+                lower: args.ignore_case,
+            }
+        };
         let changed = changed_scope(ctx, args.git_modified_only)?;
 
-        let matches = search_files(
+        let (hits, total) = grep(
             &ctx.project_root,
             &args.glob,
-            &args.pattern,
-            args.ignore_case,
+            &args.include,
+            &args.exclude,
+            &matcher,
+            args.context,
             changed.as_ref(),
         )?;
 
-        let total = matches.len();
-        const MAX_LINES: usize = 300;
+        let shown = hits.len();
         let mut out = format!("{total} match(es) for {:?}:\n", args.pattern);
-        for (file, line, text) in matches.iter().take(MAX_LINES) {
-            out.push_str(&format!("{file}:{line}: {text}\n"));
+        for hit in hits.iter().take(args.max_lines) {
+            if hit.is_match {
+                out.push_str(&format!("{}:{}: {}\n", hit.file, hit.line, hit.text));
+            } else {
+                out.push_str(&format!("{}-{}- {}\n", hit.file, hit.line, hit.text));
+            }
         }
-        if total > MAX_LINES {
-            out.push_str(&format!("... and {} more\n", total - MAX_LINES));
+        if shown > args.max_lines {
+            out.push_str(&format!("... and {} more line(s)\n", shown - args.max_lines));
         }
         Ok(clamp(out))
     }
 }
 
-/// Search matching lines across files under `root` (relative `glob`), returning
-/// (file, 1-based line, trimmed line text) tuples. When `only` is `Some`, only
-/// files in that set are searched.
-fn search_files(
+/// How an `fs_rgrep` pattern is matched against a line.
+enum Matcher {
+    /// Plain substring match; `lower` means `needle` was pre-lowercased for a
+    /// case-insensitive search.
+    Literal { needle: String, lower: bool },
+    /// Compiled regular expression.
+    Regex(Box<regex::Regex>),
+}
+
+impl Matcher {
+    fn matches(&self, line: &str) -> bool {
+        match self {
+            Matcher::Literal { needle, lower } => {
+                if *lower {
+                    line.to_lowercase().contains(needle)
+                } else {
+                    line.contains(needle)
+                }
+            }
+            Matcher::Regex(re) => re.is_match(line),
+        }
+    }
+}
+
+/// One output line of a grep: the file, its 1-based line number, the trimmed
+/// text, and whether the line itself matched (`false` for a context line).
+#[derive(Debug)]
+struct GrepHit {
+    file: String,
+    line: usize,
+    text: String,
+    is_match: bool,
+}
+
+/// Search matching lines across files under `root`, returning the printed lines
+/// (matches plus `context` lines around each) and the number of lines that
+/// actually matched. `include` (any-of) overrides `glob` when non-empty;
+/// `exclude` always filters. When `only` is `Some`, only those files are read.
+fn grep(
     root: &Path,
     glob: &str,
-    needle: &str,
-    ignore_case: bool,
+    include: &[String],
+    exclude: &[String],
+    matcher: &Matcher,
+    context: usize,
     only: Option<&HashSet<PathBuf>>,
-) -> Result<Vec<(String, usize, String)>> {
-    let glob = glob.trim().trim_start_matches("./");
-    if glob.is_empty() || glob.contains('\\') || glob.contains("..") {
-        anyhow::bail!("invalid glob {:?}", glob);
+) -> Result<(Vec<GrepHit>, usize)> {
+    fn validate(g: &str) -> Result<String> {
+        let g = g.trim().trim_start_matches("./").to_string();
+        if g.is_empty() || g.contains('\\') || g.contains("..") {
+            anyhow::bail!("invalid glob {:?}", g);
+        }
+        Ok(g)
     }
-    let needle_owned;
-    let needle: &str = if ignore_case {
-        needle_owned = needle.to_lowercase();
-        &needle_owned
-    } else {
-        needle
-    };
+    let glob = validate(glob)?;
+    let include: Vec<String> = include
+        .iter()
+        .map(|g| validate(g))
+        .collect::<Result<_>>()?;
+    let exclude: Vec<String> = exclude
+        .iter()
+        .map(|g| validate(g))
+        .collect::<Result<_>>()?;
 
     let mut files = Vec::new();
     walk(root, &mut files);
     files.sort();
 
     let mut out = Vec::new();
+    let mut total = 0usize;
     for file in files {
         if let Some(set) = only
             && !set.contains(&file)
@@ -683,7 +766,12 @@ fn search_files(
             .strip_prefix(root)
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
-        if !glob_matches(glob, &rel) {
+        let included = if include.is_empty() {
+            glob_matches(&glob, &rel)
+        } else {
+            include.iter().any(|g| glob_matches(g, &rel))
+        };
+        if !included || exclude.iter().any(|g| glob_matches(g, &rel)) {
             continue;
         }
         if file
@@ -702,21 +790,40 @@ fn search_files(
         let Ok(text) = String::from_utf8(bytes) else {
             continue;
         };
-        let hay = if ignore_case {
-            text.to_lowercase()
-        } else {
-            text.clone()
-        };
-        let src_lines: Vec<&str> = text.split('\n').collect();
-        for (idx, line) in hay.split('\n').enumerate() {
-            if line.contains(needle) {
-                let src = src_lines[idx].trim();
-                let trimmed: String = src.chars().take(160).collect();
-                out.push((rel.clone(), idx + 1, trimmed));
-            }
+        let src: Vec<&str> = text.split('\n').collect();
+
+        let matches: Vec<usize> = src
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| matcher.matches(line))
+            .map(|(idx, _)| idx + 1)
+            .collect();
+        if matches.is_empty() {
+            continue;
+        }
+        total += matches.len();
+
+        // Expand each match into the set of lines to print (match + context).
+        let mut print: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for &m in &matches {
+            let lo = m.saturating_sub(context).max(1);
+            let hi = (m + context).min(src.len());
+            print.extend(lo..=hi);
+        }
+        let match_set: HashSet<usize> = matches.iter().copied().collect();
+        for l in print {
+            let is_match = match_set.contains(&l);
+            let raw = src.get(l - 1).copied().unwrap_or("");
+            let trimmed: String = raw.trim().chars().take(200).collect();
+            out.push(GrepHit {
+                file: rel.clone(),
+                line: l,
+                text: trimmed,
+                is_match,
+            });
         }
     }
-    Ok(out)
+    Ok((out, total))
 }
 
 /// Directories never walked by file listings, regardless of ignore files.
@@ -1075,20 +1182,87 @@ mod tests {
         std::fs::write(root.join("src/b.txt"), "just hello text\n").unwrap();
         std::fs::write(root.join("README.md"), "Hello world\n").unwrap();
 
-        let m = super::search_files(&root, "**/*.rs", "hello", false, None).unwrap();
+        let lit = |p: &str, lower: bool| super::Matcher::Literal {
+            needle: if lower { p.to_lowercase() } else { p.into() },
+            lower,
+        };
+        let m = super::grep(&root, "**/*.rs", &[], &[], &lit("hello", false), 0, None)
+            .unwrap()
+            .0;
         assert_eq!(m.len(), 2);
-        assert!(m.iter().all(|(f, _, _)| f.ends_with(".rs")));
+        assert!(m.iter().all(|h| h.file.ends_with(".rs")));
         // glob restricts to md
-        let m2 = super::search_files(&root, "*.md", "hello", true, None).unwrap();
+        let m2 = super::grep(&root, "*.md", &[], &[], &lit("hello", true), 0, None)
+            .unwrap()
+            .0;
         assert_eq!(m2.len(), 1);
-        assert_eq!(m2[0].0, "README.md");
-        assert_eq!(m2[0].2, "Hello world");
+        assert_eq!(m2[0].file, "README.md");
+        assert_eq!(m2[0].text, "Hello world");
         // case-sensitive finds nothing in md
         assert!(
-            super::search_files(&root, "*.md", "hello", false, None)
+            super::grep(&root, "*.md", &[], &[], &lit("hello", false), 0, None)
                 .unwrap()
+                .0
                 .is_empty()
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rgrep_regex_include_exclude_and_context() {
+        let root = std::env::temp_dir().join(format!(
+            "comrade-rgrep2-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("src/a.rs"),
+            "// header\nfn alpha() {}\nfn beta() {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("tests/c.rs"), "fn alpha() {}\n").unwrap();
+
+        // Regex over include globs, excluding tests/.
+        let re = super::Matcher::Regex(Box::new(
+            regex::Regex::new(r"fn \w+").unwrap(),
+        ));
+        let (hits, total) = super::grep(
+            &root,
+            "**/*",
+            &["**/*.rs".to_string()],
+            &["tests/*".to_string()],
+            &re,
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(total, 3);
+        assert!(hits.iter().all(|h| !h.file.starts_with("tests/")));
+        assert!(hits.iter().all(|h| h.is_match));
+
+        // Context lines are emitted with `is_match == false`.
+        let lit = super::Matcher::Literal {
+            needle: "beta".into(),
+            lower: false,
+        };
+        let (hits, total) = super::grep(
+            &root,
+            "**/*.rs",
+            &[],
+            &[],
+            &lit,
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(hits.len(), 3, "beta line + one context each side: {hits:?}");
+        let beta = hits.iter().find(|h| h.is_match).unwrap();
+        assert_eq!(beta.line, 3);
+        assert_eq!(beta.text, "fn beta() {}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
