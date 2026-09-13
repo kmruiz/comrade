@@ -222,15 +222,22 @@ fn rank<'a>(
     scored
 }
 
-/// Where the index for `root` is cached: the user cache dir, keyed by the
-/// project path, so the repo stays clean.
-fn index_path(root: &Path) -> PathBuf {
+/// The user cache dir Comrade owns: `$XDG_CACHE_HOME/comrade` (fallback
+/// `~/.cache/comrade`, else the temp dir). Keeps model and index files out of
+/// the repo.
+fn cache_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
-    let key = fnv(&root.to_string_lossy());
     base.join("comrade")
+}
+
+/// Where the index for `root` is cached: the user cache dir, keyed by the
+/// project path, so the repo stays clean.
+fn index_path(root: &Path) -> PathBuf {
+    let key = fnv(&root.to_string_lossy());
+    cache_dir()
         .join("semantic")
         .join(format!("{key:016x}.json"))
 }
@@ -262,7 +269,9 @@ impl Embedder for FastEmbedder {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let cell = MODEL.get_or_init(|| {
             TextEmbedding::try_new(
-                InitOptions::new(EMBED_MODEL).with_show_download_progress(false),
+                InitOptions::new(EMBED_MODEL)
+                    .with_cache_dir(cache_dir().join("models"))
+                    .with_show_download_progress(false),
             )
             .map(Mutex::new)
             .map_err(|e| e.to_string())
