@@ -3969,6 +3969,9 @@ fn handle_dialog_key(app: &mut App, code: KeyCode) -> bool {
 
 /// Drive a form dialog: navigate fields, edit the focused component, submit
 /// (`enter`) or cancel (`esc`).
+///
+/// Always returns `false` (never quit): the bool is the event loop's quit flag,
+/// so every key consumed by an open form must leave the app running.
 fn handle_form_key(app: &mut App, code: KeyCode) -> bool {
     enum Act {
         None,
@@ -3977,14 +3980,14 @@ fn handle_form_key(app: &mut App, code: KeyCode) -> bool {
     }
     let act = {
         let Some(d) = app.dialogs.first_mut() else {
-            return true;
+            return false;
         };
         let Dialog { prompt, form, .. } = d;
         let UserPrompt::Form(spec) = &*prompt else {
-            return true;
+            return false;
         };
         let Some(form) = form.as_mut() else {
-            return true;
+            return false;
         };
         match code {
             KeyCode::Esc => Act::Deny,
@@ -4021,7 +4024,7 @@ fn handle_form_key(app: &mut App, code: KeyCode) -> bool {
         Act::Submit => app.submit_form(),
         Act::None => {}
     }
-    true
+    false
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
@@ -7988,6 +7991,49 @@ mod tests {
         assert_eq!(edit.values[2], "true");
         edit.toggle(&spec);
         assert_eq!(edit.values[2], "false");
+    }
+
+    /// A regression guard: pressing a key while an `ask_form` dialog is open
+    /// must never be reported as "quit the app". `handle_dialog_key`'s bool is
+    /// the event loop's quit flag (`handle_event` -> `break Ok(())`), so a stray
+    /// `true` here made the first key press — e.g. an arrow used to move between
+    /// fields — exit the app with no panic and no traceback.
+    #[tokio::test]
+    async fn form_dialog_keys_do_not_quit() {
+        let mut app = test_app();
+        let spec = form_spec(serde_json::json!({
+            "fields": [
+                { "id": "a", "label": "A", "kind": "text" },
+                { "id": "b", "label": "B", "kind": "select", "options": ["x", "y"] }
+            ]
+        }));
+        let edit = FormEdit::new(&spec);
+        let (tx, _rx) = oneshot::channel();
+        app.dialogs.push(Dialog {
+            session: app.active_id(),
+            prompt: UserPrompt::Form(spec),
+            buf: String::new(),
+            reply: tx,
+            form: Some(edit),
+        });
+        // Navigation and editing keys must be consumed (false), never quit.
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Char('x'),
+            KeyCode::Backspace,
+        ] {
+            assert!(
+                !handle_dialog_key(&mut app, code),
+                "key {code:?} was treated as a request to quit the app"
+            );
+        }
+        // The dialog is still open and held the arrow-key navigation.
+        assert_eq!(app.dialogs.len(), 1);
     }
 
     #[test]
