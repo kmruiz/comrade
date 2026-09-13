@@ -21,6 +21,7 @@
 //!   term argument.
 
 mod glossary;
+mod semantic;
 mod store;
 
 use std::sync::LazyLock;
@@ -34,7 +35,7 @@ use serde_json::{Value, json};
 pub use store::{list, read as read_entry, search};
 
 pub fn all() -> Vec<Box<dyn Tool>> {
-    vec![
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(RecordAdr),
         Box::new(FindAdr),
         Box::new(ListAdr),
@@ -47,7 +48,9 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(RenameGlossary),
         Box::new(DeleteGlossary),
         Box::new(StaleMemory),
-    ]
+    ];
+    tools.extend(semantic::all());
+    tools
 }
 
 fn default_limit() -> usize {

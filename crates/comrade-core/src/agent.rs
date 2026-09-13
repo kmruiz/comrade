@@ -108,6 +108,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "find_glossary",
     "read_glossary",
     "stale_memory",
+    "semantic_search",
     "web_search",
     "web_fetch",
 ];
