@@ -1,0 +1,93 @@
+name: release
+
+# Triggered by pushing a release ref named vTAG (e.g. v0.1.0): either the tag
+# itself, or a branch of the same name. ./release.sh {patch|minor|major} bumps
+# the latest vX.Y.Z tag and pushes it, which is the tag path below.
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+    branches:
+      - "v[0-9]*"
+
+# Needed by the `release` job to create the GitHub release / tag.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: comrade
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: macos-latest
+            platform: macos-arm64
+          - os: windows-latest
+            platform: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --bin ${{ env.BIN }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "target/release/${BIN}" "dist/${BIN}"
+          tar -C dist -czf "${BIN}-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz" "${BIN}"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/release/$env:BIN.exe" "dist/$env:BIN.exe"
+          Compress-Archive -Path "dist/$env:BIN.exe" -DestinationPath "$env:BIN-${{ github.ref_name }}-${{ matrix.platform }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ matrix.platform }}
+          path: |
+            ${{ env.BIN }}-*.tar.gz
+            ${{ env.BIN }}-*.zip
+          if-no-files-found: error
+
+  release:
+    name: create GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so `gh release create --generate-notes` can diff
+          # against the previous release.
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release with notes since the last release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --target "${{ github.sha }}" \
+            --generate-notes \
+            dist/*
