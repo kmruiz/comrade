@@ -20,9 +20,18 @@ use comrade_tool::{Tool, ToolContext, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+pub use bg::{BgJobInfo, BgJobs};
 pub use pom::{ProjectModel, load as load_model, render as render_model};
 
 pub fn all() -> Vec<Box<dyn Tool>> {
+    all_with_jobs().0
+}
+
+/// Like [`all`] but also hands back the shared background-job registry, so an
+/// observer outside the tools (the TUI's job panel and stop command) can list
+/// and stop jobs. Only the main registry needs this; the delegate registry
+/// filters the bg tools out entirely.
+pub fn all_with_jobs() -> (Vec<Box<dyn Tool>>, BgJobs) {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(PomModelTool),
         Box::new(PomRunTask),
@@ -31,8 +40,9 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(PomCheck),
         Box::new(Shell),
     ];
-    tools.extend(bg::tools());
-    tools
+    let jobs = BgJobs::new();
+    tools.extend(bg::tools(&jobs));
+    (tools, jobs)
 }
 
 /// The concrete [`comrade_tool::TaskRunner`] backed by the detected build

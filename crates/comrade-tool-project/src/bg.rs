@@ -170,9 +170,76 @@ fn tail(output: &str, lines: usize) -> String {
     all[start..].join("\n")
 }
 
+/// One background job as seen by an outside observer (the TUI's job panel and
+/// stop command): a snapshot, not a live handle.
+#[derive(Debug, Clone)]
+pub struct BgJobInfo {
+    pub id: String,
+    pub command: String,
+    /// Human status label, e.g. "running", "done", "failed (exit 1)".
+    pub status: String,
+    pub running: bool,
+    pub elapsed_secs: f32,
+}
+
+/// A cheap, cloneable handle to the shared background-job registry, for
+/// observers outside the tools (e.g. the TUI). Cloning shares the same jobs.
+#[derive(Clone)]
+pub struct BgJobs {
+    hub: Arc<BgHub>,
+}
+
+impl Default for BgJobs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BgJobs {
+    /// A fresh, empty registry.
+    pub fn new() -> Self {
+        Self { hub: BgHub::new() }
+    }
+
+    /// Every job, oldest first.
+    pub fn list(&self) -> Vec<BgJobInfo> {
+        // Take the ids (which locks/unlocks) BEFORE the read lock below: `ids()`
+        // locks the same mutex, so nesting the two would deadlock.
+        let ids = self.hub.ids();
+        let jobs = self.hub.lock();
+        ids.into_iter()
+            .filter_map(|id| {
+                jobs.get(&id).map(|j| BgJobInfo {
+                    id: j.id.clone(),
+                    command: j.command.clone(),
+                    status: j.status.label(),
+                    running: matches!(j.status, BgStatus::Running),
+                    elapsed_secs: j.started.elapsed().as_secs_f32(),
+                })
+            })
+            .collect()
+    }
+
+    /// Only the jobs still running, oldest first.
+    pub fn running(&self) -> Vec<BgJobInfo> {
+        self.list().into_iter().filter(|j| j.running).collect()
+    }
+
+    /// Request that `id` be killed. Returns `false` when no such job exists.
+    pub fn kill(&self, id: &str) -> bool {
+        match self.hub.lock().get(id) {
+            Some(job) => {
+                job.cancel.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// All four background-process tools sharing one job registry.
-pub fn tools() -> Vec<Box<dyn Tool>> {
-    let hub = BgHub::new();
+pub fn tools(jobs: &BgJobs) -> Vec<Box<dyn Tool>> {
+    let hub = jobs.hub.clone();
     vec![
         Box::new(RunBg { hub: hub.clone() }),
         Box::new(BgStatusTool { hub: hub.clone() }),
@@ -527,6 +594,34 @@ mod tests {
         spawn_job(&hub, &dir, &id, "sleep 30").await.unwrap();
         hub.lock().get(&id).unwrap().cancel.cancel();
         wait_over(&hub, &id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bgjobs_lists_and_kills() {
+        let dir = scratch();
+        let jobs = BgJobs::new();
+        let id = jobs.hub.start("sleep 30");
+        spawn_job(&jobs.hub, &dir, &id, "sleep 30").await.unwrap();
+
+        // The observer sees the running job.
+        let running = jobs.running();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, id);
+        assert!(running[0].running);
+
+        // Kill through the handle, then the job leaves the running set.
+        assert!(jobs.kill(&id));
+        assert!(!jobs.kill("bg-does-not-exist"));
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if jobs.running().is_empty() {
+                break;
+            }
+        }
+        assert!(jobs.running().is_empty(), "job did not stop");
+        // The job is still listed (with a terminal status), just not running.
+        assert_eq!(jobs.list().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

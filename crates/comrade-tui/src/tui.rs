@@ -682,6 +682,7 @@ enum MxCommand {
     SaveSession,
     SearchChat,
     SteerPrompt,
+    StopBackgroundJob,
     SubmitPrompt,
     SwitchSession,
     ToggleAutoAccept,
@@ -720,6 +721,7 @@ impl MxCommand {
         MxCommand::SaveSession,
         MxCommand::SearchChat,
         MxCommand::SteerPrompt,
+        MxCommand::StopBackgroundJob,
         MxCommand::SubmitPrompt,
         MxCommand::SwitchSession,
         MxCommand::ToggleAutoAccept,
@@ -757,6 +759,7 @@ impl MxCommand {
             MxCommand::SaveSession => "save-session",
             MxCommand::SearchChat => "search-chat-history",
             MxCommand::SteerPrompt => "steer",
+            MxCommand::StopBackgroundJob => "stop-background-job",
             MxCommand::SubmitPrompt => "submit-prompt",
             MxCommand::SwitchSession => "switch-session",
             MxCommand::ToggleAutoAccept => "toggle-auto-accept",
@@ -799,6 +802,8 @@ impl MxCommand {
             MxCommand::SaveSession => Some("C-x C-s"),
             MxCommand::SearchChat => Some("C-s"),
             MxCommand::SteerPrompt => Some("<return>"),
+            // Palette-only: pick a running background job to stop.
+            MxCommand::StopBackgroundJob => None,
             MxCommand::SubmitPrompt => Some("<return>"),
             MxCommand::SwitchSession => Some("C-x C-b"),
             MxCommand::ToggleAutoAccept => Some("C-SPC"),
@@ -842,6 +847,9 @@ impl MxCommand {
             MxCommand::SaveSession => "save the current session to a file",
             MxCommand::SearchChat => "search the chat history",
             MxCommand::SteerPrompt => "send the prompt to the running agent or delegate now",
+            MxCommand::StopBackgroundJob => {
+                "stop a running background job (pick one from the list)"
+            }
             MxCommand::SubmitPrompt => "send the prompt to the agent",
             MxCommand::SwitchSession => "switch to another open session",
             MxCommand::ToggleAutoAccept => "toggle auto-accept of approvals",
@@ -1006,6 +1014,13 @@ struct SessionPick {
     sel: usize,
 }
 
+/// The M-x stop-background-job picker: a snapshot of the running jobs (so the
+/// selection stays stable while the overlay is open), one of which to stop.
+struct JobsPick {
+    sel: usize,
+    jobs: Vec<comrade_tool_project::BgJobInfo>,
+}
+
 /// Expand a leading `~/` in a typed path to the user's home directory.
 fn expand_tilde(input: &str) -> String {
     if let Some(rest) = input.strip_prefix("~/")
@@ -1116,6 +1131,8 @@ struct App {
     client: Arc<comrade_core::LlmClient>,
     tools: Arc<comrade_tool::ToolRegistry>,
     root: std::path::PathBuf,
+    /// The shared background-job registry, to show running jobs and stop one.
+    jobs: comrade_tool_project::BgJobs,
     /// Path the live config was read from (None = defaults only), so a reload
     /// command can re-read it without restarting.
     config_source: Option<std::path::PathBuf>,
@@ -1261,6 +1278,8 @@ struct App {
     path_prompt: Option<PathPrompt>,
     /// Open session switcher overlay (Ctrl-x C-b), when any.
     session_pick: Option<SessionPick>,
+    /// Open "stop a background job" picker (M-x stop-background-job), when any.
+    jobs_pick: Option<JobsPick>,
 }
 
 /// Snapshot of the repo state shown on the emacs-style mode line, refreshed in
@@ -1951,7 +1970,7 @@ impl App {
                 return;
             }
         };
-        let tools = match crate::build_tools(&cfg, &self.root) {
+        let (tools, jobs) = match crate::build_tools(&cfg, &self.root) {
             Ok(t) => t,
             Err(e) => {
                 self.push_meta(format!("config reload failed: {e:#}"));
@@ -1968,6 +1987,7 @@ impl App {
         self.cfg = Arc::new(cfg);
         self.client = Arc::new(client);
         self.tools = Arc::new(tools);
+        self.jobs = jobs;
         // Pick up any newly-configured delegate: assign it a color the first
         // time it is seen (existing agents keep theirs) and refresh the chat
         // layout so the model panel and bands repaint.
@@ -2618,6 +2638,52 @@ impl App {
         }
     }
 
+    /// Open the "stop a background job" picker (M-x stop-background-job):
+    /// snapshot the running jobs; with none running, just note it.
+    fn open_jobs_pick(&mut self) {
+        let jobs = self.jobs.running();
+        if jobs.is_empty() {
+            self.push_meta("no running background jobs");
+            return;
+        }
+        self.jobs_pick = Some(JobsPick { sel: 0, jobs });
+    }
+
+    /// Keys while the stop-background-job picker is open.
+    fn handle_jobs_pick_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let up = key.code == KeyCode::Up || (ctrl && key.code == KeyCode::Char('p'));
+        let down = key.code == KeyCode::Down || (ctrl && key.code == KeyCode::Char('n'));
+        if up {
+            if let Some(p) = &mut self.jobs_pick {
+                p.sel = p.sel.saturating_sub(1);
+            }
+        } else if down {
+            if let Some(p) = &mut self.jobs_pick {
+                p.sel = (p.sel + 1).min(p.jobs.len().saturating_sub(1));
+            }
+        } else {
+            match key.code {
+                KeyCode::Esc => self.jobs_pick = None,
+                KeyCode::Char('g') if ctrl => self.jobs_pick = None,
+                KeyCode::Enter => {
+                    let Some(pick) = self.jobs_pick.take() else {
+                        return;
+                    };
+                    if let Some(job) = pick.jobs.get(pick.sel) {
+                        let id = job.id.clone();
+                        if self.jobs.kill(&id) {
+                            self.push_meta(format!("stopping background job {id}"));
+                        } else {
+                            self.push_meta(format!("background job {id} is no longer running"));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Keys while the save/load session path prompt is open.
     fn handle_path_prompt_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -3054,6 +3120,7 @@ impl App {
             MxCommand::SaveSession => self.save_session_prompt(),
             MxCommand::SearchChat => self.search = Some(Search::new()),
             MxCommand::SteerPrompt => self.submit_prompt(),
+            MxCommand::StopBackgroundJob => self.open_jobs_pick(),
             MxCommand::SubmitPrompt => self.submit_prompt(),
             MxCommand::SwitchSession => self.switch_session(),
             MxCommand::ToggleAutoAccept => self.toggle_auto_accept(),
@@ -3462,6 +3529,7 @@ fn build_app(
         client: deps.client.clone(),
         tools: deps.tools.clone(),
         root: deps.root.clone(),
+        jobs: deps.jobs.clone(),
         config_source: deps.config_source.clone(),
         auto_forced: deps.auto_forced,
         session: bundle.session.clone(),
@@ -3538,6 +3606,7 @@ fn build_app(
         ctrl_x: false,
         path_prompt: None,
         session_pick: None,
+        jobs_pick: None,
     }
 }
 
@@ -3723,6 +3792,10 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
             }
             if app.path_prompt.is_some() {
                 app.handle_path_prompt_key(key);
+                return false;
+            }
+            if app.jobs_pick.is_some() {
+                app.handle_jobs_pick_key(key);
                 return false;
             }
             if app.session_pick.is_some() {
@@ -4723,12 +4796,27 @@ fn draw(app: &mut App, frame: &mut Frame) {
     );
     let delegate_block = delegate_rows.as_ref().map_or(0, |r| r.len() as u16);
     let stats_h = (MODEL_PANEL_FIXED_ROWS + 2 + delegate_block).min(rows[0].height);
+    // The running-background-jobs panel sits below the plan, sized to its rows
+    // (and hidden entirely when nothing runs).
+    let run_jobs = app.jobs.running();
+    let jobs_h = if run_jobs.is_empty() {
+        0
+    } else {
+        (run_jobs.len().min(MAX_JOB_ROWS) as u16) + 2
+    };
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(stats_h), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(stats_h),
+            Constraint::Min(0),
+            Constraint::Length(jobs_h),
+        ])
         .split(cols[1]);
     draw_stats(app, frame, right[0]);
     draw_plan(app, frame, right[1]);
+    if jobs_h > 0 {
+        draw_jobs(&run_jobs, frame, right[2]);
+    }
 
     // The M-x palette or the search bar replace the prompt line while open.
     if let Some(mx) = &app.mx {
@@ -4843,6 +4931,9 @@ fn draw(app: &mut App, frame: &mut Frame) {
     }
     if let Some(p) = &app.session_pick {
         draw_session_pick(p, app, frame);
+    }
+    if let Some(p) = &app.jobs_pick {
+        draw_jobs_pick(p, frame);
     }
     if let Some(v) = &app.mcp_view {
         draw_mcp_servers(v, frame);
@@ -6947,6 +7038,74 @@ fn draw_session_pick(pick: &SessionPick, app: &App, frame: &mut Frame) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" sessions (enter:switch  esc:cancel) ");
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Maximum rows of running jobs shown in the jobs panel; the rest collapse into
+/// a "+N more" hint.
+const MAX_JOB_ROWS: usize = 4;
+
+/// The running-background-jobs panel, drawn under the plan.
+fn draw_jobs(jobs: &[comrade_tool_project::BgJobInfo], frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" background jobs ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = usize::from(inner.width).max(8);
+    let mut lines: Vec<Line> = Vec::new();
+    for job in jobs.iter().take(MAX_JOB_ROWS) {
+        let prefix = format!("{}  ", job.id);
+        let suffix = format!("  {}  {:.0}s", job.status, job.elapsed_secs);
+        let budget = width.saturating_sub(prefix.chars().count() + suffix.chars().count());
+        let cmd: String = job.command.chars().take(budget).collect();
+        lines.push(Line::from(vec![
+            Span::styled(prefix, Style::default().fg(Color::Yellow)),
+            Span::styled(cmd, Style::default().fg(Color::Gray)),
+            Span::styled(suffix, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    if jobs.len() > MAX_JOB_ROWS {
+        lines.push(Line::from(Span::styled(
+            format!("…+{} more", jobs.len() - MAX_JOB_ROWS),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The M-x stop-background-job picker: choose a running job to stop.
+fn draw_jobs_pick(pick: &JobsPick, frame: &mut Frame) {
+    let area = frame.area();
+    let w = area.width.saturating_sub(2).min(92);
+    let h = (pick.jobs.len() as u16 + 3).min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, job) in pick.jobs.iter().enumerate() {
+        let selected = i == pick.sel;
+        let text = format!(
+            "{} {}  {}  {:.0}s",
+            if selected { ">" } else { " " },
+            job.id,
+            job.command,
+            job.elapsed_secs
+        );
+        let style = if selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" background jobs (enter:stop  esc:cancel) ");
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -9807,6 +9966,7 @@ mod tests {
             balance: None,
             config_source: None,
             auto_forced: false,
+            jobs: comrade_tool_project::BgJobs::new(),
         };
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<TaggedEvent>();
         let run_tx = spawn_tagged_relay(0, events_tx.clone());
@@ -9857,6 +10017,69 @@ mod tests {
         assert_eq!(session_counts_label(&app), "1 waiting");
         app.new_session();
         assert_eq!(session_counts_label(&app), "1 waiting, 1 idle");
+    }
+
+    /// M-x stop-background-job: starting a job through `run_bg`, then picking it
+    /// in the picker and pressing Enter, stops it.
+    #[tokio::test]
+    async fn stop_background_job_picker_kills_the_selected_job() {
+        let cfg = Arc::new(comrade_core::Config::load(None).unwrap().config);
+        let client = Arc::new(comrade_core::LlmClient::new(&cfg.llm).unwrap());
+        let (project_tools, jobs) = comrade_tool_project::all_with_jobs();
+        let mut registry = comrade_tool::ToolRegistry::new();
+        registry.extend(project_tools);
+        let deps = Deps {
+            cfg,
+            client,
+            tools: Arc::new(registry),
+            root: std::env::temp_dir(),
+            balance: None,
+            config_source: None,
+            auto_forced: false,
+            jobs: jobs.clone(),
+        };
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<TaggedEvent>();
+        let run_tx = spawn_tagged_relay(0, events_tx.clone());
+        let (asks_tx, asks_rx) = mpsc::channel::<PendingAsk>(4);
+        let (git_tx, git_rx) = mpsc::channel::<GitBarInfo>(4);
+        let mut app = build_app(
+            &deps, events_tx, events_rx, run_tx, asks_tx, asks_rx, git_tx, git_rx,
+        );
+        app.ctx_base.auto_approve = true;
+
+        // Start a long job through the real run_bg tool (shared hub).
+        let run_bg = app
+            .tools
+            .iter()
+            .find(|t| t.spec().name == "run_bg")
+            .expect("run_bg tool registered");
+        run_bg
+            .invoke(&app.ctx_base, serde_json::json!({ "command": "sleep 30" }))
+            .await
+            .unwrap();
+        assert_eq!(jobs.running().len(), 1);
+
+        // The picker shows it; Enter stops it.
+        app.open_jobs_pick();
+        assert_eq!(app.jobs_pick.as_ref().unwrap().jobs.len(), 1);
+        app.handle_jobs_pick_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.jobs_pick.is_none());
+
+        for _ in 0..200 {
+            if jobs.running().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(jobs.running().is_empty(), "job was not stopped");
+    }
+
+    /// With nothing running, the picker just notes it and does not open.
+    #[tokio::test]
+    async fn stop_background_job_with_none_running_is_a_noop() {
+        let mut app = test_app();
+        app.open_jobs_pick();
+        assert!(app.jobs_pick.is_none());
     }
 
     #[tokio::test]

@@ -75,6 +75,9 @@ struct Deps {
     config_source: Option<PathBuf>,
     /// True when the CLI forced autonomy=auto; re-applied on config reloads.
     auto_forced: bool,
+    /// Shared background-job registry (the same one the `run_bg`/`bg_*` tools
+    /// use), so the TUI can show running jobs and stop one.
+    jobs: comrade_tool_project::BgJobs,
 }
 
 async fn build_deps(cli: &Cli) -> Result<Deps> {
@@ -115,7 +118,7 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
     // Connect configured MCP servers and register their tools alongside the
     // built-ins. A dead/unreachable server is skipped with a warning instead
     // of aborting startup (see connect_all).
-    let mut reg = build_tools(&cfg, &root)?;
+    let (mut reg, jobs) = build_tools(&cfg, &root)?;
     reg.extend(comrade_tool_mcp::connect_all(&cfg.mcp.servers).await);
     let tools = Arc::new(reg);
     Ok(Deps {
@@ -126,13 +129,20 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
         balance,
         config_source,
         auto_forced: cli.auto,
+        jobs,
     })
 }
 
-fn build_tools(cfg: &Config, root: &std::path::Path) -> Result<ToolRegistry> {
+fn build_tools(
+    cfg: &Config,
+    root: &std::path::Path,
+) -> Result<(ToolRegistry, comrade_tool_project::BgJobs)> {
     let mut reg = ToolRegistry::new();
     reg.extend(comrade_tool_session::all());
-    reg.extend(comrade_tool_project::all());
+    // The project tools come with the shared background-job registry, so the
+    // TUI can list and stop the jobs the agent starts.
+    let (project_tools, jobs) = comrade_tool_project::all_with_jobs();
+    reg.extend(project_tools);
     reg.extend(comrade_tool_fs::all());
     reg.extend(comrade_tool_git::all());
     reg.extend(comrade_tool_syntax::all());
@@ -193,7 +203,7 @@ fn build_tools(cfg: &Config, root: &std::path::Path) -> Result<ToolRegistry> {
     if let Some(summarise) = SummariseTool::new(&cfg.delegates, Some(task_runner))? {
         reg.register(Box::new(summarise));
     }
-    Ok(reg)
+    Ok((reg, jobs))
 }
 
 /// The tools a delegated sub-agent may call: every repository/memory/project
