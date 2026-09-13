@@ -22,3 +22,6 @@ Covers the model-facing prompt wording for semantic_search in tools-intro.md and
 ## Impact
 The agent should reach for semantic_search at the start of exploratory tasks. Follow-up: align the same framing in crates/comrade-core/prompts/delegate-system.md so delegates orient the same way.
 
+
+## Note
+Follow-up done: the same framing was aligned in the two remaining spots. (1) crates/comrade-core/prompts/delegate-system.md step 2 now leads with semantic_search EARLY (domain known, exact symbol/file unknown) and puts the name-based tools after it. (2) The SEMANTIC_SEARCH_SPEC.description in crates/comrade-tool-memory/src/semantic.rs (the text the model sees for the tool itself) now says it is the first choice when you know WHAT you want but not WHERE it lives, NOT a fallback. All three model-facing mentions (tools-intro.md, working-style.md, delegate-system.md) plus the ToolSpec now agree.
