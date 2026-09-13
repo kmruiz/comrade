@@ -66,6 +66,28 @@ The dialog wraps its body/options to the popup's real inner width (popup = min(a
 **References:**
 - `crates/comrade-tui/src/tui.rs`
 
+## CompactRequest
+> A cheap, clonable one-shot flag (`Arc<AtomicBool>`) the UI uses to ask the running agent loop to compact the context at its next rest point. `request()` sets it, `take()` consumes it once.
+
+**References:**
+- `crates/comrade-tool/src/tool.rs`
+- `crates/comrade-core/src/agent.rs`
+
+**Notes:**
+Carried on `ToolContext.compact: Option<CompactRequest>`; mirrors the `Steer` control pipe. `None` in headless runs and tests.
+
+## Context compaction
+> A user-triggered action (M-c / MxCommand `compact-context`) that asks the model to summarise what has been done and REPLACES the running `ContextManager` history with that summary, instead of the automatic, lossy budget trimming.
+
+**References:**
+- `crates/comrade-core/src/compact.rs`
+- `crates/comrade-core/src/context.rs`
+- `crates/comrade-core/src/agent.rs`
+- `crates/comrade-tui/src/tui.rs`
+
+**Notes:**
+Mid-run it is requested via `comrade_tool::CompactRequest` and honoured by `run_agent_loop` at its rest point before `enforce_budget()`; while idle the TUI runs `compact_history` in a background task. `ContextManager::compact` keeps the system message and folds the summary into the "Earlier context (compacted)" rollup.
+
 ## delegate sub-chat
 > The chat rows authored by a delegate model (its tool cards and its reply), rendered indented 2 columns under a "| " rule in the delegate's agent color with a dim per-agent background band, visually nested under the parent's delegate tool call.
 

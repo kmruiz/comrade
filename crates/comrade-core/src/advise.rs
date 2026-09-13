@@ -455,6 +455,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         }
     }
@@ -473,6 +474,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         }
     }

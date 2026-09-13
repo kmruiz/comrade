@@ -22,3 +22,6 @@ Covers tui.rs only: layout_reasoning, the MsgKind::Assistant arm, the row_band h
 ## Impact
 In the chat the model's thinking and its final answer now share the assistant look, both tinted with the model's colour band; delegate replies stay indented with their own band, so a session reads as model-coloured spoken blocks separated by dimmed tool activity. Note the final-answer header is no longer fixed Green (it follows the model's palette colour). Tests added: reasoning block shape, spoken-block banding, assistant header colour/band; the focus-mode reasoning test was adjusted for markdown span splitting.
 
+
+## Note
+Follow-up (same day): the reasoning header now shows the model NAME alongside the brain glyph ("🧠 <name>"), in the model's name colour, so thinking is attributed at a glance (it previously showed a lone 🧠 and no name). And the model panel's main-model label line was switched from a hardcoded `Color::Cyan` to `ModelColors::name_color(cfg.llm.display())`, so the panel uses the same assigned palette colour as the chat headers, reasoning blocks and bands (the user asked for the palette colour everywhere rather than the panel's cyan). See ADR on M-c compaction for the reasoning-header edit's sibling change.

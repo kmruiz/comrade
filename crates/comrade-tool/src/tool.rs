@@ -185,6 +185,36 @@ impl Steer {
     }
 }
 
+/// A one-shot request from the UI to compact the running agent's context into
+/// a summary. Cheap to clone (it shares one `Arc<AtomicBool>`): the UI creates
+/// one and hands it to the running [`ToolContext`], and the agent loop takes
+/// (and clears) a pending request at its next rest point, rewriting the
+/// history into a model-written summary.
+#[derive(Clone, Default)]
+pub struct CompactRequest(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CompactRequest {
+    /// A fresh, un-requested handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the running loop to compact at its next rest point.
+    pub fn request(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Take a pending request, clearing it. `true` when one was pending.
+    pub fn take(&self) -> bool {
+        self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `true` while a request is pending (not yet taken).
+    pub fn is_pending(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Everything a tool invocation needs access to for the current session.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -219,6 +249,11 @@ pub struct ToolContext {
     /// at their rest points, so a message typed while either is running is
     /// delivered to whichever owns the loop. `None` in headless runs and tests.
     pub steer: Option<Steer>,
+    /// One-shot "compact the context now" request from the UI, when one exists
+    /// (see [`CompactRequest`]). The agent loop takes it at its next rest point
+    /// and replaces the history with a model-written summary. `None` in
+    /// headless runs and tests.
+    pub compact: Option<CompactRequest>,
 }
 
 /// Sink a tool can report UI-visible activity through while it runs (e.g. the
@@ -439,6 +474,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(crate::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         };
         ctx.set_approval(ApprovalNotes {
@@ -462,6 +498,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(crate::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         };
         ctx.confirm("edit", Some("--- a.rs".into())).await.unwrap();

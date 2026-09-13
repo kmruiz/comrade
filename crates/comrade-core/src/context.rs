@@ -158,6 +158,24 @@ impl ContextManager {
         let _ = idx;
     }
 
+    /// Replace the whole history with a model-written `summary`: keep the system
+    /// message (index 0) when present, drop every other message and fold the
+    /// summary into the "Earlier context (compacted)" rollup message. Used by
+    /// the user-triggered compaction (M-c).
+    pub fn compact(&mut self, summary: &str) {
+        self.history.truncate(1); // keep only the system message when present
+        self.rollup = summary.to_string();
+        self.evicted = 0;
+        if self.history.is_empty() {
+            self.history.push(ChatMessage::new(
+                crate::llm::Role::User,
+                format!("Earlier context (compacted):\n{summary}"),
+            ));
+        } else {
+            self.upsert_rollup_message();
+        }
+    }
+
     /// Fit history under the budget, compacting as it *approaches* the cap:
     /// stub large old observations, then evict the oldest messages (folding
     /// thoughts into an "Earlier context" rollup). Never drops index 0
@@ -349,6 +367,20 @@ mod tests {
                 .any(|m| m.content.starts_with("Earlier context (compacted)"))
         );
         assert!(cm.total_tokens() <= 60);
+    }
+
+    #[test]
+    fn compact_replaces_history_with_summary() {
+        let mut cm = ContextManager::with_system("sys", 1000, 100);
+        cm.push(ChatMessage::new(Role::User, "do the thing"));
+        cm.push(ChatMessage::new(Role::Assistant, "did the thing"));
+        cm.compact("did X");
+        assert_eq!(cm.messages().len(), 2);
+        assert_eq!(cm.messages()[0].role, Role::System);
+        assert_eq!(cm.messages()[0].content, "sys");
+        assert!(cm.messages()[1].content.contains("did X"));
+        assert_eq!(cm.rollup(), "did X");
+        assert_eq!(cm.evicted, 0);
     }
 
     #[test]

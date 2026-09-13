@@ -275,6 +275,7 @@ pub(crate) fn session_bundle(
         approval: Default::default(),
         events: Arc::new(comrade_tool::NoopEvents),
         steer: None,
+        compact: None,
         stop: None,
     };
     SessionBundle { session, ctx_base }

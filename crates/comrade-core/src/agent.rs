@@ -477,6 +477,31 @@ async fn run_agent_loop(
         // can still make room for it.
         drain_steer(ctx.steer.as_ref(), ctxm).await;
 
+        // A compaction the user requested (M-c) is honoured at this rest point,
+        // before the budget is enforced: replace the whole history with a
+        // model-written summary of what has been done.
+        if ctx.compact.as_ref().is_some_and(|c| c.take()) {
+            match crate::compact::compact_history(client, ctxm).await {
+                Ok(rep) => {
+                    let _ = tx
+                        .send(AgentEvent::ContextCompacted {
+                            before_messages: rep.before_messages,
+                            after_messages: ctxm.messages().len(),
+                            before_tokens: rep.before_tokens,
+                            after_tokens: rep.after_tokens,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AgentEvent::Error(format!(
+                            "context compaction failed: {e:#}"
+                        )))
+                        .await;
+                }
+            }
+        }
+
         ctxm.enforce_budget();
 
         // Advertise native tools unless the protocol is strictly ReAct.
@@ -1404,6 +1429,7 @@ mod tests {
             events: Arc::new(comrade_tool::NoopEvents),
             steer: Some(steer),
             stop: None,
+            compact: None,
         };
         let tools = ToolRegistry::new();
         let client = LlmClient::new(&cfg.llm).unwrap();
@@ -1425,6 +1451,132 @@ mod tests {
         assert!(
             first.contains("stop reading and implement now"),
             "the steer must ride in the first model request"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fake model that answers both protocols the compaction test needs:
+    /// non-streaming JSON (the summariser's `chat` call) and SSE (the agent's
+    /// `chat_turn`). Every raw request body is forwarded to the channel.
+    fn spawn_compact_spy() -> (u16, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut data = Vec::new();
+                let mut tmp = [0u8; 8192];
+                let mut body_len: Option<usize> = None;
+                let mut header_end: Option<usize> = None;
+                while body_len.map_or(true, |len| header_end.unwrap_or(0) + 4 + len > data.len()) {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(r) => {
+                            data.extend_from_slice(&tmp[..r]);
+                            if header_end.is_none() {
+                                if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    header_end = Some(p);
+                                    let head =
+                                        String::from_utf8_lossy(&data[..p]).to_ascii_lowercase();
+                                    body_len = head.lines().find_map(|l| {
+                                        l.trim()
+                                            .strip_prefix("content-length:")
+                                            .and_then(|v| v.trim().parse().ok())
+                                    });
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let body = match (header_end, body_len) {
+                    (Some(he), Some(len)) => {
+                        let start = he + 4;
+                        let end = (start + len).min(data.len());
+                        String::from_utf8_lossy(&data[start..end]).into_owned()
+                    }
+                    _ => String::new(),
+                };
+                let streaming = body.contains("\"stream\":true");
+                let _ = tx.send(body);
+                let resp = if streaming {
+                    let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"All done.\"}}]}\n\n\
+                                   data: [DONE]\n\n";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                } else {
+                    let payload = "{\"choices\":[{\"message\":{\"content\":\"did X\"}}]}";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                };
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (port, rx)
+    }
+
+    /// A pending `CompactRequest` makes the very first model call a summariser
+    /// request (non-streaming `chat`) whose body carries the transcript; the run
+    /// then continues normally with the summarised history.
+    #[tokio::test]
+    async fn pending_compaction_request_summarises_the_history() {
+        let (port, bodies) = spawn_compact_spy();
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "fake".into();
+
+        let (tx, _events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        let root = std::env::temp_dir().join(format!("comrade-agent-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let undo = Arc::new(MemoryUndo::new(root.clone()));
+
+        let compact = comrade_tool::CompactRequest::new();
+        assert!(!compact.is_pending());
+        compact.request();
+        assert!(compact.is_pending());
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: undo.clone(),
+            auto_approve: true,
+            approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            compact: Some(compact),
+            stop: None,
+        };
+        let tools = ToolRegistry::new();
+        let client = LlmClient::new(&cfg.llm).unwrap();
+
+        let outcome = run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            "do the thing".to_string(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.final_answer, "All done.");
+
+        // Compaction runs before the first agent turn, so the first request the
+        // model sees is the summariser asking for the notes.
+        let first = recv_body(&bodies).await;
+        assert!(
+            first.contains("Conversation so far:"),
+            "first request must be the summariser: {first}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1460,6 +1612,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         };
         let tools = ToolRegistry::new();
@@ -1572,6 +1725,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1645,6 +1799,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1745,6 +1900,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1929,6 +2085,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         };
         let delegate_tool = crate::delegate::DelegateTool::new(
@@ -2018,6 +2175,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2162,6 +2320,7 @@ mod loop_tests {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         };
         let tools = ToolRegistry::new();

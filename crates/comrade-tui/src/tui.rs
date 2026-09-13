@@ -437,6 +437,7 @@ enum MxCommand {
     BackwardWord,
     BeginningOfLine,
     CancelRun,
+    CompactContext,
     Copy,
     EndOfLine,
     FocusMode,
@@ -472,6 +473,7 @@ impl MxCommand {
         MxCommand::BackwardWord,
         MxCommand::BeginningOfLine,
         MxCommand::CancelRun,
+        MxCommand::CompactContext,
         MxCommand::Copy,
         MxCommand::EndOfLine,
         MxCommand::FocusMode,
@@ -506,6 +508,7 @@ impl MxCommand {
             MxCommand::BackwardWord => "backward-word",
             MxCommand::BeginningOfLine => "beginning-of-line",
             MxCommand::CancelRun => "cancel-run",
+            MxCommand::CompactContext => "compact-context",
             MxCommand::Copy => "copy",
             MxCommand::EndOfLine => "end-of-line",
             MxCommand::FocusMode => "focus-mode",
@@ -542,6 +545,7 @@ impl MxCommand {
             MxCommand::BackwardWord => Some("M-<left>"),
             MxCommand::BeginningOfLine => Some("<home>"),
             MxCommand::CancelRun => Some("esc"),
+            MxCommand::CompactContext => Some("M-c"),
             MxCommand::Copy => Some("C-S-c / M-w"),
             MxCommand::EndOfLine => Some("<end>"),
             MxCommand::FocusMode => Some("M-f"),
@@ -579,6 +583,9 @@ impl MxCommand {
             MxCommand::BackwardWord => "move the prompt cursor back one word",
             MxCommand::BeginningOfLine => "move the prompt cursor to the start of the line",
             MxCommand::CancelRun => "stop the running agent",
+            MxCommand::CompactContext => {
+                "summarise the context and replace the conversation with that summary"
+            }
             MxCommand::Copy => "copy the prompt selection or the chat block under the cursor",
             MxCommand::EndOfLine => "move the prompt cursor to the end of the line",
             MxCommand::FocusMode => "filter the chat to the conversation (hide tool calls)",
@@ -721,6 +728,9 @@ struct LiveState {
     run_handle: Option<tokio::task::JoinHandle<()>>,
     running: bool,
     steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// One-shot "compact the context now" request handed to the running loop
+    /// (`None` while idle).
+    compact: Option<comrade_tool::CompactRequest>,
     queued_prompt: Option<String>,
     run_cancelled: bool,
     chat: Vec<Msg>,
@@ -806,6 +816,9 @@ struct App {
     /// Sender end of the in-flight run's steering pipe (`None` while idle).
     /// Sending fails once the run has ended and dropped its receiver.
     steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// One-shot "compact the context now" request handed to the running loop
+    /// (`None` while idle).
+    compact: Option<comrade_tool::CompactRequest>,
     /// A prompt queued (ctrl-Enter) while a run was active: submitted as the
     /// next run when the current one ends, or given back to the prompt bar if
     /// the run was cancelled (never auto-run after an explicit cancel).
@@ -1361,9 +1374,14 @@ impl App {
         // mid-run reaches the agent loop - and, nested inside it, a delegate's
         // sub-loop, which clones the same context.
         let (steer, steer_tx) = comrade_tool::Steer::channel();
+        // The UI keeps the compact-request handle (M-c); the run task keeps a
+        // clone it takes at each rest point to summarise the history.
+        let compact = comrade_tool::CompactRequest::new();
         let mut ctx = self.ctx_base.clone();
         ctx.steer = Some(steer);
+        ctx.compact = Some(compact.clone());
         self.steer_tx = Some(steer_tx);
+        self.compact = Some(compact);
         self.run_cancelled = false;
         let cfg = self.cfg.clone();
         let client = self.client.clone();
@@ -1402,6 +1420,55 @@ impl App {
             }
         });
         self.run_handle = Some(handle);
+    }
+
+    /// Compact the conversation (M-c): ask the model to summarise what has been
+    /// done so far and replace the running history with that summary.
+    ///
+    /// While a run is in flight the request is handed to the agent loop, which
+    /// performs it at its next rest point (before the budget is enforced). When
+    /// idle, the summarisation runs now in a background task and reports back
+    /// through the event queue.
+    fn compact_context(&mut self) {
+        if self.running {
+            match &self.compact {
+                Some(c) => {
+                    c.request();
+                    self.push_meta(
+                        "compaction requested: the context will be summarised at the next step",
+                    );
+                }
+                None => self.push_meta("nothing to compact yet"),
+            }
+            return;
+        }
+        self.push_meta("compacting context...");
+        let client = self.client.clone();
+        let history = self.history.clone();
+        let tx = self.events_tx.clone();
+        let id = self.active_id();
+        tokio::spawn(async move {
+            let mut history = history.lock().await;
+            match comrade_core::compact_history(&client, &mut history).await {
+                Ok(rep) => {
+                    let _ = tx.send((
+                        id,
+                        AgentEvent::ContextCompacted {
+                            before_messages: rep.before_messages,
+                            after_messages: history.messages().len(),
+                            before_tokens: rep.before_tokens,
+                            after_tokens: rep.after_tokens,
+                        },
+                    ));
+                }
+                Err(e) => {
+                    let _ = tx.send((
+                        id,
+                        AgentEvent::Error(format!("context compaction failed: {e:#}")),
+                    ));
+                }
+            }
+        });
     }
 
     fn cancel_run(&mut self) {
@@ -1855,6 +1922,7 @@ impl App {
             run_handle: None,
             running: false,
             steer_tx: None,
+            compact: None,
             queued_prompt: None,
             run_cancelled: false,
             chat: Vec::new(),
@@ -1899,6 +1967,7 @@ impl App {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         }
     }
@@ -1936,6 +2005,7 @@ impl App {
             run_handle: None,
             running: false,
             steer_tx: None,
+            compact: None,
             queued_prompt: None,
             run_cancelled: false,
             chat: file.chat,
@@ -1968,6 +2038,7 @@ impl App {
         std::mem::swap(&mut self.run_handle, &mut incoming.run_handle);
         std::mem::swap(&mut self.running, &mut incoming.running);
         std::mem::swap(&mut self.steer_tx, &mut incoming.steer_tx);
+        std::mem::swap(&mut self.compact, &mut incoming.compact);
         std::mem::swap(&mut self.queued_prompt, &mut incoming.queued_prompt);
         std::mem::swap(&mut self.run_cancelled, &mut incoming.run_cancelled);
         std::mem::swap(&mut self.chat, &mut incoming.chat);
@@ -2444,6 +2515,21 @@ impl App {
                 self.ctx_budget = budget.max(1);
                 self.ctx_estimated = estimated;
             }
+            AgentEvent::ContextCompacted {
+                before_messages,
+                after_messages,
+                before_tokens,
+                after_tokens,
+            } => {
+                // The history shrank to a summary: reflect it in the gauge and
+                // report the change in the chat.
+                self.ctx_tokens = after_tokens;
+                self.ctx_estimated = true;
+                self.push_meta(format!(
+                    "context compacted: {before_messages}->{after_messages} messages, \
+                     ~{before_tokens}->~{after_tokens} tokens"
+                ));
+            }
             AgentEvent::AccountBalance(balance) => {
                 self.balance = Some(balance);
             }
@@ -2576,6 +2662,7 @@ impl App {
             MxCommand::BackwardWord => self.input.move_word_left(false),
             MxCommand::BeginningOfLine => self.input.move_home(false),
             MxCommand::CancelRun => self.cancel_run(),
+            MxCommand::CompactContext => self.compact_context(),
             MxCommand::Copy => {
                 // Mirrors the Ctrl+Shift+C / M-w chords: copy the prompt's
                 // selection when there is one, otherwise the chat message
@@ -3006,6 +3093,7 @@ fn build_app(
         run_handle: None,
         running: false,
         steer_tx: None,
+        compact: None,
         queued_prompt: None,
         run_cancelled: false,
         last_draw: std::time::Instant::now(),
@@ -3365,6 +3453,11 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                     if ch.eq_ignore_ascii_case(&'f') {
                         // M-f: toggle focus mode.
                         app.toggle_focus_mode();
+                        return false;
+                    }
+                    if ch.eq_ignore_ascii_case(&'c') {
+                        // M-c: compact the context (summarise and replace it).
+                        app.compact_context();
                         return false;
                     }
                 }
@@ -5325,10 +5418,14 @@ fn layout_reasoning(
     open: bool,
     width: usize,
 ) {
+    // Header: the brain glyph plus the model's name, in the model's colour — the
+    // spoken-block look shared with the assistant final answer (ADR 19), with the
+    // name made explicit so thinking is attributed to its model at a glance.
+    let label = cap(&format!("🧠 {author}"), width.saturating_sub(2));
     out.push(RenderRow {
         rule: None,
         spans: vec![Span::styled(
-            "🧠",
+            label,
             Style::default()
                 .fg(colors.name_color(author))
                 .add_modifier(Modifier::BOLD),
@@ -5965,10 +6062,15 @@ fn gauge_line(tokens: usize, budget: usize, estimated: bool, width: usize) -> Li
     }
 }
 
-fn label_line(model_label: String, balance: Option<&str>, width: usize) -> Line<'static> {
-    let model_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
+/// One line for the model panel: the main model's name (in its assigned agent
+/// colour) left-aligned with the account balance right-aligned when it fits.
+fn label_line(
+    model_label: String,
+    balance: Option<&str>,
+    width: usize,
+    color: Color,
+) -> Line<'static> {
+    let model_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     let balance_style = Style::default().fg(Color::DarkGray);
 
     if let Some(bal) = balance {
@@ -6020,7 +6122,12 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
         ])
         .split(inner);
     frame.render_widget(
-        Paragraph::new(label_line(model_label, app.balance.as_deref(), width)),
+        Paragraph::new(label_line(
+            model_label,
+            app.balance.as_deref(),
+            width,
+            app.model_colors.name_color(&app.cfg.llm.display()),
+        )),
         rows[0],
     );
     frame.render_widget(
@@ -8389,10 +8496,10 @@ mod tests {
             true,
             40,
         );
-        // The header is a lone brain glyph (the model colour), not a
-        // collapsible card arrow.
+        // The header is the brain glyph plus the model's name in its colour, not
+        // a collapsible card arrow.
         assert_eq!(out[0].spans.len(), 1);
-        assert_eq!(out[0].spans[0].content, "\u{1f9e0}");
+        assert_eq!(out[0].spans[0].content, "\u{1f9e0} model");
         assert!(out[0].tool_header.is_none(), "header is not a tool card");
         // The body follows as a normal markdown block, no rule, no card.
         assert!(out.len() > 1);

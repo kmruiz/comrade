@@ -8,6 +8,7 @@
 
 pub mod advise;
 pub mod agent;
+pub mod compact;
 pub mod config;
 pub mod context;
 pub mod delegate;
@@ -19,6 +20,7 @@ pub mod undo;
 
 pub use advise::AskAdviseTool;
 pub use agent::{build_session_context, run_agent, run_agent_with_history};
+pub use compact::{CompactReport, compact_history};
 pub use config::{
     Autonomy, Config, DelegateCfg, LoadedConfig, McpAuth, McpConfig, McpServerCfg, McpTransport,
     expand_env_value,

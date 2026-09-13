@@ -11,6 +11,6 @@ pub mod tool;
 pub use plan::{AGENT_MODEL, PlanStatus, PlanStep, PlanStepDraft, PlanTarget, SessionControl};
 pub use repo::changed_files_abs;
 pub use tool::{
-    ActivityEvents, ApprovalNotes, NoopEvents, Steer, Tool, ToolContext, ToolRegistry, ToolSpec,
-    UndoLog, UserIo, UserPrompt, UserReply,
+    ActivityEvents, ApprovalNotes, CompactRequest, NoopEvents, Steer, Tool, ToolContext,
+    ToolRegistry, ToolSpec, UndoLog, UserIo, UserPrompt, UserReply,
 };

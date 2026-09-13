@@ -1205,6 +1205,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         };
         let list = FsListFiles;
@@ -1295,6 +1296,7 @@ mod tests {
             approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()

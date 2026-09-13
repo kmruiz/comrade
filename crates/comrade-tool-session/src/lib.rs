@@ -797,6 +797,7 @@ mod tests {
             approval: Arc::new(Mutex::new(None)),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
+            compact: None,
             stop: None,
         }
     }

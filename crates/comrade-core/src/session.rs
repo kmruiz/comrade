@@ -61,6 +61,14 @@ pub enum AgentEvent {
         budget: usize,
         estimated: bool,
     },
+    /// The user asked to compact the context (M-c): the running history was
+    /// replaced by a model-written summary.
+    ContextCompacted {
+        before_messages: usize,
+        after_messages: usize,
+        before_tokens: usize,
+        after_tokens: usize,
+    },
     /// A tool call made by a delegated sub-agent started. `model` is the
     /// delegate's configured name, so the UI can show the action under the
     /// delegate instead of the main model.
