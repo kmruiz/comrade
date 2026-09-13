@@ -161,12 +161,16 @@ Defined via a `FieldKind::DiffChoice { options: Vec<DiffOption> }` variant; seed
 Defaults let a minimal backend implement only model/resolve/format_command: `check_command` defaults to None, `parse_diagnostics` to the generic error-line scan, `simplify_tests` to passthrough, `is_test_command` to false. Adding npm/Maven/Go = implement the trait + one arm in `detect`. See ADR #26.
 
 ## embedded embedding model
-> The int8-quantized BGE-small-en-v1.5 ONNX bundle compiled into the comrade-tool-memory binary with include_bytes! so semantic_search runs fully offline (no download, no model cache). Files live in crates/comrade-tool-memory/assets/bge-small-en-v1.5-int8/ and are built via fastembed's try_new_from_user_defined with Pooling::Cls.
+> The int8-quantized BGE-small-en-v1.5 ONNX bundle compiled into the comrade-tool-memory binary so semantic_search runs fully offline (no download, no model cache). Raw files live in crates/comrade-tool-memory/assets/bge-small-en-v1.5-int8/ (source of truth); build.rs deflates them with flate2 into OUT_DIR/assets/*.deflate and src/semantic.rs embeds those compressed copies (include_bytes!) and inflates them in memory on first use via flate2::DeflateDecoder. Built with fastembed's try_new_from_user_defined + Pooling::Cls.
 
 **References:**
 - `crates/comrade-tool-memory/src/semantic.rs`
+- `crates/comrade-tool-memory/build.rs`
 - `crates/comrade-tool-memory/assets/bge-small-en-v1.5-int8/README.md`
-- `crates/comrade-tool-memory/Cargo.toml`
+- `Cargo.toml`
+
+**Notes:**
+Deflating the ~35 MB of assets saves ~10 MB of binary; the workspace [profile.release] strip=true removes a further ~14 MB of symbol tables. Release binary went ~96 MB -> ~68 MB.
 
 ## enabled (delegate)
 > Per-[[delegates]] boolean (default true). `enabled = false` keeps the entry in config.toml but removes the model from the `delegate`/`ask_advise` targets, their `model` enum and advertised listing (and from the TUI Ctrl-A picker), so it cannot be delegated to; it still shows dimmed with ` (disabled)` in the model panel. Unlike `approval = "deny"` (listed but refused at run time), a disabled delegate is invisible to the tech lead.

@@ -3,10 +3,10 @@
 //! `semantic_search` finds memory by MEANING, not keywords: it embeds every
 //! decision and glossary term with a small, locally-run model and ranks them by
 //! cosine similarity to the query. Everything is embedded — there is no server
-//! and no download: the model is an int8-quantized ONNX bundle compiled into
-//! the binary with `include_bytes!` and run in-process by `fastembed`, and the
-//! vector store is a persisted flat index under the user cache dir keyed by the
-//! project root.
+//! and no download: the model is an int8-quantized ONNX bundle compiled into the
+//! binary (deflated at build time by `build.rs`, inflated in memory on first
+//! use) and run in-process by `fastembed`, and the vector store is a persisted
+//! flat index under the user cache dir keyed by the project root.
 //!
 //! Why a flat index and not HNSW: a project's memory is tens to a few hundred
 //! documents, where exact cosine over all vectors is instantaneous and needs no
@@ -14,6 +14,7 @@
 //! whose text hash changed, so steady-state calls cost one query embedding.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -26,16 +27,25 @@ use fastembed::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The int8-quantized BGE-small-en-v1.5 ONNX graph (~34 MB), compiled into the
-/// binary so there is no download, no network and no model cache to manage.
-const MODEL_ONNX: &[u8] = include_bytes!("../assets/bge-small-en-v1.5-int8/model_quantized.onnx");
-/// The tokenizer and its config files, embedded alongside the graph.
-const MODEL_TOKENIZER: &[u8] = include_bytes!("../assets/bge-small-en-v1.5-int8/tokenizer.json");
-const MODEL_CONFIG: &[u8] = include_bytes!("../assets/bge-small-en-v1.5-int8/config.json");
-const MODEL_SPECIAL_TOKENS: &[u8] =
-    include_bytes!("../assets/bge-small-en-v1.5-int8/special_tokens_map.json");
-const MODEL_TOKENIZER_CONFIG: &[u8] =
-    include_bytes!("../assets/bge-small-en-v1.5-int8/tokenizer_config.json");
+/// The int8-quantized BGE-small-en-v1.5 ONNX graph (~34 MB raw, ~24 MB deflated),
+/// compiled into the binary so there is no download, no network and no model
+/// cache to manage. `build.rs` deflates the raw asset from `assets/` into
+/// `OUT_DIR`; `inflate` restores it in memory on first use.
+const MODEL_ONNX: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/assets/model_quantized.onnx.deflate"));
+/// The tokenizer and its config files, deflated alongside the graph.
+const MODEL_TOKENIZER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/assets/tokenizer.json.deflate"));
+const MODEL_CONFIG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/assets/config.json.deflate"));
+const MODEL_SPECIAL_TOKENS: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/assets/special_tokens_map.json.deflate"
+));
+const MODEL_TOKENIZER_CONFIG: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/assets/tokenizer_config.json.deflate"
+));
 
 /// Human-readable model id stored with the index so a model change invalidates
 /// cached vectors.
@@ -267,21 +277,33 @@ fn save_store(path: &Path, store: &Store) -> Result<()> {
 /// The in-process model, built from the embedded assets on first use.
 static MODEL: OnceLock<Result<Mutex<TextEmbedding>, String>> = OnceLock::new();
 
+/// Inflate one of the assets `build.rs` deflated into `OUT_DIR`.
+fn inflate(name: &str, data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    flate2::read::DeflateDecoder::new(data)
+        .read_to_end(&mut out)
+        .with_context(|| format!("cannot inflate embedded asset {name}"))?;
+    Ok(out)
+}
+
 /// The real embedder: the embedded int8 model run in-process via ONNX Runtime.
 struct FastEmbedder;
 
 impl Embedder for FastEmbedder {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let cell = MODEL.get_or_init(|| {
+            let onnx = inflate("model_quantized.onnx", MODEL_ONNX).map_err(|e| e.to_string())?;
             let tokenizer = TokenizerFiles {
-                tokenizer_file: MODEL_TOKENIZER.to_vec(),
-                config_file: MODEL_CONFIG.to_vec(),
-                special_tokens_map_file: MODEL_SPECIAL_TOKENS.to_vec(),
-                tokenizer_config_file: MODEL_TOKENIZER_CONFIG.to_vec(),
+                tokenizer_file: inflate("tokenizer.json", MODEL_TOKENIZER)
+                    .map_err(|e| e.to_string())?,
+                config_file: inflate("config.json", MODEL_CONFIG).map_err(|e| e.to_string())?,
+                special_tokens_map_file: inflate("special_tokens_map.json", MODEL_SPECIAL_TOKENS)
+                    .map_err(|e| e.to_string())?,
+                tokenizer_config_file: inflate("tokenizer_config.json", MODEL_TOKENIZER_CONFIG)
+                    .map_err(|e| e.to_string())?,
             };
             // BGE-small uses CLS pooling (matches fastembed's own model config).
-            let model = UserDefinedEmbeddingModel::new(MODEL_ONNX.to_vec(), tokenizer)
-                .with_pooling(Pooling::Cls);
+            let model = UserDefinedEmbeddingModel::new(onnx, tokenizer).with_pooling(Pooling::Cls);
             TextEmbedding::try_new_from_user_defined(model, InitOptionsUserDefined::new())
                 .map(Mutex::new)
                 .map_err(|e| e.to_string())

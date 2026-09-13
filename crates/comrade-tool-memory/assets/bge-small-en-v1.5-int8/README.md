@@ -4,6 +4,12 @@
 files are compiled into the `comrade-tool-memory` binary with `include_bytes!`
 (see `src/semantic.rs`). There is no download and no model cache.
 
+These files are the **source of truth**. At build time `build.rs` deflates each
+one with flate2 into `OUT_DIR/assets/<name>.deflate`, and the binary embeds those
+compressed copies and inflates them in memory on first model use. The ~35 MB of
+raw assets therefore cost ~25 MB in the binary; the release profile (`strip =
+true`) removes a further ~14 MB of symbol tables.
+
 ## Contents
 
 | file | bytes | what |
@@ -14,7 +20,7 @@ files are compiled into the `comrade-tool-memory` binary with `include_bytes!`
 | `tokenizer_config.json` | 366 | tokenizer config |
 | `special_tokens_map.json` | 125 | special tokens |
 
-Total: ~35 MB of the binary.
+Total: ~35 MB raw, ~25 MB in the binary after build-time deflate.
 
 ## Model
 

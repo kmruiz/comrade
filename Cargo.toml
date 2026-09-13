@@ -49,3 +49,9 @@ unicode-width = "0.2"
 tree-sitter = "0.25"
 tree-sitter-language = "0.1"
 tree-sitter-rust = "0.24"
+flate2 = "1"
+
+# The release binary embeds the ~35 MB embedding model and statically links ONNX
+# Runtime; without stripping it also carries ~14 MB of symbol tables.
+[profile.release]
+strip = true

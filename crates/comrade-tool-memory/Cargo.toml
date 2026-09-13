@@ -12,4 +12,8 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["fs"] }
+flate2.workspace = true
 fastembed = { version = "5", default-features = false, features = ["ort-download-binaries-native-tls"] }
+
+[build-dependencies]
+flate2.workspace = true
