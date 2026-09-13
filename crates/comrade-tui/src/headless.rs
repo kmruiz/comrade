@@ -23,19 +23,6 @@ impl UserIo for HeadlessIo {
                 Autonomy::Deny => UserReply::Answer("no".into()),
                 Autonomy::Ask => UserReply::Answer(confirm_on_stdin(&title).await?),
             },
-            UserPrompt::Question {
-                prompt,
-                options,
-                recommended,
-            } => match self.autonomy {
-                Autonomy::Auto => match auto_question_answer(&options, recommended.as_deref()) {
-                    Some(a) => UserReply::Answer(a),
-                    None => UserReply::Answer(question_on_stdin(&prompt, &options, None).await?),
-                },
-                _ => UserReply::Answer(
-                    question_on_stdin(&prompt, &options, recommended.as_deref()).await?,
-                ),
-            },
             UserPrompt::Form(spec) => match self.autonomy {
                 Autonomy::Auto => UserReply::Form(spec.initial_values()),
                 _ => UserReply::Form(form_on_stdin(&spec).await?),
@@ -58,54 +45,8 @@ async fn form_on_stdin(spec: &FormSpec) -> Result<BTreeMap<String, String>> {
     Ok(answers)
 }
 
-/// The answer auto mode gives a question: its recommended value when set and
-/// non-blank, else the first option when any. `None` means "no hint, ask".
-fn auto_question_answer(options: &[String], recommended: Option<&str>) -> Option<String> {
-    recommended
-        .filter(|r| !r.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| options.first().cloned())
-}
-
 async fn confirm_on_stdin(title: &str) -> Result<String> {
     let answer = read_line(&format!("[comrade] {title} [y/N] ")).await?;
-    Ok(answer)
-}
-
-async fn question_on_stdin(
-    question: &str,
-    options: &[String],
-    recommended: Option<&str>,
-) -> Result<String> {
-    let recommended = recommended.filter(|r| !r.trim().is_empty());
-    let mut msg = format!("[comrade] {question}");
-    // With free-form input the recommended answer is shown as a hint; with
-    // options it is expected to be one of them (the TUI flags it instead).
-    if options.is_empty()
-        && let Some(r) = recommended
-    {
-        msg.push_str(&format!("\n  (recommended: {r})"));
-    }
-    if !options.is_empty() {
-        for (i, o) in options.iter().enumerate() {
-            msg.push_str(&format!("\n  {}. {o}", i + 1));
-        }
-    }
-    msg.push_str("\n> ");
-    let answer = read_line(&msg).await?;
-    if !options.is_empty()
-        && let Ok(n) = answer.trim().parse::<usize>()
-        && n >= 1
-        && n <= options.len()
-    {
-        return Ok(options[n - 1].clone());
-    }
-    // An empty line accepts the recommended answer.
-    if answer.trim().is_empty()
-        && let Some(r) = recommended
-    {
-        return Ok(r.to_string());
-    }
     Ok(answer)
 }
 
@@ -148,42 +89,4 @@ pub async fn run(deps: &Deps, prompt: &str) -> Result<()> {
             .await?;
     println!("\n[comrade] done in {} iteration(s).", outcome.iterations);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::auto_question_answer;
-
-    #[test]
-    fn auto_prefers_recommended_over_first_option() {
-        let options = vec!["single".to_string(), "double".to_string()];
-        assert_eq!(
-            auto_question_answer(&options, Some("double")).as_deref(),
-            Some("double")
-        );
-    }
-
-    #[test]
-    fn auto_falls_back_to_first_option() {
-        let options = vec!["single".to_string(), "double".to_string()];
-        assert_eq!(
-            auto_question_answer(&options, None).as_deref(),
-            Some("single")
-        );
-        // A blank recommended value is ignored.
-        assert_eq!(
-            auto_question_answer(&options, Some("  ")).as_deref(),
-            Some("single")
-        );
-    }
-
-    #[test]
-    fn auto_returns_none_without_any_hint() {
-        assert_eq!(auto_question_answer(&[], None), None);
-        assert_eq!(auto_question_answer(&[], Some("  ")), None);
-        assert_eq!(
-            auto_question_answer(&[], Some("free text")).as_deref(),
-            Some("free text")
-        );
-    }
 }

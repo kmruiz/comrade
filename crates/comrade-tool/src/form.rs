@@ -73,6 +73,19 @@ pub enum FieldKind {
     Select { options: Vec<String> },
     /// Boolean toggle; the value is `"true"` or `"false"`.
     Checkbox,
+    /// Pick one of several code diffs (e.g. two competing patches). Rendered as
+    /// the diffs themselves; the value is the chosen option's `label`.
+    DiffChoice { options: Vec<DiffOption> },
+}
+
+/// One candidate in a [`FieldKind::DiffChoice`]: a label plus the diff text to
+/// show for it (a unified diff, or plain lines where `+`/`-` mark changes).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiffOption {
+    /// Human-readable label handed back as the answer when this option is chosen.
+    pub label: String,
+    /// The code diff shown for this option.
+    pub diff: String,
 }
 
 impl FormSpec {
@@ -114,7 +127,7 @@ impl FormSpec {
 impl FormField {
     /// The value this field starts with: its `recommended` value if set, else
     /// its `default`, else a kind-appropriate seed (number's `min`, a select's
-    /// first option, checkbox off).
+    /// or diff-choice's first option, checkbox off).
     pub fn initial_value(&self) -> String {
         // A recommended value wins over the plain default (and is checked
         // against min/max-free parsing like a default).
@@ -132,6 +145,9 @@ impl FormField {
                 min.map(fmt_num).unwrap_or_else(|| "0".to_string())
             }
             (FieldKind::Select { options }, None) => options.first().cloned().unwrap_or_default(),
+            (FieldKind::DiffChoice { options }, None) => {
+                options.first().map(|o| o.label.clone()).unwrap_or_default()
+            }
             _ => String::new(),
         }
     }
@@ -264,6 +280,35 @@ mod tests {
         assert_eq!(v["breakfast"], "true");
         assert_eq!(v["date"], "");
         assert_eq!(v["notes"], "none");
+    }
+
+    #[test]
+    fn parses_diff_choice_field() {
+        let spec = parse(json!({
+            "fields": [
+                { "id": "pick", "label": "Choose a patch", "kind": "diff_choice",
+                  "options": [
+                      { "label": "A", "diff": "-old\n+new" },
+                      { "label": "B", "diff": "-old\n+other" }
+                  ] }
+            ]
+        }));
+        assert!(matches!(spec.fields[0].kind, FieldKind::DiffChoice { .. }));
+        // Without a recommended value the first option's label is the seed.
+        assert_eq!(spec.fields[0].initial_value(), "A");
+
+        // A recommended label wins over the first option.
+        let spec = parse(json!({
+            "fields": [
+                { "id": "pick", "label": "Choose a patch", "kind": "diff_choice",
+                  "recommended": "B",
+                  "options": [
+                      { "label": "A", "diff": "-old\n+new" },
+                      { "label": "B", "diff": "-old\n+other" }
+                  ] }
+            ]
+        }));
+        assert_eq!(spec.fields[0].initial_value(), "B");
     }
 
     #[test]

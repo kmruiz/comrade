@@ -123,6 +123,11 @@ pub(crate) enum MsgKind {
     Tool,
     /// Small grey status note ("run finished", "plan finished", ...).
     Meta,
+    /// A question the agent asked the human (an ask_form form) and the human's
+    /// answer to it, recorded in the transcript. Unlike tool cards and grey
+    /// notes it survives focus mode, so a focused transcript still shows what
+    /// was asked.
+    Question,
     /// A collapsed failing-test block.
     Failure,
     /// The model's reasoning between actions, rendered as a brain-headed spoken
@@ -408,7 +413,8 @@ impl FormEdit {
                     self.toggle(spec);
                 }
             }
-            Some(FieldKind::Select { .. }) => {} // options are chosen with ←/→
+            // Select/diff-choice options are chosen with ←/→, not typed.
+            Some(FieldKind::Select { .. }) | Some(FieldKind::DiffChoice { .. }) => {}
             Some(FieldKind::Number { .. }) => {
                 if (c.is_ascii_digit() || c == '.')
                     && let Some(v) = self.value_mut()
@@ -490,6 +496,18 @@ impl FormEdit {
                 let next = (cur + dir).rem_euclid(n) as usize;
                 if let Some(v) = self.value_mut() {
                     *v = options[next].clone();
+                }
+            }
+            FieldKind::DiffChoice { options } if !options.is_empty() => {
+                let n = options.len() as i32;
+                let cur = self
+                    .values
+                    .get(self.sel)
+                    .and_then(|v| options.iter().position(|o| &o.label == v))
+                    .unwrap_or(0) as i32;
+                let next = (cur + dir).rem_euclid(n) as usize;
+                if let Some(v) = self.value_mut() {
+                    *v = options[next].label.clone();
                 }
             }
             FieldKind::Date => {
@@ -2819,19 +2837,21 @@ impl App {
 
     fn answer_top(&mut self, reply: UserReply) {
         if !self.dialogs.is_empty() {
-            let text = match &reply {
-                UserReply::Answer(a) => format!("answer: {a}"),
-                UserReply::Denied => "dismissed".to_string(),
+            let (kind, text) = match &reply {
+                UserReply::Answer(a) => (MsgKind::Meta, format!("answer: {a}")),
+                UserReply::Denied => (MsgKind::Meta, "dismissed".to_string()),
+                // A submitted answer is part of the question exchange, so it
+                // stays visible in focus mode like the question itself.
                 UserReply::Form(answers) => {
                     let shown = answers
                         .iter()
-                        .map(|(k, v)| format!("{k}={v}"))
+                        .map(|(k, v)| format!("{k} = {v}"))
                         .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("form submitted: {shown}")
+                        .join("\n");
+                    (MsgKind::Question, format!("form submitted:\n{shown}"))
                 }
             };
-            self.push_msg(Msg::text(MsgKind::Meta, text));
+            self.push_msg(Msg::text(kind, text));
             let d = self.dialogs.remove(0);
             let _ = d.reply.send(reply);
         }
@@ -2973,33 +2993,11 @@ impl App {
     }
 
     fn answer_from_buf(&mut self) {
-        let can_submit = self.dialogs.first().is_some_and(|d| match &d.prompt {
-            UserPrompt::Question { .. } => !d.buf.trim().is_empty(),
-            _ => true,
-        });
-        if !can_submit {
-            return;
-        }
         let reply = match self.dialogs.first_mut() {
             Some(d) => UserReply::Answer(std::mem::take(&mut d.buf)),
             None => return,
         };
         self.answer_top(reply);
-    }
-
-    fn pick_option(&mut self, n: usize) {
-        let pick = match self.dialogs.first() {
-            Some(d) => match &d.prompt {
-                UserPrompt::Question { options, .. } if n >= 1 && n <= options.len() => {
-                    Some(options[n - 1].clone())
-                }
-                _ => None,
-            },
-            None => None,
-        };
-        if let Some(p) = pick {
-            self.answer_top(UserReply::Answer(p));
-        }
     }
 
     /// Submit the form on top of the dialog stack as a `UserReply::Form`.
@@ -3454,12 +3452,18 @@ pub async fn run(deps: &Deps) -> Result<()> {
                 match ask {
                     Some(ask) => {
                         // Auto-accept mode answers any prompt that carries a
-                        // recommended value (a confirm, or a question/form with
+                        // recommended value (a confirm, or a form with
                         // recommendations) without asking the human.
                         if app.auto_accept
                             && let Some(reply) = auto_reply(&ask.prompt)
                         {
                             let label = auto_reply_label(&ask.prompt);
+                            if let UserPrompt::Form(spec) = &ask.prompt {
+                                app.push_msg(Msg::text(
+                                    MsgKind::Question,
+                                    form_question_text(spec),
+                                ));
+                            }
                             let _ = ask.reply.send(reply);
                             app.push_msg(Msg::text(MsgKind::Meta, label));
                         } else {
@@ -3467,17 +3471,15 @@ pub async fn run(deps: &Deps) -> Result<()> {
                                 UserPrompt::Form(spec) => Some(FormEdit::new(spec)),
                                 _ => None,
                             };
-                            // A free-text question prefills its recommended answer.
-                            let buf = match &ask.prompt {
-                                UserPrompt::Question {
-                                    options,
-                                    recommended,
-                                    ..
-                                } if options.is_empty() => {
-                                    recommended.clone().unwrap_or_default()
-                                }
-                                _ => String::new(),
-                            };
+                            // Record the question in the transcript so it stays
+                            // visible in focus mode (the dialog alone is not).
+                            if let UserPrompt::Form(spec) = &ask.prompt {
+                                app.push_msg(Msg::text(
+                                    MsgKind::Question,
+                                    form_question_text(spec),
+                                ));
+                            }
+                            let buf = String::new();
                             app.dialogs.push(Dialog { prompt: ask.prompt, buf, reply: ask.reply, session: ask.session, form });
                             app.dialog_ask = false;
                             app.dialog_conv.clear();
@@ -3950,17 +3952,6 @@ fn handle_dialog_key(app: &mut App, code: KeyCode) -> bool {
                 app.answer_from_buf();
             }
         }
-        KeyCode::Char(c) if ('1'..='9').contains(&c) && !app.dialog_ask => {
-            let n = c.to_digit(10).unwrap_or(0) as usize;
-            let handled = app.dialogs.first().is_some_and(|d| {
-                matches!(&d.prompt, UserPrompt::Question { options, .. } if n >= 1 && n <= options.len())
-            });
-            if handled {
-                app.pick_option(n);
-            } else if !is_confirm {
-                app.dialogs.first_mut().unwrap().buf.push(c);
-            }
-        }
         KeyCode::Char(c) => {
             if let Some(d) = app.dialogs.first_mut() {
                 d.buf.push(c);
@@ -4133,12 +4124,17 @@ fn toggle_section(collapsed: &mut Vec<bool>, chat: &[Msg], running: bool, msg_id
 }
 
 /// Whether a message produces any row in focus mode: the spoken conversation
-/// (user turn, model reply, delegate advisory) and the model reasoning. Tool
-/// cards, failure blocks and grey status notes are dropped; a folded run
-/// digest survives only as the reasoning inside it.
+/// (user turn, model reply, delegate advisory), the model reasoning and the
+/// questions the agent asked (ask_form). Tool cards, failure blocks and grey
+/// status notes are dropped; a folded run digest survives only as the
+/// reasoning inside it.
 fn focus_visible(msg: &Msg) -> bool {
     match msg.kind {
-        MsgKind::User | MsgKind::Assistant | MsgKind::Delegate | MsgKind::Reasoning => true,
+        MsgKind::User
+        | MsgKind::Assistant
+        | MsgKind::Delegate
+        | MsgKind::Reasoning
+        | MsgKind::Question => true,
         MsgKind::Run => msg.children.iter().any(|c| c.kind == MsgKind::Reasoning),
         MsgKind::Tool | MsgKind::Failure | MsgKind::Meta => false,
     }
@@ -5232,6 +5228,18 @@ fn layout_chat_rows(
                     out.push(RenderRow {
                         rule: None,
                         spans: vec![Span::styled(s, dim)],
+                        tool_header: None,
+                    });
+                }
+            }
+            MsgKind::Question => {
+                // The agent asked the human something (ask_form): a yellow entry
+                // that stays visible in focus mode, unlike the grey Meta notes.
+                let style = Style::default().fg(Color::Yellow);
+                for s in plain_wrap(&msg.text, width) {
+                    out.push(RenderRow {
+                        rule: None,
+                        spans: vec![Span::styled(s, style)],
                         tool_header: None,
                     });
                 }
@@ -6993,6 +7001,21 @@ fn draw_mcp_servers(view: &McpServersView, frame: &mut Frame) {
     );
 }
 
+/// A compact transcript description of a form question: its title (or
+/// "Question" when untitled) followed by one line per field (`label (id)`), so
+/// the answers recorded later can be read against what was asked.
+fn form_question_text(spec: &FormSpec) -> String {
+    let mut s = if spec.title.trim().is_empty() {
+        "Question".to_string()
+    } else {
+        spec.title.trim().to_string()
+    };
+    for f in &spec.fields {
+        s.push_str(&format!("\n  {} ({})", f.label, f.id));
+    }
+    s
+}
+
 /// One line of a form dialog: focus arrow, label, required marker and the
 /// component's current rendering (text box, spinner, date, select, checkbox).
 fn form_field_line(field: &comrade_tool::FormField, value: &str, focused: bool) -> Line<'static> {
@@ -7034,7 +7057,7 @@ fn form_field_line(field: &comrade_tool::FormField, value: &str, focused: bool) 
             ),
             Style::default().fg(Color::Green),
         ),
-        FieldKind::Number { .. } | FieldKind::Select { .. } => {
+        FieldKind::Number { .. } | FieldKind::Select { .. } | FieldKind::DiffChoice { .. } => {
             (format!("‹ {value} ›"), Style::default().fg(Color::Green))
         }
         FieldKind::Checkbox => (
@@ -7070,10 +7093,6 @@ fn form_field_line(field: &comrade_tool::FormField, value: &str, focused: bool) 
 fn auto_reply(prompt: &UserPrompt) -> Option<UserReply> {
     match prompt {
         UserPrompt::Confirm { .. } => Some(UserReply::Answer("yes".into())),
-        UserPrompt::Question { recommended, .. } => recommended
-            .as_deref()
-            .filter(|r| !r.trim().is_empty())
-            .map(|r| UserReply::Answer(r.to_string())),
         UserPrompt::Form(spec) => {
             let values = spec.initial_values();
             spec.is_complete(&values).then_some(UserReply::Form(values))
@@ -7093,10 +7112,6 @@ fn auto_reply_label(prompt: &UserPrompt) -> String {
                 format!("auto-accept → approved: {action}")
             }
         }
-        UserPrompt::Question { recommended, .. } => format!(
-            "auto-accept → answered (recommended): {}",
-            recommended.as_deref().unwrap_or("").trim()
-        ),
         UserPrompt::Form(_) => "auto-accept → form submitted".to_string(),
     }
 }
@@ -7111,53 +7126,7 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     let is_form = matches!(dialog.prompt, UserPrompt::Form(_));
 
     // Build the body lines for the kind of prompt, wrapped to the popup width.
-    let (kind_label, is_question, options, mut body) = match &dialog.prompt {
-        UserPrompt::Question {
-            prompt,
-            options,
-            recommended,
-        } => {
-            let text = if options.is_empty() {
-                format!("{prompt}\n\n(Type your answer below)")
-            } else {
-                prompt.clone()
-            };
-            let recommended = recommended.as_deref().filter(|r| !r.trim().is_empty());
-            let mut lines = preview_lines(&text, inner_w);
-            for (i, o) in options.iter().enumerate() {
-                let num = format!("{}. ", i + 1);
-                let num_style = Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD);
-                let is_recommended = recommended == Some(o.as_str());
-                let wrapped = wrap_plain(o, inner_w.saturating_sub(num.len()));
-                if wrapped.is_empty() {
-                    lines.push(Line::from(Span::styled(num, num_style)));
-                    continue;
-                }
-                let last = wrapped.len() - 1;
-                for (j, chunk) in wrapped.into_iter().enumerate() {
-                    let mut spans: Vec<Span<'static>> = Vec::new();
-                    if j == 0 {
-                        spans.push(Span::styled(num.clone(), num_style));
-                    } else {
-                        // Align continuation lines under the option text.
-                        spans.push(Span::raw(" ".repeat(num.len())));
-                    }
-                    spans.push(Span::styled(chunk, Style::default().fg(Color::Cyan)));
-                    if is_recommended && j == last {
-                        spans.push(Span::styled(
-                            " (recommended)",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
-                        ));
-                    }
-                    lines.push(Line::from(spans));
-                }
-            }
-            (" question ", true, options.clone(), lines)
-        }
+    let (kind_label, mut body) = match &dialog.prompt {
         UserPrompt::Confirm { title, diff } => {
             let mut lines = Vec::new();
             // The actual action (e.g. the shell command) goes on top so the
@@ -7174,7 +7143,7 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
                 let conv = app.dialog_conv.join("\n");
                 lines.extend(preview_lines(&conv, inner_w));
             }
-            (" confirm  [y/n] ", false, Vec::new(), lines)
+            (" confirm  [y/n] ", lines)
         }
         UserPrompt::Form(spec) => {
             let mut lines = Vec::new();
@@ -7195,8 +7164,16 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
                     .cloned()
                     .unwrap_or_else(|| f.initial_value());
                 lines.push(form_field_line(f, &value, focused));
+                // A diff-choice field shows the diff of its currently-selected
+                // option so the human can read the patch before deciding.
+                if let FieldKind::DiffChoice { options } = &f.kind
+                    && let Some(opt) = options.iter().find(|o| o.label == value)
+                {
+                    lines.push(Line::from(""));
+                    lines.extend(preview_lines(&opt.diff, inner_w));
+                }
             }
-            (" form ", true, Vec::new(), lines)
+            (" form ", lines)
         }
     };
     if body.is_empty() {
@@ -7215,12 +7192,8 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     frame.render_widget(Clear, popup);
 
     let mut kind_label = kind_label;
-    let mut border_color = if is_question {
-        Color::Cyan
-    } else {
-        Color::Yellow
-    };
-    if app.dialog_ask && !is_question {
+    let mut border_color = if is_form { Color::Cyan } else { Color::Yellow };
+    if app.dialog_ask {
         kind_label = " confirm  [ask the model] ";
         border_color = Color::Magenta;
     }
@@ -7260,10 +7233,6 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     // Hint row.
     let hint = if is_form {
         "up/down: field    left/right: adjust    space: toggle    enter: submit    esc: cancel"
-    } else if is_question && !options.is_empty() {
-        "number: pick    type + enter: submit    esc: cancel"
-    } else if is_question {
-        "type + enter: submit    esc: cancel"
     } else if app.dialog_ask {
         "type a question + enter: ask the model    esc: back to y/n"
     } else {
@@ -7277,37 +7246,6 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
         row_layout[2],
     );
     let _ = app;
-}
-
-/// Greedy word-wrap of plain text into lines of at most `width` columns.
-/// Over-long words are hard-split. Used to fit the dialog's option text.
-fn wrap_plain(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out: Vec<String> = Vec::new();
-    for raw in text.split('\n') {
-        let mut cur = String::new();
-        for word in raw.split_whitespace() {
-            if cur.is_empty() {
-                cur = word.to_string();
-            } else if cur.chars().count() + 1 + word.chars().count() <= width {
-                cur.push(' ');
-                cur.push_str(word);
-            } else {
-                out.push(std::mem::take(&mut cur));
-                cur = word.to_string();
-            }
-            while cur.chars().count() > width {
-                let head: String = cur.chars().take(width).collect();
-                out.push(head);
-                cur = cur.chars().skip(width).collect();
-            }
-        }
-        out.push(cur);
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
 }
 
 /// Pretty-print a free-form preview (approval diff bodies). Highlights
@@ -8002,6 +7940,28 @@ mod tests {
     }
 
     #[test]
+    fn form_edit_cycles_diff_choice_and_ignores_typing() {
+        let spec = form_spec(serde_json::json!({
+            "fields": [
+                { "id": "pick", "label": "Pick a patch", "kind": "diff_choice",
+                  "options": [
+                      { "label": "A", "diff": "-old\n+new" },
+                      { "label": "B", "diff": "-old\n+other" }
+                  ] }
+            ]
+        }));
+        let mut edit = FormEdit::new(&spec);
+        assert_eq!(edit.values[0], "A"); // the first option seeds the field
+        edit.adjust(&spec, 1);
+        assert_eq!(edit.values[0], "B");
+        edit.adjust(&spec, 1);
+        assert_eq!(edit.values[0], "A"); // wraps around
+        edit.input(&spec, 'x');
+        assert_eq!(edit.values[0], "A"); // typing is ignored
+        assert_eq!(edit.answers(&spec)["pick"], "A");
+    }
+
+    #[test]
     fn form_edit_clamps_numbers_cycles_selects_and_toggles() {
         let spec = form_spec(serde_json::json!({
             "fields": [
@@ -8044,20 +8004,6 @@ mod tests {
             }),
             Some(UserReply::Answer(a)) if a == "yes"
         ));
-        // A question with a recommended answer is auto-answered with it.
-        let q = UserPrompt::Question {
-            prompt: "Which?".into(),
-            options: vec!["a".into(), "b".into()],
-            recommended: Some("b".into()),
-        };
-        assert!(matches!(auto_reply(&q), Some(UserReply::Answer(a)) if a == "b"));
-        // Without a recommended answer the question is still shown.
-        let q2 = UserPrompt::Question {
-            prompt: "Which?".into(),
-            options: vec![],
-            recommended: None,
-        };
-        assert!(auto_reply(&q2).is_none());
         // A form whose required field has a recommended value auto-submits.
         let ok = form_spec(serde_json::json!({
             "fields": [{ "id": "n", "label": "N", "kind": "text", "required": true, "recommended": "hi" }]
@@ -8075,15 +8021,6 @@ mod tests {
 
     #[test]
     fn auto_reply_label_names_the_action() {
-        let q = UserPrompt::Question {
-            prompt: "?".into(),
-            options: vec![],
-            recommended: Some("b".into()),
-        };
-        assert_eq!(
-            auto_reply_label(&q),
-            "auto-accept → answered (recommended): b"
-        );
         let f = form_spec(
             serde_json::json!({ "fields": [{ "id": "n", "label": "N", "kind": "text" }] }),
         );
@@ -8571,6 +8508,8 @@ mod tests {
             "model",
             "thinking"
         )));
+        // A question the agent asked (ask_form) survives focus mode.
+        assert!(focus_visible(&Msg::text(MsgKind::Question, "Pick a patch")));
         // Tool/Failure/Meta are hidden
         assert!(!focus_visible(&card()));
         assert!(!focus_visible(&Msg::failure(
@@ -8578,6 +8517,25 @@ mod tests {
             "failed".into()
         )));
         assert!(!focus_visible(&Msg::text(MsgKind::Meta, "status")));
+    }
+
+    #[test]
+    fn form_question_text_lists_title_and_fields() {
+        let spec = form_spec(serde_json::json!({
+            "title": "Pick a patch",
+            "fields": [
+                { "id": "pick", "label": "Which patch?", "kind": "text" }
+            ]
+        }));
+        assert_eq!(
+            form_question_text(&spec),
+            "Pick a patch\n  Which patch? (pick)"
+        );
+        // An untitled form falls back to a plain "Question" heading.
+        let untitled = form_spec(serde_json::json!({
+            "fields": [{ "id": "n", "label": "N", "kind": "number" }]
+        }));
+        assert_eq!(form_question_text(&untitled), "Question\n  N (n)");
     }
 
     #[test]
@@ -10781,26 +10739,6 @@ mod plan_step_tests {
             plan_glyph(&PlanStatus::InProgress, 0),
             plan_glyph(&PlanStatus::InProgress, 100)
         );
-    }
-
-    #[test]
-    fn wrap_plain_wraps_within_width() {
-        let w = wrap_plain("alpha beta gamma delta epsilon", 12);
-        assert!(w.iter().all(|l| l.chars().count() <= 12), "{w:?}");
-        assert_eq!(w.join(" "), "alpha beta gamma delta epsilon");
-    }
-
-    #[test]
-    fn wrap_plain_hard_splits_long_words() {
-        let w = wrap_plain("supercalifragilistic", 8);
-        assert!(w.iter().all(|l| l.chars().count() <= 8), "{w:?}");
-        assert_eq!(w.join(""), "supercalifragilistic");
-    }
-
-    #[test]
-    fn wrap_plain_keeps_explicit_newlines() {
-        let w = wrap_plain("one\ntwo", 40);
-        assert_eq!(w, vec!["one".to_string(), "two".to_string()]);
     }
 
     #[test]

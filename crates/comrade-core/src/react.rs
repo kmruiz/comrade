@@ -709,13 +709,13 @@ mod dev_prompt_tests {
         assert!(prompt.contains("ADR"), "{prompt}");
         assert!(prompt.contains("glossary"), "{prompt}");
         // The default loop looks memory up BEFORE planning and clarifies via
-        // ask_user when a concept is unclear and not in the glossary.
+        // ask_form when a concept is unclear and not in the glossary.
         assert!(prompt.contains("read memory BEFORE planning"), "{prompt}");
         assert!(
             prompt.contains("ADRs relevant to the new functionality"),
             "{prompt}"
         );
-        assert!(prompt.contains("ask_user before you plan"), "{prompt}");
+        assert!(prompt.contains("ask_form before you plan"), "{prompt}");
         assert!(prompt.contains("find_adr"), "{prompt}");
         assert!(prompt.contains("read_adr"), "{prompt}");
         assert!(prompt.contains("find_glossary"), "{prompt}");

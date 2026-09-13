@@ -13,7 +13,7 @@
 //! - The delegate's tool registry excludes `git_commit` (only the tech lead
 //!   commits), the session/UI tools (`self_set_plan`, `self_update_plan`,
 //!   `self_set_step_model`, `self_finish_plan`, `self_rename_session`,
-//!   `self_set_status_bar`, `ask_user`) and `delegate` itself (no recursion).
+//!   `self_set_status_bar`, `ask_form`) and `delegate` itself (no recursion).
 //!   See [`DENIED_FOR_DELEGATES`].
 //! - The delegate tool call is not approval-gated by default: delegating runs
 //!   directly (like `git_commit`/`pom_run_task`/`pom_run_tests`), and every nested tool
@@ -52,7 +52,7 @@ pub const DENIED_FOR_DELEGATES: &[&str] = &[
     "git_commit",
     "delegate",
     "ask_advise",
-    "ask_user",
+    "ask_form",
     "self_rename_session",
     "self_set_status_bar",
     "self_set_plan",
@@ -1747,7 +1747,7 @@ mod tests {
     fn deny_list_keeps_commit_and_session_tools_away_but_not_work_tools() {
         assert!(DelegateTool::denied_for_delegates("git_commit"));
         assert!(DelegateTool::denied_for_delegates("delegate"));
-        assert!(DelegateTool::denied_for_delegates("ask_user"));
+        assert!(DelegateTool::denied_for_delegates("ask_form"));
         assert!(DelegateTool::denied_for_delegates("self_set_plan"));
         assert!(DelegateTool::denied_for_delegates("self_update_plan"));
         assert!(DelegateTool::denied_for_delegates("self_set_step_model"));

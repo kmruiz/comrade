@@ -45,7 +45,6 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(SelfSetStepContext),
         Box::new(SelfFinishPlan),
         Box::new(SelfSetStatusBar),
-        Box::new(AskUser),
         Box::new(AskForm),
     ]
 }
@@ -557,63 +556,6 @@ impl Tool for SelfSetStatusBar {
 }
 
 // ---------------------------------------------------------------------------
-// ask_user
-// ---------------------------------------------------------------------------
-
-struct AskUser;
-
-static ASK_USER_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
-    ToolSpec {
-    name: "ask_user".into(),
-    description: "Ask the human a single, concise question and wait for their answer. The dialog that shows this is small, so ask exactly one short question and keep it brief. Optionally supply up to 4 short answer options (each a brief phrase) so the human can pick instead of typing; omit options for free-form input. Use to resolve ambiguity, request confirmation, or let them pick between options. Prefer over guessing when a choice materially matters. Optionally set `recommended` to the answer you suggest (consult another agent with ask_advise if unsure); it is flagged in the UI and used automatically in auto mode.".into(),
-    json_schema: json!({
-        "type": "object",
-        "properties": {
-            "question": { "type": "string", "description": "A single short question (the dialog space is limited)." },
-            "options": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Optional predefined answers: at most 4 short options (brief phrases). Omit for free-form input."
-            },
-            "recommended": { "type": "string", "description": "Suggested answer. When it matches one of `options` that option is flagged 'recommended' in the UI; in auto mode the question is answered with it. Get a good value by consulting another agent with ask_advise/delegate rather than guessing." }
-        },
-        "required": ["question"],
-        "additionalProperties": false
-    }),
-}
-});
-
-#[async_trait]
-impl Tool for AskUser {
-    fn spec(&self) -> &ToolSpec {
-        &ASK_USER_SPEC
-    }
-
-    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Args {
-            question: String,
-            #[serde(default)]
-            options: Vec<String>,
-            #[serde(default)]
-            recommended: Option<String>,
-        }
-        let args: Args = serde_json::from_value(args)?;
-        let prompt = UserPrompt::Question {
-            prompt: args.question,
-            options: args.options,
-            recommended: args.recommended,
-        };
-        let reply = ctx.user.ask(prompt).await?;
-        Ok(match reply {
-            UserReply::Answer(answer) => answer,
-            UserReply::Form(_) => String::new(),
-            UserReply::Denied => "(user dismissed the question)".to_string(),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ask_form
 // ---------------------------------------------------------------------------
 
@@ -637,8 +579,8 @@ static ASK_FORM_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
                             "label": { "type": "string", "description": "Human-readable label." },
                             "kind": { 
                                 "type": "string", 
-                                "enum": ["text", "number", "date", "select", "checkbox"],
-                                "description": "Component type: text, number, date, select, or checkbox."
+                                "enum": ["text", "number", "date", "select", "checkbox", "diff_choice"],
+                                "description": "Component type: text, number, date, select, checkbox, or diff_choice."
                             },
                             "required": { "type": "boolean", "description": "Field must be filled to submit." },
                             "default": { "type": "string", "description": "Optional initial value." },
@@ -649,8 +591,16 @@ static ASK_FORM_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
                             "step": { "type": "number", "description": "Step size for number spinners." },
                             "options": { 
                                 "type": "array", 
-                                "items": { "type": "string" },
-                                "description": "Options for select dropdowns."
+                                "items": {
+                                    "anyOf": [
+                                        { "type": "string" },
+                                        { "type": "object", "properties": {
+                                            "label": { "type": "string", "description": "Human-readable label handed back as the answer when chosen." },
+                                            "diff": { "type": "string", "description": "The code diff to show (unified diff, or +/- lines)." }
+                                        }, "required": ["label", "diff"], "additionalProperties": false }
+                                    ]
+                                },
+                                "description": "For select: the option strings. For diff_choice: at least two {label, diff} objects the human picks between (the chosen label is the answer)."
                             }
                         },
                         "required": ["id", "label", "kind"],
@@ -698,8 +648,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AskForm, AskUser, SelfFinishPlan, SelfSetPlan, SelfSetStepContext, SelfSetStepModel,
-        SelfUpdatePlan,
+        AskForm, SelfFinishPlan, SelfSetPlan, SelfSetStepContext, SelfSetStepModel, SelfUpdatePlan,
     };
 
     /// A real-enough session: stores the plan and which steps the `delegate`
@@ -846,7 +795,6 @@ mod tests {
         async fn ask(&self, _p: UserPrompt) -> Result<UserReply> {
             match _p {
                 UserPrompt::Form(spec) => Ok(UserReply::Form(spec.initial_values())),
-                UserPrompt::Question { .. } => Ok(UserReply::Answer("yes".into())),
                 UserPrompt::Confirm { .. } => Ok(UserReply::Answer("yes".into())),
             }
         }
@@ -1243,24 +1191,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_user_passes_recommended_through() {
-        use std::sync::Mutex as StdMutex;
+    async fn ask_form_accepts_a_diff_choice_field() {
+        use comrade_tool::FieldKind;
+        use std::collections::BTreeMap;
 
-        struct RecIo(Arc<StdMutex<Option<UserPrompt>>>);
+        struct PickIo;
         #[async_trait]
-        impl UserIo for RecIo {
+        impl UserIo for PickIo {
             async fn ask(&self, prompt: UserPrompt) -> Result<UserReply> {
-                *self.0.lock().unwrap() = Some(prompt);
-                Ok(UserReply::Answer("ok".into()))
+                match prompt {
+                    UserPrompt::Form(spec) => {
+                        // The diff_choice parsed with both candidate diffs.
+                        match spec.fields[0].kind {
+                            FieldKind::DiffChoice { ref options } => {
+                                assert_eq!(options.len(), 2);
+                                assert_eq!(options[1].label, "B");
+                            }
+                            ref other => panic!("expected diff_choice, got {other:?}"),
+                        }
+                        Ok(UserReply::Form(BTreeMap::from([(
+                            "pick".into(),
+                            "B".into(),
+                        )])))
+                    }
+                    other => panic!("unexpected prompt: {other:?}"),
+                }
             }
         }
 
-        let seen = Arc::new(StdMutex::new(None));
         let ctx = ToolContext {
             project_root: PathBuf::from("/tmp/x"),
             cwd: PathBuf::from("/tmp/x"),
             session: Arc::new(StubSession::with_plan(vec![])),
-            user: Arc::new(RecIo(seen.clone())),
+            user: Arc::new(PickIo),
             undo: Arc::new(NoopUndo),
             auto_approve: true,
             approval: Arc::new(Mutex::new(None)),
@@ -1270,29 +1233,22 @@ mod tests {
             stop: None,
         };
 
-        let out = AskUser
+        let out = AskForm
             .invoke(
                 &ctx,
                 json!({
-                    "question": "Which room?",
-                    "options": ["single", "double"],
-                    "recommended": "double"
+                    "title": "Pick a patch",
+                    "fields": [
+                        { "id": "pick", "label": "Which patch?", "kind": "diff_choice",
+                          "options": [
+                              { "label": "A", "diff": "-let x = 1;\n+let x = 2;" },
+                              { "label": "B", "diff": "-let x = 1;\n+let x = 3;" }
+                          ] }
+                    ]
                 }),
             )
             .await
             .unwrap();
-        assert_eq!(out, "ok");
-        match seen.lock().unwrap().take() {
-            Some(UserPrompt::Question {
-                prompt,
-                options,
-                recommended,
-            }) => {
-                assert_eq!(prompt, "Which room?");
-                assert_eq!(options, vec!["single".to_string(), "double".to_string()]);
-                assert_eq!(recommended.as_deref(), Some("double"));
-            }
-            other => panic!("unexpected prompt: {other:?}"),
-        }
+        assert_eq!(out, "pick = B");
     }
 }

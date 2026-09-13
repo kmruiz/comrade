@@ -45,7 +45,7 @@ Reuses the Autonomy enum (ask/auto/deny). Delegates with ask/deny are annotated 
 Replaces the former unconditional "no approval" wording.
 
 ## ask_form
-> Session tool (crates/comrade-tool-session) that renders an agent-described interactive form in the chat and returns the human's answers as `id = value` lines. The form is defined by a FormSpec (JSON).
+> Session tool (crates/comrade-tool-session) that renders an agent-described interactive form in the chat and returns the human's answers as `id = value` lines. The form is defined by a FormSpec (JSON). Supersedes the removed `ask_user`/`UserPrompt::Question`: a plain question is now a single-field form (a select for bounded options, a text field for free input).
 
 **References:**
 - `crates/comrade-tool/src/form.rs`
@@ -53,17 +53,17 @@ Replaces the former unconditional "no approval" wording.
 - `crates/comrade-tui/src/tui.rs`
 
 **Notes:**
-Enabled by the UserPrompt::Form(FormSpec) / UserReply::Form(BTreeMap<String,String>) variants on the UserIo contract.
+Enabled by the UserPrompt::Form(FormSpec) / UserReply::Form(BTreeMap<String,String>) variants on the UserIo contract. Added FieldKind::DiffChoice (diff_choice) for picking between code diffs. The TUI records a MsgKind::Question transcript entry when a form is asked (and when it is answered) so the question stays visible in focus mode.
 
 ## ask_user dialog
-> The TUI modal shown for a `UserPrompt::Question` (from the `ask_user` tool) and for a `UserPrompt::Confirm` (permission/approval of mutating tools). Rendered by `draw_dialog`.
+> The TUI modal rendered by `draw_dialog`. It shows a `UserPrompt::Confirm` (permission/approval of mutating tools) in yellow, or a `UserPrompt::Form` (ask_form) in cyan with an editable `FormEdit`. The old `UserPrompt::Question`/`ask_user` dialog was removed (ask_form supersedes it).
 
 **References:**
-- `crates/comrade-tui/src/tui.rs (draw_dialog ~line 5499, wrap_plain ~line 5633)`
-- `crates/comrade-tool-session/src/lib.rs (ASK_USER_SPEC ~line 562)`
+- `crates/comrade-tui/src/tui.rs (draw_dialog)`
+- `crates/comrade-tool-session/src/lib.rs (ASK_FORM_SPEC)`
 
 **Notes:**
-The dialog wraps its body/options to the popup's real inner width (popup = min(area.width-2, 100) wide, minus 2 border cols), sizes its height to `body.len() + 4` (2 borders + input row + hint row) clamped to the terminal, and anchors the body to the TOP so the question/action is never scrolled out of view. Option text wraps via `wrap_plain` and continuation lines are space-padded under the number. Because space is limited, the `ask_user` tool spec instructs the model to ask a single short question with at most 4 short options.
+The dialog wraps its body to the popup's real inner width (popup = min(area.width-2, 100) wide, minus 2 border cols), sizes its height to body.len() + 4 (2 borders + input row + hint row) clamped to the terminal, and anchors the body to the TOP so the action/question is never scrolled out of view. Forms edit inline in the body (up/down field, left/right adjust, space toggle, enter submit); a confirm uses y/n, `?` asks the model about the action, esc cancels.
 
 ## background session
 > A session whose run is still in flight while it is not the active one (its LiveState is parked in its OpenSession slot). Its events keep arriving (routed by session id via on_agent_event_for) and update its own chat/metrics/plan; the session switcher marks it [running].
@@ -109,6 +109,16 @@ Mid-run it is requested via `comrade_tool::CompactRequest` and honoured by `run_
 **Notes:**
 Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by render_row_line's `sub: Option<Color>` param. Folded MsgKind::Run digests keep no sub-chat styling.
 
+## diff_choice
+> A `FieldKind` variant ("diff_choice") for ask_form: a pick-list whose options carry a code diff each (`DiffOption { label, diff }`). Rendered as the diffs; the answer is the chosen option's `label`. Used to let the human pick between competing patches.
+
+**References:**
+- `crates/comrade-tool/src/form.rs`
+- `crates/comrade-tool-session/src/lib.rs`
+
+**Notes:**
+Defined via a `FieldKind::DiffChoice { options: Vec<DiffOption> }` variant; seeded with the first option's label (or the field's `recommended`). In the TUI, left/right cycle the options and the selected option's `diff` is shown under the field; typing is ignored.
+
 ## enabled (delegate)
 > Per-[[delegates]] boolean (default true). `enabled = false` keeps the entry in config.toml but removes the model from the `delegate`/`ask_advise` targets, their `model` enum and advertised listing (and from the TUI Ctrl-A picker), so it cannot be delegated to; it still shows dimmed with ` (disabled)` in the model panel. Unlike `approval = "deny"` (listed but refused at run time), a disabled delegate is invisible to the tech lead.
 
@@ -153,6 +163,14 @@ Redesigned to be compact: previously 3 inner rows (name / gauge / usage) plus a 
 
 **Notes:**
 Mistral (https://api.mistral.ai/v1) is fully OpenAI-compatible: Bearer auth, /chat/completions, and `GET /models` advertising `max_context_length` (already parsed by model_context_from_openai). `heuristic_context` adds a name-based fallback: 128K (131072) for mistral-*/devstral/pixtral/ministral/magistral, 32K (32768) for codestral. Delegate entries resolve their own provider the same way.
+
+## read window
+> The 1-based inclusive [start_line, end_line] (or [start,end] range) passed to the fs file readers to select lines; clamped to the file's line count, and an empty/reversed window (hi <= lo) or a start past EOF yields an "empty window" message rather than a slice panic.
+
+**References:**
+- `crates/comrade-tool-fs/src/lib.rs:251`
+- `crates/comrade-tool-fs/src/lib.rs:852`
+- `crates/comrade-tool-fs/src/lib.rs:23`
 
 ## readiness handshake
 > ask_advise step=<id> — readiness-check mode of the ask_advise tool: consults the step's OWN delegate (read-only) about whether the step's context suffices to pick it up. Delegate closes with `VERDICT: READY` (step -> PlanStatus::Ready) or `VERDICT: NEEDS_MORE: <requests>` (step stays pending, note "awaiting context: ..."). Fire one call per delegate step in parallel after self_set_plan.

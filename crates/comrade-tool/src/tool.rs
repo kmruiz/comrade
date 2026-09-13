@@ -359,14 +359,6 @@ fn is_affirmative(text: &str) -> bool {
 /// A prompt directed at the human user through the UI.
 #[derive(Debug, Clone)]
 pub enum UserPrompt {
-    /// A free-form question, optionally with predefined answer options and a
-    /// recommended answer (shown with a "recommended" badge and used to
-    /// auto-answer in auto mode).
-    Question {
-        prompt: String,
-        options: Vec<String>,
-        recommended: Option<String>,
-    },
     /// A yes/no confirmation with an optional diff/preview body.
     Confirm { title: String, diff: Option<String> },
     /// A declarative interactive form (custom components) for the human to fill.
@@ -377,7 +369,7 @@ pub enum UserPrompt {
 /// Outcome of routing a prompt to the human.
 #[derive(Debug, Clone)]
 pub enum UserReply {
-    /// The human typed/picked an answer (options resolve to their text).
+    /// The human typed an answer (e.g. `yes`/`no` to a confirmation).
     Answer(String),
     /// The human dismissed the prompt (escaped / cancelled).
     Denied,

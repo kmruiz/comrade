@@ -25,3 +25,12 @@ New enum variants break exhaustive matches on UserPrompt/UserReply across the wo
 
 ## Note
 Addendum (2026-09-13): every form field (`FormField.recommended`) and every `ask_user` question (`UserPrompt::Question.recommended: Option<String>`) can now carry a **recommended** value. It prefills the field / free-text answer and is flagged " (recommended)" for options and form fields in the TUI. Auto-accept mode (M-x toggle, or headless `Autonomy::Auto`) then answers without the human: the question is answered with the recommended value, an option-question likewise, and a form is submitted with all recommended/default values — but only when every required field is satisfied, otherwise the form is still shown. The agent does not have to decide the recommendation alone: it can consult a delegate with `ask_advise` (guidance added to crates/comrade-core/prompts/tools-intro.md). Replaces the earlier "auto mode never auto-accepts forms/questions" scope note.
+
+## Note
+Addendum (2026-09-13): two follow-ups.
+
+1. New component kind `diff_choice`: `FieldKind::DiffChoice { options: Vec<DiffOption> }` where `DiffOption { label, diff }`. The human picks one of several candidate code diffs; the answer is the chosen `label`. Seeded with the first option's label (or the field's `recommended`). The TUI cycles options with left/right (typing ignored) and renders the selected option's `diff` under the field; the ask_form JSON schema advertises `diff_choice` and accepts `{label, diff}` option objects.
+
+2. `ask_user` was removed, together with the whole `UserPrompt::Question` variant and its machinery (the `AskUser` tool, the TUI question dialog, headless `question_on_stdin`/`auto_question_answer`, and the related core prompt/tests). `ask_form` supersedes it: a plain question is a single-field form (a `select` for bounded options, a `text` field for free input), and `recommended` still prefills/auto-answers. `UserReply::Answer` remains (used by `UserPrompt::Confirm`).
+
+3. The TUI now records questions in the transcript so focus mode shows them: a new `MsgKind::Question` (rendered yellow, and `focus_visible` -> true) is pushed when an ask_form form is asked and when it is answered, whereas tool cards and grey `Meta` notes stay hidden in focus mode.

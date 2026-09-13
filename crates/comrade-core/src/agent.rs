@@ -613,7 +613,7 @@ async fn run_agent_loop(
                     .map(|c| c.name.as_str())
                     .unwrap_or("");
                 let is_plan_tool =
-                    matches!(first, "self_set_plan" | "self_rename_session" | "ask_user");
+                    matches!(first, "self_set_plan" | "self_rename_session" | "ask_form");
                 if !is_plan_tool {
                     plan_nudged = true;
                     let msg = "Every task starts with a plan. Call self_set_plan first with your steps - \
@@ -755,7 +755,7 @@ async fn run_agent_loop(
         if !plan_nudged && ctx.session.plan().is_empty() {
             let is_plan_tool = matches!(
                 tool_call.name.as_str(),
-                "self_set_plan" | "self_rename_session" | "ask_user"
+                "self_set_plan" | "self_rename_session" | "ask_form"
             );
             if !is_plan_tool {
                 plan_nudged = true;
