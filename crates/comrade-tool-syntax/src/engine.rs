@@ -878,7 +878,8 @@ fn has_test_attr(node: tree_sitter::Node, text: &str) -> bool {
     false
 }
 
-/// Every test function in the project (across all Rust sources).
+/// Every test case in the project: Rust `#[test]` functions and JS/TS
+/// `it(...)` / `test(...)` / `specify(...)` cases.
 pub fn test_functions(root: &Path) -> Result<Vec<TestFn>> {
     let mut out = Vec::new();
     for (rel, text) in collect_files(root, None, None)? {
@@ -886,46 +887,142 @@ pub fn test_functions(root: &Path) -> Result<Vec<TestFn>> {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        // Test discovery is Rust-only (`#[test]` attributes); other languages
-        // are skipped rather than mis-parsed.
-        if lang_of(ext) != Some(LangId::Rust) {
+        let Some(l) = lang_of(ext) else {
             continue;
-        }
-        let lang = grammar(LangId::Rust);
+        };
+        let lang = grammar(l);
         let mut parser = tree_sitter::Parser::new();
         let _ = parser.set_language(&lang);
         let Some(tree) = parser.parse(&text, None) else {
             continue;
         };
-        let mut stack = vec![tree.root_node()];
-        while let Some(n) = stack.pop() {
-            if n.kind() == "function_item" && has_test_attr(n, &text) {
-                let name = n
-                    .child_by_field_name("name")
-                    .and_then(|c| c.utf8_text(text.as_bytes()).ok())
-                    .unwrap_or("?")
-                    .to_string();
-                let (line, _, _) = locate(&text, n.start_byte());
-                out.push(TestFn {
-                    file: rel.clone(),
-                    line,
-                    name,
-                    body: text[n.byte_range()].to_string(),
-                });
+        match l {
+            LangId::Rust => rust_tests(tree.root_node(), &text, &rel, &mut out),
+            LangId::JavaScript | LangId::TypeScript | LangId::Tsx => {
+                js_tests(tree.root_node(), &text, &rel, &mut out)
             }
-            for i in 0..n.child_count() {
-                if let Some(c) = n.child(i) {
-                    stack.push(c);
-                }
-            }
+            LangId::Css | LangId::Html => {}
         }
     }
     Ok(out)
 }
 
-/// Names of declarations (any depth) defined in one Rust source text.
-pub fn decl_names_in_text(text: &str) -> Vec<String> {
-    let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+/// Rust `#[test]`-annotated functions (any depth).
+fn rust_tests(root: tree_sitter::Node, text: &str, rel: &str, out: &mut Vec<TestFn>) {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "function_item" && has_test_attr(n, text) {
+            let name = n
+                .child_by_field_name("name")
+                .and_then(|c| c.utf8_text(text.as_bytes()).ok())
+                .unwrap_or("?")
+                .to_string();
+            let (line, _, _) = locate(text, n.start_byte());
+            out.push(TestFn {
+                file: rel.to_string(),
+                line,
+                name,
+                body: text[n.byte_range()].to_string(),
+            });
+        }
+        for i in 0..n.child_count() {
+            if let Some(c) = n.child(i) {
+                stack.push(c);
+            }
+        }
+    }
+}
+
+/// JS/TS test cases: `it('name', cb)`, `test('name', cb)`, `specify(...)` and
+/// their member forms (`it.only`, `test.skip`, `it.concurrent`, …). `describe`
+/// blocks are containers, not cases, so they are not reported (their inner
+/// `it`/`test` calls are).
+fn js_tests(root: tree_sitter::Node, text: &str, rel: &str, out: &mut Vec<TestFn>) {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "call_expression"
+            && let Some(base) = js_test_base(n, text)
+        {
+            let (line, _, _) = locate(text, n.start_byte());
+            let name = js_test_name(n, text).unwrap_or(base);
+            let body = js_test_body(n, text);
+            out.push(TestFn {
+                file: rel.to_string(),
+                line,
+                name,
+                body,
+            });
+        }
+        for i in 0..n.child_count() {
+            if let Some(c) = n.child(i) {
+                stack.push(c);
+            }
+        }
+    }
+}
+
+/// The base callee of a test call (`it`, `test`, `specify`, `xit`, …), or `None`
+/// when the call is not a test. A member callee (`it.only`) resolves to its
+/// object (`it`).
+fn js_test_base(call: tree_sitter::Node, text: &str) -> Option<String> {
+    const BASES: &[&str] = &["it", "test", "specify", "xit", "xtest", "fit", "ftest"];
+    let callee = call.child_by_field_name("function")?;
+    let base = match callee.kind() {
+        "identifier" => text[callee.byte_range()].to_string(),
+        "member_expression" => {
+            let obj = callee.child_by_field_name("object")?;
+            text[obj.byte_range()].to_string()
+        }
+        _ => return None,
+    };
+    BASES.contains(&base.as_str()).then_some(base)
+}
+
+/// The first string/template argument of a test call (its title), with the
+/// surrounding quotes/backticks trimmed.
+fn js_test_name(call: tree_sitter::Node, text: &str) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    for a in args.children(&mut cursor) {
+        if matches!(a.kind(), "string" | "template_string") {
+            return Some(
+                text[a.byte_range()]
+                    .trim_matches(|c| c == '\'' || c == '"' || c == '`')
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+/// The callback body of a test call (its function/arrow argument), else the
+/// whole call text. Scanned for referenced identifiers by `ts_test_impact`.
+fn js_test_body(call: tree_sitter::Node, text: &str) -> String {
+    if let Some(args) = call.child_by_field_name("arguments") {
+        let mut cursor = args.walk();
+        let kids: Vec<tree_sitter::Node> = args.children(&mut cursor).collect();
+        for a in kids.iter().rev() {
+            if matches!(
+                a.kind(),
+                "arrow_function" | "function" | "function_expression"
+            ) {
+                return text[a.byte_range()].to_string();
+            }
+        }
+    }
+    text[call.byte_range()].to_string()
+}
+
+/// Names of declarations (any depth) defined in one source file `rel`.
+pub fn decl_names_in_text(rel: &str, text: &str) -> Vec<String> {
+    let ext = Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let Some(l) = lang_of(ext) else {
+        return Vec::new();
+    };
+    let lang = grammar(l);
     let mut parser = tree_sitter::Parser::new();
     let _ = parser.set_language(&lang);
     let Some(tree) = parser.parse(text, None) else {
@@ -1069,5 +1166,41 @@ mod tests {
         assert!(syms.iter().any(|s| s.contains("rule #beta")), "{syms:?}");
         assert!(syms.iter().any(|s| s.contains("el div")), "{syms:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discovers_js_ts_tests() {
+        let dir = scratch("jstests");
+        std::fs::write(
+            dir.join("a.test.ts"),
+            "describe('Widget', () => {\n  it('renders Widget', () => { expect(Widget).toBeDefined(); });\n  it.only('updates', () => {});\n});\ntest('plain', function () {});\n",
+        )
+        .unwrap();
+        let tests = test_functions(&dir).unwrap();
+        let names: Vec<&str> = tests.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"renders Widget"), "{names:?}");
+        assert!(names.contains(&"updates"), "{names:?}");
+        assert!(names.contains(&"plain"), "{names:?}");
+        // `describe` is a container, not a test case.
+        assert!(!names.contains(&"Widget"), "{names:?}");
+        assert_eq!(tests.len(), 3, "{names:?}");
+        // The callback body carries the referenced identifier for impact analysis.
+        let renders = tests.iter().find(|t| t.name == "renders Widget").unwrap();
+        assert!(renders.body.contains("Widget"), "{}", renders.body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decl_names_in_text_is_language_aware() {
+        let ts = "export class Widget {}\ninterface Props {}\nfunction make() {}\n";
+        let names = decl_names_in_text("m.ts", ts);
+        assert!(names.contains(&"Widget".to_string()), "{names:?}");
+        assert!(names.contains(&"Props".to_string()), "{names:?}");
+        assert!(names.contains(&"make".to_string()), "{names:?}");
+
+        let rs = "fn compute() {}\nstruct Thing;\n";
+        let names = decl_names_in_text("lib.rs", rs);
+        assert!(names.contains(&"compute".to_string()), "{names:?}");
+        assert!(names.contains(&"Thing".to_string()), "{names:?}");
     }
 }

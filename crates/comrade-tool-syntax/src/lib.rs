@@ -594,7 +594,7 @@ struct TsTestImpact;
 static TS_TEST_IMPACT_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "ts_test_impact".into(),
-    description: "Map the files changed since a revision (git diff) to the tests likely to cover them, using tree-sitter: a test is affected when it references a symbol declared in a changed file, or lives in the same crate. Use to run the smallest useful test set before the full suite.".into(),
+    description: "Map the files changed since a revision (git diff) to the tests likely to cover them, using tree-sitter: a test is affected when it references a symbol declared in a changed file, or lives in the same crate/directory. Discovers Rust `#[test]` functions and JS/TS `it`/`test`/`specify` cases. Use to run the smallest useful test set before the full suite.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -635,23 +635,24 @@ impl Tool for TsTestImpact {
 
         // Symbols declared in the changed source files -> the file declaring them.
         let mut symbols: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut changed_rs: Vec<String> = Vec::new();
+        let mut changed_src: Vec<String> = Vec::new();
         for f in &changed {
-            if !f.ends_with(".rs") {
+            if engine::lang_of(file_ext(f)).is_none() {
                 continue;
             }
-            changed_rs.push(f.clone());
+            changed_src.push(f.clone());
             let Ok(text) = std::fs::read_to_string(root.join(f)) else {
                 continue;
             };
-            for name in engine::decl_names_in_text(&text) {
+            for name in engine::decl_names_in_text(f, &text) {
                 if ignored_symbol(&name) {
                     continue;
                 }
                 symbols.entry(name).or_default().push(f.clone());
             }
         }
-        let changed_crates: HashSet<String> = changed_rs.iter().map(|f| crate_of(f)).collect();
+        let changed_crates: HashSet<String> = changed_src.iter().map(|f| crate_of(f)).collect();
+        let changed_dirs: HashSet<String> = changed_src.iter().map(|f| parent_dir(f)).collect();
 
         let tests = engine::test_functions(root)?;
         let mut affected: Vec<(bool, String, usize, String, String)> = Vec::new();
@@ -665,12 +666,13 @@ impl Tool for TsTestImpact {
             hits.sort();
             hits.truncate(6);
             let same_only = hits.is_empty()
-                && changed_crates.contains(&crate_of(&t.file))
-                && !t.file.is_empty();
+                && !t.file.is_empty()
+                && (changed_crates.contains(&crate_of(&t.file))
+                    || changed_dirs.contains(&parent_dir(&t.file)));
             let reason = if !hits.is_empty() {
                 format!("references {}", hits.join(", "))
             } else if same_only {
-                "same crate as a changed file".to_string()
+                "same crate/dir as a changed file".to_string()
             } else {
                 continue;
             };
@@ -697,7 +699,7 @@ impl Tool for TsTestImpact {
         }
         if total == 0 {
             out.push_str(
-                "(no tests reference the changed symbols; run the changed crate's suite)\n",
+                "(no tests reference the changed symbols; run the changed module's suite)\n",
             );
             return Ok(clamp(out));
         }
@@ -709,8 +711,10 @@ impl Tool for TsTestImpact {
             out.push_str(&format!("... and {} more\n", total - args.max));
         }
         out.push_str("\nsuggested test runs:\n");
+        // Rust crates: `cargo test -p <pkg>`.
         let mut crates: Vec<String> = affected
             .iter()
+            .filter(|(_, f, _, _, _)| f.ends_with(".rs"))
             .map(|(_, f, _, _, _)| crate_of(f))
             .filter(|c| !c.is_empty())
             .collect::<HashSet<_>>()
@@ -722,6 +726,18 @@ impl Tool for TsTestImpact {
                 Some(pkg) => out.push_str(&format!("  cargo test -p {pkg}\n")),
                 None => out.push_str(&format!("  (cargo test in {c})\n")),
             }
+        }
+        // JS/TS (and any other non-Rust) tests: name each file to run.
+        let mut js_files: Vec<String> = affected
+            .iter()
+            .filter(|(_, f, _, _, _)| !f.ends_with(".rs"))
+            .map(|(_, f, _, _, _)| f.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        js_files.sort();
+        for f in js_files {
+            out.push_str(&format!("  {f}\n"));
         }
         Ok(clamp(out))
     }
@@ -770,6 +786,18 @@ fn crate_of(rel: &str) -> String {
         (Some(first), _) => first.to_string(),
         _ => String::new(),
     }
+}
+
+/// The lowercase extension of a root-relative path, without the dot.
+fn file_ext(rel: &str) -> &str {
+    rel.rsplit_once('.').map(|(_, e)| e).unwrap_or("")
+}
+
+/// The parent directory of a root-relative path (`src/a/b.ts` -> `src/a`).
+fn parent_dir(rel: &str) -> String {
+    rel.rsplit_once('/')
+        .map(|(d, _)| d.to_string())
+        .unwrap_or_default()
 }
 
 /// Read the `name = "..."` from a crate dir's Cargo.toml (falls back to the dir name).
@@ -1177,7 +1205,7 @@ mod tests {
     #[test]
     fn decl_names_and_tokens() {
         let text = "pub struct Store {}\nfn compute(x: usize) -> usize { x }\nenum Kind { A }\n";
-        let names = engine::decl_names_in_text(text);
+        let names = engine::decl_names_in_text("lib.rs", text);
         assert!(names.contains(&"Store".to_string()), "{names:?}");
         assert!(names.contains(&"compute".to_string()), "{names:?}");
         assert!(names.contains(&"Kind".to_string()), "{names:?}");
@@ -1185,6 +1213,17 @@ mod tests {
         assert!(toks.contains("Store"));
         assert!(toks.contains("compute"));
         assert!(!toks.contains("="));
+    }
+
+    #[test]
+    fn path_helpers_for_impact_mapping() {
+        assert_eq!(crate::file_ext("src/App.tsx"), "tsx");
+        assert_eq!(crate::file_ext("crates/foo/src/lib.rs"), "rs");
+        assert_eq!(crate::file_ext("Makefile"), "");
+        assert_eq!(crate::parent_dir("src/a/b.ts"), "src/a");
+        assert_eq!(crate::parent_dir("main.rs"), "");
+        assert_eq!(crate::crate_of("crates/foo/src/lib.rs"), "crates/foo");
+        assert_eq!(crate::crate_of("src/App.tsx"), "src");
     }
 
     #[test]
