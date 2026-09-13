@@ -22,3 +22,6 @@ Covers the TUI chat view only. Does not change the underlying chat model, messag
 ## Impact
 Toggling M-f re-filters rows, re-anchors the selection, and refreshes search; a "focus mode on/off" Meta note is pushed (hidden while on, since Meta is hidden in focus mode). No merge/UX impact on existing keybindings.
 
+
+## Note
+Follow-up (spinner): focus mode hides tool cards, so a run that streams no reasoning looked frozen. `draw_chat` now reserves the last chat row for a bottom-of-chat activity line (`activity_line`), showing a rotating Braille spinner (`spinner_glyph`, shared with `plan_glyph`) plus the running tool name or "working…". It is shown only when `app.focus_mode` and the active session status is `running` (`activity_spinner_visible`), i.e. hidden outside focus mode and while paused on a user dialog. Animated by the existing 100 ms `spin` interval guarded by `app.any_running()`. Chat rows area is reduced by one row (`rows_rect`/`view_h`), and `chat_rect` now points at that reduced rect so clicks on the spinner row are ignored.

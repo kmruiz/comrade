@@ -4681,6 +4681,17 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // While the agent works, a focus-mode chat shows only the conversation, so
+    // a silent tool run (no reasoning to stream) would look frozen. Reserve the
+    // last chat row for a bottom activity spinner so there is always a visible
+    // sign of life.
+    let spinner = inner.height >= 2 && activity_spinner_visible(app);
+    let view_h = inner.height.saturating_sub(u16::from(spinner));
+    let rows_rect = Rect {
+        height: view_h,
+        ..inner
+    };
+
     let width = inner.width.saturating_sub(2) as usize; // prefix column + spacing
     // Reuse the row layout of `chat` across frames while nothing chat-affecting
     // changed (typing, scrolling, search, most streaming deltas), instead of
@@ -4705,7 +4716,7 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     };
 
     let total_rows = cache.rows.len() + preview.len();
-    let max = total_rows.saturating_sub(inner.height as usize);
+    let max = total_rows.saturating_sub(view_h as usize);
     // Autoscroll: stay pinned to the bottom while following a run or while the
     // user is already at the bottom of the chat.
     if app.follow || app.was_at_bottom {
@@ -4717,13 +4728,13 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
 
     // Per-row bookkeeping the event handlers index into (mouse, selection,
     // search): chat rows come from the cache, preview rows are un-owned.
-    app.chat_rect = inner;
+    app.chat_rect = rows_rect;
     app.row_targets = cache.rows.iter().map(|r| r.tool_header).collect();
     app.row_targets.resize(total_rows, None);
     app.row_msg = cache.owner.clone();
     app.row_msg.resize(total_rows, None);
     app.msg_ranges = cache.ranges.clone();
-    app.view_rows = inner.height as usize;
+    app.view_rows = view_h as usize;
 
     let sel_start = app.sel.and_then(|i| app.msg_ranges.get(i)).map(|&(s, _)| s);
     // Row span of the currently selected search match, if any.
@@ -4734,7 +4745,7 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
         .and_then(|&idx| app.msg_ranges.get(idx).copied());
 
     // Build Lines only for the rows actually on screen.
-    let height = inner.height as usize;
+    let height = view_h as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(height.min(total_rows));
     let chat_rows = cache.rows.len();
     for row in offset..total_rows.min(offset + height) {
@@ -4776,7 +4787,15 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
         }
     }
 
-    frame.render_widget(Paragraph::new(lines).scroll((0, 0)), inner);
+    frame.render_widget(Paragraph::new(lines).scroll((0, 0)), rows_rect);
+    if spinner {
+        let row = Rect {
+            y: inner.y + view_h,
+            height: 1,
+            ..inner
+        };
+        frame.render_widget(activity_line(app, now_ms()), row);
+    }
 }
 
 /// Pure row layout for a chat transcript. Org-style sections: each user turn is
@@ -6245,6 +6264,13 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+/// The rotating Braille spinner frame for the current time. Shared by the plan
+/// checklist glyphs and the chat's live activity line.
+fn spinner_glyph(now_ms: u128) -> &'static str {
+    let frame = ((now_ms / SPINNER_FRAME_MS) as usize) % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[frame]
+}
+
 /// The status glyph shown before a plan step: "-" for pending, "●" for a step
 /// whose delegate confirmed it is ready to pick up, a rotating spinner for
 /// in-progress, a tick for done and a cross for failed/blocked.
@@ -6252,13 +6278,39 @@ fn plan_glyph(s: &PlanStatus, now_ms: u128) -> &'static str {
     match s {
         PlanStatus::Pending => "-",
         PlanStatus::Ready => "●",
-        PlanStatus::InProgress => {
-            let frame = ((now_ms / SPINNER_FRAME_MS) as usize) % SPINNER_FRAMES.len();
-            SPINNER_FRAMES[frame]
-        }
+        PlanStatus::InProgress => spinner_glyph(now_ms),
         PlanStatus::Done => "✓",
         PlanStatus::Blocked => "✗",
     }
+}
+
+/// True while the chat should show its bottom activity spinner: a run is in
+/// flight in focus mode (where tool cards are hidden, so a run that produces no
+/// reasoning would otherwise look frozen) and it is not paused on a user dialog.
+fn activity_spinner_visible(app: &App) -> bool {
+    app.focus_mode && session_status_marker(app, app.active) == Some("running")
+}
+
+/// The one-line live activity indicator pinned to the bottom of the chat while
+/// the agent works: a rotating spinner plus the tool currently running, or a
+/// generic "working…" while the model is thinking (Claude-Code style).
+fn activity_line(app: &App, now_ms: u128) -> Line<'static> {
+    let what = match &app.activity {
+        Some(name) => format!("running {name}"),
+        None => "working…".to_string(),
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("  {} ", spinner_glyph(now_ms)),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            what,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ])
 }
 
 /// One styled, non-wrapping row for a finished plan step: the status glyph, the
@@ -8025,6 +8077,49 @@ mod tests {
             !visible_indices.contains(&5),
             "Failure message should be hidden"
         );
+    }
+
+    #[tokio::test]
+    async fn activity_spinner_shows_only_for_a_running_focus_mode_chat() {
+        let mut app = test_app();
+        assert!(!activity_spinner_visible(&app), "idle: no spinner");
+        app.running = true;
+        assert!(
+            !activity_spinner_visible(&app),
+            "running but not focus mode: no spinner"
+        );
+        app.focus_mode = true;
+        assert!(activity_spinner_visible(&app), "running in focus mode");
+        // Paused on a user dialog: the spinner hides (the dialog is the signal).
+        let (tx, _rx) = oneshot::channel();
+        app.dialogs.push(Dialog {
+            session: app.active_id(),
+            prompt: UserPrompt::Confirm {
+                title: "T".to_string(),
+                diff: None,
+            },
+            buf: String::new(),
+            reply: tx,
+        });
+        assert!(!activity_spinner_visible(&app), "waiting on the user");
+    }
+
+    #[tokio::test]
+    async fn activity_line_names_the_running_tool_then_the_model() {
+        let mut app = test_app();
+        app.running = true;
+        app.focus_mode = true;
+        app.activity = Some("fs_read_file".to_string());
+        let joined = |line: Line<'static>| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let text = joined(activity_line(&app, 0));
+        assert!(text.contains("running fs_read_file"), "{text:?}");
+        assert!(text.contains(spinner_glyph(0)), "{text:?}");
+        // With no tool in flight the model is thinking.
+        app.activity = None;
+        let text = joined(activity_line(&app, 0));
+        assert!(text.contains("working"), "{text:?}");
     }
 
     #[test]
