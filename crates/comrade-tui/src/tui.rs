@@ -283,6 +283,8 @@ struct ChatRowsCache {
     width: usize,
     /// Value of `App::chat_epoch` when this cache was built.
     epoch: u64,
+    /// Value of App::focus_mode when this layout was built.
+    focus: bool,
     rows: Vec<RenderRow>,
     /// Owning chat-message index per row (parallel to `rows`).
     owner: Vec<Option<usize>>,
@@ -297,17 +299,21 @@ fn chat_cache<'a>(
     cache: &'a mut Option<ChatRowsCache>,
     epoch: u64,
     width: usize,
+    focus: bool,
     chat: &[Msg],
     collapsed: &[bool],
     delegates: &[DelegateCfg],
     colors: &ModelColors,
 ) -> &'a ChatRowsCache {
-    let stale = !matches!(cache, Some(c) if c.epoch == epoch && c.width == width);
+    let stale =
+        !matches!(cache, Some(c) if c.epoch == epoch && c.width == width && c.focus == focus);
     if stale {
-        let (rows, owner, ranges) = layout_chat_rows(chat, collapsed, "", width, delegates, colors);
+        let (rows, owner, ranges) =
+            layout_chat_rows(chat, collapsed, "", width, delegates, colors, focus);
         *cache = Some(ChatRowsCache {
             width,
             epoch,
+            focus,
             rows,
             owner,
             ranges,
@@ -432,6 +438,7 @@ enum MxCommand {
     CancelRun,
     Copy,
     EndOfLine,
+    FocusMode,
     ForkSession,
     ForwardWord,
     InsertNewline,
@@ -466,6 +473,7 @@ impl MxCommand {
         MxCommand::CancelRun,
         MxCommand::Copy,
         MxCommand::EndOfLine,
+        MxCommand::FocusMode,
         MxCommand::ForkSession,
         MxCommand::ForwardWord,
         MxCommand::InsertNewline,
@@ -499,6 +507,7 @@ impl MxCommand {
             MxCommand::CancelRun => "cancel-run",
             MxCommand::Copy => "copy",
             MxCommand::EndOfLine => "end-of-line",
+            MxCommand::FocusMode => "focus-mode",
             MxCommand::ForkSession => "fork-session",
             MxCommand::ForwardWord => "forward-word",
             MxCommand::InsertNewline => "insert-newline",
@@ -534,6 +543,7 @@ impl MxCommand {
             MxCommand::CancelRun => Some("esc"),
             MxCommand::Copy => Some("C-S-c / M-w"),
             MxCommand::EndOfLine => Some("<end>"),
+            MxCommand::FocusMode => Some("M-f"),
             MxCommand::ForkSession => Some("C-x C-w"),
             MxCommand::ForwardWord => Some("M-<right>"),
             MxCommand::InsertNewline => Some("S-<return>"),
@@ -570,6 +580,7 @@ impl MxCommand {
             MxCommand::CancelRun => "stop the running agent",
             MxCommand::Copy => "copy the prompt selection or the chat block under the cursor",
             MxCommand::EndOfLine => "move the prompt cursor to the end of the line",
+            MxCommand::FocusMode => "filter the chat to the conversation (hide tool calls)",
             MxCommand::ForkSession => "fork the current session into an independent copy",
             MxCommand::ForwardWord => "move the prompt cursor forward one word",
             MxCommand::InsertNewline => "insert a newline in the prompt",
@@ -806,6 +817,8 @@ struct App {
     last_draw: std::time::Instant,
     /// Auto-accept mode: approvals are answered "yes" without prompting.
     auto_accept: bool,
+    /// Focus mode: hide tool noise so the chat reads as pure conversation.
+    focus_mode: bool,
     /// Latest repo snapshot for the mode line.
     git: GitBarInfo,
     git_rx: mpsc::Receiver<GitBarInfo>,
@@ -1170,9 +1183,55 @@ impl App {
     /// Move to the next (`+1`) or previous (`-1`) visible chat block, stepping
     /// over the messages hidden inside a collapsed section.
     fn move_block(&mut self, dir: isize) {
-        if let Some(next) = step_visible(&self.chat, &self.section_collapsed, self.sel, dir) {
+        if let Some(next) = step_visible(
+            &self.chat,
+            &self.section_collapsed,
+            self.sel,
+            dir,
+            self.focus_mode,
+        ) {
             self.select_block(next);
         }
+    }
+
+    /// Toggle focus mode (M-f / M-x focus-mode): hide tool calls, failure
+    /// blocks, folded digests and status notes, keeping only the conversation
+    /// (user turns, model replies, delegate advisories) and the reasoning.
+    fn toggle_focus_mode(&mut self) {
+        self.focus_mode = !self.focus_mode;
+        // Re-anchor the selection onto a block that is still on screen.
+        if let Some(s) = self.sel
+            && !chat_visible(&self.chat, &self.section_collapsed, s, self.focus_mode)
+        {
+            let next = step_visible(
+                &self.chat,
+                &self.section_collapsed,
+                Some(s),
+                1,
+                self.focus_mode,
+            )
+            .or_else(|| {
+                step_visible(
+                    &self.chat,
+                    &self.section_collapsed,
+                    Some(s),
+                    -1,
+                    self.focus_mode,
+                )
+            });
+            match next {
+                Some(i) => self.select_block(i),
+                None => self.sel = None,
+            }
+        }
+        if self.search.is_some() {
+            self.refresh_search();
+        }
+        self.push_meta(if self.focus_mode {
+            "focus mode on"
+        } else {
+            "focus mode off"
+        });
     }
 
     /// Move to the next (`+1`) or previous (`-1`) user message.
@@ -1214,7 +1273,7 @@ impl App {
         self.chat
             .iter()
             .enumerate()
-            .filter(|(_, m)| msg_matches(m, &ql))
+            .filter(|(_, m)| msg_matches(m, &ql) && (!self.focus_mode || focus_visible(m)))
             .map(|(i, _)| i)
             .collect()
     }
@@ -2549,6 +2608,7 @@ impl App {
                     self.toggle_tool(idx);
                 }
             }
+            MxCommand::FocusMode => self.toggle_focus_mode(),
         }
         false
     }
@@ -2949,6 +3009,7 @@ fn build_app(
         run_cancelled: false,
         last_draw: std::time::Instant::now(),
         auto_accept: false,
+        focus_mode: false,
         git: GitBarInfo::default(),
         git_rx,
         git_tx,
@@ -3298,6 +3359,11 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                         // Alt+W, so this works even where Ctrl+Shift+C is
                         // claimed by the terminal emulator itself.
                         app.copy_prompt_or_block();
+                        return false;
+                    }
+                    if ch.eq_ignore_ascii_case(&'f') {
+                        // M-f: toggle focus mode.
+                        app.toggle_focus_mode();
                         return false;
                     }
                 }
@@ -3682,20 +3748,44 @@ fn toggle_section(collapsed: &mut Vec<bool>, chat: &[Msg], running: bool, msg_id
     }
 }
 
+/// Whether a message produces any row in focus mode: the spoken conversation
+/// (user turn, model reply, delegate advisory) and the model reasoning. Tool
+/// cards, failure blocks and grey status notes are dropped; a folded run
+/// digest survives only as the reasoning inside it.
+fn focus_visible(msg: &Msg) -> bool {
+    match msg.kind {
+        MsgKind::User | MsgKind::Assistant | MsgKind::Delegate | MsgKind::Reasoning => true,
+        MsgKind::Run => msg.children.iter().any(|c| c.kind == MsgKind::Reasoning),
+        MsgKind::Tool | MsgKind::Failure | MsgKind::Meta => false,
+    }
+}
+
 /// Whether a chat message is currently exposed: a user-turn heading always is
 /// (it is its own section's header); every other message shows only while its
-/// section is expanded. Content before the first user turn is exposed.
-fn chat_visible(chat: &[Msg], collapsed: &[bool], idx: usize) -> bool {
-    match chat.get(idx).map(|m| m.kind) {
-        Some(MsgKind::User) => true,
-        Some(_) => section_of_msg(chat, idx).is_none_or(|(o, _)| !collapsed_at(collapsed, o)),
-        None => false,
+/// section is expanded. Content before the first user turn is exposed. In focus
+/// mode only `focus_visible` messages are exposed at all.
+fn chat_visible(chat: &[Msg], collapsed: &[bool], idx: usize, focus: bool) -> bool {
+    let Some(msg) = chat.get(idx) else {
+        return false;
+    };
+    if focus && !focus_visible(msg) {
+        return false;
+    }
+    match msg.kind {
+        MsgKind::User => true,
+        _ => section_of_msg(chat, idx).is_none_or(|(o, _)| !collapsed_at(collapsed, o)),
     }
 }
 
 /// Next/previous visible chat block from the current selection, skipping the
 /// messages hidden inside a collapsed section. Returns None at the ends.
-fn step_visible(chat: &[Msg], collapsed: &[bool], sel: Option<usize>, dir: isize) -> Option<usize> {
+fn step_visible(
+    chat: &[Msg],
+    collapsed: &[bool],
+    sel: Option<usize>,
+    dir: isize,
+    focus: bool,
+) -> Option<usize> {
     if chat.is_empty() {
         return None;
     }
@@ -3711,7 +3801,7 @@ fn step_visible(chat: &[Msg], collapsed: &[bool], sel: Option<usize>, dir: isize
         if cur < 0 || cur >= len {
             return None;
         }
-        if chat_visible(chat, collapsed, cur as usize) {
+        if chat_visible(chat, collapsed, cur as usize, focus) {
             return Some(cur as usize);
         }
     }
@@ -4516,6 +4606,7 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
         &mut app.chat_rows_cache,
         app.chat_epoch,
         width,
+        app.focus_mode,
         &app.chat,
         &app.section_collapsed,
         &app.cfg.delegates,
@@ -4615,6 +4706,7 @@ fn layout_chat_rows(
     width: usize,
     delegates: &[DelegateCfg],
     colors: &ModelColors,
+    focus: bool,
 ) -> (Vec<RenderRow>, Vec<Option<usize>>, Vec<(usize, usize)>) {
     let mut out = Vec::new();
     let mut owner: Vec<Option<usize>> = Vec::new();
@@ -4637,6 +4729,11 @@ fn layout_chat_rows(
         } else {
             width
         };
+        if focus && !focus_visible(msg) {
+            ranges.push((out.len(), 0));
+            i += 1;
+            continue;
+        }
         match msg.kind {
             MsgKind::User => {
                 // A new exchange begins: recompute this section's visibility.
@@ -4692,7 +4789,26 @@ fn layout_chat_rows(
                 i += 1;
                 continue;
             }
-            MsgKind::Run => layout_run(&mut out, i, &msg.children),
+            MsgKind::Run => {
+                if focus {
+                    // Focus mode drops the digest's summary row but keeps the reasoning
+                    // folded inside it, rendered as normal reasoning blocks.
+                    for child in &msg.children {
+                        if child.kind == MsgKind::Reasoning {
+                            layout_reasoning(
+                                &mut out,
+                                i,
+                                child.text.as_str(),
+                                child.author.as_deref().unwrap_or("model"),
+                                child.open,
+                                width,
+                            );
+                        }
+                    }
+                } else {
+                    layout_run(&mut out, i, &msg.children);
+                }
+            }
             MsgKind::Failure => layout_failure(&mut out, i, msg.fail.as_ref().unwrap(), width),
             MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), w),
             MsgKind::Reasoning => layout_reasoning(
@@ -7634,13 +7750,13 @@ mod tests {
             Msg::authored(MsgKind::Assistant, "assistant", "r1"),
         ];
         let none = &[false, false];
-        assert_eq!(step_visible(&chat, none, None, 1), Some(0));
-        assert_eq!(step_visible(&chat, none, None, -1), Some(3));
+        assert_eq!(step_visible(&chat, none, None, 1, false), Some(0));
+        assert_eq!(step_visible(&chat, none, None, -1, false), Some(3));
         // Past an edge there is no visible block: no move.
-        assert_eq!(step_visible(&chat, none, Some(0), -1), None);
-        assert_eq!(step_visible(&chat, none, Some(3), 1), None);
-        assert_eq!(step_visible(&chat, none, Some(1), 1), Some(2));
-        assert_eq!(step_visible(&[], &[], Some(0), 1), None);
+        assert_eq!(step_visible(&chat, none, Some(0), -1, false), None);
+        assert_eq!(step_visible(&chat, none, Some(3), 1, false), None);
+        assert_eq!(step_visible(&chat, none, Some(1), 1, false), Some(2));
+        assert_eq!(step_visible(&[], &[], Some(0), 1, false), None);
     }
 
     #[test]
@@ -7655,15 +7771,15 @@ mod tests {
             Msg::authored(MsgKind::Assistant, "assistant", "r1"),
         ];
         let collapsed = [true, false];
-        assert_eq!(step_visible(&chat, &collapsed, Some(0), 1), Some(2));
-        assert_eq!(step_visible(&chat, &collapsed, Some(2), -1), Some(0));
-        assert_eq!(step_visible(&chat, &collapsed, Some(1), -1), Some(0));
+        assert_eq!(step_visible(&chat, &collapsed, Some(0), 1, false), Some(2));
+        assert_eq!(step_visible(&chat, &collapsed, Some(2), -1, false), Some(0));
+        assert_eq!(step_visible(&chat, &collapsed, Some(1), -1, false), Some(0));
         // chat_visible: headings always exposed; interiors only when expanded.
-        assert!(chat_visible(&chat, &collapsed, 0));
-        assert!(!chat_visible(&chat, &collapsed, 1));
-        assert!(chat_visible(&chat, &collapsed, 2));
-        assert!(chat_visible(&chat, &collapsed, 3));
-        assert!(!chat_visible(&chat, &collapsed, 99));
+        assert!(chat_visible(&chat, &collapsed, 0, false));
+        assert!(!chat_visible(&chat, &collapsed, 1, false));
+        assert!(chat_visible(&chat, &collapsed, 2, false));
+        assert!(chat_visible(&chat, &collapsed, 3, false));
+        assert!(!chat_visible(&chat, &collapsed, 99, false));
     }
 
     #[test]
@@ -7677,6 +7793,177 @@ mod tests {
         assert_eq!(step_user(&users, Some(4), 1), None); // already at last user
         assert_eq!(step_user(&users, Some(4), -1), Some(0));
         assert_eq!(step_user(&[], Some(0), 1), None);
+    }
+
+    // --- focus mode -----------------------------------------------------------
+
+    fn card() -> Msg {
+        tool_card("read_file", r#"{"path":"src/x.rs"}"#, true, false)
+    }
+
+    #[test]
+    fn focus_visible_shows_conversation_and_reasoning() {
+        // User/Assistant/Delegate/Reasoning are visible
+        assert!(focus_visible(&Msg::authored(MsgKind::User, "you", "hi")));
+        assert!(focus_visible(&Msg::authored(
+            MsgKind::Assistant,
+            "model",
+            "reply"
+        )));
+        assert!(focus_visible(&Msg::authored(
+            MsgKind::Delegate,
+            "delegate",
+            "advice"
+        )));
+        assert!(focus_visible(&Msg::authored(
+            MsgKind::Reasoning,
+            "model",
+            "thinking"
+        )));
+        // Tool/Failure/Meta are hidden
+        assert!(!focus_visible(&card()));
+        assert!(!focus_visible(&Msg::failure(
+            "test".into(),
+            "failed".into()
+        )));
+        assert!(!focus_visible(&Msg::text(MsgKind::Meta, "status")));
+    }
+
+    #[test]
+    fn focus_visible_run_with_reasoning_child_is_visible() {
+        // Run with a Reasoning child: visible
+        let run_with_reasoning = Msg::run(vec![Msg::reasoning("model", "thinking"), card()]);
+        assert!(focus_visible(&run_with_reasoning));
+        // Run with only Tool children: not visible
+        let run_only_tools = Msg::run(vec![card(), card()]);
+        assert!(!focus_visible(&run_only_tools));
+    }
+
+    #[test]
+    fn layout_chat_rows_focus_filters_messages() {
+        let chat = vec![
+            Msg::authored(MsgKind::User, "you", "do it"),
+            card(),
+            Msg::authored(MsgKind::Reasoning, "model", "thinking"),
+            Msg::authored(MsgKind::Assistant, "model", "done"),
+            Msg::text(MsgKind::Meta, "status"),
+            Msg::failure("test".into(), "failed".into()),
+        ];
+        let collapsed = &[false];
+
+        // With focus=true, only User/Reasoning/Assistant should produce rows
+        let (rows_focus, owners_focus, _) =
+            layout_chat_rows(&chat, collapsed, "", 80, &[], &ModelColors::default(), true);
+        // Only indices 0 (User), 2 (Reasoning), 3 (Assistant) should have rows
+        // Tool (idx 1), Meta (idx 4), Failure (idx 5) should be hidden
+        for owner in &owners_focus {
+            if let Some(idx) = owner {
+                let kind = chat[*idx].kind;
+                assert_ne!(
+                    kind,
+                    MsgKind::Tool,
+                    "Tool message should be hidden in focus mode"
+                );
+                assert_ne!(
+                    kind,
+                    MsgKind::Meta,
+                    "Meta message should be hidden in focus mode"
+                );
+                assert_ne!(
+                    kind,
+                    MsgKind::Failure,
+                    "Failure message should be hidden in focus mode"
+                );
+            }
+        }
+        // The visible messages (User, Reasoning, Assistant) should have rows
+        let visible_indices: std::collections::HashSet<_> = owners_focus.iter().flatten().collect();
+        assert!(
+            visible_indices.contains(&0),
+            "User message should be visible"
+        );
+        assert!(
+            visible_indices.contains(&2),
+            "Reasoning message should be visible"
+        );
+        assert!(
+            visible_indices.contains(&3),
+            "Assistant message should be visible"
+        );
+        assert!(
+            !visible_indices.contains(&1),
+            "Tool message should be hidden"
+        );
+        assert!(
+            !visible_indices.contains(&4),
+            "Meta message should be hidden"
+        );
+        assert!(
+            !visible_indices.contains(&5),
+            "Failure message should be hidden"
+        );
+    }
+
+    #[test]
+    fn layout_chat_rows_focus_run_with_reasoning_shows_reasoning() {
+        let run_with_reasoning = Msg::run(vec![
+            Msg::reasoning("model", "let me think about this"),
+            card(),
+        ]);
+        let chat = vec![
+            Msg::authored(MsgKind::User, "you", "go"),
+            run_with_reasoning,
+            Msg::authored(MsgKind::Assistant, "model", "done"),
+        ];
+        let collapsed = &[false];
+
+        // With focus=true, the Run digest's summary row is hidden but reasoning text appears
+        let (rows, owners, _) =
+            layout_chat_rows(&chat, collapsed, "", 80, &[], &ModelColors::default(), true);
+
+        // The Run digest itself (idx 1) should not have a summary row, but its reasoning child should appear
+        // Check that the reasoning text appears in some row's spans
+        let reasoning_text = "let me think about this";
+        let has_reasoning = rows.iter().any(|row| {
+            row.spans
+                .iter()
+                .any(|span| span.content.contains(reasoning_text))
+        });
+        assert!(
+            has_reasoning,
+            "Reasoning text should appear in focus mode for Run with Reasoning child"
+        );
+
+        // The digest has no summary row of its own, but the reasoning it keeps
+        // is attributed to the digest so it stays selectable as one block.
+        assert!(
+            owners.iter().any(|&o| o == Some(1)),
+            "the folded reasoning should be owned by the digest index"
+        );
+    }
+
+    #[test]
+    fn chat_visible_and_step_visible_with_focus_skip_hidden() {
+        let chat = vec![
+            Msg::authored(MsgKind::User, "you", "a"),
+            card(),
+            Msg::authored(MsgKind::Assistant, "model", "b"),
+        ];
+        let none = &[false];
+
+        // With focus=true, Tool message (idx 1) is hidden
+        assert!(chat_visible(&chat, none, 0, true)); // User visible
+        assert!(!chat_visible(&chat, none, 1, true)); // Tool hidden
+        assert!(chat_visible(&chat, none, 2, true)); // Assistant visible
+
+        // step_visible with focus=true skips the hidden Tool message
+        // Starting from User (idx 0), stepping down should go to Assistant (idx 2)
+        assert_eq!(step_visible(&chat, none, Some(0), 1, true), Some(2));
+        // Starting from Assistant (idx 2), stepping up should go to User (idx 0)
+        assert_eq!(step_visible(&chat, none, Some(2), -1, true), Some(0));
+        // Tool message (idx 1) is not visible, so stepping from it should find next visible
+        assert_eq!(step_visible(&chat, none, Some(1), 1, true), Some(2));
+        assert_eq!(step_visible(&chat, none, Some(1), -1, true), Some(0));
     }
 
     // --- run folding ------------------------------------------------------
@@ -9210,8 +9497,15 @@ mod section_tests {
 
     #[test]
     fn user_turn_renders_as_prompt_echo_heading() {
-        let (rows, owner, ranges) =
-            layout_chat_rows(&two_exchanges(), &[], "", 60, &[], &ModelColors::new());
+        let (rows, owner, ranges) = layout_chat_rows(
+            &two_exchanges(),
+            &[],
+            "",
+            60,
+            &[],
+            &ModelColors::new(),
+            false,
+        );
         // The user turn is a single "> first ask" row (heading, no "you" bar).
         assert_eq!(row_text(&rows[0]), "> first ask");
         assert_eq!(owner[0], Some(0));
@@ -9235,6 +9529,7 @@ mod section_tests {
             60,
             &[],
             &ModelColors::new(),
+            false,
         );
         let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
         // Exchange 0 collapsed: only its echo + a "… N more" marker show.
@@ -9265,6 +9560,7 @@ mod section_tests {
             60,
             &[],
             &ModelColors::new(),
+            false,
         );
         let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
         assert!(!all.contains("secret reply 0"), "{all}");
@@ -9275,6 +9571,7 @@ mod section_tests {
             60,
             &[],
             &ModelColors::new(),
+            false,
         );
         let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
         assert!(all.contains("secret reply 0"), "{all}");
@@ -9285,7 +9582,8 @@ mod section_tests {
     fn wrapped_user_echo_indents_continuation_rows() {
         let text = "abcdefghijkl mnopqrstuvwxyz 1234567890";
         let chat = vec![Msg::authored(MsgKind::User, "you", text)];
-        let (rows, _, ranges) = layout_chat_rows(&chat, &[false], "", 12, &[], &ModelColors::new());
+        let (rows, _, ranges) =
+            layout_chat_rows(&chat, &[false], "", 12, &[], &ModelColors::new(), false);
         assert!(
             rows.len() >= 2,
             "expected wrapping into rows, got {}",
@@ -9366,11 +9664,29 @@ mod section_tests {
         let chat = two_exchanges();
         // First call builds the layout; a second call with the same epoch and
         // width must reuse it unchanged (the row layout is frame-stable).
-        let c = chat_cache(&mut cache, 7, 60, &chat, &[], &[], &ModelColors::new());
+        let c = chat_cache(
+            &mut cache,
+            7,
+            60,
+            false,
+            &chat,
+            &[],
+            &[],
+            &ModelColors::new(),
+        );
         let ranges = c.ranges.clone();
         let owner = c.owner.clone();
         let rows = c.rows.len();
-        let c2 = chat_cache(&mut cache, 7, 60, &chat, &[], &[], &ModelColors::new());
+        let c2 = chat_cache(
+            &mut cache,
+            7,
+            60,
+            false,
+            &chat,
+            &[],
+            &[],
+            &ModelColors::new(),
+        );
         assert_eq!(c2.ranges, ranges);
         assert_eq!(c2.owner, owner);
         assert_eq!(c2.rows.len(), rows);
@@ -9380,15 +9696,34 @@ mod section_tests {
     fn chat_cache_relayouts_on_width_change_and_epoch_bump() {
         let mut cache: Option<ChatRowsCache> = None;
         let chat = two_exchanges();
-        chat_cache(&mut cache, 1, 60, &chat, &[], &[], &ModelColors::new());
+        chat_cache(
+            &mut cache,
+            1,
+            60,
+            false,
+            &chat,
+            &[],
+            &[],
+            &ModelColors::new(),
+        );
         // A narrower terminal width re-wraps text: the row count must change.
-        let narrow = chat_cache(&mut cache, 1, 12, &chat, &[], &[], &ModelColors::new());
+        let narrow = chat_cache(
+            &mut cache,
+            1,
+            12,
+            false,
+            &chat,
+            &[],
+            &[],
+            &ModelColors::new(),
+        );
         let narrow_rows = narrow.rows.len();
         // An epoch bump (any chat/collapse mutation) must also rebuild.
         let collapsed = chat_cache(
             &mut cache,
             2,
             12,
+            false,
             &chat,
             &[true, false],
             &[],
@@ -9399,8 +9734,15 @@ mod section_tests {
             "collapsing exchange 0 must shrink the layout"
         );
         // The rebuilt cache equals a fresh pure layout of the same inputs.
-        let (rows, owner, ranges) =
-            layout_chat_rows(&chat, &[true, false], "", 12, &[], &ModelColors::new());
+        let (rows, owner, ranges) = layout_chat_rows(
+            &chat,
+            &[true, false],
+            "",
+            12,
+            &[],
+            &ModelColors::new(),
+            false,
+        );
         assert_eq!(collapsed.rows.len(), rows.len());
         assert_eq!(collapsed.owner, owner);
         assert_eq!(collapsed.ranges, ranges);
