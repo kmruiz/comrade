@@ -95,6 +95,16 @@ Children run with `kill_on_drop(true)`; output is captured into a 200 KB bounded
 **References:**
 - `crates/comrade-tui/src/tui.rs`
 
+## CI workflow
+> .github/workflows/ci.yml — mandatory CI job `ci` (display name "fmt + test") that runs `cargo fmt --all -- --check` then `cargo test --workspace` on push to main/master and on every pull_request. Read-only (permissions: contents: read); toolchain dtolnay/rust-toolchain@stable with the rustfmt component.
+
+**References:**
+- `.github/workflows/ci.yml`
+- `.github/workflows/release.yml`
+
+**Notes:**
+Set the `ci` job as a required status check in branch protection to make it gating. Complements .github/workflows/release.yml (tag-driven binaries).
+
 ## code chunk
 > An indexable unit of source produced by the tree-sitter chunker: for Rust, one declaration (fn/struct/enum/…, recursing into impl/mod/trait so a method is its own chunk with its container head as text context), else a 40-line window. Each chunk carries file + 1-based line (the declaration's line, or the window's first line) and kind/name, so an embedding hit is a location.
 

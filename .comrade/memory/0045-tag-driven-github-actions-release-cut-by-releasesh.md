@@ -22,3 +22,6 @@ Covers the release trigger, the build matrix, artifact packaging/upload, the Git
 ## Impact
 Releasing is `./release.sh major|minor|patch`; the workflow then publishes three archives on the GitHub release. Requires the repo to have a git `origin` remote (none configured yet) and `permissions: contents: write` (granted in the workflow). macOS runners are arm64-only at present (macos-latest), so Intel macOS binaries are not produced.
 
+
+## Note
+Follow-up: the "does NOT cover a per-commit CI workflow" gap is now closed by `.github/workflows/ci.yml` — a mandatory `ci` job (name "fmt + test") running `cargo fmt --all -- --check` and `cargo test --workspace` on push to main/master and on every pull_request, with `permissions: contents: read`. Mark the `ci` job as a required status check in branch protection to make it mandatory. Uses the same toolchain/cache actions as release.yml (dtolnay/rust-toolchain@stable with the rustfmt component, Swatinem/rust-cache@v2).
