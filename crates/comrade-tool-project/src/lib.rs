@@ -7,6 +7,7 @@
 //!   configured alias, or a `!shell` alias) optionally scoped to one subproject.
 
 mod bg;
+mod ecosystem;
 mod pom;
 mod tasks;
 
@@ -58,8 +59,8 @@ impl Tool for PomModelTool {
     }
 
     async fn invoke(&self, ctx: &ToolContext, _args: Value) -> Result<String> {
-        let model = pom::load(&ctx.project_root)?;
-        Ok(pom::render(&model))
+        let eco = ecosystem::detect(&ctx.project_root)?;
+        eco.model(&ctx.project_root)
     }
 }
 
@@ -120,26 +121,28 @@ impl Tool for PomRunTask {
             .map(|s| s.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default();
 
-        let resolved = tasks::resolve(&ctx.project_root, &args.task, &args.subproject, &extra)?;
-        ensure_not_test_run(&resolved.line)?;
+        let eco = ecosystem::detect(&ctx.project_root)?;
+        if !eco.supports(&ctx.project_root, &args.task) {
+            anyhow::bail!(
+                "unknown task {:?} for the {} ecosystem; known verbs: {} (plus configured aliases)",
+                args.task,
+                eco.name(),
+                ecosystem::VERBS.join(", ")
+            );
+        }
+        let resolved = eco.resolve(&ctx.project_root, &args.task, &args.subproject, &extra)?;
+        // Refuse a command that would run tests (covers an alias expanding to
+        // `test`): tests belong to the dedicated pom_run_tests tool, whose
+        // output is a compact failure summary.
+        if eco.is_test_command(&resolved.line) {
+            anyhow::bail!(
+                "running tests through pom_run_task is disabled - use the pom_run_tests tool instead \
+                 (it returns only failing tests and costs far less context)"
+            );
+        }
         let output = tasks::run(&resolved, args.timeout_secs).await?;
         Ok(output)
     }
-}
-
-/// Refuse a resolved pom_run_task command that would execute `cargo test` (covers
-/// the literal `test` verb and aliases that expand to it). Tests belong to the
-/// dedicated `pom_run_tests` tool, whose output is a compact failure summary.
-fn ensure_not_test_run(line: &tasks::CommandLine) -> anyhow::Result<()> {
-    if let tasks::CommandLine::Cargo { args } = line
-        && args.first().map(String::as_str) == Some("test")
-    {
-        anyhow::bail!(
-            "running tests through pom_run_task is disabled - use the pom_run_tests tool instead \
-             (it returns only failing tests and costs far less context)"
-        );
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -169,13 +172,8 @@ impl Tool for PomFormatCode {
     async fn invoke(&self, ctx: &ToolContext, _args: Value) -> Result<String> {
         // A deterministic, whitespace-only rewrite, so it runs
         // directly (no human approval) like pom_run_tests/pom_run_task.
-        let resolved = tasks::Resolved {
-            cwd: ctx.project_root.clone(),
-            line: tasks::CommandLine::Cargo {
-                args: vec!["fmt".into(), "--all".into()],
-            },
-            describe: "format all code".to_string(),
-        };
+        let eco = ecosystem::detect(&ctx.project_root)?;
+        let resolved = eco.format_command(&ctx.project_root)?;
         tasks::run(&resolved, 300).await
     }
 }
@@ -227,48 +225,10 @@ impl Tool for PomRunTests {
             .as_deref()
             .map(|s| s.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default();
-        let resolved = tasks::resolve(&ctx.project_root, "test", &args.subproject, &extra)?;
+        let eco = ecosystem::detect(&ctx.project_root)?;
+        let resolved = eco.resolve(&ctx.project_root, "test", &args.subproject, &extra)?;
         let raw = tasks::run(&resolved, args.timeout_secs).await?;
-        Ok(simplify_test_output(&raw))
-    }
-}
-
-/// Reduce raw `cargo test` output to a readable summary for the model: keep
-/// totals, failing-test sections and their detail lines; drop compile/build
-/// noise and the per-test "... ok" lines.
-fn simplify_test_output(raw: &str) -> String {
-    let mut out = String::new();
-    let mut kept = 0usize;
-    for line in raw.lines() {
-        let t = line.trim_start();
-        if t.is_empty()
-            || t.starts_with("Compiling")
-            || t.starts_with("Finished")
-            || t.starts_with("Running")
-            || t.starts_with("Doc-tests")
-            || t.starts_with("warning: ")
-            || t.contains("running 0 tests")
-        {
-            continue;
-        }
-        // skip individual passing tests ("test foo ... ok")
-        if let Some(rest) = t.strip_prefix("test ")
-            && rest.ends_with(" ... ok")
-        {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-        kept += 1;
-        if kept > 200 {
-            out.push_str("... (output trimmed)\n");
-            break;
-        }
-    }
-    if out.trim().is_empty() {
-        "test run produced no summary lines (check timeout or exit code)".to_string()
-    } else {
-        out
+        Ok(eco.simplify_tests(&raw))
     }
 }
 
@@ -281,7 +241,7 @@ struct PomCheck;
 static POM_CHECK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "pom_check".into(),
-    description: "Type-check the project (cargo check) and return the first `max_errors` compiler errors with their file:line:col plus the total count. Much cheaper than pom_run_tests for iterating on compile errors; pass `all_targets: true` to also check tests/examples.".into(),
+    description: "Type-check the project (e.g. cargo check) and return the first `max_errors` compiler errors with their file:line:col plus the total count. Much cheaper than pom_run_tests for iterating on compile errors; pass `all_targets: true` to also check tests/examples. Uses the project's build ecosystem (Cargo today).".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -328,18 +288,25 @@ impl Tool for PomCheck {
             .as_deref()
             .map(|s| s.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default();
-        let mut resolved = tasks::resolve(&ctx.project_root, "check", &args.subproject, &[])?;
-        if let tasks::CommandLine::Cargo { args: a } = &mut resolved.line {
-            if args.all_targets {
-                a.push("--all-targets".to_string());
-            }
-            a.extend(extra);
-            a.push("--message-format=json".to_string());
-        }
+        let eco = ecosystem::detect(&ctx.project_root)?;
+        let Some(line) =
+            eco.check_command(&ctx.project_root, &args.subproject, args.all_targets, &extra)?
+        else {
+            anyhow::bail!(
+                "the {} ecosystem has no separate check step; use pom_run_tests or pom_run_task",
+                eco.name()
+            );
+        };
+        let resolved = tasks::Resolved {
+            cwd: ctx.project_root.clone(),
+            describe: line.describe(),
+            line,
+        };
         let out = tasks::exec(&resolved, args.timeout_secs).await?;
-        let (errors, total) = parse_check_json(&out.body, args.max_errors);
+        let (errors, total) = eco.parse_diagnostics(&out.body, args.max_errors);
         let mut s = format!(
-            "cargo check {} (exit {}, {:.1}s)\n",
+            "{} check {} (exit {}, {:.1}s)\n",
+            eco.name(),
             if out.success { "ok" } else { "failed" },
             out.code,
             out.elapsed.as_secs_f32()
@@ -349,7 +316,7 @@ impl Tool for PomCheck {
             return Ok(s);
         }
         if total == 0 {
-            // No JSON diagnostics parsed: surface the human-readable error lines.
+            // Could not parse structured diagnostics: surface the raw output.
             let mut shown = 0usize;
             for line in out.body.lines() {
                 if line.starts_with('{') || line.trim().is_empty() {
@@ -373,66 +340,6 @@ impl Tool for PomCheck {
             s.push('\n');
         }
         Ok(s)
-    }
-}
-
-/// Parse `cargo check --message-format=json` output: return up to `max` formatted
-/// error diagnostics and the total number of errors seen.
-fn parse_check_json(raw: &str, max: usize) -> (Vec<String>, usize) {
-    let mut errors = Vec::new();
-    let mut total = 0usize;
-    for line in raw.lines() {
-        let line = line.trim();
-        if !line.starts_with('{') {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if v.get("reason").and_then(Value::as_str) != Some("compiler-message") {
-            continue;
-        }
-        let Some(msg) = v.get("message") else { continue };
-        if msg.get("level").and_then(Value::as_str) != Some("error") {
-            continue;
-        }
-        total += 1;
-        if errors.len() < max {
-            errors.push(format_diagnostic(msg));
-        }
-    }
-    (errors, total)
-}
-
-/// Format one JSON diagnostic as `file:line:col: error[CODE]: message`.
-fn format_diagnostic(msg: &Value) -> String {
-    let text = msg.get("message").and_then(Value::as_str).unwrap_or("");
-    let code = msg
-        .get("code")
-        .and_then(|c| c.get("code"))
-        .and_then(Value::as_str)
-        .map(|c| format!("[{c}]"))
-        .unwrap_or_default();
-    let loc = msg
-        .get("spans")
-        .and_then(Value::as_array)
-        .and_then(|spans| {
-            spans
-                .iter()
-                .find(|s| s.get("is_primary").and_then(Value::as_bool).unwrap_or(false))
-                .or_else(|| spans.first())
-        })
-        .map(|s| {
-            let f = s.get("file_name").and_then(Value::as_str).unwrap_or("");
-            let l = s.get("line_start").and_then(Value::as_u64).unwrap_or(0);
-            let c = s.get("column_start").and_then(Value::as_u64).unwrap_or(0);
-            format!("{f}:{l}:{c}")
-        })
-        .unwrap_or_default();
-    if loc.is_empty() {
-        format!("error{code}: {text}")
-    } else {
-        format!("{loc}: error{code}: {text}")
     }
 }
 
@@ -529,6 +436,7 @@ async fn run_approved_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecosystem::Ecosystem;
 
     #[test]
     fn test_output_is_simplified() {
@@ -551,7 +459,7 @@ failures:
     bar
 test result: FAILED. 11 passed; 1 failed; 0 ignored
 ";
-        let out = simplify_test_output(raw);
+        let out = ecosystem::Cargo.simplify_tests(raw);
         assert!(out.contains("test result: FAILED"));
         assert!(out.contains("11 passed"));
         assert!(out.contains("panicked at"));
@@ -560,26 +468,21 @@ test result: FAILED. 11 passed; 1 failed; 0 ignored
     }
 
     #[test]
-    fn run_task_rejects_test_runs() {
-        let cargo = tasks::CommandLine::Cargo {
+    fn is_test_command_guards_pom_run_task() {
+        let eco = ecosystem::Cargo;
+        // a `test` invocation (or an alias expanding to one) is refused
+        assert!(eco.is_test_command(&tasks::CommandLine::Program {
+            program: "cargo".into(),
             args: vec!["test".into(), "--lib".into()],
-        };
-        let err = ensure_not_test_run(&cargo).unwrap_err().to_string();
-        assert!(err.contains("pom_run_tests"), "{err}");
-        // a cargo alias expanding to `test` is caught the same way
-        let alias = tasks::CommandLine::Cargo {
-            args: vec!["test".into()],
-        };
-        assert!(ensure_not_test_run(&alias).is_err());
-        // non-test cargo commands and shell aliases still pass
-        let build = tasks::CommandLine::Cargo {
+        }));
+        // other cargo commands and shell aliases pass
+        assert!(!eco.is_test_command(&tasks::CommandLine::Program {
+            program: "cargo".into(),
             args: vec!["build".into()],
-        };
-        assert!(ensure_not_test_run(&build).is_ok());
-        let shell = tasks::CommandLine::Shell {
+        }));
+        assert!(!eco.is_test_command(&tasks::CommandLine::Shell {
             script: "echo hi".into(),
-        };
-        assert!(ensure_not_test_run(&shell).is_ok());
+        }));
     }
 
     #[test]
@@ -591,12 +494,12 @@ test result: FAILED. 11 passed; 1 failed; 0 ignored
 {"reason":"compiler-message","message":{"level":"error","message":"mismatched types","code":null,"spans":[{"file_name":"src/lib.rs","line_start":9,"column_start":1,"is_primary":true}]}}
 Compiling foo
 "#;
-        let (errors, total) = parse_check_json(raw, 1);
+        let (errors, total) = ecosystem::Cargo.parse_diagnostics(raw, 1);
         assert_eq!(total, 2);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0], "src/main.rs:3:5: error[E0425]: cannot find value `a`");
 
-        let (all, total) = parse_check_json(raw, 10);
+        let (all, total) = ecosystem::Cargo.parse_diagnostics(raw, 10);
         assert_eq!(total, 2);
         assert_eq!(all.len(), 2);
         assert_eq!(all[1], "src/lib.rs:9:1: error: mismatched types");

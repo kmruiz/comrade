@@ -1,8 +1,11 @@
-//! Task resolution and execution for Cargo projects.
+//! Cargo task resolution + the generic process runner.
 //!
-//! A "task" is either a cargo verb, a cargo alias from `.cargo/config.toml`
-//! (which may itself be a `!shell` command), or scoped to a subproject via
-//! `--manifest-path`.
+//! [`resolve`] is the Cargo-specific resolver (verb -> cargo args, aliases from
+//! `.cargo/config.toml`, subproject -> `--manifest-path`); the `pom_*` tools
+//! reach it through the [`crate::ecosystem::Ecosystem`] seam so other build
+//! ecosystems (npm, Maven, Go, ...) can slot in behind the same tools.
+//! [`exec`]/[`run`] are ecosystem-neutral: they run a [`CommandLine`] (a program
+//! invocation or a shell script) and capture its output.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -28,11 +31,27 @@ fn verb_args(task: &str) -> Option<Vec<String>> {
     Some(argv)
 }
 
-/// How the resolved task is executed.
+/// How a resolved task is executed: a build-tool invocation (`program` + args,
+/// e.g. `cargo check`) or a shell script run with `bash -c`. Program is generic
+/// so a backend for another ecosystem (npm/maven/go) emits its own tool.
 #[derive(Debug)]
 pub enum CommandLine {
-    Cargo { args: Vec<String> },
+    Program { program: String, args: Vec<String> },
     Shell { script: String },
+}
+
+impl CommandLine {
+    /// One-line description used in the task result header.
+    pub fn describe(&self) -> String {
+        match self {
+            CommandLine::Program { program, args } => {
+                let mut parts = vec![program.clone()];
+                parts.extend(args.iter().cloned());
+                parts.join(" ")
+            }
+            CommandLine::Shell { script } => format!("bash -c {script:?}"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -48,7 +67,7 @@ fn find_alias<'a>(aliases: &'a [Alias], task: &str) -> Option<&'a Alias> {
     aliases.iter().find(|a| a.name == task)
 }
 
-fn manifest_path_arg(subproject: &Option<String>) -> Option<String> {
+pub fn manifest_path_arg(subproject: &Option<String>) -> Option<String> {
     subproject
         .as_ref()
         .map(|s| format!("--manifest-path={}/Cargo.toml", s.trim_end_matches('/')))
@@ -105,14 +124,20 @@ pub fn resolve(
                 args.push(m.clone());
             }
             args.extend(extra.iter().cloned());
-            CommandLine::Cargo { args }
+            CommandLine::Program {
+                program: "cargo".to_string(),
+                args,
+            }
         }
     } else if let Some(mut args) = verb_args(task) {
         if let Some(m) = &manifest {
             args.push(m.clone());
         }
         args.extend(extra.iter().cloned());
-        CommandLine::Cargo { args }
+        CommandLine::Program {
+            program: "cargo".to_string(),
+            args,
+        }
     } else {
         let available = model
             .aliases
@@ -126,15 +151,12 @@ pub fn resolve(
         );
     };
 
-    let describe = match &line {
-        CommandLine::Cargo { args } => cargo_describe(args),
-        CommandLine::Shell { script } => format!("bash -c {script:?}"),
-    };
+    let describe = line.describe();
 
     // cargo commands run from the workspace root (manifest-path is root
     // relative); shell commands run inside the subproject when one is given.
     let cwd = match (&line, &sub_cwd) {
-        (CommandLine::Cargo { .. }, _) => root.to_path_buf(),
+        (CommandLine::Program { .. }, _) => root.to_path_buf(),
         (CommandLine::Shell { .. }, Some(sub)) => sub.clone(),
         (CommandLine::Shell { .. }, None) => root.to_path_buf(),
     };
@@ -144,13 +166,6 @@ pub fn resolve(
         line,
         describe,
     })
-}
-
-/// `cargo <args>` for display; `args` must NOT include the leading `cargo`.
-fn cargo_describe(args: &[String]) -> String {
-    let mut parts = vec!["cargo".to_string()];
-    parts.extend(args.iter().cloned());
-    parts.join(" ")
 }
 
 /// Result of running a task to completion.
@@ -172,7 +187,7 @@ pub async fn exec(resolved: &Resolved, timeout_secs: u64) -> Result<TaskOutput> 
 
     let configure = |program: &str, resolved: &Resolved| {
         let mut command = match &resolved.line {
-            CommandLine::Cargo { args } => {
+            CommandLine::Program { args, .. } => {
                 let mut c = tokio::process::Command::new(program);
                 c.args(args);
                 c
@@ -192,7 +207,7 @@ pub async fn exec(resolved: &Resolved, timeout_secs: u64) -> Result<TaskOutput> 
     };
 
     let mut command = match &resolved.line {
-        CommandLine::Cargo { .. } => configure("cargo", resolved),
+        CommandLine::Program { program, .. } => configure(program, resolved),
         CommandLine::Shell { .. } => configure("bash", resolved),
     };
 
@@ -201,7 +216,9 @@ pub async fn exec(resolved: &Resolved, timeout_secs: u64) -> Result<TaskOutput> 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // `cargo` may not be on the PATH inherited by this process even
             // though it is on the login shell's PATH. Locate it and retry.
-            if let CommandLine::Cargo { .. } = resolved.line {
+            if let CommandLine::Program { program, .. } = &resolved.line
+                && program == "cargo"
+            {
                 if let Some(path) = find_cargo().await {
                     let mut retry = configure(path.to_string_lossy().as_ref(), resolved);
                     match retry.spawn() {
@@ -337,14 +354,18 @@ mod tests {
         let none = None;
         let r = resolve(&root, "test", &none, &[]).unwrap();
         match &r.line {
-            CommandLine::Cargo { args } => assert_eq!(args, &["test"]),
+            CommandLine::Program { program, args } => {
+                assert_eq!(program, "cargo");
+                assert_eq!(args, &["test"]);
+            }
             _ => panic!("expected cargo"),
         }
 
         let extra = [String::from("--"), String::from("--nocapture")];
         let r = resolve(&root, "t", &none, &extra).unwrap();
         match &r.line {
-            CommandLine::Cargo { args } => {
+            CommandLine::Program { program, args } => {
+                assert_eq!(program, "cargo");
                 assert_eq!(args, &["test", "--", "--nocapture"])
             }
             _ => panic!("expected cargo alias"),
@@ -353,7 +374,8 @@ mod tests {
         let sub = Some("crates/a".to_string());
         let r = resolve(&root, "check", &sub, &[]).unwrap();
         match &r.line {
-            CommandLine::Cargo { args } => {
+            CommandLine::Program { program, args } => {
+                assert_eq!(program, "cargo");
                 assert_eq!(args, &["check", "--manifest-path=crates/a/Cargo.toml"])
             }
             _ => panic!("expected cargo with manifest path"),
