@@ -3801,18 +3801,17 @@ fn draw(app: &mut App, frame: &mut Frame) {
         .constraints([Constraint::Min(20), Constraint::Percentage(30)])
         .split(rows[0]);
     draw_chat(app, frame, cols[0]);
-    // The model panel shows three fixed rows (label, gauge, usage) plus one row
-    // per wrapped delegate line under them; grow it so delegate text is never
+    // The model panel shows 2 fixed rows (label+gauge/usage merged, then delegates)
+    // plus one row per wrapped delegate line; grow it so delegate text is never
     // clipped out of view. The plan panel takes whatever is left.
-    // (6 = 2 border + 3 fixed rows + 1 header + the "delegates:" line's slack;
-    // keeping the no-delegate layout unchanged at 6.)
+    // (MODEL_PANEL_FIXED_ROWS + 2 = 2 fixed rows + 2 borders; + delegate_block rows)
     let delegate_rows = delegate_panel_rows(
         &app.cfg.delegates,
         &app.model_colors,
         usize::from(cols[1].width.saturating_sub(2)).max(1),
     );
-    let delegate_h = delegate_rows.as_ref().map_or(0, |r| r.len() as u16 - 1);
-    let stats_h = (6 + delegate_h).min(rows[0].height);
+    let delegate_block = delegate_rows.as_ref().map_or(0, |r| r.len() as u16);
+    let stats_h = (MODEL_PANEL_FIXED_ROWS + 2 + delegate_block).min(rows[0].height);
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(stats_h), Constraint::Min(0)])
@@ -5457,13 +5456,25 @@ fn delegate_panel_rows(
     Some(rows)
 }
 
-fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" model ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+const MODEL_PANEL_FIXED_ROWS: u16 = 2;
 
-    let tokens = app.ctx_tokens;
-    let budget = app.ctx_budget.max(1);
+fn short_tokens(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        let k = n as f64 / 1_000.0;
+        if k >= 10.0 {
+            format!("{k:.0}k")
+        } else {
+            format!("{k:.1}k")
+        }
+    } else {
+        n.to_string()
+    }
+}
+
+fn gauge_line(tokens: usize, budget: usize, estimated: bool, width: usize) -> Line<'static> {
+    let budget = budget.max(1);
     let ratio = (tokens as f64 / budget as f64).clamp(0.0, 1.0);
     let pct = (ratio * 100.0).round() as usize;
     let bar_color = if ratio < 0.7 {
@@ -5474,79 +5485,131 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
         Color::Red
     };
 
-    let width = inner.width as usize;
-    let model = app.cfg.llm.model.clone();
-    let mut model_label = model;
-    if let Some(v) = &app.cfg.llm.model_version {
-        if !v.is_empty() {
-            model_label.push_str("  ");
-            model_label.push_str(v);
+    let used_short = short_tokens(tokens);
+    let budget_short = short_tokens(budget);
+    let core = format!("{pct}%  {used_short}/{budget_short}");
+    let marker = if estimated { " est" } else { "" };
+
+    let core_len = core.chars().count();
+    let marker_len = marker.chars().count();
+    let bar_w = width.saturating_sub(core_len + marker_len + 1);
+
+    if bar_w >= 4 {
+        let filled = (ratio * bar_w as f64).floor() as usize;
+        let mut spans = Vec::new();
+        spans.push(Span::styled(
+            "#".repeat(filled),
+            Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            "-".repeat(bar_w.saturating_sub(filled)),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("{pct}% "),
+            Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("{used_short}/{budget_short}"),
+            Style::default().fg(Color::White),
+        ));
+        if estimated {
+            spans.push(Span::styled(" est", Style::default().fg(Color::DarkGray)));
         }
-    }
-    if let Some(b) = &app.balance {
-        if !b.is_empty() {
-            model_label.push_str("  |  ");
-            model_label.push_str(b);
+        Line::from(spans)
+    } else {
+        // Narrow panel: drop the bar, just show core text with color
+        let mut spans = Vec::new();
+        spans.push(Span::styled(
+            format!("{pct}% "),
+            Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("{used_short}/{budget_short}"),
+            Style::default().fg(Color::White),
+        ));
+        if estimated {
+            spans.push(Span::styled(" est", Style::default().fg(Color::DarkGray)));
         }
+        Line::from(spans)
     }
-    if model_label.chars().count() > width {
-        model_label = model_label.chars().take(width).collect();
-    }
+}
 
-    let filled = (ratio * width as f64).floor() as usize;
-    let mut bar_spans = Vec::new();
-    bar_spans.push(Span::styled(
-        "#".repeat(filled),
-        Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
-    ));
-    bar_spans.push(Span::styled(
-        "-".repeat(width.saturating_sub(filled)),
-        Style::default().fg(Color::DarkGray),
-    ));
-
-    let mut usage = vec![Span::styled(
-        format!("{pct}% used  "),
-        Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
-    )];
-    usage.push(Span::styled(
-        format!("{tokens} / {budget} tokens"),
-        Style::default().fg(Color::White),
-    ));
-    usage.push(Span::styled(
-        if app.ctx_estimated {
-            " (est.)"
-        } else {
-            " (api)"
-        },
-        Style::default().fg(Color::DarkGray),
-    ));
-
+fn label_line(model_label: String, balance: Option<&str>, width: usize) -> Line<'static> {
     let model_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
+    let balance_style = Style::default().fg(Color::DarkGray);
+
+    if let Some(bal) = balance {
+        if !bal.is_empty() {
+            let label_len = model_label.chars().count();
+            let bal_len = bal.chars().count();
+            if label_len + bal_len < width {
+                let pad = width - label_len - bal_len;
+                let mut spans = Vec::new();
+                spans.push(Span::styled(model_label, model_style));
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.push(Span::styled(bal.to_string(), balance_style));
+                return Line::from(spans);
+            }
+        }
+    }
+
+    // Truncate model_label to width if needed
+    let truncated = if model_label.chars().count() > width {
+        model_label.chars().take(width).collect()
+    } else {
+        model_label
+    };
+    Line::from(Span::styled(truncated, model_style))
+}
+
+fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" model ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let width = inner.width as usize;
+    let model_label = if let Some(v) = &app.cfg.llm.model_version {
+        if v.is_empty() {
+            app.cfg.llm.model.clone()
+        } else {
+            format!("{} {}", app.cfg.llm.model, v)
+        }
+    } else {
+        app.cfg.llm.model.clone()
+    };
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
         ])
         .split(inner);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(model_label, model_style))),
+        Paragraph::new(label_line(model_label, app.balance.as_deref(), width)),
         rows[0],
     );
-    frame.render_widget(Paragraph::new(Line::from(bar_spans)), rows[1]);
-    frame.render_widget(Paragraph::new(Line::from(usage)), rows[2]);
-
+    frame.render_widget(
+        Paragraph::new(gauge_line(
+            app.ctx_tokens,
+            app.ctx_budget,
+            app.ctx_estimated,
+            width,
+        )),
+        rows[1],
+    );
     // Configured delegates ([[delegates]]) shown in the leftover space under
     // the model gauge; word-wrapped to the panel width so long names or
     // descriptions never spill past the right edge.
     if let Some(delegate_rows) = delegate_panel_rows(&app.cfg.delegates, &app.model_colors, width) {
-        frame.render_widget(Paragraph::new(delegate_rows), rows[3]);
+        frame.render_widget(Paragraph::new(delegate_rows), rows[2]);
     }
-    let _ = rows;
 }
 
 fn draw_plan(app: &App, frame: &mut Frame, area: Rect) {
@@ -7844,6 +7907,44 @@ mod tests {
         }
         // No delegate configured → the panel keeps its legacy fixed height.
         assert!(delegate_panel_rows(&[], &ModelColors::new(), 24).is_none());
+    }
+
+    #[test]
+    fn short_tokens_compacts_counts() {
+        assert_eq!(short_tokens(0), "0");
+        assert_eq!(short_tokens(900), "900");
+        assert_eq!(short_tokens(9_500), "9.5k");
+        assert_eq!(short_tokens(85_000), "85k");
+        assert_eq!(short_tokens(128_000), "128k");
+        assert_eq!(short_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn gauge_line_shows_pct_and_counts() {
+        let l = gauge_line(25_000, 100_000, false, 40);
+        let flattened: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(flattened.contains("25%"), "missing pct in {flattened}");
+        assert!(
+            flattened.contains("25k/100k"),
+            "missing counts in {flattened}"
+        );
+        assert!(flattened.contains('#'), "missing bar in {flattened}");
+    }
+
+    #[test]
+    fn gauge_line_drops_bar_on_narrow_panel() {
+        let l = gauge_line(25_000, 100_000, true, 8);
+        let flattened: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !flattened.contains('#'),
+            "bar should be dropped in {flattened}"
+        );
+        assert!(flattened.contains("25%"), "missing pct in {flattened}");
+        assert!(flattened.contains("100k"), "missing budget in {flattened}");
+        assert!(
+            flattened.contains("est"),
+            "missing est marker in {flattened}"
+        );
     }
 
     #[test]
