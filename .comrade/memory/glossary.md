@@ -81,6 +81,14 @@ Children run with `kill_on_drop(true)`; output is captured into a 200 KB bounded
 **References:**
 - `crates/comrade-tui/src/tui.rs`
 
+## BgJobs
+> A cheap, cloneable handle to the shared background-job registry (crates/comrade-tool-project/src/bg.rs), for observers outside the four `bg_*` tools. Created by `BgJobs::new()`; returned alongside the tools by `comrade_tool_project::all_with_jobs()`. Methods: `list()` (all jobs, oldest first, as `BgJobInfo { id, command, status, running, elapsed_secs }`), `running()` (running only), `kill(id)` (cancels the job; false if unknown). The TUI carries one on Deps/App to draw the "background jobs" panel below the plan and to back M-x stop-background-job.
+
+**References:**
+- `crates/comrade-tool-project/src/bg.rs`
+- `crates/comrade-tool-project/src/lib.rs (all_with_jobs)`
+- `crates/comrade-tui/src/tui.rs (draw_jobs, open_jobs_pick, handle_jobs_pick_key)`
+
 ## Blocked session
 > Synonym for \"Waiting session\" (the code/UI term of record is now \"waiting\"; the local variable in session_counts_label is still named `blocked`). See the \"Waiting session\" entry.
 
