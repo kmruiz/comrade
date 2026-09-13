@@ -183,6 +183,16 @@ Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; othe
 **References:**
 - `crates/comrade-tui/src/tui.rs`
 
+## recommended (form/question value)
+> Optional suggested answer that an agent may attach to an `ask_form` field (`recommended` in the field JSON) or to an `ask_user` question (`recommended`). It prefills the field / free-text answer and is flagged " (recommended)" next to a matching option or the field in the TUI. In auto-accept mode (TUI) or `Autonomy::Auto` (headless), the question is answered with it and a form is submitted with the recommended/default values when every required field is satisfied. The agent may obtain a good value by consulting another agent with ask_advise.
+
+**References:**
+- `crates/comrade-tool/src/form.rs`
+- `crates/comrade-tool/src/tool.rs`
+- `crates/comrade-tui/src/tui.rs`
+- `crates/comrade-tui/src/headless.rs`
+- `crates/comrade-core/prompts/tools-intro.md`
+
 ## runbook-style prompt
 > The convention that all model-facing prompt text in Comrade must be terse, imperative runbook prose (numbered steps, one idea per line, short sentences, exact tool names in backticks), so that small models can act as the tech lead. Applies to the tech-lead prompt sections, the delegate/advisor sub-agent system bodies, and ToolSpec descriptions.
 

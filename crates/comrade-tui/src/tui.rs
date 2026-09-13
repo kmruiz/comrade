@@ -410,17 +410,17 @@ impl FormEdit {
             }
             Some(FieldKind::Select { .. }) => {} // options are chosen with ←/→
             Some(FieldKind::Number { .. }) => {
-                if c.is_ascii_digit() || c == '.' {
-                    if let Some(v) = self.value_mut() {
-                        v.push(c);
-                    }
+                if (c.is_ascii_digit() || c == '.')
+                    && let Some(v) = self.value_mut()
+                {
+                    v.push(c);
                 }
             }
             Some(FieldKind::Date) => {
-                if c.is_ascii_digit() || c == '-' {
-                    if let Some(v) = self.value_mut() {
-                        v.push(c);
-                    }
+                if (c.is_ascii_digit() || c == '-')
+                    && let Some(v) = self.value_mut()
+                {
+                    v.push(c);
                 }
             }
             Some(FieldKind::Text { .. }) => {
@@ -3453,29 +3453,32 @@ pub async fn run(deps: &Deps) -> Result<()> {
             ask = app.asks_rx.recv() => {
                 match ask {
                     Some(ask) => {
-                        // Auto-accept mode answers approvals immediately.
-                        let is_confirm =
-                            matches!(ask.prompt, UserPrompt::Confirm { .. });
-                        if app.auto_accept && is_confirm {
-                            let action = match &ask.prompt {
-                                UserPrompt::Confirm { title, .. } => one_line(title, 80),
-                                _ => String::new(),
-                            };
-                            let _ = ask.reply.send(UserReply::Answer("yes".into()));
-                            app.push_msg(Msg::text(
-                                MsgKind::Meta,
-                                if action.is_empty() {
-                                    "auto-accept: approved".to_string()
-                                } else {
-                                    format!("auto-accept → approved: {action}")
-                                },
-                            ));
+                        // Auto-accept mode answers any prompt that carries a
+                        // recommended value (a confirm, or a question/form with
+                        // recommendations) without asking the human.
+                        if app.auto_accept
+                            && let Some(reply) = auto_reply(&ask.prompt)
+                        {
+                            let label = auto_reply_label(&ask.prompt);
+                            let _ = ask.reply.send(reply);
+                            app.push_msg(Msg::text(MsgKind::Meta, label));
                         } else {
                             let form = match &ask.prompt {
                                 UserPrompt::Form(spec) => Some(FormEdit::new(spec)),
                                 _ => None,
                             };
-                            app.dialogs.push(Dialog { prompt: ask.prompt, buf: String::new(), reply: ask.reply, session: ask.session, form });
+                            // A free-text question prefills its recommended answer.
+                            let buf = match &ask.prompt {
+                                UserPrompt::Question {
+                                    options,
+                                    recommended,
+                                    ..
+                                } if options.is_empty() => {
+                                    recommended.clone().unwrap_or_default()
+                                }
+                                _ => String::new(),
+                            };
+                            app.dialogs.push(Dialog { prompt: ask.prompt, buf, reply: ask.reply, session: ask.session, form });
                             app.dialog_ask = false;
                             app.dialog_conv.clear();
                             app.push_meta("waiting for your input");
@@ -7052,7 +7055,50 @@ fn form_field_line(field: &comrade_tool::FormField, value: &str, focused: bool) 
     {
         spans.push(Span::styled("_", Style::default().fg(Color::Green)));
     }
+    if field.has_recommended() {
+        spans.push(Span::styled(
+            " (recommended)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     Line::from(spans)
+}
+
+/// The reply auto-accept mode gives a prompt without asking the human, or
+/// `None` when the prompt must still be shown (e.g. a form whose required
+/// fields the recommended values do not satisfy).
+fn auto_reply(prompt: &UserPrompt) -> Option<UserReply> {
+    match prompt {
+        UserPrompt::Confirm { .. } => Some(UserReply::Answer("yes".into())),
+        UserPrompt::Question { recommended, .. } => recommended
+            .as_deref()
+            .filter(|r| !r.trim().is_empty())
+            .map(|r| UserReply::Answer(r.to_string())),
+        UserPrompt::Form(spec) => {
+            let values = spec.initial_values();
+            spec.is_complete(&values).then_some(UserReply::Form(values))
+        }
+    }
+}
+
+/// Meta line describing what auto-accept did for `prompt` (the counterpart of
+/// [`auto_reply`], which decided *that* it could be auto-answered).
+fn auto_reply_label(prompt: &UserPrompt) -> String {
+    match prompt {
+        UserPrompt::Confirm { title, .. } => {
+            let action = one_line(title, 80);
+            if action.is_empty() {
+                "auto-accept: approved".to_string()
+            } else {
+                format!("auto-accept → approved: {action}")
+            }
+        }
+        UserPrompt::Question { recommended, .. } => format!(
+            "auto-accept → answered (recommended): {}",
+            recommended.as_deref().unwrap_or("").trim()
+        ),
+        UserPrompt::Form(_) => "auto-accept → form submitted".to_string(),
+    }
 }
 
 fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
@@ -7066,23 +7112,30 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
 
     // Build the body lines for the kind of prompt, wrapped to the popup width.
     let (kind_label, is_question, options, mut body) = match &dialog.prompt {
-        UserPrompt::Question { prompt, options } => {
+        UserPrompt::Question {
+            prompt,
+            options,
+            recommended,
+        } => {
             let text = if options.is_empty() {
                 format!("{prompt}\n\n(Type your answer below)")
             } else {
                 prompt.clone()
             };
+            let recommended = recommended.as_deref().filter(|r| !r.trim().is_empty());
             let mut lines = preview_lines(&text, inner_w);
             for (i, o) in options.iter().enumerate() {
                 let num = format!("{}. ", i + 1);
                 let num_style = Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD);
+                let is_recommended = recommended == Some(o.as_str());
                 let wrapped = wrap_plain(o, inner_w.saturating_sub(num.len()));
                 if wrapped.is_empty() {
                     lines.push(Line::from(Span::styled(num, num_style)));
                     continue;
                 }
+                let last = wrapped.len() - 1;
                 for (j, chunk) in wrapped.into_iter().enumerate() {
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     if j == 0 {
@@ -7092,6 +7145,14 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
                         spans.push(Span::raw(" ".repeat(num.len())));
                     }
                     spans.push(Span::styled(chunk, Style::default().fg(Color::Cyan)));
+                    if is_recommended && j == last {
+                        spans.push(Span::styled(
+                            " (recommended)",
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
                     lines.push(Line::from(spans));
                 }
             }
@@ -7971,6 +8032,65 @@ mod tests {
         assert_eq!(shift_date("2026-01-31", 1), "2026-02-01");
         assert_eq!(shift_date("2026-03-01", -1), "2026-02-28");
         assert_eq!(shift_date("", 0), "1970-01-01");
+    }
+
+    #[test]
+    fn auto_reply_uses_recommended_and_skips_incomplete_forms() {
+        // Confirm is always approved.
+        assert!(matches!(
+            auto_reply(&UserPrompt::Confirm {
+                title: "x".into(),
+                diff: None
+            }),
+            Some(UserReply::Answer(a)) if a == "yes"
+        ));
+        // A question with a recommended answer is auto-answered with it.
+        let q = UserPrompt::Question {
+            prompt: "Which?".into(),
+            options: vec!["a".into(), "b".into()],
+            recommended: Some("b".into()),
+        };
+        assert!(matches!(auto_reply(&q), Some(UserReply::Answer(a)) if a == "b"));
+        // Without a recommended answer the question is still shown.
+        let q2 = UserPrompt::Question {
+            prompt: "Which?".into(),
+            options: vec![],
+            recommended: None,
+        };
+        assert!(auto_reply(&q2).is_none());
+        // A form whose required field has a recommended value auto-submits.
+        let ok = form_spec(serde_json::json!({
+            "fields": [{ "id": "n", "label": "N", "kind": "text", "required": true, "recommended": "hi" }]
+        }));
+        assert!(matches!(
+            auto_reply(&UserPrompt::Form(ok)),
+            Some(UserReply::Form(_))
+        ));
+        // A form with an unfilled required field is shown to the human instead.
+        let pending = form_spec(serde_json::json!({
+            "fields": [{ "id": "n", "label": "N", "kind": "text", "required": true }]
+        }));
+        assert!(auto_reply(&UserPrompt::Form(pending)).is_none());
+    }
+
+    #[test]
+    fn auto_reply_label_names_the_action() {
+        let q = UserPrompt::Question {
+            prompt: "?".into(),
+            options: vec![],
+            recommended: Some("b".into()),
+        };
+        assert_eq!(
+            auto_reply_label(&q),
+            "auto-accept → answered (recommended): b"
+        );
+        let f = form_spec(
+            serde_json::json!({ "fields": [{ "id": "n", "label": "N", "kind": "text" }] }),
+        );
+        assert_eq!(
+            auto_reply_label(&UserPrompt::Form(f)),
+            "auto-accept → form submitted"
+        );
     }
 
     #[test]

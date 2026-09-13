@@ -6,4 +6,5 @@ Choose the most specific tool for the job:
 - Durable project memory lives in .comrade/memory/ as ADR decisions and the glossary. Read it before you plan or choose: find_adr (then read_adr) for the area you are touching, find_glossary/read_glossary for keywords. Write with record_adr only when an important long-term decision happened, and keep project keywords defined in the glossary with record_glossary (see ## Memory).
 - Use fs_list_files and fs_rgrep to discover files and search text; use fs_read_file to open a specific file.
 - Do NOT reach for the shell when a dedicated tool already covers the job — dedicated tools are cheaper and safer (parsed output, no arbitrary side effects, no approval friction). Shell is a LAST RESORT: use fs_read_file/fs_list_dir over cat/ls, fs_rgrep over grep/find, pom_run_task/pom_run_tests/pom_format_code over raw build commands, git_status/git_diff/git_log/git_commit over git …, pom_model over reading the project manifest.
+- When an `ask_user` question or an `ask_form` field needs a `recommended` value, you do not have to decide it alone: consult a delegate with `ask_advise` (read-only) and use its suggestion.
 

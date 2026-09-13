@@ -22,3 +22,6 @@ Covers the form/component contract, the ask_form tool, TUI rendering + interacti
 ## Impact
 New enum variants break exhaustive matches on UserPrompt/UserReply across the workspace (fixed with wildcard/default arms in core/fs/delegate/advise). New component kinds are added by extending FieldKind plus the TUI render/adjust arms and the ask_form JSON schema.
 
+
+## Note
+Addendum (2026-09-13): every form field (`FormField.recommended`) and every `ask_user` question (`UserPrompt::Question.recommended: Option<String>`) can now carry a **recommended** value. It prefills the field / free-text answer and is flagged " (recommended)" for options and form fields in the TUI. Auto-accept mode (M-x toggle, or headless `Autonomy::Auto`) then answers without the human: the question is answered with the recommended value, an option-question likewise, and a form is submitted with all recommended/default values — but only when every required field is satisfied, otherwise the form is still shown. The agent does not have to decide the recommendation alone: it can consult a delegate with `ask_advise` (guidance added to crates/comrade-core/prompts/tools-intro.md). Replaces the earlier "auto mode never auto-accepts forms/questions" scope note.

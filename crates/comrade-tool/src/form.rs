@@ -42,6 +42,11 @@ pub struct FormField {
     /// Optional initial value (as text).
     #[serde(default)]
     pub default: Option<String>,
+    /// Optional suggested value: prefills the field (shown as "recommended")
+    /// and is what auto mode / a sub-agent submits. Takes precedence over
+    /// `default`.
+    #[serde(default)]
+    pub recommended: Option<String>,
 }
 
 /// The kind of interactive component, tagged in JSON by `"kind"`.
@@ -73,8 +78,10 @@ pub enum FieldKind {
 impl FormSpec {
     /// Default answers for every field, in field order.
     ///
-    /// Used to seed the UI and to auto-answer a form from a context that cannot
-    /// show one (a sub-agent's `UserIo`, or headless auto mode).
+    /// Each value is the field's recommended value when it has one, else its
+    /// `default`, else a kind-appropriate seed. Used both to prefill the UI and
+    /// to auto-answer a form from a context that cannot show one (a sub-agent's
+    /// `UserIo`, or headless/auto mode).
     pub fn initial_values(&self) -> BTreeMap<String, String> {
         self.fields
             .iter()
@@ -105,9 +112,18 @@ impl FormSpec {
 }
 
 impl FormField {
-    /// The value this field starts with: its `default`, else a kind-appropriate
-    /// seed (number's `min`, a select's first option, checkbox off).
+    /// The value this field starts with: its `recommended` value if set, else
+    /// its `default`, else a kind-appropriate seed (number's `min`, a select's
+    /// first option, checkbox off).
     pub fn initial_value(&self) -> String {
+        // A recommended value wins over the plain default (and is checked
+        // against min/max-free parsing like a default).
+        if let Some(r) = self.recommended.as_deref() {
+            return match self.kind {
+                FieldKind::Checkbox => truthy(r).to_string(),
+                _ => r.to_string(),
+            };
+        }
         match (&self.kind, self.default.as_deref()) {
             (FieldKind::Checkbox, Some(d)) => truthy(d).to_string(),
             (FieldKind::Checkbox, None) => "false".to_string(),
@@ -118,6 +134,13 @@ impl FormField {
             (FieldKind::Select { options }, None) => options.first().cloned().unwrap_or_default(),
             _ => String::new(),
         }
+    }
+
+    /// Whether this field carries a non-blank recommended value.
+    pub fn has_recommended(&self) -> bool {
+        self.recommended
+            .as_ref()
+            .is_some_and(|r| !r.trim().is_empty())
     }
 }
 
@@ -222,5 +245,38 @@ mod tests {
             spec.answer_lines(&answers),
             "guests = 3\nroom = single\nnotes = late arrival"
         );
+    }
+
+    #[test]
+    fn recommended_value_wins_over_default() {
+        let spec = parse(json!({
+            "fields": [
+                { "id": "guests", "label": "Guests", "kind": "number", "min": 1, "default": "1", "recommended": "4" },
+                { "id": "room", "label": "Room", "kind": "select", "options": ["single", "double"], "recommended": "double" },
+                { "id": "breakfast", "label": "Breakfast", "kind": "checkbox", "recommended": "yes" },
+                { "id": "date", "label": "Date", "kind": "date" },
+                { "id": "notes", "label": "Notes", "kind": "text", "default": "none" }
+            ]
+        }));
+        let v = spec.initial_values();
+        assert_eq!(v["guests"], "4");
+        assert_eq!(v["room"], "double");
+        assert_eq!(v["breakfast"], "true");
+        assert_eq!(v["date"], "");
+        assert_eq!(v["notes"], "none");
+    }
+
+    #[test]
+    fn has_recommended_reports_presence() {
+        let spec = parse(json!({
+            "fields": [
+                { "id": "a", "label": "A", "kind": "text", "recommended": "hi" },
+                { "id": "b", "label": "B", "kind": "text", "recommended": "  " },
+                { "id": "c", "label": "C", "kind": "text" }
+            ]
+        }));
+        assert!(spec.fields[0].has_recommended());
+        assert!(!spec.fields[1].has_recommended());
+        assert!(!spec.fields[2].has_recommended());
     }
 }

@@ -565,7 +565,7 @@ struct AskUser;
 static ASK_USER_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "ask_user".into(),
-    description: "Ask the human a single, concise question and wait for their answer. The dialog that shows this is small, so ask exactly one short question and keep it brief. Optionally supply up to 4 short answer options (each a brief phrase) so the human can pick instead of typing; omit options for free-form input. Use to resolve ambiguity, request confirmation, or let them pick between options. Prefer over guessing when a choice materially matters.".into(),
+    description: "Ask the human a single, concise question and wait for their answer. The dialog that shows this is small, so ask exactly one short question and keep it brief. Optionally supply up to 4 short answer options (each a brief phrase) so the human can pick instead of typing; omit options for free-form input. Use to resolve ambiguity, request confirmation, or let them pick between options. Prefer over guessing when a choice materially matters. Optionally set `recommended` to the answer you suggest (consult another agent with ask_advise if unsure); it is flagged in the UI and used automatically in auto mode.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -574,7 +574,8 @@ static ASK_USER_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Optional predefined answers: at most 4 short options (brief phrases). Omit for free-form input."
-            }
+            },
+            "recommended": { "type": "string", "description": "Suggested answer. When it matches one of `options` that option is flagged 'recommended' in the UI; in auto mode the question is answered with it. Get a good value by consulting another agent with ask_advise/delegate rather than guessing." }
         },
         "required": ["question"],
         "additionalProperties": false
@@ -594,11 +595,14 @@ impl Tool for AskUser {
             question: String,
             #[serde(default)]
             options: Vec<String>,
+            #[serde(default)]
+            recommended: Option<String>,
         }
         let args: Args = serde_json::from_value(args)?;
         let prompt = UserPrompt::Question {
             prompt: args.question,
             options: args.options,
+            recommended: args.recommended,
         };
         let reply = ctx.user.ask(prompt).await?;
         Ok(match reply {
@@ -618,7 +622,7 @@ struct AskForm;
 static ASK_FORM_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
         name: "ask_form".into(),
-        description: "Render an interactive form (text/number/date/select/checkbox components) in the chat and return the human's answers as `id = value` lines. Use for choices a plain text question would make awkward: numbers, dates, bounded pick-lists, booleans.".into(),
+        description: "Render an interactive form (text/number/date/select/checkbox components) in the chat and return the human's answers as `id = value` lines. Use for choices a plain text question would make awkward: numbers, dates, bounded pick-lists, booleans. Set a field's `recommended` value to suggest an answer (consult another agent with ask_advise if unsure); it prefills the field and is auto-submitted in auto mode.".into(),
         json_schema: json!({
             "type": "object",
             "properties": {
@@ -638,6 +642,7 @@ static ASK_FORM_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
                             },
                             "required": { "type": "boolean", "description": "Field must be filled to submit." },
                             "default": { "type": "string", "description": "Optional initial value." },
+                            "recommended": { "type": "string", "description": "Suggested answer. Prefills the field (marked 'recommended') and is what auto mode submits when every required field is satisfied. Consult another agent with ask_advise/delegate to obtain a good value if you are unsure." },
                             "placeholder": { "type": "string", "description": "Placeholder for text fields." },
                             "min": { "type": "number", "description": "Minimum value for number fields." },
                             "max": { "type": "number", "description": "Maximum value for number fields." },
@@ -693,7 +698,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AskForm, SelfFinishPlan, SelfSetPlan, SelfSetStepContext, SelfSetStepModel, SelfUpdatePlan,
+        AskForm, AskUser, SelfFinishPlan, SelfSetPlan, SelfSetStepContext, SelfSetStepModel,
+        SelfUpdatePlan,
     };
 
     /// A real-enough session: stores the plan and which steps the `delegate`
@@ -1234,5 +1240,59 @@ mod tests {
 
         let out = AskForm.invoke(&ctx, json).await.unwrap();
         assert_eq!(out, "guests = 3\nroom = double\nbreakfast = true");
+    }
+
+    #[tokio::test]
+    async fn ask_user_passes_recommended_through() {
+        use std::sync::Mutex as StdMutex;
+
+        struct RecIo(Arc<StdMutex<Option<UserPrompt>>>);
+        #[async_trait]
+        impl UserIo for RecIo {
+            async fn ask(&self, prompt: UserPrompt) -> Result<UserReply> {
+                *self.0.lock().unwrap() = Some(prompt);
+                Ok(UserReply::Answer("ok".into()))
+            }
+        }
+
+        let seen = Arc::new(StdMutex::new(None));
+        let ctx = ToolContext {
+            project_root: PathBuf::from("/tmp/x"),
+            cwd: PathBuf::from("/tmp/x"),
+            session: Arc::new(StubSession::with_plan(vec![])),
+            user: Arc::new(RecIo(seen.clone())),
+            undo: Arc::new(NoopUndo),
+            auto_approve: true,
+            approval: Arc::new(Mutex::new(None)),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            compact: None,
+            stop: None,
+        };
+
+        let out = AskUser
+            .invoke(
+                &ctx,
+                json!({
+                    "question": "Which room?",
+                    "options": ["single", "double"],
+                    "recommended": "double"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "ok");
+        match seen.lock().unwrap().take() {
+            Some(UserPrompt::Question {
+                prompt,
+                options,
+                recommended,
+            }) => {
+                assert_eq!(prompt, "Which room?");
+                assert_eq!(options, vec!["single".to_string(), "double".to_string()]);
+                assert_eq!(recommended.as_deref(), Some("double"));
+            }
+            other => panic!("unexpected prompt: {other:?}"),
+        }
     }
 }
