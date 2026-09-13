@@ -25,6 +25,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(PomRunTask),
         Box::new(PomFormatCode),
         Box::new(PomRunTests),
+        Box::new(PomCheck),
         Box::new(Shell),
     ]
 }
@@ -269,6 +270,170 @@ fn simplify_test_output(raw: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// pom_check
+// ---------------------------------------------------------------------------
+
+struct PomCheck;
+
+static POM_CHECK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "pom_check".into(),
+    description: "Type-check the project (cargo check) and return the first `max_errors` compiler errors with their file:line:col plus the total count. Much cheaper than pom_run_tests for iterating on compile errors; pass `all_targets: true` to also check tests/examples.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "subproject": { "type": "string", "description": "Optional subproject directory relative to the root, e.g. \"crates/comrade-core\"." },
+            "all_targets": { "type": "boolean", "default": false, "description": "Also check tests, examples and benches (cargo check --all-targets)." },
+            "args": { "type": "string", "description": "Extra cargo-check arguments (e.g. \"--features foo\")." },
+            "max_errors": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20, "description": "Show at most this many errors." },
+            "timeout_secs": { "type": "integer", "minimum": 1, "default": 600, "description": "Kill after this many seconds." }
+        },
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for PomCheck {
+    fn spec(&self) -> &ToolSpec {
+        &POM_CHECK_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            subproject: Option<String>,
+            #[serde(default)]
+            all_targets: bool,
+            #[serde(default)]
+            args: Option<String>,
+            #[serde(default = "default_max_errors")]
+            max_errors: usize,
+            #[serde(default = "default_timeout")]
+            timeout_secs: u64,
+        }
+        fn default_max_errors() -> usize {
+            20
+        }
+        fn default_timeout() -> u64 {
+            600
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let extra: Vec<String> = args
+            .args
+            .as_deref()
+            .map(|s| s.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default();
+        let mut resolved = tasks::resolve(&ctx.project_root, "check", &args.subproject, &[])?;
+        if let tasks::CommandLine::Cargo { args: a } = &mut resolved.line {
+            if args.all_targets {
+                a.push("--all-targets".to_string());
+            }
+            a.extend(extra);
+            a.push("--message-format=json".to_string());
+        }
+        let out = tasks::exec(&resolved, args.timeout_secs).await?;
+        let (errors, total) = parse_check_json(&out.body, args.max_errors);
+        let mut s = format!(
+            "cargo check {} (exit {}, {:.1}s)\n",
+            if out.success { "ok" } else { "failed" },
+            out.code,
+            out.elapsed.as_secs_f32()
+        );
+        if total == 0 && out.success {
+            s.push_str("no errors");
+            return Ok(s);
+        }
+        if total == 0 {
+            // No JSON diagnostics parsed: surface the human-readable error lines.
+            let mut shown = 0usize;
+            for line in out.body.lines() {
+                if line.starts_with('{') || line.trim().is_empty() {
+                    continue;
+                }
+                s.push_str(line);
+                s.push('\n');
+                shown += 1;
+                if shown >= 40 {
+                    break;
+                }
+            }
+            return Ok(s);
+        }
+        s.push_str(&format!(
+            "{total} error(s), showing first {}:\n",
+            errors.len()
+        ));
+        for e in &errors {
+            s.push_str(e);
+            s.push('\n');
+        }
+        Ok(s)
+    }
+}
+
+/// Parse `cargo check --message-format=json` output: return up to `max` formatted
+/// error diagnostics and the total number of errors seen.
+fn parse_check_json(raw: &str, max: usize) -> (Vec<String>, usize) {
+    let mut errors = Vec::new();
+    let mut total = 0usize;
+    for line in raw.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(Value::as_str) != Some("compiler-message") {
+            continue;
+        }
+        let Some(msg) = v.get("message") else { continue };
+        if msg.get("level").and_then(Value::as_str) != Some("error") {
+            continue;
+        }
+        total += 1;
+        if errors.len() < max {
+            errors.push(format_diagnostic(msg));
+        }
+    }
+    (errors, total)
+}
+
+/// Format one JSON diagnostic as `file:line:col: error[CODE]: message`.
+fn format_diagnostic(msg: &Value) -> String {
+    let text = msg.get("message").and_then(Value::as_str).unwrap_or("");
+    let code = msg
+        .get("code")
+        .and_then(|c| c.get("code"))
+        .and_then(Value::as_str)
+        .map(|c| format!("[{c}]"))
+        .unwrap_or_default();
+    let loc = msg
+        .get("spans")
+        .and_then(Value::as_array)
+        .and_then(|spans| {
+            spans
+                .iter()
+                .find(|s| s.get("is_primary").and_then(Value::as_bool).unwrap_or(false))
+                .or_else(|| spans.first())
+        })
+        .map(|s| {
+            let f = s.get("file_name").and_then(Value::as_str).unwrap_or("");
+            let l = s.get("line_start").and_then(Value::as_u64).unwrap_or(0);
+            let c = s.get("column_start").and_then(Value::as_u64).unwrap_or(0);
+            format!("{f}:{l}:{c}")
+        })
+        .unwrap_or_default();
+    if loc.is_empty() {
+        format!("error{code}: {text}")
+    } else {
+        format!("{loc}: error{code}: {text}")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // shell
 // ---------------------------------------------------------------------------
 
@@ -412,5 +577,25 @@ test result: FAILED. 11 passed; 1 failed; 0 ignored
             script: "echo hi".into(),
         };
         assert!(ensure_not_test_run(&shell).is_ok());
+    }
+
+    #[test]
+    fn parses_and_caps_json_diagnostics() {
+        // Two compiler-message errors + noise; cap at 1.
+        let raw = r#"{"reason":"compiler-artifact","package_id":"x"}
+{"reason":"compiler-message","message":{"level":"error","message":"cannot find value `a`","code":{"code":"E0425"},"spans":[{"file_name":"src/main.rs","line_start":3,"column_start":5,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"level":"warning","message":"unused","spans":[]}}
+{"reason":"compiler-message","message":{"level":"error","message":"mismatched types","code":null,"spans":[{"file_name":"src/lib.rs","line_start":9,"column_start":1,"is_primary":true}]}}
+Compiling foo
+"#;
+        let (errors, total) = parse_check_json(raw, 1);
+        assert_eq!(total, 2);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0], "src/main.rs:3:5: error[E0425]: cannot find value `a`");
+
+        let (all, total) = parse_check_json(raw, 10);
+        assert_eq!(total, 2);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1], "src/lib.rs:9:1: error: mismatched types");
     }
 }

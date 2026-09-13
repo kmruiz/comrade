@@ -42,6 +42,7 @@ const MUTATING_TOOLS: &[&str] = &[
     "record_glossary",
     "pom_format_code",
     "pom_run_tests",
+    "pom_check",
     "shell",
 ];
 

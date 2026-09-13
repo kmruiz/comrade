@@ -153,9 +153,21 @@ fn cargo_describe(args: &[String]) -> String {
     parts.join(" ")
 }
 
-/// Run a resolved task to completion, returning the status + (capped) output.
-/// Tasks that exceed `timeout_secs` are killed.
-pub async fn run(resolved: &Resolved, timeout_secs: u64) -> Result<String> {
+/// Result of running a task to completion.
+pub struct TaskOutput {
+    /// Whether the process exited successfully.
+    pub success: bool,
+    /// Process exit code (`-1` when terminated by a signal).
+    pub code: i32,
+    /// Combined stdout+stderr, uncapped.
+    pub body: String,
+    /// Wall-clock time the task took.
+    pub elapsed: Duration,
+}
+
+/// Run a resolved task to completion, returning status + UNCAPPED output. Tasks
+/// that exceed `timeout_secs` are killed.
+pub async fn exec(resolved: &Resolved, timeout_secs: u64) -> Result<TaskOutput> {
     use std::process::Stdio;
 
     let configure = |program: &str, resolved: &Resolved| {
@@ -218,33 +230,43 @@ pub async fn run(resolved: &Resolved, timeout_secs: u64) -> Result<String> {
     let mut body = String::new();
     body.push_str(&String::from_utf8_lossy(&output.stdout));
     body.push_str(&String::from_utf8_lossy(&output.stderr));
-    let body = body.trim();
-    const MAX: usize = 9000;
-    let capped: String = if body.chars().count() > MAX {
-        let mut s: String = body.chars().take(MAX).collect();
-        s.push_str("\n... (output truncated)");
-        s
-    } else {
-        body.to_string()
-    };
 
-    let code = output.status.code().unwrap_or(-1);
-    let elapsed = started.elapsed();
-    let status = if output.status.success() {
-        "ok"
-    } else {
-        "failed"
-    };
+    Ok(TaskOutput {
+        success: output.status.success(),
+        code: output.status.code().unwrap_or(-1),
+        body: body.trim().to_string(),
+        elapsed: started.elapsed(),
+    })
+}
+
+/// Run a resolved task to completion, returning the status header + (capped)
+/// output — the shape the model reads.
+pub async fn run(resolved: &Resolved, timeout_secs: u64) -> Result<String> {
+    let out = exec(resolved, timeout_secs).await?;
+    let status = if out.success { "ok" } else { "failed" };
+    let capped = cap(&out.body, 9000);
     let mut result = format!(
-        "task {:?} {status} (exit {code}, {:.1}s)\n",
+        "task {:?} {status} (exit {}, {:.1}s)\n",
         resolved.describe,
-        elapsed.as_secs_f32()
+        out.code,
+        out.elapsed.as_secs_f32()
     );
     if !capped.is_empty() {
         result.push_str(&capped);
         result.push('\n');
     }
     Ok(result)
+}
+
+/// Cap `body` at `max` characters, appending a truncation marker.
+fn cap(body: &str, max: usize) -> String {
+    if body.chars().count() > max {
+        let mut s: String = body.chars().take(max).collect();
+        s.push_str("\n... (output truncated)");
+        s
+    } else {
+        body.to_string()
+    }
 }
 
 /// Try to locate `cargo` when it is missing from this process's PATH: first via
