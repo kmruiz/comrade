@@ -584,7 +584,7 @@ struct FsRgrep;
 static FS_RGREP_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "fs_rgrep".into(),
-    description: "Search project files (filtered grep); returns file:line: text. Use to find every place text appears. `pattern` is literal by default or a Rust regex with `regex: true`. `include` (a file must match one) and `exclude` (skip) are glob lists; `glob` is a single-include shorthand used when `include` is empty. `context` shows surrounding lines.".into(),
+    description: "Search project files (filtered grep); returns file:line: text. FIRST choice for exact literal text (config key, error string, comment) - and to find every place text appears. `pattern` is literal by default or a Rust regex with `regex: true`. `include` (a file must match one) and `exclude` (skip) are glob lists; `glob` is a single-include shorthand used when `include` is empty. `context` shows surrounding lines.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {

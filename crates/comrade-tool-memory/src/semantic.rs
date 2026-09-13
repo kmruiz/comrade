@@ -550,7 +550,7 @@ struct SemanticSearch;
 static SEMANTIC_SEARCH_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
         name: "semantic_search".into(),
-        description: "Search project memory (ADR decisions + glossary) AND source code by MEANING, not keywords: returns the closest hits with a similarity score. Code hits are tree-sitter symbols/line windows carrying file:line. Use when you are unsure of the exact words used (find_adr/ts_find_symbol are keyword search). `scope` picks memory (default), code, or all. Locally embedded model + vector index; no network for search; the index is rebuilt incrementally and only changed files are re-parsed.".into(),
+        description: "Search project memory (ADR decisions + glossary) AND source code by MEANING, not keywords: returns the closest hits with a similarity score. Code hits are tree-sitter symbols/line windows carrying file:line. Use when you only know the meaning and not the exact word (find_adr/ts_find_symbol/fs_rgrep need a word you do not have). `scope` picks memory (default), code, or all. Locally embedded model + vector index; no network for search; the index is rebuilt incrementally and only changed files are re-parsed.".into(),
         json_schema: json!({
             "type": "object",
             "properties": {

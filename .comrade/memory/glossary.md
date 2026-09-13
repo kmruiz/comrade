@@ -350,6 +350,17 @@ Frontmatter is parsed by hand (no YAML crate in the workspace). Discovery/parse 
 **Notes:**
 Model-facing tool names appear in: ToolSpec name in each comrade-tool-* lib.rs, comrade-core tables (MUTATING_TOOLS/APPROVAL_GATED_TOOLS/READ_ONLY_TOOLS/CODE_CHANGES in agent.rs, DENIED_FOR_DELEGATES in delegate.rs), prompts/*.md, react.rs assertions, and tui.rs name-keyed rendering.
 
+## tool routing
+> The project's convention for telling the agent which tool to use, stated as a single test: choose by what you already know. Project facts -> pom_model; past decision/term -> find_adr/find_glossary; exact text -> fs_rgrep (first choice for literal text); symbol name -> ts_find_symbol/ts_read_symbol; only the meaning -> semantic_search; nothing yet -> fs_list_files. shell is the only LAST RESORT.
+
+**References:**
+- `crates/comrade-core/prompts/tools-intro.md`
+- `crates/comrade-core/prompts/working-style.md`
+- `crates/comrade-core/prompts/delegate-system.md`
+
+**Notes:**
+Stated in crates/comrade-core/prompts/tools-intro.md, echoed in working-style.md step 3 and delegate-system.md step 2; reinforced by the first lines of the fs_rgrep and semantic_search ToolSpec descriptions. See ADR for the decision and why fs_rgrep is not a last resort.
+
 ## ts_test_impact
 > Read-only tree-sitter tool in comrade-tool-syntax that maps the files changed since a revision (git diff) to the tests likely to cover them: a test counts as affected if it references a symbol declared in a changed file, or lives in the same crate.
 
