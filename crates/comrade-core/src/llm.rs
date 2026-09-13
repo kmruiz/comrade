@@ -1498,7 +1498,11 @@ mod retry_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("400"), "unexpected error: {err}");
-        assert_eq!(served.load(Ordering::SeqCst), 1, "a 400 must not be retried");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "a 400 must not be retried"
+        );
     }
 
     #[test]

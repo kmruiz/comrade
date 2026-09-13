@@ -22,3 +22,6 @@ Covers language detection/parsing/chunking in comrade-tool-syntax and ecosystem 
 ## Impact
 ts_find_references/rename/list_symbols/structural_map/read_symbol/find_symbol and semantic code search now cover web sources; a mixed .rs+.ts+.css+.html repo is indexed in one pass. pom_* tools work on npm projects and on polyglot repos (pass `ecosystem` when ambiguous). Behaviour change: on a repo with BOTH manifests, `detect` prefers Cargo and a task supported by both (e.g. build) is ambiguous through `pick` and requires `ecosystem`. Rust-only paths (test_functions/decl_names_in_text) are guarded to Rust. Follow-ups: HTML elements are chunked at the outermost element only; JS/TS test discovery is not yet implemented (Rust `#[test]` only).
 
+
+## Note
+Follow-up resolved: JS/TS test discovery is now implemented. engine::test_functions finds JS/TS `it`/`test`/`specify` cases (incl. member forms `it.only`/`test.skip`/… and `xit`/`xtest`/`fit`; `describe` is treated as a container, not a case) and `decl_names_in_text` is language-aware (picks the grammar by file extension). ts_test_impact now maps changed files of any supported language, adds a same-directory heuristic for colocated tests, and lists affected JS/TS test files in its suggested runs. See crates/comrade-tool-syntax/src/engine.rs (js_tests) and src/lib.rs (ts_test_impact).

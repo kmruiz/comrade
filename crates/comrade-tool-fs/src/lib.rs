@@ -1207,9 +1207,18 @@ mod tests {
             needle: if lower { p.to_lowercase() } else { p.into() },
             lower,
         };
-        let m = super::grep(&root, None, "**/*.rs", &[], &[], &lit("hello", false), 0, None)
-            .unwrap()
-            .0;
+        let m = super::grep(
+            &root,
+            None,
+            "**/*.rs",
+            &[],
+            &[],
+            &lit("hello", false),
+            0,
+            None,
+        )
+        .unwrap()
+        .0;
         assert_eq!(m.len(), 2);
         assert!(m.iter().all(|h| h.file.ends_with(".rs")));
         // glob restricts to md
