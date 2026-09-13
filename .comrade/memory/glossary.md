@@ -44,6 +44,12 @@ Replaces the former unconditional "no approval" wording.
 **Notes:**
 The dialog wraps its body/options to the popup's real inner width (popup = min(area.width-2, 100) wide, minus 2 border cols), sizes its height to `body.len() + 4` (2 borders + input row + hint row) clamped to the terminal, and anchors the body to the TOP so the question/action is never scrolled out of view. Option text wraps via `wrap_plain` and continuation lines are space-padded under the number. Because space is limited, the `ask_user` tool spec instructs the model to ask a single short question with at most 4 short options.
 
+## background session
+> A session whose run is still in flight while it is not the active one (its LiveState is parked in its OpenSession slot). Its events keep arriving (routed by session id via on_agent_event_for) and update its own chat/metrics/plan; the session switcher marks it [running].
+
+**References:**
+- `crates/comrade-tui/src/tui.rs`
+
 ## delegate sub-chat
 > The chat rows authored by a delegate model (its tool cards and its reply), rendered indented 2 columns under a "| " rule in the delegate's agent color with a dim per-agent background band, visually nested under the parent's delegate tool call.
 
@@ -53,6 +59,12 @@ The dialog wraps its body/options to the popup's real inner width (popup = min(a
 
 **Notes:**
 Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by render_row_line's `sub: Option<Color>` param. Folded MsgKind::Run digests keep no sub-chat styling.
+
+## LiveState
+> The per-session half of the TUI App state (crates/comrade-tui/src/tui.rs struct LiveState): session Arc, ctx_base, history, run_tx, stop, run_handle, running, steer_tx, queued_prompt, run_cancelled, chat, section_collapsed, chat_epoch, chat_rows_cache, stream, ctx_tokens/budget/estimated, activity, session_file, sel, scroll_top, follow, was_at_bottom, search. A parked session stores its LiveState in its OpenSession slot (Box); App::swap_live mem::swaps these fields between the App (active session) and a LiveState.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs`
 
 ## model panel
 > The right-hand panel of the TUI titled " model ", drawn by `draw_stats` (crates/comrade-tui/src/tui.rs). Two fixed inner rows now: (1) `label_line` = model name + version left, balance right-aligned; (2) `gauge_line` = context bar merged with `NN%  used/budget` (compact via `short_tokens`, k/M) plus an `est` marker when estimated. Below them: the delegate list from `delegate_panel_rows`. Panel height = `MODEL_PANEL_FIXED_ROWS (2) + 2 borders + delegate rows`.
@@ -124,6 +136,13 @@ SessionFile is the on-disk JSON form (version/title/status/plan/delegated/finish
 > The aligned removed(left)/added(right) diff renderer in the TUI chat (crates/comrade-tui/src/tui.rs): extract_diff_sides pulls (removed, added) line lists, edit_diff_label builds the header, lcs_pairs aligns them (dropping unchanged lines, merging a removed+added pair into one row), and build_diff_row/cell_spans draw each row with diff_remove_bg/diff_add_bg. Handles fs_edit (args: literal old/new or embedded diff) and, since ADR #12, git_diff (parsed from the tool result).
 
 **References:**
+- `crates/comrade-tui/src/tui.rs`
+
+## TaggedEvent
+> TaggedEvent = (u64, AgentEvent) (crates/comrade-tui/src/main.rs): an agent event tagged with the id of the session that produced it. Each session has its own bounded run-facing sender relayed by spawn_tagged_relay, which forwards (id, event) into the App's single central unbounded queue (App::events_rx); the select loop dispatches via App::on_agent_event_for(id, ev).
+
+**References:**
+- `crates/comrade-tui/src/main.rs`
 - `crates/comrade-tui/src/tui.rs`
 
 ## tool name prefixes (fs_/ts_/pom_/self_)

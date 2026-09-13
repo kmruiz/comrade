@@ -25,3 +25,6 @@ New dependency serde (derive) on comrade-tui; new serde derives across comrade-t
 
 ## Note
 New-session is non-destructive (emacs C-x b <new-name> / scratch-buffer): M-x new-session now stashes the current session into its slot and opens a fresh empty slot as the active session, instead of wiping the current one in place. Added M-x kill-session (Ctrl-x C-k) to close the active session and activate a neighbour; it refuses to close the only open session. The session switcher title is refreshed on AgentEvent::TitleChanged so slots show the live title.
+
+## Note
+Superseded in part by ADR 0015: new-session/switch/load/kill are no longer refused while a run is in flight, and a background session now keeps a live LiveState (not only a serialized snapshot) so its run continues off-screen. Save/fork of the active session still refuse while its run is in flight. The file-backed save/load/fork model and the Ctrl-x chords from this ADR remain.
