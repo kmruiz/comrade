@@ -11,7 +11,8 @@ use std::sync::LazyLock;
 use anyhow::Result;
 use async_trait::async_trait;
 use comrade_tool::{
-    AGENT_MODEL, PlanStatus, PlanTarget, Tool, ToolContext, ToolSpec, UserPrompt, UserReply,
+    AGENT_MODEL, FormSpec, PlanStatus, PlanTarget, Tool, ToolContext, ToolSpec, UserPrompt,
+    UserReply,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -45,6 +46,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(SelfFinishPlan),
         Box::new(SelfSetStatusBar),
         Box::new(AskUser),
+        Box::new(AskForm),
     ]
 }
 
@@ -601,8 +603,78 @@ impl Tool for AskUser {
         let reply = ctx.user.ask(prompt).await?;
         Ok(match reply {
             UserReply::Answer(answer) => answer,
+            UserReply::Form(_) => String::new(),
             UserReply::Denied => "(user dismissed the question)".to_string(),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ask_form
+// ---------------------------------------------------------------------------
+
+struct AskForm;
+
+static ASK_FORM_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+        name: "ask_form".into(),
+        description: "Render an interactive form (text/number/date/select/checkbox components) in the chat and return the human's answers as `id = value` lines. Use for choices a plain text question would make awkward: numbers, dates, bounded pick-lists, booleans.".into(),
+        json_schema: json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "Form heading." },
+                "description": { "type": "string", "description": "Optional explanatory text." },
+                "fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "Unique identifier for the answer." },
+                            "label": { "type": "string", "description": "Human-readable label." },
+                            "kind": { 
+                                "type": "string", 
+                                "enum": ["text", "number", "date", "select", "checkbox"],
+                                "description": "Component type: text, number, date, select, or checkbox."
+                            },
+                            "required": { "type": "boolean", "description": "Field must be filled to submit." },
+                            "default": { "type": "string", "description": "Optional initial value." },
+                            "placeholder": { "type": "string", "description": "Placeholder for text fields." },
+                            "min": { "type": "number", "description": "Minimum value for number fields." },
+                            "max": { "type": "number", "description": "Maximum value for number fields." },
+                            "step": { "type": "number", "description": "Step size for number spinners." },
+                            "options": { 
+                                "type": "array", 
+                                "items": { "type": "string" },
+                                "description": "Options for select dropdowns."
+                            }
+                        },
+                        "required": ["id", "label", "kind"],
+                        "additionalProperties": false
+                    },
+                    "minItems": 1,
+                    "description": "Fields in display order; each must have a unique `id`."
+                }
+            },
+            "required": ["fields"],
+            "additionalProperties": false
+        }),
+    }
+});
+
+#[async_trait]
+impl Tool for AskForm {
+    fn spec(&self) -> &ToolSpec {
+        &ASK_FORM_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        let spec: FormSpec = serde_json::from_value(args)?;
+        let reply = ctx.user.ask(UserPrompt::Form(spec.clone())).await?;
+        match reply {
+            UserReply::Form(answers) => Ok(spec.answer_lines(&answers)),
+            UserReply::Answer(text) => Ok(text),
+            UserReply::Denied => Ok("(user dismissed the form)".to_string()),
+        }
     }
 }
 
@@ -621,7 +693,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        SelfFinishPlan, SelfSetPlan, SelfSetStepContext, SelfSetStepModel, SelfUpdatePlan,
+        AskForm, SelfFinishPlan, SelfSetPlan, SelfSetStepContext, SelfSetStepModel, SelfUpdatePlan,
     };
 
     /// A real-enough session: stores the plan and which steps the `delegate`
@@ -766,7 +838,11 @@ mod tests {
     #[async_trait]
     impl UserIo for NoopIo {
         async fn ask(&self, _p: UserPrompt) -> Result<UserReply> {
-            Ok(UserReply::Answer("yes".into()))
+            match _p {
+                UserPrompt::Form(spec) => Ok(UserReply::Form(spec.initial_values())),
+                UserPrompt::Question { .. } => Ok(UserReply::Answer("yes".into())),
+                UserPrompt::Confirm { .. } => Ok(UserReply::Answer("yes".into())),
+            }
         }
     }
 
@@ -1110,5 +1186,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("`index`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ask_form_returns_id_equals_value_lines() {
+        use std::collections::BTreeMap;
+
+        // A UserIo that "fills" the form with chosen values.
+        struct FormStubIo;
+        #[async_trait]
+        impl UserIo for FormStubIo {
+            async fn ask(&self, prompt: UserPrompt) -> Result<UserReply> {
+                match prompt {
+                    UserPrompt::Form(_) => Ok(UserReply::Form(BTreeMap::from([
+                        ("guests".into(), "3".into()),
+                        ("room".into(), "double".into()),
+                        ("breakfast".into(), "true".into()),
+                    ]))),
+                    other => panic!("unexpected prompt: {other:?}"),
+                }
+            }
+        }
+
+        let ctx = ToolContext {
+            project_root: PathBuf::from("/tmp/x"),
+            cwd: PathBuf::from("/tmp/x"),
+            session: Arc::new(StubSession::with_plan(vec![])),
+            user: Arc::new(FormStubIo),
+            undo: Arc::new(NoopUndo),
+            auto_approve: true,
+            approval: Arc::new(Mutex::new(None)),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            compact: None,
+            stop: None,
+        };
+
+        let json = json!({
+            "title": "Room Booking",
+            "description": "Choose your room and meal plan",
+            "fields": [
+                { "id": "guests", "label": "Number of guests", "kind": "number", "min": 1, "max": 4 },
+                { "id": "room", "label": "Room type", "kind": "select", "options": ["single", "double"] },
+                { "id": "breakfast", "label": "Breakfast", "kind": "checkbox", "default": "false" }
+            ]
+        });
+
+        let out = AskForm.invoke(&ctx, json).await.unwrap();
+        assert_eq!(out, "guests = 3\nroom = double\nbreakfast = true");
     }
 }

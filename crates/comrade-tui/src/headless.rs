@@ -1,9 +1,10 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use comrade_core::Autonomy;
-use comrade_tool::{UserIo, UserPrompt, UserReply};
+use comrade_tool::{FormSpec, UserIo, UserPrompt, UserReply};
 
 use crate::{Deps, new_session};
 
@@ -26,9 +27,26 @@ impl UserIo for HeadlessIo {
                 Autonomy::Auto if !options.is_empty() => UserReply::Answer(options[0].clone()),
                 _ => UserReply::Answer(question_on_stdin(&prompt, &options).await?),
             },
+            UserPrompt::Form(spec) => match self.autonomy {
+                Autonomy::Auto => UserReply::Form(spec.initial_values()),
+                _ => UserReply::Form(form_on_stdin(&spec).await?),
+            },
         };
         Ok(reply)
     }
+}
+
+/// Ask each form field on stdin, keeping the seed value when the line is empty.
+async fn form_on_stdin(spec: &FormSpec) -> Result<BTreeMap<String, String>> {
+    let mut answers = spec.initial_values();
+    for f in &spec.fields {
+        let label = format!("[comrade] {} ({}) [{}]: ", f.label, f.id, answers[&f.id]);
+        let line = read_line(&label).await?;
+        if !line.trim().is_empty() {
+            answers.insert(f.id.clone(), line.trim().to_string());
+        }
+    }
+    Ok(answers)
 }
 
 async fn confirm_on_stdin(title: &str) -> Result<String> {

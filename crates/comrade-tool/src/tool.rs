@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::form::FormSpec;
 use crate::plan::SessionControl;
 
 /// Static description of a tool, used both for the native function-calling
@@ -329,6 +330,8 @@ impl ToolContext {
             UserReply::Answer(text) if is_affirmative(&text) => Ok(()),
             UserReply::Answer(text) => anyhow::bail!("user denied request ({text:?})"),
             UserReply::Denied => anyhow::bail!("user denied request"),
+            // A form answer to a yes/no confirmation is nonsense: treat as not consenting.
+            UserReply::Form(_) => anyhow::bail!("user denied request"),
         }
     }
 }
@@ -363,6 +366,9 @@ pub enum UserPrompt {
     },
     /// A yes/no confirmation with an optional diff/preview body.
     Confirm { title: String, diff: Option<String> },
+    /// A declarative interactive form (custom components) for the human to fill.
+    /// The UI renders the fields and returns a [`UserReply::Form`] keyed by id.
+    Form(FormSpec),
 }
 
 /// Outcome of routing a prompt to the human.
@@ -372,6 +378,8 @@ pub enum UserReply {
     Answer(String),
     /// The human dismissed the prompt (escaped / cancelled).
     Denied,
+    /// Answers to a [`UserPrompt::Form`], keyed by field id.
+    Form(BTreeMap<String, String>),
 }
 
 /// Abstraction over "talk to the human". Implemented by the TUI (modal

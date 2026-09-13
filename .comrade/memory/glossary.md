@@ -44,6 +44,17 @@ Reuses the Autonomy enum (ask/auto/deny). Delegates with ask/deny are annotated 
 **Notes:**
 Replaces the former unconditional "no approval" wording.
 
+## ask_form
+> Session tool (crates/comrade-tool-session) that renders an agent-described interactive form in the chat and returns the human's answers as `id = value` lines. The form is defined by a FormSpec (JSON).
+
+**References:**
+- `crates/comrade-tool/src/form.rs`
+- `crates/comrade-tool-session/src/lib.rs`
+- `crates/comrade-tui/src/tui.rs`
+
+**Notes:**
+Enabled by the UserPrompt::Form(FormSpec) / UserReply::Form(BTreeMap<String,String>) variants on the UserIo contract.
+
 ## ask_user dialog
 > The TUI modal shown for a `UserPrompt::Question` (from the `ask_user` tool) and for a `UserPrompt::Confirm` (permission/approval of mutating tools). Rendered by `draw_dialog`.
 
@@ -111,6 +122,12 @@ Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by rende
 
 **References:**
 - `crates/comrade-tui/src/tui.rs`
+
+## FormSpec
+> JSON-described interactive form: { title, description, fields: [FormField] }, where FormField = { id, label, kind: FieldKind, required, default } and FieldKind is serde-tagged by `kind` (text|number|date|select|checkbox) with per-kind params (placeholder; min/max/step; options). Helpers: initial_values(), is_complete(), answer_lines() emit `id = value`.
+
+**References:**
+- `crates/comrade-tool/src/form.rs`
 
 ## LiveState
 > The per-session half of the TUI App state (crates/comrade-tui/src/tui.rs struct LiveState): session Arc, ctx_base, history, run_tx, stop, run_handle, running, steer_tx, queued_prompt, run_cancelled, chat, section_collapsed, chat_epoch, chat_rows_cache, stream, ctx_tokens/budget/estimated, activity, session_file, sel, scroll_top, follow, was_at_bottom, search. A parked session stores its LiveState in its OpenSession slot (Box); App::swap_live mem::swaps these fields between the App (active session) and a LiveState.

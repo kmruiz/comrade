@@ -8,7 +8,7 @@
 //!   (or the mouse wheel) opens the details
 //! - assistant/user text is rendered as markdown
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -20,8 +20,8 @@ use comrade_core::{
     build_session_context, run_agent_with_history,
 };
 use comrade_tool::{
-    AGENT_MODEL, PlanStatus, PlanStep, PlanTarget, SessionControl, ToolContext, UserIo, UserPrompt,
-    UserReply,
+    AGENT_MODEL, FieldKind, FormSpec, PlanStatus, PlanStep, PlanTarget, SessionControl,
+    ToolContext, UserIo, UserPrompt, UserReply,
 };
 
 use serde::{Deserialize, Serialize};
@@ -354,6 +354,209 @@ struct Dialog {
     reply: oneshot::Sender<UserReply>,
     /// id of the session whose run is waiting on this dialog.
     session: u64,
+    /// Editable state when `prompt` is a [`UserPrompt::Form`]; `None` otherwise.
+    form: Option<FormEdit>,
+}
+
+/// Editable state for a [`UserPrompt::Form`]: one value per field, in order,
+/// plus the index of the field that currently has focus.
+struct FormEdit {
+    values: Vec<String>,
+    sel: usize,
+}
+
+impl FormEdit {
+    fn new(spec: &FormSpec) -> Self {
+        FormEdit {
+            values: spec.fields.iter().map(|f| f.initial_value()).collect(),
+            sel: 0,
+        }
+    }
+
+    /// Move focus to the next (`forward`) or previous field, wrapping around.
+    fn focus(&mut self, forward: bool) {
+        let n = self.values.len();
+        if n == 0 {
+            return;
+        }
+        self.sel = if forward {
+            (self.sel + 1) % n
+        } else {
+            (self.sel + n - 1) % n
+        };
+    }
+
+    /// The answers keyed by field id, in field order.
+    fn answers(&self, spec: &FormSpec) -> BTreeMap<String, String> {
+        spec.fields
+            .iter()
+            .zip(&self.values)
+            .map(|(f, v)| (f.id.clone(), v.clone()))
+            .collect()
+    }
+
+    fn value_mut(&mut self) -> Option<&mut String> {
+        self.values.get_mut(self.sel)
+    }
+
+    /// Apply a typed character to the focused field, driving its component.
+    fn input(&mut self, spec: &FormSpec, c: char) {
+        let kind = spec.fields.get(self.sel).map(|f| &f.kind);
+        match kind {
+            Some(FieldKind::Checkbox) => {
+                if c == ' ' {
+                    self.toggle(spec);
+                }
+            }
+            Some(FieldKind::Select { .. }) => {} // options are chosen with ←/→
+            Some(FieldKind::Number { .. }) => {
+                if c.is_ascii_digit() || c == '.' {
+                    if let Some(v) = self.value_mut() {
+                        v.push(c);
+                    }
+                }
+            }
+            Some(FieldKind::Date) => {
+                if c.is_ascii_digit() || c == '-' {
+                    if let Some(v) = self.value_mut() {
+                        v.push(c);
+                    }
+                }
+            }
+            Some(FieldKind::Text { .. }) => {
+                if let Some(v) = self.value_mut() {
+                    v.push(c);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn backspace(&mut self) {
+        if let Some(v) = self.value_mut() {
+            v.pop();
+        }
+    }
+
+    fn toggle(&mut self, spec: &FormSpec) {
+        if !matches!(
+            spec.fields.get(self.sel).map(|f| &f.kind),
+            Some(FieldKind::Checkbox)
+        ) {
+            return;
+        }
+        if let Some(v) = self.value_mut() {
+            *v = if comrade_tool::truthy(v) {
+                "false".to_string()
+            } else {
+                "true".to_string()
+            };
+        }
+    }
+
+    /// Step the focused component: `dir` = -1 (left / decrease) or +1 (right /
+    /// increase). Numbers clamp to min/max, selects cycle options, dates shift a
+    /// day, checkboxes toggle.
+    fn adjust(&mut self, spec: &FormSpec, dir: i32) {
+        let Some(field) = spec.fields.get(self.sel) else {
+            return;
+        };
+        match &field.kind {
+            FieldKind::Number { min, max, step } => {
+                let cur: f64 = self
+                    .values
+                    .get(self.sel)
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0.0);
+                let step = step.filter(|s| *s > 0.0).unwrap_or(1.0);
+                let mut next = cur + f64::from(dir) * step;
+                if let Some(lo) = min {
+                    next = next.max(*lo);
+                }
+                if let Some(hi) = max {
+                    next = next.min(*hi);
+                }
+                if let Some(v) = self.value_mut() {
+                    *v = fmt_f64(next);
+                }
+            }
+            FieldKind::Select { options } if !options.is_empty() => {
+                let n = options.len() as i32;
+                let cur = self
+                    .values
+                    .get(self.sel)
+                    .and_then(|v| options.iter().position(|o| o == v))
+                    .unwrap_or(0) as i32;
+                let next = (cur + dir).rem_euclid(n) as usize;
+                if let Some(v) = self.value_mut() {
+                    *v = options[next].clone();
+                }
+            }
+            FieldKind::Date => {
+                let cur = self.values.get(self.sel).cloned().unwrap_or_default();
+                let shifted = shift_date(&cur, dir);
+                if let Some(v) = self.value_mut() {
+                    *v = shifted;
+                }
+            }
+            FieldKind::Checkbox => self.toggle(spec),
+            _ => {}
+        }
+    }
+}
+
+/// Format a number like the spinner shows it (whole numbers without `.0`).
+fn fmt_f64(v: f64) -> String {
+    if v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
+/// Shift an ISO `YYYY-MM-DD` date by whole days (`days` may be negative).
+/// An empty or unparseable value starts from 1970-01-01.
+fn shift_date(cur: &str, days: i32) -> String {
+    let (y, m, d) = parse_ymd(cur).unwrap_or((1970, 1, 1));
+    let (y, m, d) = civil_from_days(days_from_civil(y, m, d) + i64::from(days));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Parse `YYYY-MM-DD` into (year, month, day); `None` when malformed.
+fn parse_ymd(s: &str) -> Option<(i64, i64, i64)> {
+    let mut it = s.trim().split('-');
+    let y = it.next()?.parse().ok()?;
+    let m = it.next()?.parse().ok()?;
+    let d = it.next()?.parse().ok()?;
+    if it.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Inverse of [`days_from_civil`].
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// A plan step offered in the Ctrl-A "assign a model" overlay.
@@ -2619,6 +2822,14 @@ impl App {
             let text = match &reply {
                 UserReply::Answer(a) => format!("answer: {a}"),
                 UserReply::Denied => "dismissed".to_string(),
+                UserReply::Form(answers) => {
+                    let shown = answers
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("form submitted: {shown}")
+                }
             };
             self.push_msg(Msg::text(MsgKind::Meta, text));
             let d = self.dialogs.remove(0);
@@ -2789,6 +3000,29 @@ impl App {
         if let Some(p) = pick {
             self.answer_top(UserReply::Answer(p));
         }
+    }
+
+    /// Submit the form on top of the dialog stack as a `UserReply::Form`.
+    /// Refuses while a required field is still empty.
+    fn submit_form(&mut self) {
+        let Some(d) = self.dialogs.first() else {
+            return;
+        };
+        let UserPrompt::Form(spec) = &d.prompt else {
+            return;
+        };
+        let Some(form) = &d.form else {
+            return;
+        };
+        let answers = form.answers(spec);
+        if !spec.is_complete(&answers) {
+            self.push_msg(Msg::text(
+                MsgKind::Meta,
+                "form: fill all required fields before submitting".to_string(),
+            ));
+            return;
+        }
+        self.answer_top(UserReply::Form(answers));
     }
 
     /// Open the Ctrl-A overlay: offer every plan step that is still pending or
@@ -3237,7 +3471,11 @@ pub async fn run(deps: &Deps) -> Result<()> {
                                 },
                             ));
                         } else {
-                            app.dialogs.push(Dialog { prompt: ask.prompt, buf: String::new(), reply: ask.reply, session: ask.session });
+                            let form = match &ask.prompt {
+                                UserPrompt::Form(spec) => Some(FormEdit::new(spec)),
+                                _ => None,
+                            };
+                            app.dialogs.push(Dialog { prompt: ask.prompt, buf: String::new(), reply: ask.reply, session: ask.session, form });
                             app.dialog_ask = false;
                             app.dialog_conv.clear();
                             app.push_meta("waiting for your input");
@@ -3673,6 +3911,9 @@ fn handle_mx_key(app: &mut App, key: KeyEvent) -> MxKeyOutcome {
 }
 
 fn handle_dialog_key(app: &mut App, code: KeyCode) -> bool {
+    if matches!(app.dialogs.first().unwrap().prompt, UserPrompt::Form(_)) {
+        return handle_form_key(app, code);
+    }
     let is_confirm = matches!(
         app.dialogs.first().unwrap().prompt,
         UserPrompt::Confirm { .. }
@@ -3730,6 +3971,63 @@ fn handle_dialog_key(app: &mut App, code: KeyCode) -> bool {
         _ => {}
     }
     false
+}
+
+/// Drive a form dialog: navigate fields, edit the focused component, submit
+/// (`enter`) or cancel (`esc`).
+fn handle_form_key(app: &mut App, code: KeyCode) -> bool {
+    enum Act {
+        None,
+        Deny,
+        Submit,
+    }
+    let act = {
+        let Some(d) = app.dialogs.first_mut() else {
+            return true;
+        };
+        let Dialog { prompt, form, .. } = d;
+        let UserPrompt::Form(spec) = &*prompt else {
+            return true;
+        };
+        let Some(form) = form.as_mut() else {
+            return true;
+        };
+        match code {
+            KeyCode::Esc => Act::Deny,
+            KeyCode::Enter => Act::Submit,
+            KeyCode::Up | KeyCode::BackTab => {
+                form.focus(false);
+                Act::None
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                form.focus(true);
+                Act::None
+            }
+            KeyCode::Left => {
+                form.adjust(spec, -1);
+                Act::None
+            }
+            KeyCode::Right => {
+                form.adjust(spec, 1);
+                Act::None
+            }
+            KeyCode::Char(c) => {
+                form.input(spec, c);
+                Act::None
+            }
+            KeyCode::Backspace => {
+                form.backspace();
+                Act::None
+            }
+            _ => Act::None,
+        }
+    };
+    match act {
+        Act::Deny => app.answer_top(UserReply::Denied),
+        Act::Submit => app.submit_form(),
+        Act::None => {}
+    }
+    true
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
@@ -6692,6 +6990,71 @@ fn draw_mcp_servers(view: &McpServersView, frame: &mut Frame) {
     );
 }
 
+/// One line of a form dialog: focus arrow, label, required marker and the
+/// component's current rendering (text box, spinner, date, select, checkbox).
+fn form_field_line(field: &comrade_tool::FormField, value: &str, focused: bool) -> Line<'static> {
+    let arrow = if focused { "▶ " } else { "  " };
+    let label_style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    let mut spans = vec![
+        Span::styled(arrow.to_string(), Style::default().fg(Color::Yellow)),
+        Span::styled(field.label.clone(), label_style),
+    ];
+    if field.required {
+        spans.push(Span::styled(" *", Style::default().fg(Color::Red)));
+    }
+    spans.push(Span::raw(": "));
+    let (widget, style) = match &field.kind {
+        FieldKind::Text { placeholder } => {
+            if value.is_empty() {
+                (
+                    placeholder.clone().unwrap_or_default(),
+                    Style::default().fg(Color::DarkGray),
+                )
+            } else {
+                (value.to_string(), Style::default().fg(Color::Green))
+            }
+        }
+        FieldKind::Date => (
+            format!(
+                "‹ {} ›",
+                if value.is_empty() {
+                    "YYYY-MM-DD"
+                } else {
+                    value
+                }
+            ),
+            Style::default().fg(Color::Green),
+        ),
+        FieldKind::Number { .. } | FieldKind::Select { .. } => {
+            (format!("‹ {value} ›"), Style::default().fg(Color::Green))
+        }
+        FieldKind::Checkbox => (
+            if comrade_tool::truthy(value) {
+                "[x]".to_string()
+            } else {
+                "[ ]".to_string()
+            },
+            Style::default().fg(Color::Green),
+        ),
+    };
+    spans.push(Span::styled(widget, style));
+    if focused
+        && matches!(
+            field.kind,
+            FieldKind::Text { .. } | FieldKind::Number { .. } | FieldKind::Date
+        )
+    {
+        spans.push(Span::styled("_", Style::default().fg(Color::Green)));
+    }
+    Line::from(spans)
+}
+
 fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     let area = frame.area();
 
@@ -6699,6 +7062,7 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     // block borders shave two columns off the popup).
     let w = area.width.saturating_sub(2).clamp(20, 100);
     let inner_w = w.saturating_sub(2).max(10) as usize;
+    let is_form = matches!(dialog.prompt, UserPrompt::Form(_));
 
     // Build the body lines for the kind of prompt, wrapped to the popup width.
     let (kind_label, is_question, options, mut body) = match &dialog.prompt {
@@ -6751,6 +7115,28 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
             }
             (" confirm  [y/n] ", false, Vec::new(), lines)
         }
+        UserPrompt::Form(spec) => {
+            let mut lines = Vec::new();
+            if !spec.title.trim().is_empty() {
+                lines.extend(preview_lines(&spec.title, inner_w));
+            }
+            if let Some(desc) = &spec.description
+                && !desc.trim().is_empty()
+            {
+                lines.push(Line::from(""));
+                lines.extend(preview_lines(desc, inner_w));
+            }
+            let edit = dialog.form.as_ref();
+            for (i, f) in spec.fields.iter().enumerate() {
+                let focused = edit.is_some_and(|e| e.sel == i);
+                let value = edit
+                    .and_then(|e| e.values.get(i))
+                    .cloned()
+                    .unwrap_or_else(|| f.initial_value());
+                lines.push(form_field_line(f, &value, focused));
+            }
+            (" form ", true, Vec::new(), lines)
+        }
     };
     if body.is_empty() {
         body.push(Line::from(""));
@@ -6797,17 +7183,23 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
     // when it is taller than the popup.
     frame.render_widget(Paragraph::new(body), row_layout[0]);
 
-    // Input row.
-    let input_prompt = if app.dialog_ask { "? " } else { "> " };
-    let input = Line::from(vec![
-        Span::styled(input_prompt, Style::default().fg(Color::Green)),
-        Span::raw(dialog.buf.clone()),
-        Span::styled("_", Style::default().fg(Color::Green)),
-    ]);
+    // Input row (forms edit inline in the body, so it stays blank there).
+    let input = if is_form {
+        Line::from("")
+    } else {
+        let input_prompt = if app.dialog_ask { "? " } else { "> " };
+        Line::from(vec![
+            Span::styled(input_prompt, Style::default().fg(Color::Green)),
+            Span::raw(dialog.buf.clone()),
+            Span::styled("_", Style::default().fg(Color::Green)),
+        ])
+    };
     frame.render_widget(Paragraph::new(input), row_layout[1]);
 
     // Hint row.
-    let hint = if is_question && !options.is_empty() {
+    let hint = if is_form {
+        "up/down: field    left/right: adjust    space: toggle    enter: submit    esc: cancel"
+    } else if is_question && !options.is_empty() {
         "number: pick    type + enter: submit    esc: cancel"
     } else if is_question {
         "type + enter: submit    esc: cancel"
@@ -7519,6 +7911,68 @@ fn strip_react_scaffolding(text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn form_spec(v: serde_json::Value) -> FormSpec {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn form_edit_seeds_and_answers_in_order() {
+        let spec = form_spec(serde_json::json!({
+            "fields": [
+                { "id": "guests", "label": "Guests", "kind": "number", "min": 1 },
+                { "id": "room", "label": "Room", "kind": "select", "options": ["single", "double"] },
+                { "id": "notes", "label": "Notes", "kind": "text" }
+            ]
+        }));
+        let mut edit = FormEdit::new(&spec);
+        assert_eq!(edit.values, vec!["1", "single", ""]);
+        edit.adjust(&spec, 1);
+        assert_eq!(edit.values[0], "2");
+        edit.focus(true);
+        edit.adjust(&spec, 1);
+        assert_eq!(edit.values[1], "double");
+        edit.focus(true);
+        edit.input(&spec, 'h');
+        edit.input(&spec, 'i');
+        let answers = edit.answers(&spec);
+        assert_eq!(answers["guests"], "2");
+        assert_eq!(answers["room"], "double");
+        assert_eq!(answers["notes"], "hi");
+    }
+
+    #[test]
+    fn form_edit_clamps_numbers_cycles_selects_and_toggles() {
+        let spec = form_spec(serde_json::json!({
+            "fields": [
+                { "id": "n", "label": "N", "kind": "number", "min": 0, "max": 2 },
+                { "id": "d", "label": "D", "kind": "select", "options": ["a", "b"] },
+                { "id": "c", "label": "C", "kind": "checkbox" }
+            ]
+        }));
+        let mut edit = FormEdit::new(&spec);
+        edit.adjust(&spec, -1);
+        assert_eq!(edit.values[0], "0"); // clamped at min
+        edit.adjust(&spec, 1);
+        edit.adjust(&spec, 1);
+        edit.adjust(&spec, 1);
+        assert_eq!(edit.values[0], "2"); // clamped at max
+        edit.focus(true);
+        edit.adjust(&spec, -1);
+        assert_eq!(edit.values[1], "b"); // wraps backwards
+        edit.focus(true);
+        edit.input(&spec, ' ');
+        assert_eq!(edit.values[2], "true");
+        edit.toggle(&spec);
+        assert_eq!(edit.values[2], "false");
+    }
+
+    #[test]
+    fn date_shift_crosses_month_boundary() {
+        assert_eq!(shift_date("2026-01-31", 1), "2026-02-01");
+        assert_eq!(shift_date("2026-03-01", -1), "2026-02-28");
+        assert_eq!(shift_date("", 0), "1970-01-01");
+    }
+
     #[test]
     fn common_prefix_shared() {
         assert_eq!(
@@ -8100,6 +8554,7 @@ mod tests {
             },
             buf: String::new(),
             reply: tx,
+            form: None,
         });
         assert!(!activity_spinner_visible(&app), "waiting on the user");
     }
@@ -8957,6 +9412,7 @@ mod tests {
             },
             buf: String::new(),
             reply: tx,
+            form: None,
         });
         assert_eq!(session_status_marker(&app, 0), Some("waiting"));
         assert_eq!(session_counts_label(&app), "1 waiting");
