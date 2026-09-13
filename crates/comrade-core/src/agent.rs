@@ -95,6 +95,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "find_glossary",
     "read_glossary",
     "web_search",
+    "web_fetch",
 ];
 
 /// After this many consecutive reads with no state change, we refuse another.

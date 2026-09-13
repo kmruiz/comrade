@@ -337,7 +337,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub fn all() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(WebSearch)]
+    vec![Box::new(WebSearch), Box::new(WebFetch)]
 }
 
 struct WebSearch;
@@ -378,6 +378,186 @@ impl Tool for WebSearch {
         let args: Args = serde_json::from_value(args)?;
         let results = search(&args.query, args.max_results).await?;
         Ok(render(&results))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// web_fetch
+// ---------------------------------------------------------------------------
+
+struct WebFetch;
+
+static WEB_FETCH_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+        name: "web_fetch".into(),
+        description: "Fetch a URL and return its readable text (HTML stripped to plain text). Use to read a docs page, README or article found via web_search; returns text only, never markup.".into(),
+        json_schema: json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "Absolute http(s) URL to fetch." },
+                "max_chars": { "type": "integer", "default": 8000, "minimum": 500, "maximum": 50000, "description": "Cap on returned characters." }
+            },
+            "required": ["url"],
+            "additionalProperties": false
+        }),
+    }
+});
+
+#[async_trait]
+impl Tool for WebFetch {
+    fn spec(&self) -> &ToolSpec {
+        &WEB_FETCH_SPEC
+    }
+
+    async fn invoke(&self, _ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            url: String,
+            #[serde(default = "default_max_chars")]
+            max_chars: usize,
+        }
+        fn default_max_chars() -> usize {
+            8000
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let url = args.url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            anyhow::bail!("`url` must be an absolute http(s) URL");
+        }
+        fetch_text(url, args.max_chars).await
+    }
+}
+
+/// Fetch `url` and return its readable text: HTML is stripped to plain text
+/// (scripts/styles dropped, block tags become newlines), anything else is
+/// returned as-is. Output is capped at `max_chars`.
+pub async fn fetch_text(url: &str, max_chars: usize) -> Result<String> {
+    let client = client()?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch {url}"))?
+        .error_for_status()
+        .with_context(|| format!("HTTP error fetching {url}"))?;
+    let is_html = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("html"))
+        .unwrap_or(true);
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("failed to read body of {url}"))?;
+    let text = if is_html { html_to_text(&body) } else { body };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty response body for {url}");
+    }
+    Ok(clamp_chars(trimmed, max_chars))
+}
+
+/// Strip HTML to readable text: drop script/style/head content, turn block-level
+/// tags into newlines, collapse whitespace.
+fn html_to_text(html: &str) -> String {
+    use scraper::node::Node as SNode;
+    let doc = Html::parse_document(html);
+    let mut out = String::new();
+    for node in doc.tree.root().descendants() {
+        match node.value() {
+            SNode::Text(t) => {
+                let skip = node.ancestors().any(|a| {
+                    matches!(
+                        a.value(),
+                        SNode::Element(e)
+                            if matches!(
+                                e.name(),
+                                "script" | "style" | "noscript" | "template" | "head"
+                            )
+                    )
+                });
+                if !skip {
+                    out.push_str(t.text.as_ref());
+                    out.push(' ');
+                }
+            }
+            SNode::Element(e) => {
+                if matches!(
+                    e.name(),
+                    "p" | "br"
+                        | "div"
+                        | "li"
+                        | "tr"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "pre"
+                        | "section"
+                        | "article"
+                ) {
+                    out.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+    collapse_ws(&out)
+}
+
+/// Collapse runs of spaces/tabs to one, drop blank lines, trim each line.
+fn collapse_ws(text: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for raw in text.split('\n') {
+        let line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
+/// Cap `text` at `max_chars` characters, appending a truncation marker.
+fn clamp_chars(text: &str, max_chars: usize) -> String {
+    let mut s: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        s.push_str("\n... (output truncated)");
+    }
+    s
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+
+    #[test]
+    fn strips_html_to_readable_text() {
+        let html = r#"
+<html><head><style>body{color:red}</style><script>alert(1)</script></head>
+<body>
+  <h1>Title</h1>
+  <p>First   paragraph with <b>bold</b> text.</p>
+  <p>Second paragraph.</p>
+</body></html>"#;
+        let text = html_to_text(html);
+        assert!(text.contains("Title"));
+        assert!(text.contains("First paragraph with bold text."));
+        assert!(text.contains("Second paragraph."));
+        assert!(!text.contains("color:red"));
+        assert!(!text.contains("alert(1)"));
+        assert!(!text.contains('<'));
+    }
+
+    #[test]
+    fn clamps_long_text() {
+        let long = "a".repeat(100);
+        let out = clamp_chars(&long, 10);
+        assert!(out.starts_with("aaaaaaaaaa"));
+        assert!(out.contains("truncated"));
+        assert_eq!(clamp_chars("short", 10), "short");
     }
 }
 
