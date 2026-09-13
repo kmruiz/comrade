@@ -83,6 +83,20 @@ impl UserIo for TuiUserIo {
 }
 
 // ---------------------------------------------------------------------------
+// utilities
+// ---------------------------------------------------------------------------
+
+/// Extract the base model name from a display string that may include budget info.
+/// For example: "deepseek (32768)" -> "deepseek", "codestral" -> "codestral"
+fn base_model_name(display_name: &str) -> &str {
+    // Find the first '(' and return the substring before it, or the whole string if no '(' found
+    display_name
+        .find('(')
+        .map_or(display_name, |pos| &display_name[..pos])
+        .trim()
+}
+
+// ---------------------------------------------------------------------------
 // chat model
 // ---------------------------------------------------------------------------
 
@@ -2047,7 +2061,14 @@ impl App {
             return;
         }
         let mut models = vec![AGENT_MODEL.to_string()];
-        models.extend(self.cfg.delegates.iter().map(|d| d.name.clone()));
+        models.extend(self.cfg.delegates.iter().map(|d| {
+            if let Some(ctx_window) = d.llm.context_window {
+                format!("{} ({})", d.name, ctx_window)
+            } else {
+                d.name.clone()
+            }
+        }));
+
         self.pick = Some(ModelPick {
             steps,
             sel: 0,
@@ -4920,7 +4941,9 @@ fn delegate_panel_rows(
     // Reserve two columns of left indent for the wrapped body.
     let body_width = width.saturating_sub(2).max(1);
     for d in delegates {
-        let name = if d.name == d.llm.model {
+        let name = if let Some(ctx_window) = d.llm.context_window {
+            format!("{} ({})", d.name, ctx_window)
+        } else if d.name == d.llm.model {
             d.name.clone()
         } else {
             format!("{} ({})", d.name, d.llm.model)
@@ -5246,7 +5269,7 @@ fn draw_model_pick(pick: &ModelPick, colors: &ModelColors, frame: &mut Frame) {
             let mut st = Style::default().fg(if selected {
                 Color::White
             } else {
-                colors.name_color(m)
+                colors.name_color(base_model_name(m))
             });
             if selected {
                 st = st.add_modifier(Modifier::BOLD);
