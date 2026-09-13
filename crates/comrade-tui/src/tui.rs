@@ -5235,13 +5235,16 @@ fn layout_chat_rows(
             MsgKind::Question => {
                 // The agent asked the human something (ask_form): a yellow entry
                 // that stays visible in focus mode, unlike the grey Meta notes.
+                // Render line by line so the field list keeps its indentation.
                 let style = Style::default().fg(Color::Yellow);
-                for s in plain_wrap(&msg.text, width) {
-                    out.push(RenderRow {
-                        rule: None,
-                        spans: vec![Span::styled(s, style)],
-                        tool_header: None,
-                    });
+                for line in msg.text.lines() {
+                    for chunk in hard_cut(line, width) {
+                        out.push(RenderRow {
+                            rule: None,
+                            spans: vec![Span::styled(chunk, style)],
+                            tool_header: None,
+                        });
+                    }
                 }
             }
             MsgKind::Assistant => {
@@ -8536,6 +8539,28 @@ mod tests {
             "fields": [{ "id": "n", "label": "N", "kind": "number" }]
         }));
         assert_eq!(form_question_text(&untitled), "Question\n  N (n)");
+    }
+
+    #[test]
+    fn focus_mode_keeps_question_rows_and_drops_tool_rows() {
+        let chat = vec![
+            Msg::authored(MsgKind::User, "you", "do it"),
+            Msg::text(MsgKind::Question, "Pick a patch\n  Which patch? (pick)"),
+            card(),
+            Msg::authored(MsgKind::Assistant, "model", "done"),
+        ];
+        let collapsed = &[false];
+        let (rows, owners, _) =
+            layout_chat_rows(&chat, collapsed, "", 80, &[], &ModelColors::default(), true);
+        // The question message (idx 1) shows in focus mode...
+        assert!(owners.iter().flatten().any(|&i| i == 1));
+        let text: String = rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("Which patch?"), "{text}");
+        // ...while the tool card (idx 2) still does not.
+        assert!(!owners.iter().flatten().any(|&i| i == 2));
     }
 
     #[test]
