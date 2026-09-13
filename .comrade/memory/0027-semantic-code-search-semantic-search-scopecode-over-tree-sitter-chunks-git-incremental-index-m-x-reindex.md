@@ -22,3 +22,6 @@ Covers how memory and code are chunked, embedded and indexed, and how the code i
 ## Impact
 Embedding cost now scales with project code size on the first code search; the index is a cache under the user cache dir (nothing lands in the repo) and is refreshed incrementally after that. `semantic_search` stays read-only (already in READ_ONLY_TOOLS). `AgentEvent` gained a `Notice` variant for background-command results. The M-x command has no default key.
 
+
+## Note
+Default scope changed from `memory` to `all`: an omitted `scope` now searches BOTH memory and source code. Agents narrow with `scope=memory` or `scope=code` when they only want one side. Updated the spec `default`, the tool description and the runtime fallback in crates/comrade-tool-memory/src/semantic.rs.

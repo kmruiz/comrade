@@ -550,12 +550,12 @@ struct SemanticSearch;
 static SEMANTIC_SEARCH_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
         name: "semantic_search".into(),
-        description: "Search project memory (ADR decisions + glossary) AND source code by MEANING, not keywords: returns the closest hits with a similarity score. Code hits are tree-sitter symbols/line windows carrying file:line. Use when you only know the meaning and not the exact word (find_adr/ts_find_symbol/fs_rgrep need a word you do not have). `scope` picks memory (default), code, or all. Locally embedded model + vector index; no network for search; the index is rebuilt incrementally and only changed files are re-parsed.".into(),
+        description: "Search project memory (ADR decisions + glossary) AND source code by MEANING, not keywords: returns the closest hits with a similarity score. Code hits are tree-sitter symbols/line windows carrying file:line. Use when you only know the meaning and not the exact word (find_adr/ts_find_symbol/fs_rgrep need a word you do not have). Searches memory and code by default; pass `scope` to narrow to memory or code. Locally embedded model + vector index; no network for search; the index is rebuilt incrementally and only changed files are re-parsed.".into(),
         json_schema: json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "What you are looking for, in natural language." },
-                "scope": { "type": "string", "enum": ["memory", "code", "all"], "default": "memory", "description": "Search project memory, source code, or both." },
+                "scope": { "type": "string", "enum": ["memory", "code", "all"], "default": "all", "description": "Search project memory, source code, or both (default: both)." },
                 "kind": { "type": "string", "enum": ["adr", "glossary", "code"], "description": "Restrict to one hit kind (default: any in scope)." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 30, "default": 5, "description": "Max results." },
                 "rebuild": { "type": "boolean", "default": false, "description": "Force a full re-embed of the index (rarely needed; it rebuilds incrementally)." }
@@ -593,7 +593,7 @@ impl Tool for SemanticSearch {
         if query.is_empty() {
             anyhow::bail!("`query` must not be empty");
         }
-        let scope = args.scope.unwrap_or_else(|| "memory".to_string());
+        let scope = args.scope.unwrap_or_else(|| "all".to_string());
         if !matches!(scope.as_str(), "memory" | "code" | "all") {
             anyhow::bail!("`scope` must be one of memory|code|all (got {scope:?})");
         }
