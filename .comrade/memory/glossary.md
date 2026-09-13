@@ -65,6 +65,16 @@ Enabled by the UserPrompt::Form(FormSpec) / UserReply::Form(BTreeMap<String,Stri
 **Notes:**
 The dialog wraps its body to the popup's real inner width (popup = min(area.width-2, 100) wide, minus 2 border cols), sizes its height to body.len() + 4 (2 borders + input row + hint row) clamped to the terminal, and anchors the body to the TOP so the action/question is never scrolled out of view. Forms edit inline in the body (up/down field, left/right adjust, space toggle, enter submit); a confirm uses y/n, `?` asks the model about the action, esc cancels.
 
+## background job (BgHub)
+> The background-process tools `run_bg`/`bg_status`/`bg_tail`/`bg_kill` (comrade-tool-project `src/bg.rs`): they start a detached `bash -c` job and poll/kill it. One `BgHub` (jobs map + id counter) per `all()` call is shared by the four tools.
+
+**References:**
+- `crates/comrade-tool-project/src/bg.rs`
+- `.comrade/memory/0024-background-jobs-detached-processes-with-a-shared-bghub-in-comrade-tool-project.md`
+
+**Notes:**
+Children run with `kill_on_drop(true)`; output is captured into a 200 KB bounded buffer; `run_bg` is approval-gated and all four are DENIED_FOR_DELEGATES. See ADR #24.
+
 ## background session
 > A session whose run is still in flight while it is not the active one (its LiveState is parked in its OpenSession slot). Its events keep arriving (routed by session id via on_agent_event_for) and update its own chat/metrics/plan; the session switcher marks it [running].
 
@@ -108,6 +118,17 @@ Mid-run it is requested via `comrade_tool::CompactRequest` and honoured by `run_
 
 **Notes:**
 Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by render_row_line's `sub: Option<Color>` param. Folded MsgKind::Run digests keep no sub-chat styling.
+
+## delegate_parallel
+> `delegate_parallel` (comrade-core delegate.rs, `DelegateParallelTool`): runs up to 8 independent delegate jobs concurrently in ONE call (jobs: [{model, task, context}]) and returns each reply. Works under both native and ReAct protocols, unlike the loop's own parallel dispatch of a pure-delegate native batch.
+
+**References:**
+- `crates/comrade-core/src/delegate.rs`
+- `crates/comrade-tui/src/main.rs (build_tools)`
+- `.comrade/memory/0023-parallel-delegates-via-a-one-call-delegate-parallel-tool.md`
+
+**Notes:**
+Each job's approval policy is enforced before any run starts; it never touches the plan; it is DENIED_FOR_DELEGATES so a delegate cannot fan out recursively. See ADR #23.
 
 ## diff_choice
 > A `FieldKind` variant ("diff_choice") for ask_form: a pick-list whose options carry a code diff each (`DiffOption { label, diff }`). Rendered as the diffs; the answer is the chosen option's `label`. Used to let the human pick between competing patches.
@@ -153,6 +174,16 @@ Defined via a `FieldKind::DiffChoice { options: Vec<DiffOption> }` variant; seed
 
 **Notes:**
 Redesigned to be compact: previously 3 inner rows (name / gauge / usage) plus a wasted blank row; the '(api)' suffix was dropped (api is the default; only 'est' is shown).
+
+## pom_check
+> Tool (comrade-tool-project) that runs `cargo check` and returns the first N compiler errors with file:line:col plus the total count - a cheap alternative to pom_run_tests for iterating on compile errors.
+
+**References:**
+- `crates/comrade-tool-project/src/lib.rs (PomCheck)`
+- `crates/comrade-tool-project/src/tasks.rs (exec)`
+
+**Notes:**
+Runs with `--message-format=json`; `parse_check_json`/`format_diagnostic` parse it. Falls back to human-readable error lines when no JSON diagnostics parse. `tasks::exec` returns uncapped output so parsing sees the whole stream.
 
 ## provider preset
 > A named provider in `LlmCfg.provider` (ollama, openai, deepseek, mistral, openrouter, groq, together) that resolves to a preset base URL via `provider_base_url()` when the config omits an explicit `base_url`. All providers are spoken to through the single OpenAI-compatible `LlmClient` (Bearer auth, `/chat/completions` with native tool calls).
@@ -224,6 +255,16 @@ Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; othe
 **Notes:**
 Adopted in ADR #6. Prompt sources: crates/comrade-core/prompts/*.md (assembled by react::build_system_prompt and delegate::render_subagent_system) and the ToolSpec.description strings in every comrade-tool-* crate. Known follow-ups: comrade-core delegate/ask_advise tool descriptions and json_schema per-property descriptions are still verbose.
 
+## semantic_search
+> Memory tool (comrade-tool-memory, `semantic_search`) that finds ADRs/glossary terms by MEANING using a locally run embedding model, complementing the keyword tools find_adr/find_glossary.
+
+**References:**
+- `crates/comrade-tool-memory/src/semantic.rs`
+- `.comrade/memory/0022-semantic-memory-search-fastembed-model-persisted-flat-cosine-index.md`
+
+**Notes:**
+Backed by fastembed (quantized BGE-small-en-v1.5, in-process ONNX) + a flat cosine index persisted in the user cache dir and rebuilt incrementally by text hash; see ADR #22. Read-only for the loop (advisors/delegates may call it).
+
 ## session (TUI)
 > A named unit owning its own plan and chat. In the TUI the active session's live state is the App's own fields (AgentSession plan/title, ContextManager history, Vec<Msg> chat); every other opened session is an OpenSession slot holding a Box<SessionFile> snapshot. Ctrl-x C-b switches, C-s saves, C-f loads, C-k closes (kill-session) and C-w forks; the M-x names are switch-session/save-session/load-session/kill-session/fork-session.
 
@@ -269,6 +310,25 @@ Frontmatter is parsed by hand (no YAML crate in the workspace). Discovery/parse 
 
 **Notes:**
 Model-facing tool names appear in: ToolSpec name in each comrade-tool-* lib.rs, comrade-core tables (MUTATING_TOOLS/APPROVAL_GATED_TOOLS/READ_ONLY_TOOLS/CODE_CHANGES in agent.rs, DENIED_FOR_DELEGATES in delegate.rs), prompts/*.md, react.rs assertions, and tui.rs name-keyed rendering.
+
+## ts_test_impact
+> Read-only tree-sitter tool in comrade-tool-syntax that maps the files changed since a revision (git diff) to the tests likely to cover them: a test counts as affected if it references a symbol declared in a changed file, or lives in the same crate.
+
+**References:**
+- `crates/comrade-tool-syntax/src/lib.rs (TsTestImpact)`
+- `crates/comrade-tool-syntax/src/engine.rs`
+
+**Notes:**
+Heuristic, not a proof of coverage. Engine helpers: `test_functions`, `decl_names_in_text`, `identifier_tokens`. It also suggests `cargo test -p <crate>` lines.
+
+## verify-then-commit guard
+> The agent loop's monitor (agent.rs `update_verify_state` + the `git_commit` pre-check) that refuses a `git_commit` while unverified code changes exist. A change tool in CODE_CHANGES (fs_edit, fs_write_file, ts_rename, pom_format_code, shell, delegate) sets verified=false; only a successful `pom_run_tests`/`pom_run_task` whose observation contains the literal "test result: ok." sets it back to true.
+
+**References:**
+- `crates/comrade-core/src/agent.rs (CODE_CHANGES, update_verify_state, verify_guard_message)`
+
+**Notes:**
+Trap: because the loop observes the TRUNCATED tool output, a huge test run can be cut off before the "test result: ok." line, leaving the guard stuck - run a SMALL test target (e.g. one crate) so the marker survives truncation, then commit.
 
 ## verify-then-commit monitor
 > Guard in the agent loop (crates/comrade-core/src/agent.rs, `update_verify_state`/`verified_after_change`) that refuses a `git_commit` until a test run has gone green since the last code change. Any tool in `CODE_CHANGES` (fs_edit, fs_write_file, ts_rename, pom_format_code, shell, delegate) sets it unverified; only a `pom_run_tests`/`pom_run_task` run that succeeded AND whose output text contains the literal `test result: ok.` sets it verified again.
