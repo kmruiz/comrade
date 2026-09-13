@@ -21,6 +21,7 @@ comrade-tool-memory = { path = "../comrade-tool-memory" }
 comrade-tool-web = { path = "../comrade-tool-web" }
 comrade-tool-mcp = { path = "../comrade-tool-mcp" }
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "io-std"] }

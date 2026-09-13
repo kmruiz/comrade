@@ -78,6 +78,30 @@ impl ContextManager {
         &self.history
     }
 
+    pub fn rollup(&self) -> &str {
+        &self.rollup
+    }
+
+    pub fn history_clone(&self) -> Vec<ChatMessage> {
+        self.history.clone()
+    }
+
+    pub fn from_parts(
+        budget_tokens: usize,
+        max_tool_output_chars: usize,
+        history: Vec<ChatMessage>,
+        rollup: String,
+        evicted: usize,
+    ) -> Self {
+        Self {
+            budget_tokens,
+            max_tool_output_chars,
+            history,
+            rollup,
+            evicted,
+        }
+    }
+
     pub fn truncate_observation(&self, text: &str) -> String {
         let limit = self.max_tool_output_chars;
         let chars = text.chars().count();
@@ -525,5 +549,19 @@ mod tool_role_invariant_tests {
         let history = cm.messages().to_vec();
         assert!(no_orphaned_tool_messages(&history), "{history:?}");
         assert!(cm.evicted > 0);
+    }
+
+    #[test]
+    fn from_parts_roundtrips() {
+        let history = vec![
+            ChatMessage::new(Role::System, "sys"),
+            ChatMessage::new(Role::User, "hello"),
+        ];
+        let rollup = "Earlier: test".to_string();
+        let cm = ContextManager::from_parts(1000, 500, history.clone(), rollup.clone(), 3);
+        assert_eq!(cm.messages().len(), 2);
+        assert_eq!(cm.rollup(), rollup);
+        assert_eq!(cm.evicted, 3);
+        assert_eq!(cm.history_clone(), history);
     }
 }

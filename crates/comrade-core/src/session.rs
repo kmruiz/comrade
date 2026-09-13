@@ -150,6 +150,38 @@ impl AgentSession {
     pub fn as_control(self: Arc<Self>) -> Arc<dyn SessionControl> {
         self
     }
+
+    /// Restore a saved session: replace title, status bar, plan, delegation
+    /// records and finished summary, then notify the UI.
+    pub fn restore(
+        &self,
+        title: String,
+        status: String,
+        plan: Vec<PlanStep>,
+        delegated: HashSet<u64>,
+        finished: Option<String>,
+    ) {
+        *self.title.write().unwrap() = title;
+        *self.status.write().unwrap() = status;
+        let max_id = plan.iter().map(|s| s.id).max().unwrap_or(0);
+        *self.next_id.write().unwrap() = max_id + 1;
+        *self.plan.write().unwrap() = plan;
+        *self.delegated.write().unwrap() = delegated;
+        *self.finished.write().unwrap() = finished;
+        self.emit(AgentEvent::TitleChanged);
+        self.emit(AgentEvent::StatusChanged);
+        self.emit(AgentEvent::PlanChanged);
+    }
+
+    /// Snapshot the plan step ids the delegate tool has run (for saving).
+    pub fn delegated_ids(&self) -> HashSet<u64> {
+        self.delegated.read().unwrap().clone()
+    }
+
+    /// Next plan step id to be assigned (for testing).
+    pub fn next_id(&self) -> u64 {
+        *self.next_id.read().unwrap()
+    }
 }
 
 impl SessionControl for AgentSession {
@@ -542,5 +574,134 @@ mod tests {
 
         // unknown target -> Ok(false).
         assert!(!s.set_step_context(&PlanTarget::Id(99), "x").unwrap());
+    }
+
+    #[test]
+    fn restore_replaces_title_status_plan_delegated_and_finished() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let s = AgentSession::new(tx);
+
+        // Initial state
+        s.set_title("Initial Title");
+        s.set_status("Initial Status");
+        s.set_plan(vec![draft("initial step", "")]);
+        s.mark_step_delegated(1);
+        s.finish_plan(Some("Initial finished".into()));
+
+        // Prepare restored data
+        let restored_plan = vec![
+            PlanStep {
+                id: 10,
+                goal: "restored step 1".into(),
+                verification: "verify 1".into(),
+                model: "model1".into(),
+                context: "ctx1".into(),
+                status: PlanStatus::Done,
+                note: None,
+                started_at_ms: None,
+                took_ms: None,
+            },
+            PlanStep {
+                id: 20,
+                goal: "restored step 2".into(),
+                verification: "verify 2".into(),
+                model: "model2".into(),
+                context: "ctx2".into(),
+                status: PlanStatus::Pending,
+                note: None,
+                started_at_ms: None,
+                took_ms: None,
+            },
+        ];
+        let mut restored_delegated = HashSet::new();
+        restored_delegated.insert(10);
+
+        // Restore
+        s.restore(
+            "Restored Title".into(),
+            "Restored Status".into(),
+            restored_plan,
+            restored_delegated,
+            Some("Restored finished".into()),
+        );
+
+        // Verify all fields were replaced
+        assert_eq!(s.title(), "Restored Title");
+        assert_eq!(s.status(), "Restored Status");
+        assert_eq!(s.plan().len(), 2);
+        assert_eq!(s.plan()[0].goal, "restored step 1");
+        assert_eq!(s.plan()[1].goal, "restored step 2");
+        assert_eq!(s.finished_summary(), Some("Restored finished".into()));
+        assert!(s.step_was_delegated(10));
+        assert!(!s.step_was_delegated(20));
+    }
+
+    #[test]
+    fn restore_sets_next_id_past_max_restored_id() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let s = AgentSession::new(tx);
+
+        // Restore a plan with ids 1..3
+        let restored_plan = vec![
+            PlanStep {
+                id: 1,
+                goal: "step 1".into(),
+                verification: "".into(),
+                model: "".into(),
+                context: "".into(),
+                status: PlanStatus::Pending,
+                note: None,
+                started_at_ms: None,
+                took_ms: None,
+            },
+            PlanStep {
+                id: 2,
+                goal: "step 2".into(),
+                verification: "".into(),
+                model: "".into(),
+                context: "".into(),
+                status: PlanStatus::Pending,
+                note: None,
+                started_at_ms: None,
+                took_ms: None,
+            },
+            PlanStep {
+                id: 3,
+                goal: "step 3".into(),
+                verification: "".into(),
+                model: "".into(),
+                context: "".into(),
+                status: PlanStatus::Pending,
+                note: None,
+                started_at_ms: None,
+                took_ms: None,
+            },
+        ];
+
+        s.restore(
+            "Title".into(),
+            "Status".into(),
+            restored_plan,
+            HashSet::new(),
+            None,
+        );
+
+        // next_id should be 4 (max restored id + 1)
+        assert_eq!(s.next_id(), 4);
+    }
+
+    #[test]
+    fn delegated_ids_returns_snapshot() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let s = AgentSession::new(tx);
+
+        s.set_plan(vec![draft("step 1", ""), draft("step 2", "")]);
+        s.mark_step_delegated(1);
+        s.mark_step_delegated(2);
+
+        let ids = s.delegated_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
     }
 }

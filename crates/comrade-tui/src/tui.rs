@@ -24,6 +24,8 @@ use comrade_tool::{
     UserReply,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::colors::ModelColors;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -46,6 +48,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::editor::{Editor, LayoutRow, cursor_col, cursor_row, wrap_rows};
+use crate::session_store::SessionFile;
 use crate::{Deps, new_session};
 
 /// Width of the `"> "` gutter on the prompt line (also used as the indent
@@ -100,8 +103,8 @@ fn base_model_name(display_name: &str) -> &str {
 // chat model
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum MsgKind {
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub(crate) enum MsgKind {
     /// A message from the human user.
     User,
     /// A message written by the (main) model: replies and final answers.
@@ -123,8 +126,8 @@ enum MsgKind {
     Run,
 }
 
-#[derive(Clone)]
-struct ToolCard {
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ToolCard {
     name: String,
     /// Display name of the model that invoked the tool (None for legacy rows).
     author: Option<String>,
@@ -134,6 +137,7 @@ struct ToolCard {
     ok: bool,
     open: bool,
     /// When the call reached the UI (wall clock), to measure how long it took.
+    #[serde(skip)]
     started: Option<std::time::Instant>,
     /// Elapsed wall time once the call finished (None while still running or
     /// when the run was interrupted before the result arrived).
@@ -145,8 +149,8 @@ struct ToolCard {
 }
 
 /// One failed test: name + captured failure detail.
-#[derive(Clone)]
-struct TestFail {
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct TestFail {
     name: String,
     detail: String,
     open: bool,
@@ -162,8 +166,8 @@ struct TestSummary {
     cases: Vec<(String, String)>,
 }
 
-#[derive(Clone)]
-struct Msg {
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Msg {
     kind: MsgKind,
     text: String,
     tool: Option<ToolCard>,
@@ -416,10 +420,12 @@ enum MxCommand {
     CancelRun,
     Copy,
     EndOfLine,
+    ForkSession,
     ForwardWord,
     InsertNewline,
     KillWord,
     ListMcpServers,
+    LoadSession,
     MoveBlockDown,
     MoveBlockUp,
     MoveUserDown,
@@ -428,9 +434,11 @@ enum MxCommand {
     QueuePrompt,
     Quit,
     ReloadConfig,
+    SaveSession,
     SearchChat,
     SteerPrompt,
     SubmitPrompt,
+    SwitchSession,
     ToggleAutoAccept,
     ToggleToolCard,
 }
@@ -445,10 +453,12 @@ impl MxCommand {
         MxCommand::CancelRun,
         MxCommand::Copy,
         MxCommand::EndOfLine,
+        MxCommand::ForkSession,
         MxCommand::ForwardWord,
         MxCommand::InsertNewline,
         MxCommand::KillWord,
         MxCommand::ListMcpServers,
+        MxCommand::LoadSession,
         MxCommand::MoveBlockDown,
         MxCommand::MoveBlockUp,
         MxCommand::MoveUserDown,
@@ -457,9 +467,11 @@ impl MxCommand {
         MxCommand::QueuePrompt,
         MxCommand::Quit,
         MxCommand::ReloadConfig,
+        MxCommand::SaveSession,
         MxCommand::SearchChat,
         MxCommand::SteerPrompt,
         MxCommand::SubmitPrompt,
+        MxCommand::SwitchSession,
         MxCommand::ToggleAutoAccept,
         MxCommand::ToggleToolCard,
     ];
@@ -473,10 +485,12 @@ impl MxCommand {
             MxCommand::CancelRun => "cancel-run",
             MxCommand::Copy => "copy",
             MxCommand::EndOfLine => "end-of-line",
+            MxCommand::ForkSession => "fork-session",
             MxCommand::ForwardWord => "forward-word",
             MxCommand::InsertNewline => "insert-newline",
             MxCommand::KillWord => "kill-word",
             MxCommand::ListMcpServers => "list-mcp-servers",
+            MxCommand::LoadSession => "load-session",
             MxCommand::MoveBlockDown => "move-block-down",
             MxCommand::MoveBlockUp => "move-block-up",
             MxCommand::MoveUserDown => "move-user-down",
@@ -485,9 +499,11 @@ impl MxCommand {
             MxCommand::QueuePrompt => "queue-prompt",
             MxCommand::Quit => "quit",
             MxCommand::ReloadConfig => "reload-config",
+            MxCommand::SaveSession => "save-session",
             MxCommand::SearchChat => "search-chat-history",
             MxCommand::SteerPrompt => "steer",
             MxCommand::SubmitPrompt => "submit-prompt",
+            MxCommand::SwitchSession => "switch-session",
             MxCommand::ToggleAutoAccept => "toggle-auto-accept",
             MxCommand::ToggleToolCard => "toggle-tool-card",
         }
@@ -503,6 +519,7 @@ impl MxCommand {
             MxCommand::CancelRun => Some("esc"),
             MxCommand::Copy => Some("C-S-c / M-w"),
             MxCommand::EndOfLine => Some("<end>"),
+            MxCommand::ForkSession => Some("C-x C-w"),
             MxCommand::ForwardWord => Some("M-<right>"),
             MxCommand::InsertNewline => Some("S-<return>"),
             MxCommand::KillWord => Some("M-<delete>"),
@@ -514,12 +531,15 @@ impl MxCommand {
             MxCommand::NewSession => None,
             // Palette-only: shows the configured MCP servers in a modal.
             MxCommand::ListMcpServers => None,
+            MxCommand::LoadSession => Some("C-x C-f"),
             MxCommand::QueuePrompt => Some("C-<return>"),
             MxCommand::Quit => Some("C-c"),
             MxCommand::ReloadConfig => Some("C-r"),
+            MxCommand::SaveSession => Some("C-x C-s"),
             MxCommand::SearchChat => Some("C-s"),
             MxCommand::SteerPrompt => Some("<return>"),
             MxCommand::SubmitPrompt => Some("<return>"),
+            MxCommand::SwitchSession => Some("C-x C-b"),
             MxCommand::ToggleAutoAccept => Some("C-SPC"),
             MxCommand::ToggleToolCard => Some("tab"),
         }
@@ -534,10 +554,12 @@ impl MxCommand {
             MxCommand::CancelRun => "stop the running agent",
             MxCommand::Copy => "copy the prompt selection or the chat block under the cursor",
             MxCommand::EndOfLine => "move the prompt cursor to the end of the line",
+            MxCommand::ForkSession => "fork the current session into an independent copy",
             MxCommand::ForwardWord => "move the prompt cursor forward one word",
             MxCommand::InsertNewline => "insert a newline in the prompt",
             MxCommand::KillWord => "delete the word after the prompt cursor",
             MxCommand::ListMcpServers => "view and toggle MCP server tools",
+            MxCommand::LoadSession => "load a session from a file",
             MxCommand::MoveBlockDown => "move to the next chat block",
             MxCommand::MoveBlockUp => "move to the previous chat block",
             MxCommand::MoveUserDown => "jump to the next message you sent",
@@ -546,9 +568,11 @@ impl MxCommand {
             MxCommand::QueuePrompt => "hold the prompt and submit it when the current run ends",
             MxCommand::Quit => "quit the cockpit",
             MxCommand::ReloadConfig => "reload the config file without restarting",
+            MxCommand::SaveSession => "save the current session to a file",
             MxCommand::SearchChat => "search the chat history",
             MxCommand::SteerPrompt => "send the prompt to the running agent or delegate now",
             MxCommand::SubmitPrompt => "send the prompt to the agent",
+            MxCommand::SwitchSession => "switch to another open session",
             MxCommand::ToggleAutoAccept => "toggle auto-accept of approvals",
             MxCommand::ToggleToolCard => {
                 "expand or collapse the selected tool card (or a whole user-turn section)"
@@ -629,6 +653,46 @@ impl Mx {
 fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
     let n = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
     &a[..a.char_indices().nth(n).map_or(a.len(), |(i, _)| i)]
+}
+
+/// One session opened in this run. The active session's live state lives in the
+/// App's own fields; every other slot keeps a serialized snapshot so it can be
+/// switched back to (Ctrl-x C-b / `switch-session`).
+struct OpenSession {
+    /// Display name (the session's title) shown in the switcher.
+    title: String,
+    /// Path the session was last saved to or loaded from, when known.
+    file: Option<std::path::PathBuf>,
+    /// Saved snapshot of a non-active session (None for the active slot).
+    state: Option<Box<SessionFile>>,
+}
+
+/// What a save/load session path prompt does once confirmed.
+#[derive(Clone, Copy, PartialEq)]
+enum PathIntent {
+    Save,
+    Load,
+}
+
+/// The Ctrl-x C-s / Ctrl-x C-f minibuffer prompting for a session file path.
+struct PathPrompt {
+    intent: PathIntent,
+    input: String,
+}
+
+/// The Ctrl-x C-b session switcher overlay.
+struct SessionPick {
+    sel: usize,
+}
+
+/// Expand a leading `~/` in a typed path to the user's home directory.
+fn expand_tilde(input: &str) -> String {
+    if let Some(rest) = input.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
+    }
+    input.to_string()
 }
 
 struct App {
@@ -748,6 +812,20 @@ struct App {
     /// handle for the app's lifetime keeps the X11 window and its server
     /// thread serving our contents until the next copy or app exit.
     clipboard: Option<Clipboard>,
+
+    /// Sessions opened in this run; the active one's live state is in the App
+    /// fields above, the others keep a saved snapshot (see [`OpenSession`]).
+    open_sessions: Vec<OpenSession>,
+    /// Index of the active session within `open_sessions`.
+    active: usize,
+    /// Path the active session was last saved to or loaded from (Save default).
+    session_file: Option<std::path::PathBuf>,
+    /// True between a Ctrl-x prefix key and the key that selects the command.
+    ctrl_x: bool,
+    /// Open save/load session path prompt, when any.
+    path_prompt: Option<PathPrompt>,
+    /// Open session switcher overlay (Ctrl-x C-b), when any.
+    session_pick: Option<SessionPick>,
 }
 
 /// Snapshot of the repo state shown on the emacs-style mode line, refreshed in
@@ -1566,7 +1644,312 @@ impl App {
         self.steer_tx = None;
         self.queued_prompt = None;
         self.run_cancelled = false;
+        self.open_sessions = vec![OpenSession {
+            title: "New session".to_string(),
+            file: None,
+            state: None,
+        }];
+        self.active = 0;
+        self.session_file = None;
+        self.ctrl_x = false;
+        self.path_prompt = None;
+        self.session_pick = None;
         self.push_meta("started a fresh session");
+    }
+
+    /// Snapshot the active session's observable state into a serializable form.
+    fn session_snapshot(&self) -> SessionFile {
+        let (history, rollup, evicted) = match self.history.try_lock() {
+            Ok(h) => (h.history_clone(), h.rollup().to_string(), h.evicted),
+            Err(_) => (Vec::new(), String::new(), 0),
+        };
+        SessionFile {
+            version: 1,
+            title: self.session.title(),
+            status: self.session.status(),
+            plan: self.session.plan(),
+            delegated: self.session.delegated_ids().into_iter().collect(),
+            finished: self.session.finished_summary(),
+            chat: self.chat.clone(),
+            section_collapsed: self.section_collapsed.clone(),
+            ctx_tokens: self.ctx_tokens,
+            ctx_budget: self.ctx_budget,
+            ctx_estimated: self.ctx_estimated,
+            history,
+            rollup,
+            evicted,
+        }
+    }
+
+    /// Replace the active session's live state with a loaded snapshot.
+    fn apply_session(&mut self, file: SessionFile, path: Option<std::path::PathBuf>) {
+        let user = self.ctx_base.user.clone();
+        let undo = Arc::new(comrade_core::MemoryUndo::new(self.root.clone()));
+        let session = Arc::new(AgentSession::new(self.events_tx.clone()));
+        let ctx_base = ToolContext {
+            project_root: self.root.clone(),
+            cwd: self.root.clone(),
+            session: session.clone().as_control(),
+            user,
+            undo,
+            auto_approve: self.cfg.auto_approve(),
+            approval: Default::default(),
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            stop: None,
+        };
+        let delegated: HashSet<u64> = file.delegated.iter().copied().collect();
+        let budget = file.ctx_budget.max(1);
+        session.restore(file.title, file.status, file.plan, delegated, file.finished);
+        let history = ContextManager::from_parts(
+            budget,
+            self.cfg.context.max_tool_output_chars,
+            file.history,
+            file.rollup,
+            file.evicted,
+        );
+        self.session = session;
+        self.ctx_base = ctx_base;
+        self.history = Arc::new(tokio::sync::Mutex::new(history));
+        self.chat = file.chat;
+        self.section_collapsed = file.section_collapsed;
+        self.chat_rows_cache = None;
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
+        self.stream.clear();
+        self.search = None;
+        self.sel = None;
+        self.scroll_top = 0;
+        self.follow = true;
+        self.was_at_bottom = true;
+        self.ctx_tokens = file.ctx_tokens;
+        self.ctx_budget = budget;
+        self.ctx_estimated = file.ctx_estimated;
+        self.steer_tx = None;
+        self.queued_prompt = None;
+        self.run_cancelled = false;
+        self.session_file = path;
+    }
+
+    /// Refresh the active slot's title/file from the live session.
+    fn refresh_active_slot(&mut self) {
+        if let Some(slot) = self.open_sessions.get_mut(self.active) {
+            slot.title = self.session.title();
+            slot.file = self.session_file.clone();
+        }
+    }
+
+    /// Stash the active session's live state into its slot (before switching).
+    fn stash_active(&mut self) {
+        if self.active >= self.open_sessions.len() {
+            return;
+        }
+        let state = self.session_snapshot();
+        let file = self.session_file.clone();
+        let slot = &mut self.open_sessions[self.active];
+        slot.title = state.title.clone();
+        slot.file = file;
+        slot.state = Some(Box::new(state));
+    }
+
+    /// Switch the active session to the slot at `idx`.
+    fn switch_to(&mut self, idx: usize) {
+        if idx == self.active || idx >= self.open_sessions.len() {
+            return;
+        }
+        self.stash_active();
+        let file = self.open_sessions[idx].file.clone();
+        let title = self.open_sessions[idx].title.clone();
+        match self.open_sessions[idx].state.take() {
+            Some(state) => {
+                self.active = idx;
+                self.apply_session(*state, file);
+                self.open_sessions[idx].title = title.clone();
+                self.push_meta(format!("switched to session \"{title}\""));
+            }
+            None => self.push_meta("session has no saved state yet"),
+        }
+    }
+
+    /// Write the active session to `path`.
+    fn save_to(&mut self, path: std::path::PathBuf) {
+        let file = self.session_snapshot();
+        match crate::session_store::save(&path, &file) {
+            Ok(()) => {
+                self.session_file = Some(path.clone());
+                self.refresh_active_slot();
+                self.push_meta(format!("saved session to {}", path.display()));
+            }
+            Err(e) => self.push_meta(format!("save failed: {e:#}")),
+        }
+    }
+
+    /// Read a session from `path` and make it the active session.
+    fn load_from(&mut self, path: std::path::PathBuf) {
+        match crate::session_store::load(&path) {
+            Ok(file) => {
+                self.stash_active();
+                let mut title = file.title.clone();
+                if title.trim().is_empty() {
+                    title = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "session".to_string());
+                }
+                let mut file = file;
+                file.title = title.clone();
+                self.apply_session(file, Some(path.clone()));
+                self.open_sessions.push(OpenSession {
+                    title: title.clone(),
+                    file: Some(path.clone()),
+                    state: None,
+                });
+                self.active = self.open_sessions.len() - 1;
+                self.push_meta(format!(
+                    "loaded session \"{title}\" from {}",
+                    path.display()
+                ));
+            }
+            Err(e) => self.push_meta(format!("load failed: {e:#}")),
+        }
+    }
+
+    /// Fork the active session into an independent, immediately-active copy.
+    fn fork_session(&mut self) {
+        if self.running {
+            self.push_meta("cannot fork a session while a run is in flight");
+            return;
+        }
+        let mut fork = self.session_snapshot();
+        self.stash_active();
+        let orig = fork.title.clone();
+        let title = format!("{orig} (fork)");
+        fork.title = title.clone();
+        self.open_sessions.push(OpenSession {
+            title: title.clone(),
+            file: None,
+            state: None,
+        });
+        self.active = self.open_sessions.len() - 1;
+        self.apply_session(fork, None);
+        self.push_meta(format!("forked session \"{orig}\" as \"{title}\""));
+    }
+
+    /// Open the path prompt to save the active session (Ctrl-x C-s).
+    fn save_session_prompt(&mut self) {
+        if self.running {
+            self.push_meta("cannot save a session while a run is in flight");
+            return;
+        }
+        let default = self
+            .session_file
+            .clone()
+            .unwrap_or_else(|| crate::session_store::default_path(&self.root));
+        self.path_prompt = Some(PathPrompt {
+            intent: PathIntent::Save,
+            input: default.to_string_lossy().to_string(),
+        });
+    }
+
+    /// Open the path prompt to load a session (Ctrl-x C-f).
+    fn load_session_prompt(&mut self) {
+        if self.running {
+            self.push_meta("cannot load a session while a run is in flight");
+            return;
+        }
+        let default = self
+            .session_file
+            .clone()
+            .unwrap_or_else(|| crate::session_store::default_path(&self.root));
+        self.path_prompt = Some(PathPrompt {
+            intent: PathIntent::Load,
+            input: default.to_string_lossy().to_string(),
+        });
+    }
+
+    /// Open the session switcher overlay (Ctrl-x C-b).
+    fn switch_session(&mut self) {
+        if self.running {
+            self.push_meta("cannot switch sessions while a run is in flight");
+            return;
+        }
+        if self.open_sessions.len() <= 1 {
+            self.push_meta("only one session is open");
+            return;
+        }
+        self.stash_active();
+        self.session_pick = Some(SessionPick { sel: self.active });
+    }
+
+    /// Keys while the session switcher overlay is open.
+    fn handle_session_pick_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let max = self.open_sessions.len().saturating_sub(1);
+        let up = key.code == KeyCode::Up || (ctrl && key.code == KeyCode::Char('p'));
+        let down = key.code == KeyCode::Down || (ctrl && key.code == KeyCode::Char('n'));
+        if up {
+            if let Some(p) = &mut self.session_pick {
+                p.sel = p.sel.saturating_sub(1);
+            }
+        } else if down {
+            if let Some(p) = &mut self.session_pick {
+                p.sel = (p.sel + 1).min(max);
+            }
+        } else {
+            match key.code {
+                KeyCode::Esc => self.session_pick = None,
+                KeyCode::Char('g') if ctrl => self.session_pick = None,
+                KeyCode::Enter => {
+                    let idx = self
+                        .session_pick
+                        .as_ref()
+                        .map(|p| p.sel)
+                        .unwrap_or(self.active);
+                    self.session_pick = None;
+                    self.switch_to(idx);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Keys while the save/load session path prompt is open.
+    fn handle_path_prompt_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.path_prompt = None,
+            KeyCode::Char('g') if ctrl => self.path_prompt = None,
+            KeyCode::Enter => {
+                let Some(p) = self.path_prompt.take() else {
+                    return;
+                };
+                let text = p.input.trim();
+                if text.is_empty() {
+                    self.push_meta("no path given");
+                    return;
+                }
+                let raw = std::path::PathBuf::from(expand_tilde(text));
+                let path = if raw.is_absolute() {
+                    raw
+                } else {
+                    self.root.join(raw)
+                };
+                match p.intent {
+                    PathIntent::Save => self.save_to(path),
+                    PathIntent::Load => self.load_from(path),
+                }
+            }
+            KeyCode::Backspace if !ctrl => {
+                if let Some(p) = &mut self.path_prompt {
+                    p.input.pop();
+                }
+            }
+            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                if let Some(p) = &mut self.path_prompt {
+                    p.input.push(c);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// True when approvals run without prompting: either the config autonomy
@@ -1911,10 +2294,12 @@ impl App {
                 self.copy_prompt_or_block();
             }
             MxCommand::EndOfLine => self.input.move_end(false),
+            MxCommand::ForkSession => self.fork_session(),
             MxCommand::ForwardWord => self.input.move_word_right(false),
             MxCommand::InsertNewline => self.input.insert('\n'),
             MxCommand::KillWord => self.input.delete_word(),
             MxCommand::ListMcpServers => self.list_mcp_servers(),
+            MxCommand::LoadSession => self.load_session_prompt(),
             MxCommand::MoveBlockDown => self.move_block(1),
             MxCommand::MoveBlockUp => self.move_block(-1),
             MxCommand::MoveUserDown => self.move_user(1),
@@ -1923,9 +2308,11 @@ impl App {
             MxCommand::QueuePrompt => self.queue_prompt(),
             MxCommand::Quit => return true,
             MxCommand::ReloadConfig => self.reload_config(),
+            MxCommand::SaveSession => self.save_session_prompt(),
             MxCommand::SearchChat => self.search = Some(Search::new()),
             MxCommand::SteerPrompt => self.submit_prompt(),
             MxCommand::SubmitPrompt => self.submit_prompt(),
+            MxCommand::SwitchSession => self.switch_session(),
             MxCommand::ToggleAutoAccept => self.toggle_auto_accept(),
             MxCommand::ToggleToolCard => {
                 if let Some(idx) = self.sel {
@@ -2358,6 +2745,16 @@ pub async fn run(deps: &Deps) -> Result<()> {
         balance: deps.balance.clone(),
         activity: None,
         clipboard: None,
+        open_sessions: vec![OpenSession {
+            title: "New session".to_string(),
+            file: None,
+            state: None,
+        }],
+        active: 0,
+        session_file: None,
+        ctrl_x: false,
+        path_prompt: None,
+        session_pick: None,
     };
     app.dialog_ask_tx = Some(dialog_ans_tx);
 
@@ -2517,6 +2914,26 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                     return true;
                 }
             }
+            if app.path_prompt.is_some() {
+                app.handle_path_prompt_key(key);
+                return false;
+            }
+            if app.session_pick.is_some() {
+                app.handle_session_pick_key(key);
+                return false;
+            }
+            // Ctrl-x is a prefix (emacs): the next key picks the command.
+            if app.ctrl_x {
+                app.ctrl_x = false;
+                match key.code {
+                    KeyCode::Char('b') => app.switch_session(),
+                    KeyCode::Char('s') => app.save_session_prompt(),
+                    KeyCode::Char('f') => app.load_session_prompt(),
+                    KeyCode::Char('w') => app.fork_session(),
+                    _ => {}
+                }
+                return false;
+            }
             if app.pick.is_some() {
                 app.handle_pick_key(key);
                 return false;
@@ -2540,6 +2957,14 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                     // Ctrl-S pressed while the palette is open still searches.
                     MxKeyOutcome::Closed => {}
                 }
+            }
+            // Ctrl-X opens a prefix chord: C-x C-b/s/f/w for session commands.
+            if key.code == KeyCode::Char('x')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+            {
+                app.ctrl_x = true;
+                return false;
             }
             // Ctrl-A opens the "assign a model to a plan step" overlay.
             if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -3402,6 +3827,27 @@ fn draw(app: &mut App, frame: &mut Frame) {
         ]);
         frame.render_widget(Paragraph::new(mx_line), rows[1]);
         draw_mx_list(mx, frame, rows[1]);
+    } else if let Some(p) = &app.path_prompt {
+        // The save/load session path minibuffer replaces the prompt line.
+        let label = match p.intent {
+            PathIntent::Save => " save session to ",
+            PathIntent::Load => " load session from ",
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(p.input.clone()),
+            Span::styled("_", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "  enter:confirm  esc:cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), rows[1]);
     } else if let Some(s) = &app.search {
         // Search bar replaces the prompt line while Ctrl-S is active.
         let total = s.matches.len();
@@ -3445,6 +3891,9 @@ fn draw(app: &mut App, frame: &mut Frame) {
     }
     if let Some(p) = &app.pick {
         draw_model_pick(p, &app.model_colors, frame);
+    }
+    if let Some(p) = &app.session_pick {
+        draw_session_pick(p, app, frame);
     }
     if let Some(v) = &app.mcp_view {
         draw_mcp_servers(v, frame);
@@ -5239,6 +5688,42 @@ fn collapsed_done_toks(step: &PlanStep, width: usize) -> Vec<Tok> {
         toks.push(t);
     }
     toks
+}
+
+/// The Ctrl-x C-b session switcher overlay: pick an open session to switch to.
+fn draw_session_pick(pick: &SessionPick, app: &App, frame: &mut Frame) {
+    let area = frame.area();
+    let w = area.width.saturating_sub(2).min(92);
+    let h = (app.open_sessions.len() as u16 + 3).min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, s) in app.open_sessions.iter().enumerate() {
+        let selected = i == pick.sel;
+        let marker = if i == app.active { "*" } else { " " };
+        let file = s
+            .file
+            .as_ref()
+            .map(|f| format!("  {}", f.display()))
+            .unwrap_or_default();
+        let mut text = format!("{marker} {} {}", if selected { ">" } else { " " }, s.title);
+        text.push_str(&file);
+        let style = if selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" sessions (enter:switch  esc:cancel) ");
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// The Ctrl-A "assign a model" overlay: choose a plan step (pending/blocked
@@ -8441,5 +8926,32 @@ mod plan_step_tests {
     fn wrap_plain_keeps_explicit_newlines() {
         let w = wrap_plain("one\ntwo", 40);
         assert_eq!(w, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    #[test]
+    fn session_mx_commands() {
+        // All four session commands are present in MxCommand::ALL.
+        assert!(MxCommand::ALL.contains(&MxCommand::SaveSession));
+        assert!(MxCommand::ALL.contains(&MxCommand::LoadSession));
+        assert!(MxCommand::ALL.contains(&MxCommand::SwitchSession));
+        assert!(MxCommand::ALL.contains(&MxCommand::ForkSession));
+
+        // Names match the expected Emacs-style identifiers.
+        assert_eq!(MxCommand::SaveSession.name(), "save-session");
+        assert_eq!(MxCommand::LoadSession.name(), "load-session");
+        assert_eq!(MxCommand::SwitchSession.name(), "switch-session");
+        assert_eq!(MxCommand::ForkSession.name(), "fork-session");
+
+        // Keybindings are as configured.
+        assert_eq!(MxCommand::SaveSession.keys(), Some("C-x C-s"));
+        assert_eq!(MxCommand::LoadSession.keys(), Some("C-x C-f"));
+        assert_eq!(MxCommand::SwitchSession.keys(), Some("C-x C-b"));
+        assert_eq!(MxCommand::ForkSession.keys(), Some("C-x C-w"));
+
+        // Descriptions are non-empty.
+        assert!(!MxCommand::SaveSession.desc().is_empty());
+        assert!(!MxCommand::LoadSession.desc().is_empty());
+        assert!(!MxCommand::SwitchSession.desc().is_empty());
+        assert!(!MxCommand::ForkSession.desc().is_empty());
     }
 }

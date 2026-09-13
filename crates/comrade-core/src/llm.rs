@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::config::LlmCfg;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
@@ -20,7 +20,7 @@ pub enum Role {
 
 /// A function call the assistant made (native tool-calling). Serialized in the
 /// OpenAI wire format with `arguments` as a JSON string.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCallMsg {
     pub id: String,
     pub name: String,
@@ -48,21 +48,51 @@ impl Serialize for ToolCallMsg {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for ToolCallMsg {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawToolCall {
+            id: String,
+            #[serde(rename = "type")]
+            _type: Option<String>,
+            function: RawFunction,
+        }
+
+        #[derive(Deserialize)]
+        struct RawFunction {
+            name: String,
+            arguments: String,
+        }
+
+        let raw = RawToolCall::deserialize(deserializer)?;
+        let arguments = serde_json::from_str::<serde_json::Value>(&raw.function.arguments)
+            .unwrap_or(serde_json::Value::Null);
+        Ok(ToolCallMsg {
+            id: raw.id,
+            name: raw.function.name,
+            arguments,
+        })
+    }
+}
+
 #[derive(Serialize)]
 struct SerializedFunction<'a> {
     name: &'a str,
     arguments: &'a str,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
     /// Assistant tool calls (native mode).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_calls: Option<Vec<ToolCallMsg>>,
     /// Links a `Role::Tool` result to the call that produced it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_call_id: Option<String>,
 }
 
@@ -1212,5 +1242,52 @@ mod balance_tests {
         }"#;
         assert_eq!(parse_balance(json).as_deref(), Some("110.50 CNY"));
         assert_eq!(parse_balance("{}"), None);
+    }
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+
+    #[test]
+    fn chat_message_serde_roundtrip() {
+        let sys = ChatMessage::new(Role::System, "You are a helpful assistant");
+        let sys_json = serde_json::to_string(&sys).unwrap();
+        let sys_de: ChatMessage = serde_json::from_str(&sys_json).unwrap();
+        assert_eq!(sys.role, sys_de.role);
+        assert_eq!(sys.content, sys_de.content);
+        assert_eq!(sys.tool_calls, sys_de.tool_calls);
+        assert_eq!(sys.tool_call_id, sys_de.tool_call_id);
+
+        // Test assistant with tool calls
+        let assistant = ChatMessage::assistant_with_calls(
+            "x".to_string(),
+            vec![ToolCallMsg {
+                id: "c1".into(),
+                name: "fs_read".into(),
+                arguments: serde_json::json!({"path": "x"}),
+            }],
+        );
+        let assistant_json = serde_json::to_string(&assistant).unwrap();
+        let assistant_de: ChatMessage = serde_json::from_str(&assistant_json).unwrap();
+        assert_eq!(assistant.role, assistant_de.role);
+        assert_eq!(assistant.content, assistant_de.content);
+        assert_eq!(
+            assistant.tool_calls.as_ref().unwrap().len(),
+            assistant_de.tool_calls.as_ref().unwrap().len()
+        );
+        let call = &assistant.tool_calls.as_ref().unwrap()[0];
+        let call_de = &assistant_de.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.id, call_de.id);
+        assert_eq!(call.name, call_de.name);
+        assert_eq!(call.arguments, call_de.arguments);
+
+        // Test tool result
+        let tool_result = ChatMessage::tool_result("c1", "ok");
+        let tool_result_json = serde_json::to_string(&tool_result).unwrap();
+        let tool_result_de: ChatMessage = serde_json::from_str(&tool_result_json).unwrap();
+        assert_eq!(tool_result.role, tool_result_de.role);
+        assert_eq!(tool_result.content, tool_result_de.content);
+        assert_eq!(tool_result.tool_call_id, tool_result_de.tool_call_id);
     }
 }

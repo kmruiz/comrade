@@ -18,7 +18,7 @@ pub const AGENT_MODEL: &str = "self";
 /// [`PlanStatus::Ready`] — "ready to pick up". Only then is the step delegated
 /// (which moves it to `InProgress`/working). A step whose delegate still needs
 /// more context stays `Pending` with an "awaiting context: ..." note.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
     /// Created by `set_plan`, or put back when more context is needed before
@@ -92,20 +92,24 @@ pub struct PlanStepDraft {
 }
 
 /// One row of the session plan the agent presents in the UI.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlanStep {
     /// Stable 1-based id assigned when the plan is (re)set.
     pub id: u64,
     /// What this step aims to accomplish.
     pub goal: String,
     /// How to verify the step succeeded (may be empty).
+    #[serde(default)]
     pub verification: String,
     /// Which model will execute this step. [`AGENT_MODEL`] ("self") means the
     /// main model; anything else is a delegate's name.
+    #[serde(default)]
     pub model: String,
     /// Summarised context for the executing model (never shown in the UI).
+    #[serde(default)]
     pub context: String,
     pub status: PlanStatus,
+    #[serde(default)]
     pub note: Option<String>,
     /// Wall-clock millis (UNIX epoch) when the step was first marked
     /// `InProgress` (started being worked), None until then.
@@ -387,5 +391,33 @@ mod tests {
         s.update_at(PlanStatus::InProgress, None, 300);
         s.update_at(PlanStatus::Done, None, 350);
         assert_eq!(s.took_ms, Some(50));
+    }
+
+    #[test]
+    fn plan_step_serde_roundtrip() {
+        let step = PlanStep {
+            id: 1,
+            goal: "test goal".to_string(),
+            verification: "test verification".to_string(),
+            model: "test model".to_string(),
+            context: "test context".to_string(),
+            status: PlanStatus::Ready,
+            note: Some("n".to_string()),
+            started_at_ms: Some(1),
+            took_ms: Some(2),
+        };
+
+        let json = serde_json::to_string(&step).unwrap();
+        let parsed: PlanStep = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.id, step.id);
+        assert_eq!(parsed.goal, step.goal);
+        assert_eq!(parsed.verification, step.verification);
+        assert_eq!(parsed.model, step.model);
+        assert_eq!(parsed.context, step.context);
+        assert_eq!(parsed.status, step.status);
+        assert_eq!(parsed.note, step.note);
+        assert_eq!(parsed.started_at_ms, step.started_at_ms);
+        assert_eq!(parsed.took_ms, step.took_ms);
     }
 }
