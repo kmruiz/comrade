@@ -482,35 +482,64 @@ fn format_tsc_line(line: &str) -> Option<String> {
 /// Reduce raw jest/vitest/mocha output to a readable summary: the summary lines,
 /// failing-test markers and key errors, capped. When nothing is recognizable the
 /// last non-empty lines are returned instead.
+/// Reduce raw jest/vitest/mocha output to a small, failure-first summary: the
+/// totals lines followed by the failing-test / error lines. Passing-only lines
+/// are dropped and the result is bounded, so it is never truncated downstream.
 fn simplify_js_tests(raw: &str) -> String {
-    const KEYS: &[&str] = &[
+    /// Totals/summary lines (checked first).
+    const SUMMARY: &[&str] = &[
         "tests:",
         "test suites:",
         "test files",
-        "passed",
-        "failed",
-        "pending",
-        "skipped",
         "snapshots:",
+        "time:",
         "duration",
-        "passing",
-        "failing",
+    ];
+    /// Lines that report a failure or an error.
+    const FAIL: &[&str] = &[
         "✕",
         "✗",
         "✘",
         "×",
+        "fail",
+        "error",
         "assertionerror",
-        "error:",
+        "expected",
+        "received",
         "expect(",
     ];
-    let mut out: Vec<&str> = Vec::new();
+    /// Hard cap on the whole summary (well under the agent observation cap).
+    const MAX_CHARS: usize = 3000;
+
+    let mut summary: Vec<&str> = Vec::new();
+    let mut fails: Vec<&str> = Vec::new();
     for line in raw.lines() {
-        let l = line.to_lowercase();
-        if KEYS.iter().any(|k| l.contains(k)) {
-            out.push(line.trim_end());
+        let t = line.trim_end();
+        if t.trim().is_empty() {
+            continue;
+        }
+        let l = t.to_lowercase();
+        if SUMMARY.iter().any(|k| l.contains(k)) {
+            summary.push(t);
+        } else if FAIL.iter().any(|k| l.contains(k)) {
+            fails.push(t);
         }
     }
-    if out.is_empty() {
+
+    let mut out = String::new();
+    for s in &summary {
+        out.push_str(s);
+        out.push('\n');
+    }
+    if !fails.is_empty() {
+        out.push_str("failures:\n");
+        for f in &fails {
+            out.push_str(f);
+            out.push('\n');
+        }
+    }
+    if out.trim().is_empty() {
+        // Nothing recognizable: keep the tail rather than nothing at all.
         let mut tail: Vec<&str> = raw
             .lines()
             .rev()
@@ -518,14 +547,9 @@ fn simplify_js_tests(raw: &str) -> String {
             .take(20)
             .collect();
         tail.reverse();
-        return tail.join("\n");
+        return trim_chars(tail.join("\n"), MAX_CHARS);
     }
-    let joined = out.join("\n");
-    if joined.chars().count() > 6000 {
-        joined.chars().take(6000).collect()
-    } else {
-        joined
-    }
+    trim_chars(out, MAX_CHARS)
 }
 
 /// Fallback diagnostic extraction for toolchains without a structured format:
@@ -622,40 +646,92 @@ fn format_diagnostic(msg: &Value) -> String {
 /// Reduce raw `cargo test` output to a readable summary for the model: keep
 /// totals, failing-test sections and their detail lines; drop compile/build
 /// noise and the per-test "... ok" lines.
+/// Reduce raw `cargo test` output to the failure-only summary the model needs:
+/// the per-binary `test result:` totals, the names of the failing tests, and a
+/// bounded excerpt of each failure's captured output. Passing tests, build
+/// noise and unbounded test stdout are dropped, so the result stays small
+/// enough that the agent loop never truncates it.
 fn simplify_test_output(raw: &str) -> String {
-    let mut out = String::new();
-    let mut kept = 0usize;
+    /// Lines kept from each failing test's captured output.
+    const EXCERPT_LINES: usize = 15;
+    /// Hard cap on the whole summary (well under the agent observation cap).
+    const MAX_CHARS: usize = 3500;
+
+    let mut results: Vec<String> = Vec::new();
+    let mut failing: Vec<String> = Vec::new();
+    let mut excerpts: Vec<String> = Vec::new();
+    let mut in_excerpt = false;
+    let mut excerpt_lines = 0usize;
+
     for line in raw.lines() {
         let t = line.trim_start();
-        if t.is_empty()
-            || t.starts_with("Compiling")
-            || t.starts_with("Finished")
-            || t.starts_with("Running")
-            || t.starts_with("Doc-tests")
-            || t.starts_with("warning: ")
-            || t.contains("running 0 tests")
-        {
+        if t.starts_with("test result:") {
+            in_excerpt = false;
+            results.push(line.trim_end().to_string());
             continue;
         }
-        // skip individual passing tests ("test foo ... ok")
+        // "test NAME ... FAILED" (optionally with a trailing " (1.2s)").
         if let Some(rest) = t.strip_prefix("test ")
-            && rest.ends_with(" ... ok")
+            && let Some((name, _)) = rest.split_once(" ... FAILED")
         {
+            in_excerpt = false;
+            failing.push(name.trim().to_string());
             continue;
         }
-        out.push_str(line);
-        out.push('\n');
-        kept += 1;
-        if kept > 200 {
-            out.push_str("... (output trimmed)\n");
-            break;
+        // A captured-output block for one test: "---- NAME stdout ----".
+        if t.starts_with("---- ") && t.trim_end().ends_with(" ----") {
+            in_excerpt = true;
+            excerpt_lines = 0;
+            excerpts.push(line.trim_end().to_string());
+            continue;
         }
+        if in_excerpt {
+            if t.starts_with("failures:") {
+                in_excerpt = false;
+                continue;
+            }
+            if excerpt_lines < EXCERPT_LINES {
+                excerpts.push(line.trim_end().to_string());
+                excerpt_lines += 1;
+            }
+            continue;
+        }
+        // Everything else (Compiling/Finished/Running/passing tests/…) is noise.
     }
+
+    let mut out = String::new();
+    for r in &results {
+        out.push_str(r);
+        out.push('\n');
+    }
+    if !failing.is_empty() {
+        out.push_str(&format!(
+            "{} failing test(s): {}\n",
+            failing.len(),
+            failing.join(", ")
+        ));
+    }
+    if !excerpts.is_empty() {
+        out.push_str("\nfailure output:\n");
+        out.push_str(&excerpts.join("\n"));
+        out.push('\n');
+    }
+    let out = trim_chars(out, MAX_CHARS);
     if out.trim().is_empty() {
         "test run produced no summary lines (check timeout or exit code)".to_string()
     } else {
         out
     }
+}
+
+/// Truncate `s` to at most `max` chars, appending a marker when cut.
+fn trim_chars(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s;
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str("\n...(trimmed)");
+    out
 }
 
 #[cfg(test)]
@@ -783,6 +859,37 @@ test result: FAILED. 11 passed; 1 failed; 0 ignored
         assert!(out.contains("panicked at"));
         assert!(!out.contains("Compiling"));
         assert!(!out.contains("Finished"));
+    }
+
+    #[test]
+    fn failing_test_output_is_bounded_and_failure_only() {
+        let mut raw = String::from(
+            "running 2 tests\ntest ok_one ... ok\ntest boom ... FAILED\n\nfailures:\n\n---- boom stdout ----\n",
+        );
+        // A failing test that prints a lot of captured stdout.
+        for i in 0..500 {
+            raw.push_str(&format!("noisy stdout line {i}\n"));
+        }
+        raw.push_str(
+            "\n---- boom stderr ----\nthread 'boom' panicked at src/lib.rs:7:5:\nboom\n\nfailures:\n    boom\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n",
+        );
+        let out = Cargo.simplify_tests(&raw);
+        assert!(out.contains("1 failing test(s): boom"), "{out}");
+        assert!(out.contains("test result: FAILED"), "{out}");
+        assert!(out.contains("panicked at"), "{out}");
+        assert!(
+            !out.contains("ok_one"),
+            "passing tests must be dropped: {out}"
+        );
+        assert!(
+            !out.contains("noisy stdout line 499"),
+            "per-test stdout must be bounded: {out}"
+        );
+        assert!(
+            out.chars().count() <= 4000,
+            "bounded: {}",
+            out.chars().count()
+        );
     }
 
     fn node_scratch(tag: &str) -> std::path::PathBuf {
