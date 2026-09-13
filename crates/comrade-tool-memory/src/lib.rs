@@ -37,11 +37,16 @@ pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(RecordAdr),
         Box::new(FindAdr),
+        Box::new(ListAdr),
         Box::new(ReadAdr),
         Box::new(AmendAdr),
+        Box::new(MergeAdr),
         Box::new(RecordGlossary),
         Box::new(FindGlossary),
         Box::new(ReadGlossary),
+        Box::new(RenameGlossary),
+        Box::new(DeleteGlossary),
+        Box::new(StaleMemory),
     ]
 }
 
@@ -489,5 +494,280 @@ impl Tool for ReadGlossary {
                 }
             }
         }
+    }
+}
+
+/// Capture the current content of a project-relative file into the undo log.
+async fn capture_file(ctx: &ToolContext, rel: &str) -> Result<()> {
+    let abs = ctx.project_root.join(rel);
+    let before = std::fs::read_to_string(&abs).unwrap_or_default();
+    ctx.undo.capture(rel, before).await
+}
+
+// ---------------------------------------------------------------------------
+// list_adr
+// ---------------------------------------------------------------------------
+
+struct ListAdr;
+
+static LIST_ADR_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "list_adr".into(),
+    description: "List every persistent decision (.comrade/memory/) as id, status, date and excerpt, newest first. Use to survey the whole memory for duplicates or superseded entries; find_adr searches by keyword instead.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "status": { "type": "string", "enum": ["proposed", "accepted", "superseded", "rejected"], "description": "Only entries with this status." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50, "description": "Max entries." }
+        },
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for ListAdr {
+    fn spec(&self) -> &ToolSpec {
+        &LIST_ADR_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            status: Option<String>,
+            #[serde(default = "default_list_limit")]
+            limit: usize,
+        }
+        fn default_list_limit() -> usize {
+            50
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let mut rows = store::list(&ctx.project_root)?;
+        if let Some(s) = args
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            rows.retain(|m| m.status.eq_ignore_ascii_case(s));
+        }
+        let total = rows.len();
+        rows.truncate(args.limit.max(1));
+        if rows.is_empty() {
+            return Ok("No decisions recorded.".to_string());
+        }
+        let mut out = format!("{total} decision(s):\n");
+        for m in rows {
+            let when = m.date.as_deref().map(|d| format!(" {d}")).unwrap_or_default();
+            let ex = m.excerpt();
+            let tail = if ex.is_empty() {
+                String::new()
+            } else {
+                format!(" - {ex}")
+            };
+            out.push_str(&format!("#{:04} [{}]{when}{tail}\n", m.id, m.status));
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// merge_adr
+// ---------------------------------------------------------------------------
+
+struct MergeAdr;
+
+static MERGE_ADR_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "merge_adr".into(),
+    description: "Merge one or more decisions into a target decision: each source's body is appended under a `## Merged from #NNNN` heading and the source is marked `superseded`. Use to consolidate duplicate or fragmented decisions. Runs directly without approval.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "into": { "type": "integer", "minimum": 1, "description": "Target decision id (kept and updated)." },
+            "from": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "description": "Decision ids to merge in and supersede." },
+            "note": { "type": "string", "description": "Optional note appended to the target explaining the merge." }
+        },
+        "required": ["into", "from"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for MergeAdr {
+    fn spec(&self) -> &ToolSpec {
+        &MERGE_ADR_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            into: u32,
+            from: Vec<u32>,
+            #[serde(default)]
+            note: Option<String>,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        if args.from.iter().all(|id| *id == args.into) {
+            anyhow::bail!("`from` must name at least one other decision");
+        }
+        // Capture every touched file for rollback.
+        let mut touched = vec![args.into];
+        touched.extend(args.from.iter().copied().filter(|id| *id != args.into));
+        for id in &touched {
+            let entry = store::read(&ctx.project_root, *id)?;
+            capture_file(ctx, &format!(".comrade/memory/{}", entry.meta.file_name)).await?;
+        }
+        let summary = store::merge(
+            &ctx.project_root,
+            args.into,
+            &args.from,
+            args.note.as_deref(),
+        )?;
+        Ok(format!("{summary}."))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rename_glossary
+// ---------------------------------------------------------------------------
+
+struct RenameGlossary;
+
+static RENAME_GLOSSARY_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "rename_glossary".into(),
+    description: "Rename a glossary term, keeping its meaning, references and notes. Use to fix a typo or adopt the canonical name. Runs directly without approval.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "term": { "type": "string", "description": "Current term to rename." },
+            "to": { "type": "string", "description": "New term (must not already exist)." }
+        },
+        "required": ["term", "to"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for RenameGlossary {
+    fn spec(&self) -> &ToolSpec {
+        &RENAME_GLOSSARY_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            term: String,
+            to: String,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        if glossary::read_term(&ctx.project_root, &args.term)?.is_none() {
+            anyhow::bail!("no glossary term {:?}", args.term);
+        }
+        capture_file(ctx, ".comrade/memory/glossary.md").await?;
+        glossary::rename(&ctx.project_root, &args.term, &args.to)?;
+        Ok(format!("Renamed glossary term {:?} -> {:?}.", args.term, args.to))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// delete_glossary
+// ---------------------------------------------------------------------------
+
+struct DeleteGlossary;
+
+static DELETE_GLOSSARY_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "delete_glossary".into(),
+    description: "Remove a glossary term (prune an obsolete keyword). Use with stale_memory to keep the glossary from silting up. Runs directly without approval.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "term": { "type": "string", "description": "Keyword to delete." }
+        },
+        "required": ["term"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for DeleteGlossary {
+    fn spec(&self) -> &ToolSpec {
+        &DELETE_GLOSSARY_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            term: String,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        capture_file(ctx, ".comrade/memory/glossary.md").await?;
+        if glossary::delete(&ctx.project_root, &args.term)? {
+            Ok(format!("Deleted glossary term {:?}.", args.term))
+        } else {
+            Ok(format!("No glossary term {:?} to delete.", args.term))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// stale_memory
+// ---------------------------------------------------------------------------
+
+struct StaleMemory;
+
+static STALE_MEMORY_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "stale_memory".into(),
+    description: "Report memory that has drifted from the code: ADR and glossary entries whose backticked file references no longer exist on disk. Read-only; use it to prune or fix outdated memory.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for StaleMemory {
+    fn spec(&self) -> &ToolSpec {
+        &STALE_MEMORY_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, _args: Value) -> Result<String> {
+        let root = &ctx.project_root;
+        let adrs = store::stale(root)?;
+        let terms = glossary::dangling(root)?;
+        if adrs.is_empty() && terms.is_empty() {
+            return Ok("No stale memory: every referenced path still exists.".to_string());
+        }
+        let mut out = String::new();
+        if !adrs.is_empty() {
+            out.push_str(&format!("{} ADR(s) with missing references:\n", adrs.len()));
+            for (meta, missing) in &adrs {
+                out.push_str(&format!(
+                    "  #{:04} {} -> missing {}\n",
+                    meta.id,
+                    meta.excerpt(),
+                    missing.join(", ")
+                ));
+            }
+        }
+        if !terms.is_empty() {
+            out.push_str(&format!(
+                "{} glossary term(s) with missing references:\n",
+                terms.len()
+            ));
+            for (term, missing) in &terms {
+                out.push_str(&format!("  {term} -> missing {}\n", missing.join(", ")));
+            }
+        }
+        Ok(out)
     }
 }

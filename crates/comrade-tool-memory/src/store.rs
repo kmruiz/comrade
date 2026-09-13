@@ -417,6 +417,130 @@ pub fn search(
     Ok(scored.into_iter().map(|(_, m)| m).collect())
 }
 
+/// The title of an entry body: its first `# NNNN - Title` line, title only.
+fn title_of(body: &str) -> String {
+    let first = body.lines().next().unwrap_or("").trim();
+    let first = first.trim_start_matches('#').trim();
+    match first.split_once(" - ") {
+        Some((_, t)) => t.trim().to_string(),
+        None => first.to_string(),
+    }
+}
+
+/// Merge `sources` into `target`: append each source's body under a
+/// `## Merged from #NNNN - title` heading and mark the source `superseded`.
+/// Returns a one-line summary of what happened.
+pub fn merge(
+    root: &Path,
+    target: u32,
+    sources: &[u32],
+    note: Option<&str>,
+) -> Result<String> {
+    if !path_for(root, target)?.exists() {
+        anyhow::bail!("no decision #{target}");
+    }
+    let mut text = read(root, target)?.body;
+    let mut merged: Vec<String> = Vec::new();
+    for &src in sources {
+        if src == target {
+            continue;
+        }
+        let e = read(root, src)?;
+        let title = title_of(&e.body);
+        let mut src_body = e.body.clone();
+        if let Some(i) = src_body.find('\n') {
+            src_body = src_body[i + 1..].to_string();
+        }
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "\n## Merged from #{src:04} - {title}\n{}\n",
+            src_body.trim()
+        ));
+        amend(
+            root,
+            src,
+            Some("superseded"),
+            Some(&format!("merged into #{target:04}")),
+        )?;
+        merged.push(format!("#{src:04}"));
+    }
+    if let Some(n) = note.map(str::trim).filter(|n| !n.is_empty()) {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("\n## Note\n{n}\n"));
+    }
+    let path = path_for(root, target)?;
+    std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
+    if merged.is_empty() {
+        Ok(format!("updated #{target:04} (nothing to merge)"))
+    } else {
+        Ok(format!("merged {} into #{target:04}", merged.join(", ")))
+    }
+}
+
+/// Backtick-quoted spans that look like filesystem paths (used for staleness).
+pub fn extract_paths(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_tick = false;
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if ch == '`' {
+            if in_tick {
+                let t = cur.trim();
+                if looks_like_path(t) && !out.iter().any(|p| p == t) {
+                    out.push(t.to_string());
+                }
+                cur.clear();
+            }
+            in_tick = !in_tick;
+            continue;
+        }
+        if in_tick {
+            cur.push(ch);
+        }
+    }
+    out
+}
+
+/// A token worth checking for existence: no spaces/globs/placeholders, and it
+/// either contains a `/` or ends with a known source/doc extension.
+fn looks_like_path(t: &str) -> bool {
+    !t.is_empty()
+        && !t.contains(' ')
+        && !t.contains('*')
+        && !t.contains('<')
+        && !t.contains('>')
+        && !t.contains('{')
+        && (t.contains('/')
+            || t.ends_with(".rs")
+            || t.ends_with(".toml")
+            || t.ends_with(".md")
+            || t.ends_with(".json"))
+}
+
+/// Entries that reference files which no longer exist on disk, as
+/// `(meta, missing_paths)`. Use to spot memory that has drifted from the code.
+pub fn stale(root: &Path) -> Result<Vec<(EntryMeta, Vec<String>)>> {
+    let mut out = Vec::new();
+    for meta in list(root)? {
+        let path = dir(root).join(&meta.file_name);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let missing: Vec<String> = extract_paths(&text)
+            .into_iter()
+            .filter(|p| !root.join(p).exists() && !root.join(p.trim_start_matches("./")).exists())
+            .collect();
+        if !missing.is_empty() {
+            out.push((meta, missing));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +754,55 @@ mod tests {
         assert!(parts[0].chars().all(|c| c.is_ascii_digit()));
         assert!(parts[1].chars().all(|c| c.is_ascii_digit()));
         assert!(parts[2].chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn merge_appends_and_supersedes_sources() {
+        let root = scratch();
+        let a = write(&root, draft("Alpha", "first", None, None, vec![])).unwrap();
+        let b = write(&root, draft("Beta", "second", None, None, vec![])).unwrap();
+        let msg = merge(&root, a, &[b], Some("consolidated")).unwrap();
+        assert!(msg.contains(&format!("#{b:04}")), "{msg}");
+        let target = read(&root, a).unwrap();
+        assert!(
+            target.body.contains(&format!("Merged from #{b:04}")),
+            "{}",
+            target.body
+        );
+        assert!(target.body.contains("consolidated"), "{}", target.body);
+        let src = read(&root, b).unwrap();
+        assert_eq!(src.meta.status, "superseded");
+        assert!(src.body.contains(&format!("merged into #{a:04}")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extract_paths_and_stale_flag_missing_refs() {
+        let paths = extract_paths("see `crates/foo/src/lib.rs`, `Foo::bar` and `README.md`");
+        assert!(paths.contains(&"crates/foo/src/lib.rs".to_string()));
+        assert!(paths.contains(&"README.md".to_string()));
+        assert!(!paths.iter().any(|p| p == "Foo::bar"));
+
+        let root = scratch();
+        let id = write(
+            &root,
+            draft(
+                "Doc",
+                "s",
+                Some("refers to `crates/nope/missing.rs`"),
+                None,
+                vec![],
+            ),
+        )
+        .unwrap();
+        let stale_list = stale(&root).unwrap();
+        assert_eq!(stale_list.len(), 1, "{stale_list:?}");
+        assert_eq!(stale_list[0].0.id, id);
+        assert!(
+            stale_list[0]
+                .1
+                .contains(&"crates/nope/missing.rs".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

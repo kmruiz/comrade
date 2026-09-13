@@ -269,21 +269,28 @@ pub fn upsert(
     if was_new {
         kept.push((term.to_string(), new_section));
     }
-    kept.sort_by(|a, b| {
-        a.0.to_lowercase()
-            .cmp(&b.0.to_lowercase())
-            .then_with(|| a.0.cmp(&b.0))
-    });
+    kept.sort_by(sort_sections);
+    write_sections(&p, prefix, &kept)?;
+    Ok(was_new)
+}
 
+/// Alphabetical section ordering (case-insensitive, ties broken by exact text).
+fn sort_sections(a: &(String, String), b: &(String, String)) -> std::cmp::Ordering {
+    a.0.to_lowercase()
+        .cmp(&b.0.to_lowercase())
+        .then_with(|| a.0.cmp(&b.0))
+}
+
+/// Rewrite the glossary file from `sections`, keeping the header `prefix`.
+fn write_sections(p: &Path, prefix: &str, sections: &[(String, String)]) -> Result<()> {
     let mut out = String::new();
     out.push_str(prefix.trim_end());
     if !out.is_empty() {
         out.push_str("\n\n");
     }
-    for (t, raw) in kept {
+    for (t, raw) in sections {
         // Re-emit every section with exactly one blank line between entries so
-        // repeated upserts never accumulate stray blank lines. `raw` holds
-        // everything after the `## term` heading.
+        // repeated edits never accumulate stray blank lines.
         let body = raw.trim_end_matches('\n');
         out.push_str(&format!("## {t}\n"));
         if !body.is_empty() {
@@ -292,8 +299,79 @@ pub fn upsert(
         }
         out.push('\n');
     }
-    std::fs::write(&p, out).with_context(|| format!("cannot write {}", p.display()))?;
-    Ok(was_new)
+    std::fs::write(p, out).with_context(|| format!("cannot write {}", p.display()))?;
+    Ok(())
+}
+
+/// Read the glossary, let `mutate` edit the section list, write it back sorted.
+/// Returns whether anything changed.
+fn rewrite_sections(
+    root: &Path,
+    mutate: impl FnOnce(&mut Vec<(String, String)>) -> bool,
+) -> Result<bool> {
+    ensure(root)?;
+    let p = path(root);
+    let text =
+        std::fs::read_to_string(&p).with_context(|| format!("cannot read {}", p.display()))?;
+    let prefix = header_prefix(&text);
+    let mut sections = split_sections(&text[prefix.len()..]);
+    if !mutate(&mut sections) {
+        return Ok(false);
+    }
+    sections.sort_by(sort_sections);
+    write_sections(&p, prefix, &sections)?;
+    Ok(true)
+}
+
+/// Remove a term's section. Returns whether it existed.
+pub fn delete(root: &Path, term: &str) -> Result<bool> {
+    let key = term.trim().to_lowercase();
+    if key.is_empty() {
+        anyhow::bail!("term must not be empty");
+    }
+    rewrite_sections(root, |sections| {
+        let before = sections.len();
+        sections.retain(|(t, _)| t.to_lowercase() != key);
+        before != sections.len()
+    })
+}
+
+/// Rename a term, keeping its section body. Errors if `to` already exists.
+pub fn rename(root: &Path, from: &str, to: &str) -> Result<bool> {
+    let to = to.trim();
+    if to.is_empty() {
+        anyhow::bail!("new term must not be empty");
+    }
+    if read_term(root, to)?.is_some() {
+        anyhow::bail!("term {to:?} already exists");
+    }
+    let key = from.trim().to_lowercase();
+    rewrite_sections(root, |sections| {
+        let mut done = false;
+        for (t, _raw) in sections.iter_mut() {
+            if !done && t.to_lowercase() == key {
+                *t = to.to_string();
+                done = true;
+            }
+        }
+        done
+    })
+}
+
+/// Terms whose references point at files that no longer exist, as
+/// `(term, missing_paths)`.
+pub fn dangling(root: &Path) -> Result<Vec<(String, Vec<String>)>> {
+    let mut out = Vec::new();
+    for t in terms(root)? {
+        let missing: Vec<String> = super::store::extract_paths(&t.body)
+            .into_iter()
+            .filter(|p| !root.join(p).exists())
+            .collect();
+        if !missing.is_empty() {
+            out.push((t.term, missing));
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -395,6 +473,47 @@ mod tests {
         let root = scratch();
         assert_eq!(read_whole(&root).unwrap(), "");
         assert!(upsert(&root, "x", "y", &[], None).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_rename_and_dangling() {
+        let root = scratch();
+        // A real file so only the second reference is dangling.
+        std::fs::create_dir_all(root.join("crates/foo/src")).unwrap();
+        std::fs::write(root.join("crates/foo/src/lib.rs"), "").unwrap();
+
+        upsert(
+            &root,
+            "Alpha",
+            "first meaning",
+            &["crates/foo/src/lib.rs".into()],
+            None,
+        )
+        .unwrap();
+        upsert(
+            &root,
+            "Beta",
+            "second meaning",
+            &["crates/nope/missing.rs".into()],
+            None,
+        )
+        .unwrap();
+
+        assert!(rename(&root, "Alpha", "Gamma").unwrap());
+        assert!(read_term(&root, "Gamma").unwrap().is_some());
+        assert!(read_term(&root, "Alpha").unwrap().is_none());
+        // Renaming onto an existing term is refused.
+        assert!(rename(&root, "Gamma", "Beta").is_err());
+
+        let d = dangling(&root).unwrap();
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].0, "Beta");
+
+        assert!(delete(&root, "Beta").unwrap());
+        assert!(!delete(&root, "Beta").unwrap());
+        // The surviving term kept its body.
+        assert!(read_term(&root, "Gamma").unwrap().unwrap().body.contains("first meaning"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
