@@ -254,7 +254,7 @@ impl Tool for FsReadFile {
             (None, Some(e)) => (0, e.min(total)),
             (None, None) => (0, MAX_UNWINDOWED_LINES.min(total)),
         };
-        if lo >= total {
+        if lo >= total || hi <= lo {
             return Ok(format!("({total} lines total; requested window is empty)"));
         }
         let unwindowed_cap =
@@ -852,7 +852,7 @@ impl Tool for FsReadRanges {
         for (start, end) in args.ranges {
             let lo = start.saturating_sub(1);
             let hi = end.min(total);
-            if lo >= total {
+            if lo >= total || hi <= lo {
                 out.push_str(&format!("# {start}..{end} (out of range, {total} lines)\n"));
                 continue;
             }
@@ -1331,6 +1331,36 @@ mod tests {
             .unwrap();
         assert!(out.contains("a\n") && out.contains("c"), "{out}");
         assert!(out.contains("-- 1..3 of 3 lines"), "{out}");
+
+        // A reversed window (start_line > end_line) must not panic: it used to
+        // slice `lines[lo..hi]` with hi < lo. It reports an empty window instead.
+        let out = rt
+            .block_on(FsReadFile.invoke(
+                &ctx,
+                json!({ "path": "big.rs", "start_line": 260, "end_line": 250 }),
+            ))
+            .unwrap();
+        assert!(out.contains("requested window is empty"), "{out}");
+
+        // A start past EOF is likewise an empty window, not a panic.
+        let out = rt
+            .block_on(FsReadFile.invoke(
+                &ctx,
+                json!({ "path": "big.rs", "start_line": 400, "end_line": 500 }),
+            ))
+            .unwrap();
+        assert!(out.contains("requested window is empty"), "{out}");
+
+        // fs_read_ranges must not panic on a reversed [start, end] range either,
+        // and still returns the valid ranges that follow it.
+        let out = rt
+            .block_on(FsReadRanges.invoke(
+                &ctx,
+                json!({ "path": "big.rs", "ranges": [[260, 250], [1, 2]] }),
+            ))
+            .unwrap();
+        assert!(out.contains("260..250 (out of range, 300 lines)"), "{out}");
+        assert!(out.contains("body line 1"), "{out}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
