@@ -216,6 +216,12 @@ Deflating the ~35 MB of assets saves ~10 MB of binary; the workspace [profile.re
 **References:**
 - `crates/comrade-tui/src/tui.rs`
 
+## follow_plan
+> Per-session flag (App + LiveState, default true) controlling plan-panel autofollow: while true, draw_plan scrolls the plan so the active step (first InProgress, else first Pending/Ready; bottom when nothing is actionable) stays visible. Any manual scroll (App::scroll_plan from the wheel / PageUp / PageDown / M-x scroll-plan-*) sets it false; M-x toggle-plan-follow flips it.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs`
+
 ## FormSpec
 > JSON-described interactive form: { title, description, fields: [FormField] }, where FormField = { id, label, kind: FieldKind, required, default } and FieldKind is serde-tagged by `kind` (text|number|date|select|checkbox) with per-kind params (placeholder; min/max/step; options). Helpers: initial_values(), is_complete(), answer_lines() emit `id = value`.
 

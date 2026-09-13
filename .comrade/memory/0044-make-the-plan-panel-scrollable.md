@@ -19,3 +19,6 @@ Applies to the TUI plan panel only (crates/comrade-tui/src/tui.rs). Does not add
 ## Impact
 Long plans are now fully reachable. New per-session field must be initialised at all App/LiveState construction sites (it is: App::new live-state literal, the two LiveState literals, build_app's App literal). Tests: tui::tests::scroll_plan_saturates_at_zero_and_moves and tui::tests::mx_scroll_plan_commands_metadata.
 
+
+## Note
+Autofollow added (follow-up). A per-session `follow_plan: bool` (App + LiveState, swapped in swap_live, default true) makes draw_plan keep the active step in view: it targets the first InProgress step, else the first Pending/Ready step, else pins to the bottom when nothing is actionable; it scrolls minimally (only when the target's line range leaves the viewport) so a step visible on screen does not jitter. A manual scroll (mouse wheel, PageUp/PageDown, M-x scroll-plan-*) sets follow_plan=false; the new palette-only M-x command `toggle-plan-follow` flips it back on. Tested by scroll_plan_disables_autofollow, toggle_plan_follow_flips_the_flag, plan_follow_targets_the_active_step, mx_toggle_plan_follow_metadata.

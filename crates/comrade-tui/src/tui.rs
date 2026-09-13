@@ -688,6 +688,7 @@ enum MxCommand {
     SubmitPrompt,
     SwitchSession,
     ToggleAutoAccept,
+    TogglePlanFollow,
     ToggleToolCard,
     Undo,
 }
@@ -729,6 +730,7 @@ impl MxCommand {
         MxCommand::SubmitPrompt,
         MxCommand::SwitchSession,
         MxCommand::ToggleAutoAccept,
+        MxCommand::TogglePlanFollow,
         MxCommand::ToggleToolCard,
         MxCommand::Undo,
     ];
@@ -769,6 +771,7 @@ impl MxCommand {
             MxCommand::SubmitPrompt => "submit-prompt",
             MxCommand::SwitchSession => "switch-session",
             MxCommand::ToggleAutoAccept => "toggle-auto-accept",
+            MxCommand::TogglePlanFollow => "toggle-plan-follow",
             MxCommand::ToggleToolCard => "toggle-tool-card",
             MxCommand::Undo => "undo",
         }
@@ -815,6 +818,8 @@ impl MxCommand {
             MxCommand::SubmitPrompt => Some("<return>"),
             MxCommand::SwitchSession => Some("C-x C-b"),
             MxCommand::ToggleAutoAccept => Some("C-SPC"),
+            // Palette-only: turns plan-panel autofollow back on after a scroll.
+            MxCommand::TogglePlanFollow => None,
             MxCommand::ToggleToolCard => Some("tab"),
             // Palette-only: restores files from the undo log (no default key).
             MxCommand::Undo => None,
@@ -863,6 +868,9 @@ impl MxCommand {
             MxCommand::SubmitPrompt => "send the prompt to the agent",
             MxCommand::SwitchSession => "switch to another open session",
             MxCommand::ToggleAutoAccept => "toggle auto-accept of approvals",
+            MxCommand::TogglePlanFollow => {
+                "follow the active plan step automatically (or stop following)"
+            }
             MxCommand::ToggleToolCard => {
                 "expand or collapse the selected tool card (or a whole user-turn section)"
             }
@@ -1001,6 +1009,8 @@ struct LiveState {
     scroll_top: usize,
     /// Vertical scroll offset of this session's plan panel.
     plan_scroll: u16,
+    /// Whether the plan panel follows the active step automatically.
+    follow_plan: bool,
     follow: bool,
     was_at_bottom: bool,
     search: Option<Search>,
@@ -1245,6 +1255,8 @@ struct App {
     plan_scroll: u16,
     /// Last rendered rect of the plan panel, for mouse hit-testing.
     plan_rect: Rect,
+    /// Whether the plan panel follows the active step automatically.
+    follow_plan: bool,
     row_targets: Vec<Option<usize>>,
     /// Owning chat-message index for each rendered row (None = live preview).
     row_msg: Vec<Option<usize>>,
@@ -2323,6 +2335,7 @@ impl App {
             sel: None,
             scroll_top: 0,
             plan_scroll: 0,
+            follow_plan: true,
             follow: true,
             was_at_bottom: true,
             search: None,
@@ -2403,6 +2416,7 @@ impl App {
             sel: None,
             scroll_top: 0,
             plan_scroll: 0,
+            follow_plan: true,
             follow: true,
             was_at_bottom: true,
             search: None,
@@ -2437,6 +2451,7 @@ impl App {
         std::mem::swap(&mut self.sel, &mut incoming.sel);
         std::mem::swap(&mut self.scroll_top, &mut incoming.scroll_top);
         std::mem::swap(&mut self.plan_scroll, &mut incoming.plan_scroll);
+        std::mem::swap(&mut self.follow_plan, &mut incoming.follow_plan);
         std::mem::swap(&mut self.follow, &mut incoming.follow);
         std::mem::swap(&mut self.was_at_bottom, &mut incoming.was_at_bottom);
         std::mem::swap(&mut self.search, &mut incoming.search);
@@ -2446,12 +2461,21 @@ impl App {
     /// Scroll the plan panel by `delta` rows (negative scrolls up). The offset
     /// is clamped to the content height on the next draw; saturating
     /// arithmetic here keeps it from wrapping below zero or above `u16::MAX`.
+    /// A manual scroll opts out of autofollow so the view stays where the user
+    /// put it; M-x `toggle-plan-follow` turns following back on.
     fn scroll_plan(&mut self, delta: isize) {
+        self.follow_plan = false;
         if delta < 0 {
             self.plan_scroll = self.plan_scroll.saturating_sub((-delta) as u16);
         } else {
             self.plan_scroll = self.plan_scroll.saturating_add(delta as u16);
         }
+    }
+
+    /// Turn plan autofollow on or off. When it is on, the next draw scrolls the
+    /// plan panel to keep the active step in view.
+    fn toggle_plan_follow(&mut self) {
+        self.follow_plan = !self.follow_plan;
     }
 
     /// Park the active session into its slot and swap the session at `idx` in.
@@ -3156,6 +3180,7 @@ impl App {
             MxCommand::SubmitPrompt => self.submit_prompt(),
             MxCommand::SwitchSession => self.switch_session(),
             MxCommand::ToggleAutoAccept => self.toggle_auto_accept(),
+            MxCommand::TogglePlanFollow => self.toggle_plan_follow(),
             MxCommand::ToggleToolCard => {
                 if let Some(idx) = self.sel {
                     self.toggle_tool(idx);
@@ -3609,6 +3634,7 @@ fn build_app(
         chat_rect: Rect::default(),
         plan_scroll: 0,
         plan_rect: Rect::default(),
+        follow_plan: true,
         row_targets: Vec::new(),
         row_msg: Vec::new(),
         msg_ranges: Vec::new(),
@@ -6845,6 +6871,9 @@ fn draw_plan(app: &mut App, frame: &mut Frame, area: Rect) {
     let width = usize::from(inner.width).max(16);
     let steps = app.session.plan();
     let mut lines: Vec<Line> = Vec::new();
+    // Line index where each step starts, so autofollow can scroll the active
+    // step into view.
+    let mut step_starts: Vec<usize> = Vec::with_capacity(steps.len());
     if steps.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no plan yet)",
@@ -6852,6 +6881,7 @@ fn draw_plan(app: &mut App, frame: &mut Frame, area: Rect) {
         )));
     }
     for step in &steps {
+        step_starts.push(lines.len());
         let color = match step.status {
             PlanStatus::Done => Color::Green,
             PlanStatus::InProgress => Color::Yellow,
@@ -6915,8 +6945,38 @@ fn draw_plan(app: &mut App, frame: &mut Frame, area: Rect) {
     // the offset can never scroll past the end.
     let view = inner.height as usize;
     let max = lines.len().saturating_sub(view) as u16;
+    // Autofollow: keep the active step in view unless the user scrolled away.
+    // With nothing to follow (no steps, or every step done) pin to the bottom.
+    if app.follow_plan {
+        match follow_step_index(&steps) {
+            Some(i) => {
+                let start = step_starts[i];
+                let end = step_starts.get(i + 1).copied().unwrap_or(lines.len());
+                let off = app.plan_scroll as usize;
+                if start < off || end > off + view {
+                    app.plan_scroll = start.saturating_sub(1).min(max as usize) as u16;
+                }
+            }
+            None => app.plan_scroll = max,
+        }
+    }
     app.plan_scroll = app.plan_scroll.min(max);
     frame.render_widget(Paragraph::new(lines).scroll((app.plan_scroll, 0)), inner);
+}
+
+/// Which step autofollow should keep in view: the step currently being worked
+/// (InProgress), else the next one to be picked up (Pending or Ready). Returns
+/// None when there is nothing to follow (no steps, or all done/blocked), which
+/// makes the plan panel pin to the bottom instead.
+fn follow_step_index(steps: &[PlanStep]) -> Option<usize> {
+    steps
+        .iter()
+        .position(|s| s.status == PlanStatus::InProgress)
+        .or_else(|| {
+            steps
+                .iter()
+                .position(|s| matches!(s.status, PlanStatus::Pending | PlanStatus::Ready))
+        })
 }
 
 /// Collapse runs of whitespace (incl. newlines) into single spaces so a plan
@@ -10045,6 +10105,69 @@ mod tests {
         assert_eq!(app.plan_scroll, 3);
         app.scroll_plan(2);
         assert_eq!(app.plan_scroll, 5);
+    }
+
+    #[tokio::test]
+    async fn scroll_plan_disables_autofollow() {
+        let mut app = test_app();
+        assert!(app.follow_plan, "autofollow is on by default");
+        app.scroll_plan(3);
+        assert!(!app.follow_plan, "a manual scroll opts out of autofollow");
+    }
+
+    #[tokio::test]
+    async fn toggle_plan_follow_flips_the_flag() {
+        let mut app = test_app();
+        let before = app.follow_plan;
+        app.toggle_plan_follow();
+        assert_eq!(app.follow_plan, !before);
+        app.toggle_plan_follow();
+        assert_eq!(app.follow_plan, before);
+    }
+
+    #[test]
+    fn plan_follow_targets_the_active_step() {
+        let step = |id, status| PlanStep {
+            id,
+            goal: "g".into(),
+            verification: "v".into(),
+            model: String::new(),
+            context: String::new(),
+            status,
+            note: None,
+            started_at_ms: None,
+            took_ms: None,
+        };
+        // The in-progress step wins over pending ones, wherever it sits.
+        let steps = vec![
+            step(1, PlanStatus::Done),
+            step(2, PlanStatus::Pending),
+            step(3, PlanStatus::InProgress),
+            step(4, PlanStatus::Pending),
+        ];
+        assert_eq!(follow_step_index(&steps), Some(2));
+        // With nothing running, the first step still to be done is followed.
+        let steps = vec![
+            step(1, PlanStatus::Done),
+            step(2, PlanStatus::Ready),
+            step(3, PlanStatus::Pending),
+        ];
+        assert_eq!(follow_step_index(&steps), Some(1));
+        // Everything done or blocked: nothing to follow (pin to the bottom).
+        let steps = vec![step(1, PlanStatus::Done), step(2, PlanStatus::Blocked)];
+        assert_eq!(follow_step_index(&steps), None);
+        assert_eq!(follow_step_index(&[]), None);
+    }
+
+    #[test]
+    fn mx_toggle_plan_follow_metadata() {
+        assert!(MxCommand::ALL.contains(&MxCommand::TogglePlanFollow));
+        assert_eq!(MxCommand::TogglePlanFollow.name(), "toggle-plan-follow");
+        assert_eq!(
+            MxCommand::TogglePlanFollow.keys(),
+            None,
+            "toggle-plan-follow is palette-only"
+        );
     }
 
     #[test]
