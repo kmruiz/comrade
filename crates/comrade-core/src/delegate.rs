@@ -63,6 +63,10 @@ pub const DENIED_FOR_DELEGATES: &[&str] = &[
     "self_set_step_model",
     "self_set_step_context",
     "self_finish_plan",
+    "run_bg",
+    "bg_status",
+    "bg_tail",
+    "bg_kill",
 ];
 
 /// A delegated plan step gets one attempt from the delegate; if the parent's

@@ -43,6 +43,8 @@ const MUTATING_TOOLS: &[&str] = &[
     "pom_format_code",
     "pom_run_tests",
     "pom_check",
+    "run_bg",
+    "bg_kill",
     "shell",
 ];
 
@@ -58,7 +60,7 @@ const MUTATING_TOOLS: &[&str] = &[
 /// hard refusal) via `approval = "ask"/"deny"` on their `[[delegates]]` entry;
 /// delegate.rs and advise.rs enforce it with a `ctx.confirm` before the
 /// sub-agent runs.
-const APPROVAL_GATED_TOOLS: &[&str] = &["fs_write_file", "ts_rename", "shell"];
+const APPROVAL_GATED_TOOLS: &[&str] = &["fs_write_file", "ts_rename", "shell", "run_bg"];
 
 fn is_approval_gated(name: &str) -> bool {
     APPROVAL_GATED_TOOLS.contains(&name)

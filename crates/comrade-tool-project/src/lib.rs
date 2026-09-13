@@ -6,6 +6,7 @@
 //! - `pom_run_task` executes a named task (a standard build-system task, a
 //!   configured alias, or a `!shell` alias) optionally scoped to one subproject.
 
+mod bg;
 mod pom;
 mod tasks;
 
@@ -20,14 +21,16 @@ use serde_json::{Value, json};
 pub use pom::{ProjectModel, load as load_model, render as render_model};
 
 pub fn all() -> Vec<Box<dyn Tool>> {
-    vec![
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(PomModelTool),
         Box::new(PomRunTask),
         Box::new(PomFormatCode),
         Box::new(PomRunTests),
         Box::new(PomCheck),
         Box::new(Shell),
-    ]
+    ];
+    tools.extend(bg::tools());
+    tools
 }
 
 // ---------------------------------------------------------------------------
