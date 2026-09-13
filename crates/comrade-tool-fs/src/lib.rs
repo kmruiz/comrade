@@ -589,6 +589,7 @@ static FS_RGREP_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|
         "type": "object",
         "properties": {
             "pattern": { "type": "string", "description": "Text or regex to search for." },
+            "path": { "type": "string", "description": "Restrict the search to this file or directory (project-root relative; default: whole project)." },
             "regex": { "type": "boolean", "default": false, "description": "Treat `pattern` as a Rust regex instead of literal text." },
             "glob": { "type": "string", "default": "**/*", "description": "Glob restricting files searched (used when `include` is empty)." },
             "include": { "type": "array", "items": { "type": "string" }, "description": "Globs a file must match (any of them). Overrides `glob` when non-empty." },
@@ -616,6 +617,8 @@ impl Tool for FsRgrep {
             pattern: String,
             #[serde(default)]
             regex: bool,
+            #[serde(default)]
+            path: Option<String>,
             #[serde(default = "default_glob")]
             glob: String,
             #[serde(default)]
@@ -660,8 +663,21 @@ impl Tool for FsRgrep {
         };
         let changed = changed_scope(ctx, args.git_modified_only)?;
 
+        // `path` scopes the search to one file or directory (project relative).
+        let scope = match &args.path {
+            Some(p) => {
+                let abs = ctx.project_root.join(p);
+                if !abs.starts_with(&ctx.project_root) {
+                    anyhow::bail!("path {p:?} escapes the project root");
+                }
+                Some(abs)
+            }
+            None => None,
+        };
+
         let (hits, total) = grep(
             &ctx.project_root,
+            scope.as_deref(),
             &args.glob,
             &args.include,
             &args.exclude,
@@ -725,10 +741,13 @@ struct GrepHit {
 
 /// Search matching lines across files under `root`, returning the printed lines
 /// (matches plus `context` lines around each) and the number of lines that
-/// actually matched. `include` (any-of) overrides `glob` when non-empty;
-/// `exclude` always filters. When `only` is `Some`, only those files are read.
+/// actually matched. When `scope` is `Some`, only that file or directory is
+/// searched (paths are still reported relative to `root`). `include` (any-of)
+/// overrides `glob` when non-empty; `exclude` always filters. When `only` is
+/// `Some`, only those files are read.
 fn grep(
     root: &Path,
+    scope: Option<&Path>,
     glob: &str,
     include: &[String],
     exclude: &[String],
@@ -748,7 +767,12 @@ fn grep(
     let exclude: Vec<String> = exclude.iter().map(|g| validate(g)).collect::<Result<_>>()?;
 
     let mut files = Vec::new();
-    walk(root, &mut files);
+    match scope {
+        Some(p) if p.is_dir() => walk(p, &mut files),
+        Some(p) if p.is_file() => files.push(p.to_path_buf()),
+        Some(_) => {} // a path that does not exist: nothing to search
+        None => walk(root, &mut files),
+    }
     files.sort();
 
     let mut out = Vec::new();
@@ -1183,13 +1207,13 @@ mod tests {
             needle: if lower { p.to_lowercase() } else { p.into() },
             lower,
         };
-        let m = super::grep(&root, "**/*.rs", &[], &[], &lit("hello", false), 0, None)
+        let m = super::grep(&root, None, "**/*.rs", &[], &[], &lit("hello", false), 0, None)
             .unwrap()
             .0;
         assert_eq!(m.len(), 2);
         assert!(m.iter().all(|h| h.file.ends_with(".rs")));
         // glob restricts to md
-        let m2 = super::grep(&root, "*.md", &[], &[], &lit("hello", true), 0, None)
+        let m2 = super::grep(&root, None, "*.md", &[], &[], &lit("hello", true), 0, None)
             .unwrap()
             .0;
         assert_eq!(m2.len(), 1);
@@ -1197,7 +1221,7 @@ mod tests {
         assert_eq!(m2[0].text, "Hello world");
         // case-sensitive finds nothing in md
         assert!(
-            super::grep(&root, "*.md", &[], &[], &lit("hello", false), 0, None)
+            super::grep(&root, None, "*.md", &[], &[], &lit("hello", false), 0, None)
                 .unwrap()
                 .0
                 .is_empty()
@@ -1226,6 +1250,7 @@ mod tests {
         let re = super::Matcher::Regex(Box::new(regex::Regex::new(r"fn \w+").unwrap()));
         let (hits, total) = super::grep(
             &root,
+            None,
             "**/*",
             &["**/*.rs".to_string()],
             &["tests/*".to_string()],
@@ -1243,12 +1268,75 @@ mod tests {
             needle: "beta".into(),
             lower: false,
         };
-        let (hits, total) = super::grep(&root, "**/*.rs", &[], &[], &lit, 1, None).unwrap();
+        let (hits, total) = super::grep(&root, None, "**/*.rs", &[], &[], &lit, 1, None).unwrap();
         assert_eq!(total, 1);
         assert_eq!(hits.len(), 3, "beta line + one context each side: {hits:?}");
         let beta = hits.iter().find(|h| h.is_match).unwrap();
         assert_eq!(beta.line, 3);
         assert_eq!(beta.text, "fn beta() {}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rgrep_path_scopes_to_a_file_or_subtree() {
+        let root = std::env::temp_dir().join(format!(
+            "comrade-rgrep-path-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn beta() {}\n").unwrap();
+        std::fs::write(root.join("other/c.rs"), "fn gamma() {}\n").unwrap();
+
+        let lit = super::Matcher::Literal {
+            needle: "fn ".into(),
+            lower: false,
+        };
+        // A directory scope searches only that subtree.
+        let (hits, _) = super::grep(
+            &root,
+            Some(&root.join("src")),
+            "**/*.rs",
+            &[],
+            &[],
+            &lit,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(hits.iter().all(|h| h.file.starts_with("src/")), "{hits:?}");
+        assert!(hits.iter().any(|h| h.file == "src/a.rs"));
+
+        // A file scope searches only that file.
+        let (hits, _) = super::grep(
+            &root,
+            Some(&root.join("src/b.rs")),
+            "**/*",
+            &[],
+            &[],
+            &lit,
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file, "src/b.rs");
+
+        // A non-existent scope searches nothing.
+        let (hits, _) = super::grep(
+            &root,
+            Some(&root.join("nope")),
+            "**/*",
+            &[],
+            &[],
+            &lit,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(hits.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
