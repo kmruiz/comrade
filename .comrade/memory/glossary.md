@@ -76,6 +76,14 @@ The dialog wraps its body/options to the popup's real inner width (popup = min(a
 **Notes:**
 Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by render_row_line's `sub: Option<Color>` param. Folded MsgKind::Run digests keep no sub-chat styling.
 
+## enabled (delegate)
+> Per-[[delegates]] boolean (default true). `enabled = false` keeps the entry in config.toml but removes the model from the `delegate`/`ask_advise` targets, their `model` enum and advertised listing (and from the TUI Ctrl-A picker), so it cannot be delegated to; it still shows dimmed with ` (disabled)` in the model panel. Unlike `approval = "deny"` (listed but refused at run time), a disabled delegate is invisible to the tech lead.
+
+**References:**
+- `crates/comrade-core/src/config.rs`
+- `crates/comrade-core/src/delegate.rs`
+- `crates/comrade-tui/src/tui.rs`
+
 ## focus mode
 > A chat view filter in the TUI, toggled by M-f or M-x focus-mode (same chord turns it off). When on it hides tool noise so the chat reads as pure conversation: it keeps MsgKind::User, MsgKind::Assistant, MsgKind::Delegate (advisories) and MsgKind::Reasoning, and drops MsgKind::Tool, MsgKind::Failure, MsgKind::Meta and the folded MsgKind::Run digest's summary row — but a folded Run still renders the Reasoning children inside it.
 

@@ -182,6 +182,9 @@ pub(crate) fn build_targets(delegates: &[DelegateCfg]) -> Result<Vec<Target>> {
     let mut names: Vec<String> = Vec::new();
     let mut targets: Vec<Target> = Vec::with_capacity(delegates.len());
     for (i, cfg) in delegates.iter().enumerate() {
+        if !cfg.enabled {
+            continue;
+        }
         if cfg.name.trim().is_empty() {
             bail!("delegates[{i}]: every delegate needs a `name`");
         }
@@ -236,10 +239,14 @@ impl DelegateTool {
             return Ok(None);
         }
         let targets = build_targets(delegates)?;
+        if targets.is_empty() {
+            return Ok(None);
+        }
         let names: Vec<String> = targets.iter().map(|t| t.cfg.name.clone()).collect();
 
         let listing = delegates
             .iter()
+            .filter(|d| d.enabled)
             .map(cfg_line)
             .collect::<Vec<_>>()
             .join("\n");
@@ -1065,6 +1072,7 @@ mod tests {
         DelegateCfg {
             name: name.into(),
             description: format!("{name} test delegate"),
+            enabled: true,
             approval: Autonomy::Auto,
             llm: LlmCfg {
                 base_url: base_url.into(),
@@ -1148,6 +1156,46 @@ mod tests {
     fn empty_delegate_list_yields_no_tool() {
         let tool = mk_delegate(&[]).unwrap();
         assert!(tool.is_none());
+    }
+
+    #[test]
+    fn disabled_delegate_is_hidden_and_unselectable() {
+        let on = delegate("on", "http://x/v1");
+        let mut off = delegate("off", "http://x/v1");
+        off.enabled = false;
+        let tool = mk_delegate(&[on, off]).unwrap().unwrap();
+        let schema = &tool.spec().json_schema;
+        let models = schema["properties"]["model"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(models, vec!["on"]);
+        assert!(
+            !tool.spec().description.contains("off"),
+            "disabled delegate must not be advertised:\n{}",
+            tool.spec().description
+        );
+    }
+
+    #[test]
+    fn all_delegates_disabled_yields_no_tool() {
+        let mut off = delegate("off", "http://x/v1");
+        off.enabled = false;
+        assert!(mk_delegate(&[off]).unwrap().is_none());
+    }
+
+    #[test]
+    fn disabled_delegate_is_not_validated() {
+        // A disabled entry may be blank/duplicate without failing the build,
+        // as long as at least one enabled delegate remains.
+        let dup_disabled = DelegateCfg {
+            enabled: false,
+            ..delegate("dup", "http://x/v1")
+        };
+        let tool = mk_delegate(&[delegate("dup", "http://x/v1"), dup_disabled]).unwrap();
+        assert!(tool.is_some());
     }
 
     #[test]

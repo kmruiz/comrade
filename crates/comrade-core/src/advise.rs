@@ -90,9 +90,13 @@ impl AskAdviseTool {
             return Ok(None);
         }
         let targets = build_targets(delegates)?;
+        if targets.is_empty() {
+            return Ok(None);
+        }
         let names: Vec<String> = targets.iter().map(|t| t.cfg.name.clone()).collect();
         let listing = delegates
             .iter()
+            .filter(|d| d.enabled)
             .map(cfg_line)
             .collect::<Vec<_>>()
             .join("\n");
@@ -595,6 +599,7 @@ mod tests {
         DelegateCfg {
             name: name.into(),
             description: format!("{name} test delegate"),
+            enabled: true,
             approval: Autonomy::Auto,
             llm: LlmCfg {
                 base_url: base_url.into(),
@@ -608,6 +613,27 @@ mod tests {
     fn empty_delegate_list_yields_no_tool() {
         let tool = mk_advise(&[]).unwrap();
         assert!(tool.is_none());
+    }
+
+    #[test]
+    fn disabled_delegate_is_hidden_and_unselectable() {
+        let on = delegate("on", "http://127.0.0.1:1/v1");
+        let mut off = delegate("off", "http://127.0.0.1:1/v1");
+        off.enabled = false;
+        let tool = mk_advise(&[on, off]).unwrap().unwrap();
+        let models = tool.spec().json_schema["properties"]["model"]["enum"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(models, vec!["on"]);
+        assert!(!tool.spec().description.contains("off test delegate"));
+    }
+
+    #[test]
+    fn all_delegates_disabled_yields_no_tool() {
+        let mut off = delegate("off", "http://127.0.0.1:1/v1");
+        off.enabled = false;
+        assert!(mk_advise(&[off]).unwrap().is_none());
     }
 
     #[test]

@@ -109,6 +109,11 @@ pub struct DelegateCfg {
     /// Short human-readable blurb of when to use this model (shown to the
     /// tech lead so it can pick the right developer for a task).
     pub description: String,
+    /// Whether this delegate can be used by the `delegate`/`ask_advise` tools.
+    /// Defaults to `true`; set `enabled = false` to keep the entry in the
+    /// config but stop the tech lead using it to delegate (it is then not
+    /// validated, not advertised and not selectable).
+    pub enabled: bool,
     /// Approval policy for running this model via the `delegate` and
     /// `ask_advise` tools. `auto` (default) runs without asking, like any
     /// un-gated delegate; `ask` pauses for human approval before each use
@@ -126,6 +131,7 @@ impl Default for DelegateCfg {
         Self {
             name: String::new(),
             description: String::new(),
+            enabled: true,
             approval: Autonomy::Auto,
             llm: LlmCfg::default(),
         }
@@ -489,6 +495,7 @@ mod tests {
 
             [[delegates]]
             name = "local-tiny"
+            enabled = false
             provider = "ollama"
             model = "qwen3:4b"
             "#,
@@ -509,6 +516,9 @@ mod tests {
         // `approval` parses and defaults to Auto (ungated) when omitted.
         assert_eq!(groq.approval, Autonomy::Ask);
         assert_eq!(c.delegates[1].approval, Autonomy::Auto);
+        // `enabled` defaults to true and parses `false`.
+        assert!(groq.enabled);
+        assert!(!c.delegates[1].enabled);
         // second delegate has no description and still resolves its provider.
         assert_eq!(c.delegates[1].llm.base_url, "http://localhost:11434/v1");
         assert!(c.delegates[1].description.is_empty());

@@ -1883,6 +1883,7 @@ mod tests {
             crate::config::DelegateCfg {
                 name: "a".into(),
                 description: "delegate a".into(),
+                enabled: true,
                 approval: crate::config::Autonomy::Auto,
                 llm: crate::config::LlmCfg {
                     base_url: delegate_url.clone(),
@@ -1893,6 +1894,7 @@ mod tests {
             crate::config::DelegateCfg {
                 name: "b".into(),
                 description: "delegate b".into(),
+                enabled: true,
                 approval: crate::config::Autonomy::Auto,
                 llm: crate::config::LlmCfg {
                     base_url: delegate_url,

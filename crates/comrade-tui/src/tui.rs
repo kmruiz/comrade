@@ -2738,7 +2738,7 @@ impl App {
             return;
         }
         let mut models = vec![AGENT_MODEL.to_string()];
-        models.extend(self.cfg.delegates.iter().map(|d| {
+        models.extend(self.cfg.delegates.iter().filter(|d| d.enabled).map(|d| {
             if let Some(ctx_window) = d.llm.context_window {
                 format!("{} ({})", d.name, ctx_window)
             } else {
@@ -5834,13 +5834,22 @@ fn delegate_panel_rows(
             format!("{} ({})", d.name, d.llm.model)
         };
         // The delegate's name carries its assigned agent color, so the panel
-        // matches the color used for its sub-chat and author tags.
-        let name_style = Style::default()
-            .fg(colors.name_color(&d.name))
-            .add_modifier(Modifier::BOLD);
+        // matches the color used for its sub-chat and author tags. A disabled
+        // delegate (`enabled = false`) is dimmed and marked so the human can
+        // see it is configured but off.
+        let name_style = if d.enabled {
+            Style::default()
+                .fg(colors.name_color(&d.name))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            dim
+        };
         let mut toks = vec![tok(flat(&name), name_style)];
         if !d.description.trim().is_empty() {
             toks.push(tok(format!(" — {}", flat(d.description.trim())), dim));
+        }
+        if !d.enabled {
+            toks.push(tok(" (disabled)".to_string(), dim));
         }
         for wrapped in wrap_toks(&toks, body_width) {
             let mut spans = vec![Span::styled("  ", dim)];
@@ -8488,6 +8497,23 @@ mod tests {
         }
         // No delegate configured → the panel keeps its legacy fixed height.
         assert!(delegate_panel_rows(&[], &ModelColors::new(), 24).is_none());
+    }
+
+    #[test]
+    fn disabled_delegate_is_flagged_in_the_panel() {
+        let mut d = DelegateCfg::default();
+        d.name = "off".into();
+        d.llm.model = "off".into();
+        d.enabled = false;
+        let rows = delegate_panel_rows(&[d], &ModelColors::new(), 24)
+            .expect("rows for a configured delegate");
+        let joined: String = rows
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(joined.contains("off"), "{joined:?}");
+        assert!(joined.contains("(disabled)"), "{joined:?}");
     }
 
     #[test]
