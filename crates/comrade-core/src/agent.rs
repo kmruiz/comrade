@@ -141,34 +141,6 @@ fn read_guard_message(count: usize) -> String {
     )
 }
 
-/// Tools that modify source code (used by the verify-then-commit monitor).
-const CODE_CHANGES: &[&str] = &[
-    "fs_edit",
-    "fs_write_file",
-    "ts_rename",
-    "pom_format_code",
-    "shell",
-    "delegate",
-];
-
-/// Update the "is the current change verified?" state after a tool ran.
-fn update_verify_state(name: &str, ok: bool, output: &str, verified_after_change: &mut bool) {
-    if CODE_CHANGES.contains(&name) {
-        *verified_after_change = false;
-    } else if matches!(name, "pom_run_tests" | "pom_run_task")
-        && ok
-        && output.contains("test result: ok.")
-    {
-        *verified_after_change = true;
-    }
-}
-
-fn verify_guard_message() -> String {
-    "You have unverified code changes. Run pom_run_tests (or pom_run_task test) and get them green BEFORE \
-     calling git_commit."
-        .to_string()
-}
-
 /// Classify a failed tool output and attach one short corrective hint.
 fn failure_hint(name: &str, output: &str) -> String {
     let _ = name;
@@ -463,9 +435,6 @@ async fn run_agent_loop(
     let mut plan_nudged = false;
     // Consecutive read-only calls since the last state change (read guard).
     let mut consecutive_reads = 0usize;
-    // Verify-then-commit monitor: false once code changes and true again after
-    // a green test run.
-    let mut verified_after_change = true;
 
     loop {
         if stop.is_cancelled() {
@@ -654,7 +623,6 @@ async fn run_agent_loop(
                 &ctx,
                 &mut tracker,
                 &mut consecutive_reads,
-                &mut verified_after_change,
                 turn,
             )
             .await?;
@@ -811,23 +779,6 @@ async fn run_agent_loop(
             continue;
         }
 
-        // Verify-then-commit monitor: refuse commits of unverified changes.
-        if tool_call.name == "git_commit" && !verified_after_change {
-            let msg = verify_guard_message();
-            let _ = tx
-                .send(AgentEvent::ToolResult {
-                    name: tool_call.name.clone(),
-                    output: msg.clone(),
-                    ok: false,
-                })
-                .await;
-            ctxm.push(ChatMessage::new(
-                Role::User,
-                render_observation(&tool_call.name, &msg),
-            ));
-            continue;
-        }
-
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
         let sig = format!("{} {args_pretty}", tool_call.name);
         if let Some(count) = tracker.check(&sig) {
@@ -891,7 +842,6 @@ async fn run_agent_loop(
             })
             .await;
 
-        update_verify_state(&tool_call.name, ok, &clamped, &mut verified_after_change);
         ctxm.push(ChatMessage::new(
             Role::User,
             observation_with_failure_hint(&tool_call.name, ok, &clamped),
@@ -914,7 +864,6 @@ async fn run_native_calls(
     ctx: &ToolContext,
     tracker: &mut LoopTracker,
     consecutive_reads: &mut usize,
-    verified_after_change: &mut bool,
     turn: crate::llm::LlmTurn,
 ) -> Result<()> {
     if !turn.content.trim().is_empty() {
@@ -986,19 +935,6 @@ async fn run_native_calls(
         if !allow_read_step(&p.name, consecutive_reads) {
             let count = *consecutive_reads;
             let msg = read_guard_message(count);
-            let _ = tx
-                .send(AgentEvent::ToolResult {
-                    name: p.name.clone(),
-                    output: msg.clone(),
-                    ok: false,
-                })
-                .await;
-            ctxm.push(ChatMessage::tool_result(p.id, msg));
-            continue;
-        }
-        // Verify-then-commit monitor (native).
-        if p.name == "git_commit" && !*verified_after_change {
-            let msg = verify_guard_message();
             let _ = tx
                 .send(AgentEvent::ToolResult {
                     name: p.name.clone(),
@@ -1108,7 +1044,6 @@ async fn run_native_calls(
                 ok,
             })
             .await;
-        update_verify_state(&p.name, ok, &clamped, verified_after_change);
         let content = if ok {
             clamped.clone()
         } else {
@@ -1163,7 +1098,6 @@ async fn run_native_calls(
                     ok,
                 })
                 .await;
-            update_verify_state(&p.name, ok, &clamped, verified_after_change);
             let content = if ok {
                 clamped.clone()
             } else {
@@ -2496,37 +2430,7 @@ mod monitors_tests {
         let g = failure_hint("shell", "any generic failure here");
         assert!(!g.is_empty());
     }
-
-    #[test]
-    fn verify_state_tracks_change_and_green_tests() {
-        let mut v = true;
-        // a code edit invalidates verification
-        update_verify_state("fs_edit", true, "Edited src/a.rs.", &mut v);
-        assert!(!v);
-        // a red test run does not re-verify
-        update_verify_state(
-            "pom_run_tests",
-            true,
-            "test result: FAILED. 0 passed; 1 failed",
-            &mut v,
-        );
-        assert!(!v);
-        // a green run does
-        update_verify_state("pom_run_tests", true, "test result: ok. 4 passed", &mut v);
-        assert!(v);
-        // another edit invalidates again
-        update_verify_state("fs_write_file", true, "Wrote src/b.rs.", &mut v);
-        assert!(!v);
-    }
-
-    #[test]
-    fn verify_guard_message_is_actionable() {
-        let m = verify_guard_message();
-        assert!(m.contains("pom_run_tests"));
-        assert!(m.contains("git_commit"));
-    }
 }
-
 #[cfg(test)]
 mod usage_tests {
     use super::usage_total;
