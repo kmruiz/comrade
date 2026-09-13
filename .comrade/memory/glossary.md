@@ -12,6 +12,16 @@ Project keywords and their meaning, with references to the code or documentation
 **Notes:**
 Assigned in App construction and re-assigned in App::reload_config; name_color/band_color are read-only lookups. Palette: AGENT_PALETTE (8 entries); band tint alpha BAND_ALPHA = 0.14 over DIFF_BASE_BG.
 
+## AGENTS.md
+> Project instructions file at the working-directory root, read by Comrade and injected into the system prompt as a "## Project instructions (AGENTS.md)" section (before the built-in prompt sections) so the repo's own rules (build commands, style, guardrails) apply from the first turn. Only the project-root AGENTS.md is read (no parent walk, no CLAUDE.md).
+
+**References:**
+- `crates/comrade-core/src/instructions.rs`
+- `crates/comrade-core/src/react.rs`
+
+**Notes:**
+Loaded by crates/comrade-core/src/instructions.rs (load_project_instructions) and injected in react.rs build_system_prompt. Absent/blank file is a no-op.
+
 ## approval ([[delegates]])
 > Per-[[delegates]] config key (crates/comrade-core/src/config.rs DelegateCfg.approval) controlling whether delegate/ask_advise may run that model without asking: "auto" (default) runs directly, "ask" pauses via ToolContext::confirm (skipped when the context is auto-approved), "deny" refuses to run that model through delegate/ask_advise at all. Enforced by delegate::enforce_approval inside DelegateTool::invoke and AskAdviseTool::invoke before a run starts (and before a delegated plan step is marked working).
 
@@ -152,6 +162,16 @@ SessionFile is the on-disk JSON form (version/title/status/plan/delegated/finish
 
 **References:**
 - `crates/comrade-tui/src/tui.rs`
+
+## skill
+> A Claude-format skill: a directory `<name>/SKILL.md` with optional YAML frontmatter (`name`, `description`) and a markdown body of instructions (possibly referencing bundled files beside it). Comrade discovers skills under `.comrade/skills` (its default), `.claude/skills` (project) and `~/.comrade/skills` + `~/.claude/skills` (personal), project dirs winning on a name clash. Each skill is exposed to the model as a tool named `skill_<name>` whose description is the skill's one-line blurb; invoking it returns the SKILL.md body (progressive disclosure).
+
+**References:**
+- `crates/comrade-tool-skill/src/lib.rs`
+- `crates/comrade-tui/src/main.rs`
+
+**Notes:**
+Frontmatter is parsed by hand (no YAML crate in the workspace). Discovery/parse live in crates/comrade-tool-skill (parse_skill_md, discover_in, discover, all); the TUI registers the tools in main.rs build_tools/delegate_registry/advise_registry, which now take the project root.
 
 ## TaggedEvent
 > TaggedEvent = (u64, AgentEvent) (crates/comrade-tui/src/main.rs): an agent event tagged with the id of the session that produced it. Each session has its own bounded run-facing sender relayed by spawn_tagged_relay, which forwards (id, event) into the App's single central unbounded queue (App::events_rx); the select loop dispatches via App::on_agent_event_for(id, ev).
