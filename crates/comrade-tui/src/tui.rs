@@ -125,7 +125,8 @@ pub(crate) enum MsgKind {
     Meta,
     /// A collapsed failing-test block.
     Failure,
-    /// A collapsible "thinking" block: model reasoning between actions.
+    /// The model's reasoning between actions, rendered as a brain-headed spoken
+    /// block tinted with the model's colour (like an assistant answer).
     Reasoning,
     /// A reply from a delegated model, shown under that model's name.
     Delegate,
@@ -253,8 +254,8 @@ impl Msg {
             children,
         }
     }
-    /// A thinking block under `author`. Reasoning is visible (expanded) by
-    /// default; the user can still collapse it with Tab.
+    /// A thinking block under `author`, rendered like a spoken answer with a
+    /// brain header, tinted with the model's colour. Visible by default.
     fn reasoning(author: impl Into<String>, text: impl Into<String>) -> Self {
         let mut m = Msg::authored(MsgKind::Reasoning, author, text);
         m.open = true;
@@ -949,8 +950,8 @@ impl App {
         self.stream.clear();
     }
 
-    /// Push a thinking block under the main model's name. Reasoning is visible
-    /// (expanded) by default; the user can still collapse it with Tab.
+    /// Push a thinking block under the main model's name, shown as a
+    /// brain-headed block tinted with the model's colour.
     fn push_reasoning(&mut self, text: impl Into<String>) {
         let author = self.actor_label();
         self.push_msg(Msg::reasoning(author, text));
@@ -4662,13 +4663,14 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
             // the lifted user band; delegate rows are tinted in their agent's
             // dim color and indented under the parent.
             let owner = cache.owner[row].and_then(|i| app.chat.get(i));
-            let sub_author =
-                owner.and_then(|m| subchat_model(m.author.as_deref(), &app.cfg.delegates));
-            let sub = sub_author.map(|a| app.model_colors.name_color(a));
-            let band = match owner {
-                Some(m) if m.kind == MsgKind::User => Some(user_band_bg()),
-                _ => sub_author.map(|a| app.model_colors.band_color(a)),
-            };
+            // Band + sub-chat tint by the row's owning message: user turns get
+            // the lifted user band; reasoning and delegate rows are tinted in
+            // their model's dim color (delegate rows also indent under the
+            // parent).
+            let sub = owner
+                .and_then(|m| subchat_model(m.author.as_deref(), &app.cfg.delegates))
+                .map(|a| app.model_colors.name_color(a));
+            let band = row_band(owner, &app.model_colors, &app.cfg.delegates, app.focus_mode);
             let row_width = if sub.is_some() {
                 width.saturating_sub(2)
             } else {
@@ -4797,9 +4799,9 @@ fn layout_chat_rows(
                         if child.kind == MsgKind::Reasoning {
                             layout_reasoning(
                                 &mut out,
-                                i,
                                 child.text.as_str(),
                                 child.author.as_deref().unwrap_or("model"),
+                                colors,
                                 child.open,
                                 width,
                             );
@@ -4813,9 +4815,9 @@ fn layout_chat_rows(
             MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), w),
             MsgKind::Reasoning => layout_reasoning(
                 &mut out,
-                i,
                 msg.text.as_str(),
                 msg.author.as_deref().unwrap_or("model"),
+                colors,
                 msg.open,
                 width,
             ),
@@ -4829,12 +4831,12 @@ fn layout_chat_rows(
                 }
             }
             MsgKind::Assistant => {
-                author_header(
-                    &mut out,
-                    msg.author.as_deref().unwrap_or("assistant"),
-                    Color::Green,
-                    width,
-                );
+                // The model's spoken answer: a one-line header in the model's
+                // colour over a markdown body, banded with the model's dim
+                // colour — the same shape as the reasoning block, so answers,
+                // thinking and delegate replies read as one integrated chat.
+                let author = msg.author.as_deref().unwrap_or("assistant");
+                author_header(&mut out, author, colors.name_color(author), width);
                 for spans in md_to_lines(&msg.text, width) {
                     out.push(RenderRow {
                         rule: None,
@@ -5268,6 +5270,33 @@ fn subchat_model<'a>(author: Option<&'a str>, delegates: &[DelegateCfg]) -> Opti
     author.filter(|a| delegates.iter().any(|d| d.name == *a))
 }
 
+/// The dimmed background band for a chat row, chosen from the message the row
+/// belongs to: user turns get the lifted user band; the model's reasoning, its
+/// final answer and a delegate's reply are tinted with their model's band, so
+/// the spoken blocks read as one integrated chat rather than tool noise. When
+/// `focus` is set a folded digest renders only the reasoning it holds, so those
+/// rows take the thinking model's band too.
+fn row_band(
+    owner: Option<&Msg>,
+    colors: &ModelColors,
+    delegates: &[DelegateCfg],
+    focus: bool,
+) -> Option<Color> {
+    let msg = owner?;
+    match msg.kind {
+        MsgKind::User => Some(user_band_bg()),
+        MsgKind::Reasoning | MsgKind::Assistant => {
+            Some(colors.band_color(msg.author.as_deref().unwrap_or("")))
+        }
+        MsgKind::Run if focus => msg
+            .children
+            .iter()
+            .find(|c| c.kind == MsgKind::Reasoning)
+            .map(|c| colors.band_color(c.author.as_deref().unwrap_or(""))),
+        _ => subchat_model(msg.author.as_deref(), delegates).map(|a| colors.band_color(a)),
+    }
+}
+
 /// A one-row author tag ("you", the main model's label, or a delegate name)
 /// rendered above a content block so the transcript shows *who* produced it.
 fn author_header(out: &mut Vec<RenderRow>, author: &str, color: Color, width: usize) {
@@ -5282,47 +5311,38 @@ fn author_header(out: &mut Vec<RenderRow>, author: &str, color: Color, width: us
     });
 }
 
-/// A collapsible "reasoning" block: the model's visible thinking between
-/// actions, headed by an author tag and toggled like a tool card.
+/// The model's visible thinking between actions, rendered like the assistant
+/// final-answer block: a one-line brain header in the model's colour, then the
+/// reasoning text as markdown. No card arrow or author tag - the block reads as
+/// the model speaking, and `draw_chat` tints its rows with the model's dimmed
+/// background band (the same band a delegate's reply uses), so who is thinking
+/// is carried by the colour.
 fn layout_reasoning(
     out: &mut Vec<RenderRow>,
-    msg_idx: usize,
     text: &str,
     author: &str,
+    colors: &ModelColors,
     open: bool,
     width: usize,
 ) {
     out.push(RenderRow {
         rule: None,
-        spans: vec![
-            Span::styled(
-                if open { "v " } else { "> " },
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                "🧠 reasoning",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  · {author}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ],
-        tool_header: Some(msg_idx),
+        spans: vec![Span::styled(
+            "🧠",
+            Style::default()
+                .fg(colors.name_color(author))
+                .add_modifier(Modifier::BOLD),
+        )],
+        tool_header: None,
     });
     if !open {
         return;
     }
     if !text.trim().is_empty() {
-        for s in plain_wrap(text, width.saturating_sub(2)) {
+        for spans in md_to_lines(text, width) {
             out.push(RenderRow {
                 rule: None,
-                spans: vec![Span::styled(
-                    format!("  {s}"),
-                    Style::default().fg(Color::DarkGray),
-                )],
+                spans,
                 tool_header: None,
             });
         }
@@ -7930,13 +7950,15 @@ mod tests {
         let (rows, owners, _) =
             layout_chat_rows(&chat, collapsed, "", 80, &[], &ModelColors::default(), true);
 
-        // The Run digest itself (idx 1) should not have a summary row, but its reasoning child should appear
-        // Check that the reasoning text appears in some row's spans
+        // The digest has no summary row of its own, but its reasoning child
+        // renders as a normal block (header + markdown body), so search the
+        // row spans for the text with whitespace normalised (markdown splits
+        // prose into several spans).
         let reasoning_text = "let me think about this";
         let has_reasoning = rows.iter().any(|row| {
-            row.spans
-                .iter()
-                .any(|span| span.content.contains(reasoning_text))
+            let joined: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+            let joined = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+            joined.contains(reasoning_text)
         });
         assert!(
             has_reasoning,
@@ -8354,6 +8376,131 @@ mod tests {
             !children[1].tool.as_ref().unwrap().open,
             "tool cards are still force-collapsed"
         );
+    }
+
+    #[test]
+    fn reasoning_block_renders_as_a_brained_spoken_block() {
+        let mut out = Vec::new();
+        layout_reasoning(
+            &mut out,
+            "let me check **this**",
+            "model",
+            &ModelColors::default(),
+            true,
+            40,
+        );
+        // The header is a lone brain glyph (the model colour), not a
+        // collapsible card arrow.
+        assert_eq!(out[0].spans.len(), 1);
+        assert_eq!(out[0].spans[0].content, "\u{1f9e0}");
+        assert!(out[0].tool_header.is_none(), "header is not a tool card");
+        // The body follows as a normal markdown block, no rule, no card.
+        assert!(out.len() > 1);
+        let joined: String = out[1..]
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(joined.contains("this"), "body must render: {joined:?}");
+        for r in &out {
+            assert!(r.rule.is_none() && r.tool_header.is_none());
+        }
+        // Collapsed: only the header line.
+        let mut closed = Vec::new();
+        layout_reasoning(
+            &mut closed,
+            "hidden",
+            "model",
+            &ModelColors::default(),
+            false,
+            40,
+        );
+        assert_eq!(closed.len(), 1);
+    }
+
+    #[test]
+    fn reasoning_body_text_is_bright_like_the_answer() {
+        // Reasoning is a chat bubble like the final answer, so its prose must
+        // render in the same bright base colour - never dimmed grey.
+        let mut out = Vec::new();
+        layout_reasoning(
+            &mut out,
+            "plain reasoning prose",
+            "model",
+            &ModelColors::default(),
+            true,
+            40,
+        );
+        let body = &out[1];
+        assert!(
+            body.spans.iter().any(|s| s.style.fg == Some(Color::White)),
+            "reasoning prose must use the bright base fg: {:?}",
+            body.spans
+        );
+        assert!(
+            body.spans
+                .iter()
+                .all(|s| s.style.fg != Some(Color::DarkGray)),
+            "reasoning prose must never be dimmed: {:?}",
+            body.spans
+        );
+    }
+
+    #[test]
+    fn spoken_blocks_are_banded_by_their_model() {
+        let mut colors = ModelColors::new();
+        colors.assign(&["main".to_string(), "dev".to_string()]);
+        let mut dev = DelegateCfg::default();
+        dev.name = "dev".into();
+        let delegates = vec![dev];
+        // Reasoning is banded with its model's dimmed colour.
+        let r = Msg::reasoning("main", "think");
+        assert_eq!(
+            row_band(Some(&r), &colors, &delegates, false),
+            Some(colors.band_color("main"))
+        );
+        // The final answer is banded with the model's colour too (integration).
+        let a = Msg::authored(MsgKind::Assistant, "main", "done");
+        assert_eq!(
+            row_band(Some(&a), &colors, &delegates, false),
+            Some(colors.band_color("main"))
+        );
+        // A delegate reply keeps its own band.
+        let d = Msg::authored(MsgKind::Delegate, "dev", "hi");
+        assert_eq!(
+            row_band(Some(&d), &colors, &delegates, false),
+            Some(colors.band_color("dev"))
+        );
+        // A user turn takes the lifted user band.
+        let u = Msg::authored(MsgKind::User, "you", "go");
+        assert_eq!(
+            row_band(Some(&u), &colors, &delegates, false),
+            Some(user_band_bg())
+        );
+        // A folded digest bands its reasoning only in focus mode; an unowned
+        // row is never banded.
+        let run = Msg::run(vec![Msg::reasoning("main", "hmm")]);
+        assert_eq!(
+            row_band(Some(&run), &colors, &delegates, true),
+            Some(colors.band_color("main"))
+        );
+        assert_eq!(row_band(Some(&run), &colors, &delegates, false), None);
+        assert_eq!(row_band(None, &colors, &delegates, false), None);
+    }
+
+    #[test]
+    fn assistant_header_uses_the_model_colour_and_is_banded() {
+        // The final-answer block shares the reasoning block's shape: a header in
+        // the model's colour (not the old fixed Green) and a model-coloured
+        // band on its rows.
+        let mut colors = ModelColors::new();
+        colors.assign(&["main".to_string()]);
+        let chat = vec![Msg::authored(MsgKind::Assistant, "main", "the answer")];
+        let (rows, owners, _) = layout_chat_rows(&chat, &[false], "", 60, &[], &colors, false);
+        assert!(owners.iter().all(|o| *o == Some(0)));
+        let header = &rows[0];
+        assert_eq!(header.spans[0].style.fg, Some(colors.name_color("main")));
+        assert_ne!(header.spans[0].style.fg, Some(Color::Green));
     }
 
     #[test]

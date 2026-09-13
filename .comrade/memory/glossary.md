@@ -141,6 +141,12 @@ Mutually exclusive with model/question/context args. The delegate tool descripti
 **Notes:**
 Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; otherwise the step stays pending with an "awaiting context: ..." note. Reassigning the model or calling self_set_step_context on a ready step resets it to pending. TUI shows a blue ● glyph. Denied to delegate sub-agents.
 
+## reasoning block
+> The chat element showing a model's visible reasoning between actions (MsgKind::Reasoning). It renders like the assistant final-answer block — a one-line header + markdown body, no left rule, no collapsible card — but headed by a single 🧠 glyph in the model's name colour, and its rows are tinted with the model's dimmed background band (ModelColors::band_color). Visible by default; Tab toggles its body. See `layout_reasoning`.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs`
+
 ## runbook-style prompt
 > The convention that all model-facing prompt text in Comrade must be terse, imperative runbook prose (numbered steps, one idea per line, short sentences, exact tool names in backticks), so that small models can act as the tech lead. Applies to the tech-lead prompt sections, the delegate/advisor sub-agent system bodies, and ToolSpec descriptions.
 
