@@ -5569,7 +5569,8 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             });
         }
     }
-    if let Some((old, new)) = extract_diff_sides(&card.name, &card.args, card.result.as_deref()) {
+    let diff_sides = extract_diff_sides(&card.name, &card.args, card.result.as_deref());
+    if let Some((old, new)) = &diff_sides {
         out.push(RenderRow {
             rule: None,
             spans: vec![Span::styled(
@@ -5579,7 +5580,7 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             tool_header: None,
         });
         const MAX_DIFF_ROWS: usize = 200;
-        let pairs = lcs_pairs(&old, &new);
+        let pairs = lcs_pairs(old, new);
         let shown = pairs.len().min(MAX_DIFF_ROWS);
         for pair in pairs.iter().take(shown) {
             let spans = build_diff_row(
@@ -5622,19 +5623,26 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             }
         }
     }
-    if let Some(result) = &card.result {
-        let color = if card.ok { Color::Green } else { Color::Red };
-        out.push(RenderRow {
-            rule: None,
-            spans: vec![Span::styled("result:", Style::default().fg(color))],
-            tool_header: None,
-        });
-        for row in result_rows(result, card.ok, width) {
+    // For `git_diff` the side-by-side view above already renders the tool's
+    // whole output, so echoing the raw `result:` block below it is pure
+    // duplication. Every other card (edits, reads, test runs, failures, ...)
+    // still shows its result text.
+    let result_is_diff = card.name == "git_diff" && diff_sides.is_some();
+    if !result_is_diff {
+        if let Some(result) = &card.result {
+            let color = if card.ok { Color::Green } else { Color::Red };
             out.push(RenderRow {
                 rule: None,
-                spans: row,
+                spans: vec![Span::styled("result:", Style::default().fg(color))],
                 tool_header: None,
             });
+            for row in result_rows(result, card.ok, width) {
+                out.push(RenderRow {
+                    rule: None,
+                    spans: row,
+                    tool_header: None,
+                });
+            }
         }
     }
 }
@@ -8856,6 +8864,36 @@ mod diff_tests {
         let result = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-x\n+y\n\
                       diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -5 +5 @@\n-p\n+q\n";
         assert_eq!(edit_diff_label("git_diff", "{}", Some(result)), "diff:");
+    }
+
+    #[test]
+    fn git_diff_card_shows_only_the_side_by_side_diff() {
+        let result = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}\n";
+        let card = ToolCard {
+            name: "git_diff".into(),
+            author: Some("model".into()),
+            args: "{}".into(),
+            justification: None,
+            result: Some(result.into()),
+            ok: true,
+            open: true,
+            started: Some(Instant::now()),
+            taken_ms: Some(5),
+            tokens: None,
+        };
+        let mut out = Vec::new();
+        layout_tool(&mut out, 1, &card, 60);
+        let body: String = out
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        // The side-by-side diff rows are rendered...
+        assert!(body.contains("fn old() {}"), "{body}");
+        assert!(body.contains("fn new() {}"), "{body}");
+        // ...and the raw git-diff output is NOT echoed below them.
+        assert!(!body.contains("result:"), "{body}");
+        assert!(!body.contains("diff --git"), "{body}");
     }
 }
 
