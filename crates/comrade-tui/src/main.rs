@@ -183,11 +183,14 @@ fn build_tools(cfg: &Config, root: &std::path::Path) -> Result<ToolRegistry> {
     )? {
         reg.register(Box::new(advise));
     }
-    // The same [[delegates]] back the `summarise` tool: run a command and get a
-    // delegate-written summary of its output instead of the raw text, so a huge
-    // log never floods the tech lead's context (the full output is saved to
-    // .comrade/artifacts/).
-    if let Some(summarise) = SummariseTool::new(&cfg.delegates)? {
+    // The same [[delegates]] back the `summarise` tool: run a command OR a
+    // project task and get a delegate-written summary of its output instead of
+    // the raw text, so a huge log never floods the tech lead's context (the full
+    // output is saved to .comrade/artifacts/). The project tool crate supplies
+    // the task runner so comrade-core stays agnostic to tool crates.
+    let task_runner: std::sync::Arc<dyn comrade_tool::TaskRunner> =
+        std::sync::Arc::new(comrade_tool_project::ProjectTaskRunner);
+    if let Some(summarise) = SummariseTool::new(&cfg.delegates, Some(task_runner))? {
         reg.register(Box::new(summarise));
     }
     Ok(reg)

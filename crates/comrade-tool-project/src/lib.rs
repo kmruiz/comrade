@@ -35,6 +35,45 @@ pub fn all() -> Vec<Box<dyn Tool>> {
     tools
 }
 
+/// The concrete [`comrade_tool::TaskRunner`] backed by the detected build
+/// ecosystem(s). Injected into `comrade-core`'s `summarise` tool so it can run a
+/// named project task (verb or alias) and summarise its uncapped output, while
+/// the core stays agnostic to this crate.
+pub struct ProjectTaskRunner;
+
+#[async_trait]
+impl comrade_tool::TaskRunner for ProjectTaskRunner {
+    async fn run_task(
+        &self,
+        root: &std::path::Path,
+        task: &str,
+        subproject: Option<&str>,
+        ecosystem: Option<&str>,
+        extra: &[String],
+        timeout_secs: u64,
+    ) -> Result<comrade_tool::TaskRun> {
+        let eco = ecosystem::pick(root, ecosystem, task.trim())?;
+        if !eco.supports(root, task) {
+            anyhow::bail!(
+                "unknown task {:?} for the {} ecosystem; known verbs: {} (plus configured aliases)",
+                task,
+                eco.name(),
+                ecosystem::VERBS.join(", ")
+            );
+        }
+        let subproject = subproject.map(str::to_string);
+        let resolved = eco.resolve(root, task, &subproject, extra)?;
+        let out = tasks::exec(&resolved, timeout_secs).await?;
+        Ok(comrade_tool::TaskRun {
+            describe: resolved.describe,
+            success: out.success,
+            code: out.code,
+            body: out.body,
+            elapsed: out.elapsed,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // pom_model
 // ---------------------------------------------------------------------------

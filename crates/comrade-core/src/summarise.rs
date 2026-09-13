@@ -13,10 +13,11 @@ use crate::delegate::{Target, build_targets};
 use crate::llm::{ChatMessage, LlmClient, Role};
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
-use comrade_tool::{Tool, ToolContext, ToolSpec};
+use comrade_tool::{TaskRunner, Tool, ToolContext, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Name of the tool advertised to the tech lead model.
@@ -30,13 +31,17 @@ const MAX_RAW_CHARS: usize = 24_000;
 /// Directory (under the project root) the full command output is written to.
 const ARTIFACT_DIR: &str = ".comrade/artifacts";
 
-/// A tool that runs one command and returns a delegate-written summary of its
-/// output, saving the full output to a file.
+/// A tool that runs one command (a shell command or a project task) and returns
+/// a delegate-written summary of its output, saving the full output to a file.
 pub struct SummariseTool {
     spec: ToolSpec,
     targets: Vec<Target>,
-    /// Delegate used when the caller does not name one: the first enabled one.
+    /// Delegate used when the caller does not name one: the one whose blurb best
+    /// fits summarising (see [`pick_default_model`]).
     default_model: String,
+    /// Runs project tasks (`task` arg). `None` when the caller built the tool
+    /// without a runner (tests); the `task` path then refuses, `command` works.
+    task_runner: Option<Arc<dyn TaskRunner>>,
 }
 
 /// The system prompt given to the summariser model. Kept short and strict so a
@@ -53,13 +58,20 @@ impl SummariseTool {
     /// `Ok(None)` when no delegate is configured (the tool is then not
     /// advertised). The delegate models are the same ones the `delegate` and
     /// `ask_advise` tools use.
-    pub fn new(delegates: &[DelegateCfg]) -> Result<Option<Self>> {
+    ///
+    /// `task_runner` resolves project tasks for the `task` arg; pass `None` to
+    /// offer only the raw `command` path (the crate stays agnostic to the tool
+    /// crates that provide it).
+    pub fn new(
+        delegates: &[DelegateCfg],
+        task_runner: Option<Arc<dyn TaskRunner>>,
+    ) -> Result<Option<Self>> {
         let targets = build_targets(delegates)?;
         if targets.is_empty() {
             return Ok(None);
         }
         let names: Vec<String> = targets.iter().map(|t| t.cfg.name.clone()).collect();
-        let default_model = names[0].clone();
+        let default_model = pick_default_model(&targets);
         let listing = delegates
             .iter()
             .filter(|d| d.enabled)
@@ -68,23 +80,38 @@ impl SummariseTool {
             .join("\n");
 
         let description = format!(
-            "Run ONE shell command whose output you expect to be large, noisy or low-value \
-             (a full test log, a big diff, a verbose build) and return a DELEGATE-WRITTEN \
-             SUMMARY of that output instead of the raw text — this keeps the bulk out of your \
-             context. The full, uncapped output is written to a file under .comrade/artifacts/ \
-             and its path is returned, so you can read the exact parts you still need. The \
-             command runs after your approval, exactly like the `shell` tool. Prefer a \
-             dedicated tool (pom_run_tests, pom_check, ...) when it already returns a tight \
-             summary; use this only when you must run a raw command and only its gist matters.\n\n\
-             The summary is written by one of your delegate models \
-             (overridable with `model`; the default is {default_model}):\n{listing}"
+            "Run ONE command whose output you expect to be large, noisy or low-value (a full \
+             build/test log, a big diff, a verbose command) and return a DELEGATE-WRITTEN SUMMARY \
+             of that output instead of the raw text — keeping the bulk out of your context. Pass \
+             EITHER `command` (an arbitrary shell command, run with your approval exactly like \
+             `shell`) OR `task` (a project task verb or alias, e.g. build/check/clippy, resolved \
+             in the project's build ecosystem and optionally scoped with `subproject`); the two \
+             are mutually exclusive. The full, uncapped output is written under \
+             .comrade/artifacts/ and its path is returned, so you can read the exact parts you \
+             still need. Prefer a dedicated tool (pom_run_tests, pom_check) when it already \
+             returns a tight summary; use this when you must run a raw command or task and only \
+             its gist matters.\n\n\
+             The summary is written by the delegate whose description best fits the summarising \
+             job (override with `model`); configured delegates:\n{listing}"
         );
         let schema = json!({
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to run (bash -c). Its raw output is summarised, not returned."
+                    "description": "Arbitrary shell command to run (bash -c); its raw output is summarised. Mutually exclusive with `task`."
+                },
+                "task": {
+                    "type": "string",
+                    "description": "Project task verb or alias (e.g. \"build\", \"check\", \"clippy\") resolved via the build ecosystem; its raw output is summarised. Mutually exclusive with `command`."
+                },
+                "subproject": {
+                    "type": "string",
+                    "description": "Optional subproject directory for `task`, e.g. \"crates/app\"."
+                },
+                "ecosystem": {
+                    "type": "string",
+                    "description": "Which build ecosystem to use for `task` in a polyglot repo, \"cargo\" or \"npm\". Defaults to the only one present, or the one that supports the task."
                 },
                 "focus": {
                     "type": "string",
@@ -92,21 +119,24 @@ impl SummariseTool {
                 },
                 "dir": {
                     "type": "string",
-                    "description": "Optional directory relative to the project root to run in."
+                    "description": "Optional directory relative to the project root to run `command` in."
                 },
                 "timeout_secs": {
                     "type": "integer",
                     "minimum": 1,
                     "default": 300,
-                    "description": "Kill the command after this many seconds."
+                    "description": "Kill the command/task after this many seconds."
                 },
                 "model": {
                     "type": "string",
                     "enum": names,
-                    "description": "Which delegate model writes the summary. Defaults to the first configured delegate."
+                    "description": "Which delegate model writes the summary. Defaults to the delegate whose description best fits summarising."
                 }
             },
-            "required": ["command"],
+            "oneOf": [
+                { "required": ["command"] },
+                { "required": ["task"] }
+            ],
             "additionalProperties": false
         });
 
@@ -118,6 +148,7 @@ impl SummariseTool {
             },
             targets,
             default_model,
+            task_runner,
         }))
     }
 
@@ -143,7 +174,14 @@ impl Tool for SummariseTool {
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
         #[derive(Deserialize)]
         struct Args {
-            command: String,
+            #[serde(default)]
+            command: Option<String>,
+            #[serde(default)]
+            task: Option<String>,
+            #[serde(default)]
+            subproject: Option<String>,
+            #[serde(default)]
+            ecosystem: Option<String>,
             #[serde(default)]
             focus: Option<String>,
             #[serde(default)]
@@ -158,17 +196,32 @@ impl Tool for SummariseTool {
         }
 
         let args: Args = serde_json::from_value(args)?;
-        if args.command.trim().is_empty() {
-            bail!("command must not be empty");
+        let command = args
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let task = args
+            .task
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        match (&command, &task) {
+            (None, None) => bail!("provide `command` (a shell command) or `task` (a project task)"),
+            (Some(_), Some(_)) => bail!("`command` and `task` are mutually exclusive"),
+            _ => {}
         }
 
+        // Which delegate writes the summary.
         let model = args
             .model
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or(&self.default_model)
-            .to_string();
+            .map(str::to_string)
+            .unwrap_or_else(|| self.default_model.clone());
         let Some((client, cfg)) = self.client_for(&model) else {
             bail!(
                 "unknown summariser model {model:?}; choose one of {:?}",
@@ -184,28 +237,48 @@ impl Tool for SummariseTool {
             );
         }
 
-        // Policy gate BEFORE approval: a denied command never even prompts.
-        comrade_tool::check_command(&args.command, &comrade_tool::policy())?;
-        let cwd = resolve_dir(&ctx.project_root, args.dir.as_deref())?;
-        ctx.confirm(format!("run (output summarised): {}", args.command), None)
-            .await?;
+        // Run the command (or project task) and capture the uncapped output.
+        let (label, out) = if let Some(task) = task {
+            let Some(runner) = &self.task_runner else {
+                bail!("no project task runner is available; use `command` instead of `task`");
+            };
+            let run = runner
+                .run_task(
+                    &ctx.project_root,
+                    &task,
+                    args.subproject.as_deref(),
+                    args.ecosystem.as_deref(),
+                    &[],
+                    args.timeout_secs,
+                )
+                .await?;
+            (
+                run.describe.clone(),
+                RawOutput {
+                    success: run.success,
+                    code: run.code,
+                    body: run.body,
+                    elapsed: run.elapsed,
+                },
+            )
+        } else {
+            let command = command.expect("checked: exactly one of command/task is set");
+            // Policy gate BEFORE approval: a denied command never even prompts.
+            comrade_tool::check_command(&command, &comrade_tool::policy())?;
+            let cwd = resolve_dir(&ctx.project_root, args.dir.as_deref())?;
+            ctx.confirm(format!("run (output summarised): {command}"), None)
+                .await?;
+            let out = run_command(&cwd, &command, args.timeout_secs).await?;
+            (command, out)
+        };
 
-        let out = run_command(&cwd, &args.command, args.timeout_secs).await?;
-        let artifact = write_artifact(&ctx.project_root, &args.command, &out.body).ok();
-
-        let summary = summarise_output(
-            client,
-            &args.command,
-            out.code,
-            args.focus.as_deref(),
-            &out.body,
-        )
-        .await?;
+        let artifact = write_artifact(&ctx.project_root, &label, &out.body).ok();
+        let summary =
+            summarise_output(client, &label, out.code, args.focus.as_deref(), &out.body).await?;
 
         let status = if out.success { "ok" } else { "failed" };
         let mut result = format!(
-            "command {:?} {status} (exit {}, {:.1}s)\n",
-            args.command,
+            "{label} {status} (exit {}, {:.1}s)\n",
             out.code,
             out.elapsed.as_secs_f32()
         );
@@ -228,6 +301,34 @@ impl Tool for SummariseTool {
         result.push_str(&format!("\nSUMMARY (by {model}):\n{summary}"));
         Ok(result)
     }
+}
+
+/// Description-hint keywords that mark a delegate as a good fit for bulk,
+/// low-stakes summarisation work. A `[[delegates]]` `description` is the
+/// config's stated purpose for the model — the same text the tech lead reads to
+/// pick a delegate — so it is the signal the tool uses to choose one itself.
+const SUMMARISER_HINTS: &[&str] = &[
+    "summar", "cheap", "fast", "quick", "small", "light", "econom", "budget",
+];
+
+/// Choose the delegate that best fits summarisation: the enabled one whose
+/// name, model id or description matches the most [`SUMMARISER_HINTS`], with
+/// config order breaking ties. Falls back to the first enabled delegate when no
+/// blurb hints at a preference.
+fn pick_default_model(targets: &[Target]) -> String {
+    let mut best: Option<(usize, &str)> = None;
+    for t in targets {
+        let hay =
+            format!("{} {} {}", t.cfg.name, t.cfg.llm.model, t.cfg.description).to_lowercase();
+        let score: usize = SUMMARISER_HINTS
+            .iter()
+            .map(|h| hay.matches(h).count())
+            .sum();
+        if best.is_none_or(|(best_score, _)| score > best_score) {
+            best = Some((score, &t.cfg.name));
+        }
+    }
+    best.map(|(_, name)| name.to_string()).unwrap_or_default()
 }
 
 /// Resolve the working directory from the project root + an optional relative
@@ -430,6 +531,30 @@ mod tests {
         }
     }
 
+    /// A task runner double: returns a fixed sentinel body for any task, so a
+    /// test can prove the task's raw output is summarised, not returned.
+    struct FakeRunner;
+    #[async_trait]
+    impl comrade_tool::TaskRunner for FakeRunner {
+        async fn run_task(
+            &self,
+            _root: &Path,
+            task: &str,
+            _subproject: Option<&str>,
+            _ecosystem: Option<&str>,
+            _extra: &[String],
+            _timeout_secs: u64,
+        ) -> Result<comrade_tool::TaskRun> {
+            Ok(comrade_tool::TaskRun {
+                describe: format!("task {task}"),
+                success: true,
+                code: 0,
+                body: "SECRET_TASK_OUTPUT".to_string(),
+                elapsed: Duration::from_millis(1),
+            })
+        }
+    }
+
     /// The tool only reads the root and (under auto_approve) never asks, so a
     /// no-op IO double plus a fresh session is all the tests need.
     struct NoopIo;
@@ -467,7 +592,7 @@ mod tests {
 
     #[test]
     fn empty_delegates_yield_no_tool() {
-        assert!(SummariseTool::new(&[]).unwrap().is_none());
+        assert!(SummariseTool::new(&[], None).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -478,7 +603,7 @@ mod tests {
         // the test prove the raw text never reaches the caller.
         std::fs::write(root.join("sentinel.txt"), "SECRET_RAW_PAYLOAD").unwrap();
         let (url, rx) = fake_summariser("3 failures: a, b, c");
-        let tool = SummariseTool::new(&[delegate("cheap", &url)])
+        let tool = SummariseTool::new(&[delegate("cheap", &url)], None)
             .unwrap()
             .unwrap();
         let ctx = ctx(&root);
@@ -522,13 +647,90 @@ mod tests {
         let (url, _rx) = fake_summariser("nope");
         let mut d = delegate("banned", &url);
         d.approval = Autonomy::Deny;
-        let tool = SummariseTool::new(&[d]).unwrap().unwrap();
+        let tool = SummariseTool::new(&[d], None).unwrap().unwrap();
         let err = tool
             .invoke(&ctx(&root), json!({ "command": "true" }))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("deny"), "{err}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn runs_a_project_task_via_the_runner() {
+        let root = scratch("task");
+        let (url, rx) = fake_summariser("build succeeded cleanly");
+        let tool = SummariseTool::new(&[delegate("cheap", &url)], Some(Arc::new(FakeRunner)))
+            .unwrap()
+            .unwrap();
+
+        let out = tool
+            .invoke(&ctx(&root), json!({ "task": "build" }))
+            .await
+            .unwrap();
+
+        // The task's raw output was summarised, not returned...
+        assert!(!out.contains("SECRET_TASK_OUTPUT"), "{out}");
+        assert!(out.contains("task build"), "{out}");
+        assert!(out.contains("build succeeded cleanly"), "{out}");
+        // ...and the summariser received it.
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request.contains("SECRET_TASK_OUTPUT"), "{request}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn task_is_refused_without_a_runner() {
+        let root = scratch("norunner");
+        let (url, _rx) = fake_summariser("x");
+        let tool = SummariseTool::new(&[delegate("cheap", &url)], None)
+            .unwrap()
+            .unwrap();
+        let err = tool
+            .invoke(&ctx(&root), json!({ "task": "build" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("task runner"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn command_and_task_are_mutually_exclusive() {
+        let root = scratch("both");
+        let (url, _rx) = fake_summariser("x");
+        let tool = SummariseTool::new(&[delegate("cheap", &url)], Some(Arc::new(FakeRunner)))
+            .unwrap()
+            .unwrap();
+        let err = tool
+            .invoke(&ctx(&root), json!({ "command": "true", "task": "build" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn picker_prefers_the_delegate_blurbed_for_summarising() {
+        let mut frontier = delegate("frontier", "http://x/v1");
+        frontier.description = "strongest model, use for hard reasoning".into();
+        frontier.llm.model = "big-model".into();
+        let mut mini = delegate("mini", "http://y/v1");
+        mini.description = "cheap fast model, ideal for summarising logs".into();
+        mini.llm.model = "mini-2b".into();
+        let targets = crate::delegate::build_targets(&[frontier, mini]).unwrap();
+        assert_eq!(pick_default_model(&targets), "mini");
+    }
+
+    #[test]
+    fn picker_breaks_ties_by_config_order() {
+        let mut alpha = delegate("alpha", "http://a/v1");
+        alpha.description = "general purpose".into();
+        alpha.llm.model = "model-a".into();
+        let mut beta = delegate("beta", "http://b/v1");
+        beta.description = "another one".into();
+        beta.llm.model = "model-b".into();
+        let targets = crate::delegate::build_targets(&[alpha, beta]).unwrap();
+        assert_eq!(pick_default_model(&targets), "alpha");
     }
 
     #[test]
