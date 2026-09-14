@@ -441,25 +441,26 @@ Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; othe
 - `.comrade/memory/0036-process-wide-securitypolicy-fs-confinement-shell-allowdeny-secret-redaction.md`
 
 ## release workflow
-> .github/workflows/release.yml — GitHub Actions workflow triggered on push of a ref named v[0-9]* (tag or branch). `build` matrix: ubuntu-latest/macos-latest/windows-latest each run `cargo build --release --bin comrade` and upload `comrade-<ref>-<platform>.tar.gz|.zip`; `release` (needs: build, contents: write) downloads the artifacts and runs `gh release create <ref> --generate-notes --notes-file .github/release-notes-header.md`, so the release body is the static functionality summary followed by the commits since the previous release.
+> .github/workflows/release.yml — GitHub Actions workflow triggered on push of a ref named v[0-9]* (tag or branch). `build` matrix: ubuntu-latest/macos-latest/windows-latest each run `cargo build --release --bin comrade` and upload `comrade-<ref>-<platform>.tar.gz|.zip`; `release` (needs: build, contents: write) checks out with fetch-depth: 0 + fetch-tags: true, downloads the artifacts, renders the release body with `bash .github/scripts/release-notes.sh <ref> > $RUNNER_TEMP/notes.md` and runs `gh release create <ref> --title <ref> --target <sha> --notes-file $RUNNER_TEMP/notes.md dist/*`. The body therefore describes only what changed in that release (no --generate-notes, no static header — see ADR 0045).
 
 **References:**
 - `.github/workflows/release.yml`
-- `.github/release-notes-header.md`
-- `release.sh`
+- `.github/scripts/release-notes.sh`
 
-**Notes:**
-The released binary is named `comrade` ([[bin]] in crates/comrade-tui/Cargo.toml). macos-latest is arm64. Actions are pinned at Node.js 24-compatible versions (checkout@v5, upload/download-artifact@v5).
+## Release-notes commit
+> The commit a release tag points at. Its subject is exactly `release: vX.Y.Z` and its **body is the GitHub release description**, written by the agent that cuts the release; `.github/scripts/release-notes.sh <tag>` extracts the body and appends the `**Full Changelog**` compare link, `release.sh` refuses to tag anything else, and the workflow's `release` job publishes it with `gh release create --notes-file`. Committed with `git commit --allow-empty -m "release: vX.Y.Z" -m "<what changed>"` right before running `./release.sh`.
+
+**References:**
+- `.github/scripts/release-notes.sh`
+- `release.sh`
+- `.github/workflows/release.yml`
 
 ## release.sh
-> Root-level bash script that cuts a release: `./release.sh {patch|minor|major}` finds the highest `vX.Y.Z` git tag (git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname, fallback v0.0.0), applies the semver bump, creates an annotated tag and pushes it to origin, which triggers the release workflow.
+> Root-level bash script that cuts a release: `./release.sh {patch|minor|major} [--no-notes]` finds the highest `vX.Y.Z` git tag (git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname, fallback v0.0.0), applies the semver bump, creates an annotated tag and pushes it to origin, which triggers the release workflow. Unless `--no-notes` is given it first requires HEAD to be the Release-notes commit for the next version (subject exactly `release: v<next>`, non-empty body) and prints the description rendered by `.github/scripts/release-notes.sh` before pushing.
 
 **References:**
 - `release.sh`
-- `.github/workflows/release.yml`
-
-**Notes:**
-Refuses if the target tag already exists; warns (does not abort) on a dirty working tree. Needs a configured origin remote.
+- `.github/scripts/release-notes.sh`
 
 ## resident semantic index
 > The resident per-project vector index for `semantic_search` (crates/comrade-tool-memory/src/semantic/mod.rs): `MEM_STORE`/`CODE_STORE` are process-global `Mutex<HashMap<PathBuf, Store>>` maps holding the memory and code `Store` for each project root. A search loads a store from disk at most once, reuses it across calls, and writes it back only when the CONTENT actually changed — `refresh`/`code_refresh` return `(Store, bool)` where the bool comes from `same_docs` (order-independent `(id, hash)` signatures), the per-file `FileStamp` map and the recorded HEAD, so a dirty tree that re-parses to identical chunks is NOT a change (no full-cache rewrite). On a clean repo (recorded HEAD matches and `git::dirty_files` empty) the code file walk is skipped entirely. Vectors are stored pre-normalised (L2) so ranking is a plain dot product (`dot`), not `cosine`.

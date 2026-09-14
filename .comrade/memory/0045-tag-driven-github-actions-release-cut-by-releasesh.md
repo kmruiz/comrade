@@ -58,3 +58,14 @@ Release binary 72,518,632 B -> 62,493,216 B (-10,025,416 B, ~13.8%; 70 MB -> 60 
 
 ## Note
 Rollup of the release process: this ADR adds the tag-driven GitHub Actions release cut; #0031 tunes the release profile for a minimum-size static binary. Body preserved under "Merged from".
+
+## Note
+**Release descriptions are now authored, not generated (2026-09-14, supersedes the static-header note above).**
+
+Context: every GitHub release body was identical (`.github/release-notes-header.md` described the product, not the release) because `gh release create --notes-file` overrides `--generate-notes` — and `--generate-notes` would be empty anyway, since this repo commits straight to `main` with no PRs (its changelog is built from merged PRs).
+
+Decision: the release description is written by the agent that cuts the release and lives in the **body of the commit the tag points at**, whose subject is exactly `release: vX.Y.Z`. `.github/scripts/release-notes.sh <tag>` extracts that body (`git log -1 --format=%b`), exits 1 when it is empty, and appends `**Full Changelog**: .../compare/<prev>...<tag>` (prev from `git describe --tags --abbrev=0 <tag>^`; the slug comes from `GITHUB_REPOSITORY` or the origin remote). The `release` job runs it into `$RUNNER_TEMP/notes.md` and passes that to `gh release create --notes-file`; checkout now sets `fetch-tags: true` so the previous tag resolves. `./release.sh` gained a pre-flight check: HEAD's subject must be `release: v<next>` and its body non-empty, and it prints the description before pushing (`--no-notes` skips the check). `.github/release-notes-header.md` and `--generate-notes` were deleted.
+
+Alternatives rejected: `gh --generate-notes` (empty without PRs); a conventional-commit section generator (still describes the process rather than the change, and needs a per-repo type->heading map); a `CHANGELOG.md` (an extra artefact to keep in sync).
+
+Impact: notes are version-controlled with the code and written once, per release; tagging a commit that is not the release-notes commit now fails fast. Older tags keep their old bodies (v0.3.0 was retroactively given an authored description with `gh release edit --notes-file`). Note that `release.sh` relies on the script path `.github/scripts/release-notes.sh` relative to the repo root.
