@@ -28,3 +28,6 @@ Follow-up: the "does NOT cover a per-commit CI workflow" gap is now closed by `.
 
 ## Note
 Enforcement applied (kmruiz/comrade): branch protection on `main` now requires the status check context "fmt + test" (strict=false, enforce_admins=false, no PR requirement), set with `gh api -X PUT repos/kmruiz/comrade/branches/main/protection`. The required context must match the check-run name, which is the job's `name:` (not the workflow `name: ci`), hence "fmt + test". The ci.yml commit was pushed to origin/main and its run 34790172929 completed green.
+
+## Note
+Release notes now lead with a short functionality summary: the static header lives in `.github/release-notes-header.md` and is passed to `gh release create` via `--notes-file` alongside `--generate-notes` (gh appends the auto-generated changelog after the provided notes). This was also applied retroactively to the v0.1.0 release with `gh release edit --notes-file`. Separately, all actions bumped off Node.js 20 (the runners force Node 24 and warn): actions/checkout@v4 -> v5, actions/upload-artifact@v4 -> v5, actions/download-artifact@v4 -> v5 in ci.yml and release.yml; Swatinem/rust-cache@v2 and dtolnay/rust-toolchain@stable did not warn and were left as-is. Verified on ci run 34791184250 (success, zero deprecation lines).

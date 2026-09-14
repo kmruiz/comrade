@@ -375,14 +375,15 @@ Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; othe
 - `.comrade/memory/0036-process-wide-securitypolicy-fs-confinement-shell-allowdeny-secret-redaction.md`
 
 ## release workflow
-> .github/workflows/release.yml — GitHub Actions workflow triggered on push of a ref named v[0-9]* (tag or branch). `build` matrix: ubuntu-latest/macos-latest/windows-latest each run `cargo build --release --bin comrade` and upload `comrade-<ref>-<platform>.tar.gz|.zip`; `release` (needs: build, contents: write) downloads the artifacts and runs `gh release create <ref> --generate-notes`.
+> .github/workflows/release.yml — GitHub Actions workflow triggered on push of a ref named v[0-9]* (tag or branch). `build` matrix: ubuntu-latest/macos-latest/windows-latest each run `cargo build --release --bin comrade` and upload `comrade-<ref>-<platform>.tar.gz|.zip`; `release` (needs: build, contents: write) downloads the artifacts and runs `gh release create <ref> --generate-notes --notes-file .github/release-notes-header.md`, so the release body is the static functionality summary followed by the commits since the previous release.
 
 **References:**
 - `.github/workflows/release.yml`
+- `.github/release-notes-header.md`
 - `release.sh`
 
 **Notes:**
-The released binary is named `comrade` ([[bin]] in crates/comrade-tui/Cargo.toml). macos-latest is arm64. Notes are the commits since the previous release (--generate-notes).
+The released binary is named `comrade` ([[bin]] in crates/comrade-tui/Cargo.toml). macos-latest is arm64. Actions are pinned at Node.js 24-compatible versions (checkout@v5, upload/download-artifact@v5).
 
 ## release.sh
 > Root-level bash script that cuts a release: `./release.sh {patch|minor|major}` finds the highest `vX.Y.Z` git tag (git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname, fallback v0.0.0), applies the semver bump, creates an annotated tag and pushes it to origin, which triggers the release workflow.
