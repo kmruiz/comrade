@@ -22,7 +22,7 @@ can follow while it runs.
 | | |
 |---|---|
 | 🧠 **Agent loop** | ReAct-style tool use with a live, scrollable plan, streaming output, reasoning blocks and a focus mode that hides tool/meta noise by default. |
-| 🔌 **Models** | Anthropic-compatible clients with retry/backoff and optional prompt caching. Configure **delegates** for parallel jobs and isolated git worktrees. |
+| 🔌 **Models** | OpenAI-compatible clients with retry/backoff and optional prompt caching. Configure **delegates** for parallel jobs and isolated git worktrees. |
 | 🌳 **Code tools** | tree-sitter powered `ts_*` tools: find/read symbol, references, rename, structural map — plus `fs_*` read / write / edit / rgrep. |
 | 📦 **Project tools** | Detect and run the project's own tasks (Cargo & npm), background jobs, git operations and web search/fetch. |
 | 🗂️ **Memory** | ADR decisions and a glossary under `.comrade/memory/`, with semantic search across both memory and code (the index warms in the background at startup). |
@@ -40,9 +40,9 @@ can follow while it runs.
 
 ## 📥 Install
 
-Prebuilt binaries are published on the [releases page](../../releases). Each
-command below resolves the latest release tag and installs the `comrade` binary
-into `/usr/local/bin` (drop the `sudo` if that directory is writable for you).
+Prebuilt binaries are on the [releases page](../../releases). Each command below
+resolves the latest tag and installs the `comrade` binary into `/usr/local/bin`
+(drop the `sudo` if that directory is writable for you).
 
 | Platform | Archive |
 |---|---|
@@ -96,10 +96,10 @@ comrade                    # start the TUI in the current directory
 ```
 
 Comrade keeps project memory (decisions and a glossary) in `.comrade/memory/`
-inside the project, and reads its configuration from a TOML file — see
-[Configuration](#-configuration). If the project root contains an `AGENTS.md`,
-its text is injected into the agent's system prompt (this repo does not ship one;
-it is user-supplied).
+inside the project and reads its configuration from a TOML file (see
+[Configuration](#-configuration)). If the project root contains an `AGENTS.md`,
+its text is injected into the agent's system prompt (user-supplied; this repo
+does not ship one).
 
 ## ⚙️ Configuration
 
@@ -111,13 +111,13 @@ Configuration is a single TOML file, resolved in this order:
 
 When no file is found, built-in defaults apply. Every table below is optional.
 
-A **project-level `.comrade.toml`** at the project root (the `--dir` directory,
-else the current directory) is then layered on top of the resolved file. Project
-values supersede it key by key; `[[delegates]]`, `[[mcp.servers]]` and
-`[[sensors]]` entries merge by `name` (a project entry with the same name
-replaces the user's entry, new names are appended); every other array is
-replaced wholesale. Because it comes from the repository, a `.comrade.toml` can
-also set `[security]` and `[hooks]` — treat it as trusted input.
+A project-level `.comrade.toml` at the project root (the `--dir` directory, else
+the current directory) is layered on top; project values supersede it key by key,
+while `[[delegates]]`, `[[mcp.servers]]` and `[[sensors]]` entries merge by
+`name` (same name replaces the user's, new names are appended) and every other
+array is replaced wholesale. Because it comes from the repository, a
+`.comrade.toml` can also set `[security]` and `[hooks]` — treat it as trusted
+input.
 
 ```toml
 # .comrade.toml — project overrides, layered on top of the user config
@@ -161,10 +161,10 @@ The model the agent talks to.
 One table per developer model the tech lead may hand sub-tasks to (the
 `delegate` / `ask_advise` tools). Keys: `name`, `description`, `enabled`
 (`true`), `approval` (`auto` \| `ask` \| `deny`, default `auto`), plus the inline
-`[llm]` keys (`provider`, `model`, `api_key`, `temperature`, …). Every delegate
-run is bounded by `[agent].delegate_timeout_secs` (default `60`): a delegate that
-has not produced a final answer by then is stopped and replies with whatever it
-had gathered, so a slow or stuck delegate can never hang the parent run.
+`[llm]` keys (`provider`, `model`, `api_key`, `temperature`, …). Every run is
+bounded by `[agent].delegate_timeout_secs` (default `60`): a delegate that has
+not produced a final answer by then is stopped and replies with what it gathered,
+so a slow or stuck delegate can never hang the parent run.
 
 ### `[agent]`
 
@@ -221,17 +221,16 @@ non-zero `pre_tool` exit aborts the call; a non-zero `post_tool` exit only warns
 
 ### `[[sensors]]` — proactive mode
 
-Proactive mode lets Comrade watch external sources (JIRA tickets, GitHub issues,
-a queue, …) without being asked. Each `[[sensors]]` table polls either a shell
-**command** or a registered **tool** (any built-in, a bridged MCP tool, or a
-skill) on an interval; when the result changes Comrade queues the request, and —
-depending on `mode` — either waits for you or handles it on its own.
+Proactive mode watches external sources (JIRA tickets, GitHub issues, a queue, …)
+unprompted. Each `[[sensors]]` table polls a shell **command** or a registered
+**tool** (a built-in, a bridged MCP tool, or a skill) on an interval; when the
+result changes Comrade queues the request.
 
 | Key | Default | Notes |
 |---|---|---|
 | `name` | – | Unique sensor id; also names the session Comrade opens. |
 | `command` | – | Shell command run through `bash -c`; its stdout is watched. |
-| `tool` | – | Name of a registered tool to invoke instead (a built-in, an MCP tool like `mcp_jira_…`, or a `skill_…`); its result is watched. Wins over `command` when both are set. |
+| `tool` | – | Registered tool to invoke instead (a built-in, an MCP tool like `mcp_jira_…`, or a `skill_…`); its result is watched. Wins over `command` when both are set. |
 | `args` | `{}` | JSON arguments passed to `tool`. |
 | `interval_secs` | `300` | Poll period (floored at 10 seconds). |
 | `mode` | `ask` | `ask` = queue and wait for you; `auto` = handle it on its own. |
@@ -239,22 +238,20 @@ depending on `mode` — either waits for you or handles it on its own.
 | `enabled` | `true` | Set `false` to keep the entry but stop polling it. |
 
 The first poll only establishes a baseline. A change is diffed line by line
-(blank lines and surrounding whitespace are ignored) and reported in the
-transcript, then pushed onto the **sensors queue** — a panel under the model
-panel listing every request received but not yet handled, oldest (highest
-priority) first. A request is handled by opening a new session titled
-`sensor: <name>`, **backed by a temporary file** and seeded with the detected
-change, and running it — the agent can hand the triage work to a delegate so the
-main context is not bloated. In `auto` mode Comrade starts the session as soon as
-nothing else is running; in `ask` mode it waits for you.
+(blank lines and whitespace ignored) and reported in the transcript, then pushed
+onto the **sensors queue** — a panel under the model panel listing unhandled
+requests, oldest (highest priority) first. A request is handled by opening a
+session titled `sensor: <name>`, **backed by a temporary file** and seeded with
+the detected change; the agent can delegate the triage so the main context stays
+lean. In `auto` mode Comrade starts the session as soon as nothing else is
+running; in `ask` mode it waits for you.
 
-The session a sensor request opens is short-lived: as soon as its run finishes
-Comrade closes it and deletes its temporary backing file, so recurring proactive
-runs do not pile up in memory or on disk. Sessions you open yourself are left
-untouched.
+Sensor sessions are short-lived: when a run finishes Comrade closes it and
+deletes its temporary backing file, so recurring runs do not pile up in memory or
+on disk. Sessions you open yourself are untouched.
 
-The queue is managed from the M-x palette: `sensors-next` / `sensors-previous`
-move the selection, `sensors-priority-up` / `sensors-priority-down` reorder it,
+Manage the queue from the M-x palette: `sensors-next` / `sensors-previous` move
+the selection, `sensors-priority-up` / `sensors-priority-down` reorder it,
 `sensors-discard` drops a request, and `sensors-start` tackles the selected one
 now.
 
@@ -309,15 +306,15 @@ Requires a recent stable Rust toolchain (edition 2024).
 
 ## 🤝 Contributing
 
-Issues and pull requests are very welcome. To make them easy to act on, please
-use the provided templates — GitHub pre-fills them when you open a new
+Issues and pull requests are very welcome. To make them easy to act on, use the
+provided templates — GitHub pre-fills them when you open a new
 [issue](../../issues/new/choose) or [pull request](../../compare):
 
 - **[Bug report](../../issues/new?template=bug_report.yml)** — what you expected, what happened, and how to reproduce.
 - **[Feature request](../../issues/new?template=feature_request.yml)** — the problem, the proposal, and alternatives you considered.
 - **[Pull request template](.github/pull_request_template.md)** — a summary, the linked issue, the changes and how you tested them.
 
-Before opening a PR, please make sure the same commands CI runs are green:
+Before opening a PR, make sure the commands CI runs are green:
 
 ```bash
 cargo fmt --all -- --check
@@ -326,7 +323,7 @@ cargo test --workspace
 
 ## 🏷️ Releasing
 
-Releases are cut by pushing a `vX.Y.Z` tag, which triggers the release workflow
+Cut a release by pushing a `vX.Y.Z` tag, which triggers the release workflow
 (builds the binary on Linux/macOS/Windows and creates the GitHub release with
 notes generated from the commits since the previous release):
 
