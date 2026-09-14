@@ -144,6 +144,18 @@ Carried on `ToolContext.compact: Option<CompactRequest>`; mirrors the `Steer` co
 **Notes:**
 Mid-run it is requested via `comrade_tool::CompactRequest` and honoured by `run_agent_loop` at its rest point before `enforce_budget()`; while idle the TUI runs `compact_history` in a background task. `ContextManager::compact` keeps the system message and folds the summary into the "Earlier context (compacted)" rollup. The automatic path was added in ADR #34; disable with `[context] auto_compact = false`.
 
+## contribution templates
+> GitHub contribution scaffolding under .github/: ISSUE_TEMPLATE/config.yml (blank issues disabled, security + discussions links), bug_report.yml and feature_request.yml (issue forms with labels bug/enhancement), and pull_request_template.md. The PR template requires a summary, a linked issue, the changes, how it was tested (checkboxes for `cargo fmt --all -- --check` and `cargo test --workspace`) and a checklist including updating `.comrade/memory/` (ADR/glossary) for architectural changes.
+
+**References:**
+- `.github/pull_request_template.md`
+- `.github/ISSUE_TEMPLATE/bug_report.yml`
+- `.github/ISSUE_TEMPLATE/feature_request.yml`
+- `LICENSE`
+
+**Notes:**
+The project declares `license = "MIT OR Apache-2.0"` in Cargo.toml but only an Apache-2.0 `LICENSE` file exists (added 2026-09-13); add LICENSE-MIT or narrow the Cargo.toml license field if that matters.
+
 ## delegate sub-chat
 > The chat rows authored by a delegate model (its tool cards and its reply), rendered indented 2 columns under a "| " rule in the delegate's agent color with a dim per-agent background band, visually nested under the parent's delegate tool call.
 
