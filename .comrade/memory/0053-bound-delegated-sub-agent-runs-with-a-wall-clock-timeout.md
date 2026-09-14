@@ -25,3 +25,6 @@ A stuck/slow delegate can no longer hang the parent run; it is cut off at the bu
 
 ## Note
 Observed in practice: the configured coding delegate (qwen/qwen3.6-35b-a3b) exhausts the default 60s budget and returns "stopped after 60s without a final answer" on a step that edits two files (the semantic_search `path` feature). Readiness checks (ask_advise step=N) hit the same cap. For this delegate, either raise [agent].delegate_timeout_secs or hand it a smaller step (one file / one function); a two-file implementation is faster to do directly.
+
+## Note
+Confirmed again in practice: with the default 60s budget the delegate cannot even finish a READ-ONLY readiness check (`ask_advise step=N`) on a large file — the check for a crates/comrade-tui/src/tui.rs (~12k lines) step timed out. While the budget stays at 60s, don't plan delegate steps that must read/edit/unittest that file: do them directly, or first add `[agent] delegate_timeout_secs = 600` to the project `.comrade.toml` (layered over the user config; needs Ctrl-R / M-x reload-config, or just the next start, to take effect — a reload is refused while a run is in flight).
