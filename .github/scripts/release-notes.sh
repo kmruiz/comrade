@@ -9,6 +9,9 @@
 #
 #   usage: release-notes.sh <tag>        # e.g. release-notes.sh v0.3.0
 #
+# The Full Changelog compare link is appended automatically unless the
+# description already contains one.
+#
 # Exit codes: 0 = notes printed, 1 = the tagged commit has no description,
 #             2 = bad usage. Requires: git, sed. Honours GITHUB_REPOSITORY.
 set -euo pipefail
@@ -43,8 +46,15 @@ if [ -z "$slug" ]; then
   slug="$(printf '%s' "$url" | sed -n 's#.*github\.com[:/]##p' | sed 's#\.git$##')"
 fi
 
-# Previous tag reachable from the tagged commit, if any.
+# Previous tag reachable from the tagged commit, if any. The compare link is
+# appended only when the description does not already carry one, so writing it
+# by hand in the commit body cannot duplicate it.
 prev="$(git describe --tags --abbrev=0 "${ref}^" 2>/dev/null || true)"
-if [ -n "$slug" ] && [ -n "$prev" ]; then
-  printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$slug" "$prev" "$ref"
-fi
+case "$body" in
+  *'**Full Changelog**'*) ;;
+  *)
+    if [ -n "$slug" ] && [ -n "$prev" ]; then
+      printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$slug" "$prev" "$ref"
+    fi
+    ;;
+esac
