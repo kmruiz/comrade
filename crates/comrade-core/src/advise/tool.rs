@@ -303,4 +303,3 @@ impl Tool for AskAdviseTool {
         }
     }
 }
-

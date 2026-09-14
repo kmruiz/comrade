@@ -64,9 +64,9 @@ pub struct AskAdviseTool {
     limits: DelegateLimits,
 }
 
-mod tool;
 mod readiness;
 #[cfg(test)]
 mod tests;
-pub use tool::*;
+mod tool;
 pub use readiness::*;
+pub use tool::*;
