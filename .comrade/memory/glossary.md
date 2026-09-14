@@ -156,6 +156,13 @@ Mid-run it is requested via `comrade_tool::CompactRequest` and honoured by `run_
 **Notes:**
 The project declares `license = "MIT OR Apache-2.0"` in Cargo.toml but only an Apache-2.0 `LICENSE` file exists (added 2026-09-13); add LICENSE-MIT or narrow the Cargo.toml license field if that matters.
 
+## CSMV store format
+> The persisted on-disk format of a `semantic_search` index. Since ADR 0040 it is a compact dependency-free binary blob: magic `CSMV`, u16 version, then length-prefixed strings and raw little-endian `f32` vectors, produced/parsed by `encode_store`/`decode_store` and written to `$XDG_CACHE_HOME/comrade/semantic/<key>.bin` (`load_store` normalises vectors on load and still reads a legacy `<key>.json` once, migrating it). Chosen over JSON (which stores each f32 as ~7 text bytes) and over bson/flate2: measured 11.6 MB JSON -> 4.1 MB binary for this repo's code index, and deflate only shaves a further ~16% because the payload is incompressible f32.
+
+**References:**
+- `crates/comrade-tool-memory/src/semantic/mod.rs`
+- `.comrade/memory/0040-make-the-semantic-index-resident-load-once-write-only-on-change-skip-clean-repo-walks.md`
+
 ## delegate sub-chat
 > The chat rows authored by a delegate model (its tool cards and its reply), rendered indented 2 columns under a "| " rule in the delegate's agent color with a dim per-agent background band, visually nested under the parent's delegate tool call.
 
@@ -213,16 +220,11 @@ Defined via a `FieldKind::DiffChoice { options: Vec<DiffOption> }` variant; seed
 Defaults let a minimal backend implement only model/resolve/format_command: `check_command` defaults to None, `parse_diagnostics` to the generic error-line scan, `simplify_tests` to passthrough, `is_test_command` to false. Adding npm/Maven/Go = implement the trait + one arm in `detect`. See ADR #26.
 
 ## embedded embedding model
-> The int8-quantized BGE-small-en-v1.5 ONNX bundle compiled into the comrade-tool-memory binary so semantic_search runs fully offline (no download, no model cache). Raw files live in crates/comrade-tool-memory/assets/bge-small-en-v1.5-int8/ (source of truth); build.rs deflates them with flate2 into OUT_DIR/assets/*.deflate and src/semantic.rs embeds those compressed copies (include_bytes!) and inflates them in memory on first use via flate2::DeflateDecoder. Built with fastembed's try_new_from_user_defined + Pooling::Cls.
+> The int8-quantized BGE-small-en-v1.5 ONNX bundle compiled into the comrade-tool-memory binary so semantic_search runs fully offline (no download, no model cache). Raw files live in crates/comrade-tool-memory/assets/bge-small-en-v1.5-int8/ (source of truth); build.rs deflates them with flate2 into OUT_DIR/assets/*.deflate and crates/comrade-tool-memory/src/semantic/mod.rs embeds those compressed copies (include_bytes!) and inflates them in memory on first use via flate2::DeflateDecoder (inflate()/FastEmbedder). Built with fastembed's try_new_from_user_defined + Pooling::Cls. NOTE: this flate2/deflate machinery is the "compression we already have" — the semantic index store deliberately does NOT use it (see CSMV store format).
 
 **References:**
-- `crates/comrade-tool-memory/src/semantic.rs`
+- `crates/comrade-tool-memory/src/semantic/mod.rs`
 - `crates/comrade-tool-memory/build.rs`
-- `crates/comrade-tool-memory/assets/bge-small-en-v1.5-int8/README.md`
-- `Cargo.toml`
-
-**Notes:**
-Deflating the ~35 MB of assets saves ~10 MB of binary; the workspace [profile.release] strip=true removes a further ~14 MB of symbol tables. Release binary went ~96 MB -> ~68 MB.
 
 ## enabled (delegate)
 > Per-[[delegates]] boolean (default true). `enabled = false` keeps the entry in config.toml but removes the model from the `delegate`/`ask_advise` targets, their `model` enum and advertised listing (and from the TUI Ctrl-A picker), so it cannot be delegated to; it still shows dimmed with ` (disabled)` in the model panel. Unlike `approval = "deny"` (listed but refused at run time), a disabled delegate is invisible to the tech lead.
@@ -422,11 +424,10 @@ The released binary is named `comrade` ([[bin]] in crates/comrade-tui/Cargo.toml
 Refuses if the target tag already exists; warns (does not abort) on a dirty working tree. Needs a configured origin remote.
 
 ## resident semantic index
-> The resident per-project vector index for `semantic_search` (crates/comrade-tool-memory/src/semantic.rs): `MEM_STORE`/`CODE_STORE` are process-global `Mutex<HashMap<PathBuf, Store>>` maps holding the memory and code `Store` for each project root. A search loads a store from disk at most once, reuses it across calls, and writes it back only when `refresh`/`code_refresh` report a change; on a clean repo (recorded HEAD matches and `git::dirty_files` is empty) the code file walk is skipped entirely.
+> The resident per-project vector index for `semantic_search` (crates/comrade-tool-memory/src/semantic/mod.rs): `MEM_STORE`/`CODE_STORE` are process-global `Mutex<HashMap<PathBuf, Store>>` maps holding the memory and code `Store` for each project root. A search loads a store from disk at most once, reuses it across calls, and writes it back only when the CONTENT actually changed — `refresh`/`code_refresh` return `(Store, bool)` where the bool comes from `same_docs` (order-independent `(id, hash)` signatures), the per-file `FileStamp` map and the recorded HEAD, so a dirty tree that re-parses to identical chunks is NOT a change (no full-cache rewrite). On a clean repo (recorded HEAD matches and `git::dirty_files` empty) the code file walk is skipped entirely. Vectors are stored pre-normalised (L2) so ranking is a plain dot product (`dot`), not `cosine`.
 
 **References:**
-- `crates/comrade-tool-memory/src/semantic.rs`
-- `.comrade/memory/0040-make-the-semantic-index-resident-load-once-write-only-on-change-skip-clean-repo-walks.md`
+- `crates/comrade-tool-memory/src/semantic/mod.rs`
 
 ## retryable provider error
 > A provider request failure the LLM client retries rather than surfacing: a transport error (reqwest timeout/connect/request/body, e.g. connection reset/refused) or an HTTP status in 408|425|429|500|502|503|504|529. Classified by `is_retryable`/`is_retryable_status` in crates/comrade-core/src/llm.rs; a non-success status is carried as the typed `LlmHttpError`. Retried with exponential backoff (`[llm] max_retries`, `retry_backoff_ms`); mid-stream failures after the first emitted delta are NOT retried.
