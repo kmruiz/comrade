@@ -87,13 +87,36 @@ jobs:
           bash .github/scripts/release-notes.sh "${{ github.ref_name }}" > "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md"
 
-      - name: Create GitHub release
+      - name: Create or update the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -uo pipefail
           ls -l dist
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --target "${{ github.sha }}" \
-            --notes-file "$RUNNER_TEMP/notes.md" \
-            dist/*
+          ref="${{ github.ref_name }}"
+          # On the tag path the tag already exists, so do not make gh touch the
+          # refs API by passing --target; only the branch path may need it to
+          # create the tag. $target is intentionally unquoted: it expands to
+          # either nothing or the two words '--target <sha>'.
+          if git rev-parse -q --verify "refs/tags/$ref" >/dev/null; then
+            target=""
+          else
+            target="--target ${{ github.sha }}"
+          fi
+          # gh release create/get can fail transiently with 'HTTP 403: Resource
+          # not accessible by integration'; retry a few times before giving up,
+          # and treat an already-published release as success (refresh it).
+          for attempt in 1 2 3 4 5; do
+            if gh release view "$ref" >/dev/null 2>&1; then
+              gh release edit "$ref" --notes-file "$RUNNER_TEMP/notes.md" \
+                && gh release upload "$ref" dist/* --clobber \
+                && exit 0
+            elif gh release create "$ref" --title "$ref" $target \
+                --notes-file "$RUNNER_TEMP/notes.md" dist/*; then
+              exit 0
+            fi
+            echo "release step failed (attempt ${attempt}/5); retrying in $((attempt * 10))s" >&2
+            sleep $((attempt * 10))
+          done
+          echo "error: could not create or update the release ${ref}" >&2
+          exit 1
