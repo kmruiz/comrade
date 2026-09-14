@@ -130,6 +130,12 @@ pub fn resolve(
             }
         }
     } else if let Some(mut args) = verb_args(task) {
+        // A root-level `cargo test` (the verb `pom_run_tests` uses) covers the
+        // whole workspace when one is declared, so the summary lists every
+        // member's tests in a single pass instead of only the root package.
+        if task == "test" && subproject.is_none() && model.is_workspace {
+            args.push("--workspace".to_string());
+        }
         if let Some(m) = &manifest {
             args.push(m.clone());
         }
@@ -356,7 +362,19 @@ mod tests {
         match &r.line {
             CommandLine::Program { program, args } => {
                 assert_eq!(program, "cargo");
-                assert_eq!(args, &["test"]);
+                // at a workspace root the whole workspace is tested
+                assert_eq!(args, &["test", "--workspace"]);
+            }
+            _ => panic!("expected cargo"),
+        }
+
+        // a subproject-scoped run targets only that crate (no --workspace)
+        let sub_a = Some("crates/a".to_string());
+        let r = resolve(&root, "test", &sub_a, &[]).unwrap();
+        match &r.line {
+            CommandLine::Program { program, args } => {
+                assert_eq!(program, "cargo");
+                assert_eq!(args, &["test", "--manifest-path=crates/a/Cargo.toml"]);
             }
             _ => panic!("expected cargo"),
         }

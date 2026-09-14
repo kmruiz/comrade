@@ -265,7 +265,7 @@ struct PomRunTests;
 static POM_RUN_TESTS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "pom_run_tests".into(),
-    description: "Run the project's tests and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names, key error lines. Use to verify work instead of reasoning about code. Works for Cargo and npm projects; pass `ecosystem` in a polyglot repo.".into(),
+    description: "Run the project's tests and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names, key error lines. Use to verify work instead of reasoning about code. Works for Cargo and npm projects; pass `ecosystem` in a polyglot repo. In a Cargo workspace, a root-level run tests the whole workspace (every member).".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -653,7 +653,6 @@ Compiling foo
             user: Arc::new(U),
             undo: Arc::new(L),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,

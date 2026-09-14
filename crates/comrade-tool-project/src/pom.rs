@@ -56,6 +56,10 @@ pub struct ProjectModel {
     pub root_package: Option<Package>,
     /// True when the root Cargo.toml is a virtual workspace manifest.
     pub is_virtual: bool,
+    /// True when the root Cargo.toml declares a `[workspace]` table (virtual or
+    /// not). `pom_run_tests` uses it to add `--workspace` so a root-level test
+    /// run covers every member.
+    pub is_workspace: bool,
     /// Workspace member packages (subprojects).
     pub subprojects: Vec<Package>,
     /// Names from `[workspace.dependencies]`.
@@ -92,6 +96,7 @@ pub fn load(root: &Path) -> Result<ProjectModel> {
     };
 
     let workspace = value.get("workspace");
+    let is_workspace = workspace.is_some();
     let members: Vec<String> = workspace
         .and_then(|w| w.get("members"))
         .and_then(Value::as_array)
@@ -140,6 +145,7 @@ pub fn load(root: &Path) -> Result<ProjectModel> {
         root: root.to_path_buf(),
         root_package,
         is_virtual,
+        is_workspace,
         subprojects,
         workspace_deps,
         aliases: load_aliases(root),
