@@ -562,6 +562,46 @@ fn sensor_mode_as_str() {
 }
 
 #[test]
+fn a_tool_sensor_parses_a_registered_tool_and_args() {
+    let p = write_tmp(
+        r#"
+        [[sensors]]
+        name = "jira-sprint"
+        tool = "mcp_jira_list_tickets"
+        args = { sprint = "S-42", state = "open" }
+        interval_secs = 120
+        mode = "auto"
+        "#,
+    );
+    let c = Config::load(Some(&p)).unwrap().config;
+    let _ = std::fs::remove_file(&p);
+    assert_eq!(c.sensors.len(), 1);
+    let s = &c.sensors[0];
+    assert_eq!(s.tool_name(), Some("mcp_jira_list_tickets"));
+    assert!(s.is_pollable());
+    assert_eq!(s.args["sprint"], "S-42");
+    assert_eq!(s.args["state"], "open");
+    // A blank `command` is fine for a tool sensor; `tool` wins when both are set.
+    assert!(s.command.is_empty());
+}
+
+#[test]
+fn a_command_sensor_has_no_tool_and_is_pollable() {
+    let p = write_tmp("[[sensors]]\nname = \"c\"\ncommand = \"echo hi\"\n");
+    let c = Config::load(Some(&p)).unwrap().config;
+    let _ = std::fs::remove_file(&p);
+    let s = &c.sensors[0];
+    assert_eq!(s.tool_name(), None);
+    assert!(s.is_pollable());
+    // An enabled sensor with neither a tool nor a command must not be polled.
+    let empty = SensorCfg {
+        enabled: true,
+        ..Default::default()
+    };
+    assert!(!empty.is_pollable());
+}
+
+#[test]
 fn repo_config_merges_sensors_by_name() {
     let user = write_tmp(
         r#"

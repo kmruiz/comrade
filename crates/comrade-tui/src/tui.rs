@@ -677,6 +677,12 @@ enum MxCommand {
     QueuePrompt,
     Quit,
     ReindexSemanticSearch,
+    SensorsDiscard,
+    SensorsNext,
+    SensorsPrevious,
+    SensorsPriorityDown,
+    SensorsPriorityUp,
+    SensorsStart,
     ReloadConfig,
     SaveSession,
     SearchChat,
@@ -724,6 +730,12 @@ impl MxCommand {
         MxCommand::ScrollPlanDown,
         MxCommand::ScrollPlanUp,
         MxCommand::SearchChat,
+        MxCommand::SensorsDiscard,
+        MxCommand::SensorsNext,
+        MxCommand::SensorsPrevious,
+        MxCommand::SensorsPriorityDown,
+        MxCommand::SensorsPriorityUp,
+        MxCommand::SensorsStart,
         MxCommand::SteerPrompt,
         MxCommand::StopBackgroundJob,
         MxCommand::SubmitPrompt,
@@ -765,6 +777,12 @@ impl MxCommand {
             MxCommand::ScrollPlanDown => "scroll-plan-down",
             MxCommand::ScrollPlanUp => "scroll-plan-up",
             MxCommand::SearchChat => "search-chat-history",
+            MxCommand::SensorsDiscard => "sensors-discard",
+            MxCommand::SensorsNext => "sensors-next",
+            MxCommand::SensorsPrevious => "sensors-previous",
+            MxCommand::SensorsPriorityDown => "sensors-priority-down",
+            MxCommand::SensorsPriorityUp => "sensors-priority-up",
+            MxCommand::SensorsStart => "sensors-start",
             MxCommand::SteerPrompt => "steer",
             MxCommand::StopBackgroundJob => "stop-background-job",
             MxCommand::SubmitPrompt => "submit-prompt",
@@ -811,6 +829,12 @@ impl MxCommand {
             MxCommand::ScrollPlanDown => Some("pgdn"),
             MxCommand::ScrollPlanUp => Some("pgup"),
             MxCommand::SearchChat => Some("C-s"),
+            MxCommand::SensorsDiscard => None,
+            MxCommand::SensorsNext => None,
+            MxCommand::SensorsPrevious => None,
+            MxCommand::SensorsPriorityDown => None,
+            MxCommand::SensorsPriorityUp => None,
+            MxCommand::SensorsStart => None,
             MxCommand::SteerPrompt => Some("<return>"),
             // Palette-only: pick a running background job to stop.
             MxCommand::StopBackgroundJob => None,
@@ -860,6 +884,12 @@ impl MxCommand {
             MxCommand::ScrollPlanDown => "scroll the plan panel down",
             MxCommand::ScrollPlanUp => "scroll the plan panel up",
             MxCommand::SearchChat => "search the chat history",
+            MxCommand::SensorsDiscard => "discard the selected sensor request",
+            MxCommand::SensorsNext => "select the next sensor request",
+            MxCommand::SensorsPrevious => "select the previous sensor request",
+            MxCommand::SensorsPriorityDown => "lower the selected sensor request's priority",
+            MxCommand::SensorsPriorityUp => "raise the selected sensor request's priority",
+            MxCommand::SensorsStart => "tackle the selected sensor request now",
             MxCommand::SteerPrompt => "send the prompt to the running agent or delegate now",
             MxCommand::StopBackgroundJob => {
                 "stop a running background job (pick one from the list)"
@@ -876,6 +906,25 @@ impl MxCommand {
             MxCommand::Undo => "restore files from the undo log (the last mutating writes)",
         }
     }
+}
+
+/// Most rows the sensors-queue panel shows before it starts scrolling.
+const MAX_SENSOR_ROWS: usize = 6;
+
+/// One pending proactive-mode request: a change a sensor reported, waiting in the
+/// sensors queue for the human to start, re-prioritise or discard it (or for an
+/// `auto` sensor's change to be picked up automatically once the app is idle).
+struct SensorEntry {
+    /// Stable id shown in the panel and used in chat notes.
+    id: u64,
+    /// The sensor that reported the change.
+    name: String,
+    /// `auto` requests are started automatically when idle; `ask` ones wait.
+    mode: comrade_core::SensorMode,
+    /// Optional seed prompt for the session that tackles it.
+    prompt: Option<String>,
+    /// The detected change.
+    delta: crate::proactive::Delta,
 }
 
 /// The Alt+X command palette: type to narrow, enter runs the highlighted
@@ -1247,6 +1296,16 @@ struct App {
     /// Owning handle of the running sensor polling tasks, held for the whole
     /// session so the tasks are not dropped.
     sensor_runtime: Option<crate::proactive::SensorRuntime>,
+    /// Proactive-mode requests received but not yet acted on, oldest first (the
+    /// front has the highest priority). M-x commands reorder, discard or start
+    /// them; `auto` requests are pumped automatically once the app is idle.
+    sensor_queue: Vec<SensorEntry>,
+    /// Selected row in the sensors panel (an index into `sensor_queue`).
+    sensor_sel: usize,
+    /// First visible row of the sensors panel.
+    sensor_scroll: u16,
+    /// Next sensor-request id.
+    next_sensor_id: u64,
     /// One-shot "compact the context now" request handed to the running loop
     /// (`None` while idle).
     compact: Option<comrade_tool::CompactRequest>,
@@ -2276,8 +2335,8 @@ impl App {
         self.push_meta("opened a new session");
     }
 
-    /// React to a proactive-mode sensor event: note it, then either start a
-    /// session to handle it (`auto`) or ask the human first (`ask`).
+    /// React to a proactive-mode sensor event: a failure is only noted; a change
+    /// is recorded and queued as a request the human (or `auto` mode) can act on.
     fn on_sensor_event(&mut self, ev: crate::proactive::SensorEvent) {
         use crate::proactive::SensorEvent;
         match ev {
@@ -2289,24 +2348,10 @@ impl App {
                 mode,
                 prompt,
                 delta,
-                raw,
+                ..
             } => {
                 self.notify_sensor(&name, &delta);
-                match mode {
-                    comrade_core::SensorMode::Auto => {
-                        self.start_sensor_session(&name, prompt.as_deref(), &delta);
-                    }
-                    comrade_core::SensorMode::Ask => {
-                        self.ask_about_sensor(name, prompt, delta, raw);
-                    }
-                }
-            }
-            SensorEvent::Confirmed {
-                name,
-                prompt,
-                delta,
-            } => {
-                self.start_sensor_session(&name, prompt.as_deref(), &delta);
+                self.enqueue_sensor(name, mode, prompt, delta);
             }
         }
     }
@@ -2327,38 +2372,113 @@ impl App {
         }
     }
 
-    /// Ask the human whether to tackle a sensor change (`ask` mode). A background
-    /// task feeds a `Confirmed` event back into the loop if they say yes, which
-    /// is what opens the session — so nothing starts without consent.
-    fn ask_about_sensor(
+    /// Push a received sensor change onto the sensors queue. The request waits
+    /// there until the human starts or discards it, or — for an `auto` sensor —
+    /// until [`App::pump_sensor_queue`] picks it up.
+    fn enqueue_sensor(
         &mut self,
         name: String,
+        mode: comrade_core::SensorMode,
         prompt: Option<String>,
         delta: crate::proactive::Delta,
-        raw: String,
     ) {
-        let title = format!("Sensor \"{name}\" reported changes; tackle them now?");
-        let diff = (!raw.trim().is_empty()).then(|| truncate_preview(&raw, 4000));
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.dialogs.push(Dialog {
-            prompt: UserPrompt::Confirm { title, diff },
-            buf: String::new(),
-            reply: reply_tx,
-            session: self.active_id(),
-            form: None,
+        let id = self.next_sensor_id;
+        self.next_sensor_id += 1;
+        self.sensor_queue.push(SensorEntry {
+            id,
+            name,
+            mode,
+            prompt,
+            delta,
         });
-        let tx = self.sensor_tx.clone();
-        tokio::spawn(async move {
-            if let Ok(comrade_tool::UserReply::Answer(answer)) = reply_rx.await
-                && answer.trim().eq_ignore_ascii_case("yes")
-            {
-                let _ = tx.send(crate::proactive::SensorEvent::Confirmed {
-                    name,
-                    prompt,
-                    delta,
-                });
-            }
-        });
+        let (auto, ask) = self.sensor_counts();
+        self.push_meta(format!(
+            "queued sensor request #{id} ({auto} auto, {ask} ask pending)"
+        ));
+    }
+
+    /// Number of queued `auto` and `ask` sensor requests.
+    fn sensor_counts(&self) -> (usize, usize) {
+        let auto = self
+            .sensor_queue
+            .iter()
+            .filter(|e| e.mode == comrade_core::SensorMode::Auto)
+            .count();
+        (auto, self.sensor_queue.len() - auto)
+    }
+
+    /// Start the highest-priority queued `auto` request when the app is idle, so
+    /// a proactive sensor that arrived while a run was in flight is handled as
+    /// soon as nothing else is running. `ask` requests wait for the human.
+    fn pump_sensor_queue(&mut self) {
+        if self.running {
+            return;
+        }
+        if let Some(pos) = self
+            .sensor_queue
+            .iter()
+            .position(|e| e.mode == comrade_core::SensorMode::Auto)
+        {
+            self.start_sensor_entry(pos);
+        }
+    }
+
+    /// Remove the queue entry at `pos`, fix up the selection and open a session
+    /// for it.
+    fn start_sensor_entry(&mut self, pos: usize) {
+        if pos >= self.sensor_queue.len() {
+            return;
+        }
+        let entry = self.sensor_queue.remove(pos);
+        self.clamp_sensor_sel();
+        self.start_sensor_session(&entry.name, entry.prompt.as_deref(), &entry.delta);
+    }
+
+    /// Keep the queue selection inside bounds.
+    fn clamp_sensor_sel(&mut self) {
+        if self.sensor_queue.is_empty() {
+            self.sensor_sel = 0;
+        } else if self.sensor_sel >= self.sensor_queue.len() {
+            self.sensor_sel = self.sensor_queue.len() - 1;
+        }
+    }
+
+    /// Select the next (`delta > 0`) or previous (`delta < 0`) queued request.
+    fn sensor_move(&mut self, delta: isize) {
+        if self.sensor_queue.is_empty() {
+            return;
+        }
+        let len = self.sensor_queue.len() as isize;
+        self.sensor_sel = (self.sensor_sel as isize + delta).clamp(0, len - 1) as usize;
+    }
+
+    /// Move the selected request up (`delta < 0`) or down (`delta > 0`) in the
+    /// queue, changing its priority (the queue is handled front to back).
+    fn sensor_reorder(&mut self, delta: isize) {
+        let len = self.sensor_queue.len() as isize;
+        let target = self.sensor_sel as isize + delta;
+        if target < 0 || target >= len {
+            return;
+        }
+        self.sensor_queue.swap(self.sensor_sel, target as usize);
+        self.sensor_sel = target as usize;
+    }
+
+    /// Discard the selected request without acting on it.
+    fn sensor_discard(&mut self) {
+        if self.sensor_queue.is_empty() {
+            return;
+        }
+        let entry = self.sensor_queue.remove(self.sensor_sel);
+        self.clamp_sensor_sel();
+        self.push_meta(format!("discarded sensor request #{}", entry.id));
+    }
+
+    /// Tackle the selected request now.
+    fn sensor_start_selected(&mut self) {
+        if !self.sensor_queue.is_empty() {
+            self.start_sensor_entry(self.sensor_sel);
+        }
     }
 
     /// Open a fresh session to handle a sensor change, back it with a temporary
@@ -3343,6 +3463,12 @@ impl App {
             MxCommand::ScrollPlanDown => self.scroll_plan(3),
             MxCommand::ScrollPlanUp => self.scroll_plan(-3),
             MxCommand::SearchChat => self.search = Some(Search::new()),
+            MxCommand::SensorsDiscard => self.sensor_discard(),
+            MxCommand::SensorsNext => self.sensor_move(1),
+            MxCommand::SensorsPrevious => self.sensor_move(-1),
+            MxCommand::SensorsPriorityDown => self.sensor_reorder(1),
+            MxCommand::SensorsPriorityUp => self.sensor_reorder(-1),
+            MxCommand::SensorsStart => self.sensor_start_selected(),
             MxCommand::SteerPrompt => self.submit_prompt(),
             MxCommand::StopBackgroundJob => self.open_jobs_pick(),
             MxCommand::SubmitPrompt => self.submit_prompt(),
@@ -3780,6 +3906,10 @@ fn build_app(
         sensor_rx,
         sensor_tx,
         sensor_runtime: None,
+        sensor_queue: Vec::new(),
+        sensor_sel: 0,
+        sensor_scroll: 0,
+        next_sensor_id: 1,
         compact: None,
         queued_prompt: None,
         run_cancelled: false,
@@ -3862,7 +3992,17 @@ pub async fn run(deps: &Deps) -> Result<()> {
 
     // Start polling the configured proactive-mode sensors. The receiver is
     // drained by the main loop; the runtime is held for the session's lifetime.
-    let (sensor_runtime, sensor_rx) = crate::proactive::SensorRuntime::start(&deps.cfg.sensors);
+    // Sensors may invoke tools (an MCP tool, a skill, a built-in), so they get
+    // the tool registry and a context that runs unattended and does not spam the
+    // chat with tool events.
+    let mut sensor_ctx = app.ctx_base.clone();
+    sensor_ctx.auto_approve = true;
+    sensor_ctx.events = std::sync::Arc::new(comrade_tool::NoopEvents);
+    sensor_ctx.steer = None;
+    sensor_ctx.compact = None;
+    sensor_ctx.stop = None;
+    let (sensor_runtime, sensor_rx) =
+        crate::proactive::SensorRuntime::start(&deps.cfg.sensors, deps.tools.clone(), sensor_ctx);
     app.sensor_tx = sensor_runtime.sender();
     app.sensor_rx = sensor_rx;
     app.sensor_runtime = Some(sensor_runtime);
@@ -3987,6 +4127,8 @@ pub async fn run(deps: &Deps) -> Result<()> {
             }
         }
         app.refresh_git();
+        // Start any queued `auto` sensor request once the app is idle.
+        app.pump_sensor_queue();
         // Coalesce repaints: while a run is streaming, bursts of agent events
         // (a fast local model feeds a `Delta` every ~33 ms plus tool activity)
         // can arrive faster than the terminal can usefully repaint, and each
@@ -5089,18 +5231,29 @@ fn draw(app: &mut App, frame: &mut Frame) {
     } else {
         (run_jobs.len().min(MAX_JOB_ROWS) as u16) + 2
     };
+    // The sensors queue sits between the model panel and the plan; shown only
+    // when there are configured sensors or pending requests.
+    let sensors_h = if app.cfg.sensors.is_empty() && app.sensor_queue.is_empty() {
+        0
+    } else {
+        app.sensor_queue.len().clamp(1, MAX_SENSOR_ROWS) as u16 + 2
+    };
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(stats_h),
+            Constraint::Length(sensors_h),
             Constraint::Min(0),
             Constraint::Length(jobs_h),
         ])
         .split(cols[1]);
     draw_stats(app, frame, right[0]);
-    draw_plan(app, frame, right[1]);
+    if sensors_h > 0 {
+        draw_sensors(app, frame, right[1]);
+    }
+    draw_plan(app, frame, right[2]);
     if jobs_h > 0 {
-        draw_jobs(&run_jobs, frame, right[2]);
+        draw_jobs(&run_jobs, frame, right[3]);
     }
 
     // The M-x palette or the search bar replace the prompt line while open.
@@ -7048,6 +7201,72 @@ fn draw_stats(app: &App, frame: &mut Frame, area: Rect) {
     if let Some(delegate_rows) = delegate_panel_rows(&app.cfg.delegates, &app.model_colors, width) {
         frame.render_widget(Paragraph::new(delegate_rows), rows[2]);
     }
+}
+
+/// The proactive-mode sensors queue panel, drawn between the model panel and the
+/// plan: every sensor request received but not yet acted on, oldest first. The
+/// selected row is highlighted; M-x commands reorder (priority), discard or start
+/// entries.
+fn draw_sensors(app: &mut App, frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" sensors ({}) ", app.sensor_queue.len()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.sensor_queue.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "(no sensor requests)",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    let width = usize::from(inner.width).max(8);
+    let lines: Vec<Line> = app
+        .sensor_queue
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let glyph = match e.mode {
+                comrade_core::SensorMode::Auto => "AUTO",
+                comrade_core::SensorMode::Ask => "ASK ",
+            };
+            let summary = e
+                .delta
+                .added
+                .first()
+                .map(|s| format!(": {s}"))
+                .or_else(|| e.delta.removed.first().map(|s| format!(" (-{s})")))
+                .unwrap_or_default();
+            let text = truncate_preview(
+                &format!("{:>3} {} {} {}", e.id, glyph, e.name, summary),
+                width,
+            );
+            let style = if i == app.sensor_sel {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+
+    // Keep the selected row in view.
+    let view = usize::from(inner.height).max(1);
+    if app.sensor_sel < usize::from(app.sensor_scroll) {
+        app.sensor_scroll = app.sensor_sel as u16;
+    }
+    let bottom = app.sensor_sel + 1;
+    if bottom > usize::from(app.sensor_scroll) + view {
+        app.sensor_scroll = (bottom - view) as u16;
+    }
+    let max = lines.len().saturating_sub(view) as u16;
+    app.sensor_scroll = app.sensor_scroll.min(max);
+    frame.render_widget(Paragraph::new(lines).scroll((app.sensor_scroll, 0)), inner);
 }
 
 fn draw_plan(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -10318,6 +10537,42 @@ mod tests {
         build_app(
             &deps, events_tx, events_rx, run_tx, asks_tx, asks_rx, git_tx, git_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn sensor_queue_enqueues_reorders_and_discards() {
+        let mut app = test_app();
+        let d = |s: &str| crate::proactive::Delta {
+            added: vec![s.to_string()],
+            removed: Vec::new(),
+        };
+        app.enqueue_sensor("a".into(), comrade_core::SensorMode::Ask, None, d("x"));
+        app.enqueue_sensor("b".into(), comrade_core::SensorMode::Auto, None, d("y"));
+        app.enqueue_sensor("c".into(), comrade_core::SensorMode::Ask, None, d("z"));
+        assert_eq!(app.sensor_queue.len(), 3);
+        let names =
+            |a: &App| -> Vec<String> { a.sensor_queue.iter().map(|e| e.name.clone()).collect() };
+        assert_eq!(names(&app), vec!["a", "b", "c"]);
+        // Priority: move the last entry up one slot.
+        app.sensor_sel = 2;
+        app.sensor_reorder(-1);
+        assert_eq!(names(&app), vec!["a", "c", "b"]);
+        assert_eq!(app.sensor_sel, 1);
+        // Discard the selected entry without acting on it.
+        app.sensor_sel = 0;
+        app.sensor_discard();
+        assert_eq!(names(&app), vec!["c", "b"]);
+        // Selection and reorder stay within bounds.
+        app.sensor_move(-9);
+        assert_eq!(app.sensor_sel, 0);
+        app.sensor_reorder(-1);
+        assert_eq!(names(&app), vec!["c", "b"]);
+        app.sensor_move(9);
+        assert_eq!(app.sensor_sel, 1);
+        app.sensor_discard();
+        app.sensor_discard();
+        assert!(app.sensor_queue.is_empty());
+        assert_eq!(app.sensor_sel, 0);
     }
 
     #[tokio::test]

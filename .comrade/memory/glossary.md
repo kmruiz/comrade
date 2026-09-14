@@ -547,6 +547,20 @@ Backed by fastembed (quantized BGE-small-en-v1.5, in-process ONNX) + a flat cosi
 - `crates/comrade-tui/src/proactive.rs`
 - `README.md`
 
+## Sensor probe
+> A polled source for a proactive-mode sensor. Since ADR 0054 a `[[sensors]]` entry may poll either a shell `command` (run via `bash -c`) or a registered `tool` (a built-in, a bridged MCP tool such as `mcp_jira_…`, or a `skill_…`) with optional JSON `args`; both are wrapped behind the `Probe` trait in crates/comrade-tui/src/proactive.rs and their string result is diffed by `line_delta`.
+
+**References:**
+- `crates/comrade-tui/src/proactive.rs`
+- `crates/comrade-core/src/config.rs`
+
+## Sensors queue
+> A panel in the TUI's right column (between the model panel and the plan, drawn by draw_sensors) listing every proactive sensor request received but not yet handled, oldest/highest-priority first. The selected row is highlighted; M-x commands sensors-next/previous (selection), sensors-priority-up/down (reorder), sensors-discard (drop) and sensors-start (tackle now) manage it. `auto` entries are started automatically once the app is idle.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs`
+- `.comrade/memory/0054-tool-capable-sensors-and-a-sensors-queue-panel.md`
+
 ## session (TUI)
 > A named unit owning its own plan and chat. In the TUI the active session's live state is the App's own fields (AgentSession plan/title, ContextManager history, Vec<Msg> chat); every other opened session is an OpenSession slot holding a Box<SessionFile> snapshot. Ctrl-x C-b switches, C-s saves, C-f loads, C-k closes (kill-session) and C-w forks; the M-x names are switch-session/save-session/load-session/kill-session/fork-session.
 

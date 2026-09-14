@@ -222,26 +222,36 @@ non-zero `pre_tool` exit aborts the call; a non-zero `post_tool` exit only warns
 ### `[[sensors]]` — proactive mode
 
 Proactive mode lets Comrade watch external sources (JIRA tickets, GitHub issues,
-a queue, …) without being asked. Each `[[sensors]]` table names a shell command
-that is polled on an interval; when its output changes Comrade notifies you, and
-— depending on `mode` — either asks what to do or starts a session to handle it.
+a queue, …) without being asked. Each `[[sensors]]` table polls either a shell
+**command** or a registered **tool** (any built-in, a bridged MCP tool, or a
+skill) on an interval; when the result changes Comrade queues the request, and —
+depending on `mode` — either waits for you or handles it on its own.
 
 | Key | Default | Notes |
 |---|---|---|
 | `name` | – | Unique sensor id; also names the session Comrade opens. |
 | `command` | – | Shell command run through `bash -c`; its stdout is watched. |
+| `tool` | – | Name of a registered tool to invoke instead (a built-in, an MCP tool like `mcp_jira_…`, or a `skill_…`); its result is watched. Wins over `command` when both are set. |
+| `args` | `{}` | JSON arguments passed to `tool`. |
 | `interval_secs` | `300` | Poll period (floored at 10 seconds). |
-| `mode` | `ask` | `ask` = notify and wait for you; `auto` = handle it on its own. |
+| `mode` | `ask` | `ask` = queue and wait for you; `auto` = handle it on its own. |
 | `prompt` | – | Optional seed prompt for the session Comrade opens. |
 | `enabled` | `true` | Set `false` to keep the entry but stop polling it. |
 
 The first poll only establishes a baseline. A change is diffed line by line
 (blank lines and surrounding whitespace are ignored) and reported in the
-transcript. In `auto` mode Comrade opens a new session titled `sensor: <name>`,
-**backed by a temporary file** and seeded with the detected change, and runs it —
-the agent can hand the listening/triage work to a delegate so the main context
-is not bloated. In `ask` mode a confirmation dialog appears first and nothing is
-started unless you agree.
+transcript, then pushed onto the **sensors queue** — a panel under the model
+panel listing every request received but not yet handled, oldest (highest
+priority) first. A request is handled by opening a new session titled
+`sensor: <name>`, **backed by a temporary file** and seeded with the detected
+change, and running it — the agent can hand the triage work to a delegate so the
+main context is not bloated. In `auto` mode Comrade starts the session as soon as
+nothing else is running; in `ask` mode it waits for you.
+
+The queue is managed from the M-x palette: `sensors-next` / `sensors-previous`
+move the selection, `sensors-priority-up` / `sensors-priority-down` reorder it,
+`sensors-discard` drops a request, and `sensors-start` tackles the selected one
+now.
 
 ```toml
 [[sensors]]
@@ -250,9 +260,11 @@ command = "gh issue list --state open"
 interval_secs = 120
 mode = "ask"
 
+# Poll a JIRA MCP tool instead of a shell command.
 [[sensors]]
-name = "jira"
-command = "jira issue list --jql 'assignee = currentUser()'"
+name = "jira-sprint"
+tool = "mcp_jira_list_tickets"
+args = { sprint = "S-42", state = "open" }
 interval_secs = 300
 mode = "auto"
 prompt = "Triage these tickets and delegate the small fixes."

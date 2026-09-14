@@ -276,7 +276,16 @@ pub struct SensorCfg {
     pub name: String,
     /// Shell command polled via `bash -c`. Its stdout is what is watched for
     /// changes; a non-zero exit is reported as a sensor error, not a change.
+    /// Mutually exclusive with `tool` (`tool` wins when both are set).
     pub command: String,
+    /// Name of a registered tool to invoke instead of a shell command. Any tool
+    /// the harness knows — a built-in, a bridged MCP tool (`mcp_<server>_<tool>`,
+    /// e.g. one that lists the sprint's JIRA tickets), or a skill
+    /// (`skill_<name>`) — so a sensor can poll a real integration, not just a
+    /// shell. Its string result is what is watched for changes.
+    pub tool: Option<String>,
+    /// JSON arguments passed to `tool` when it is invoked (default `{}`).
+    pub args: serde_json::Value,
     /// How often to poll, in seconds. Clamped to a 10s floor at runtime.
     pub interval_secs: u64,
     /// `ask` (notify and wait for the human) or `auto` (handle the change on its
@@ -295,6 +304,8 @@ impl Default for SensorCfg {
         Self {
             name: String::new(),
             command: String::new(),
+            tool: None,
+            args: serde_json::Value::Object(Default::default()),
             interval_secs: 300,
             mode: SensorMode::Ask,
             prompt: None,
@@ -308,6 +319,21 @@ impl SensorCfg {
     /// tiny value) cannot hammer the command.
     pub fn effective_interval_secs(&self) -> u64 {
         self.interval_secs.max(10)
+    }
+
+    /// The tool this sensor invokes, if it is tool-based (`tool` set, blank
+    /// ignored). `None` means it is a shell-command sensor.
+    pub fn tool_name(&self) -> Option<&str> {
+        self.tool
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Whether this sensor is enabled and has something to poll (a tool, or a
+    /// non-blank command).
+    pub fn is_pollable(&self) -> bool {
+        self.enabled && (self.tool_name().is_some() || !self.command.trim().is_empty())
     }
 }
 

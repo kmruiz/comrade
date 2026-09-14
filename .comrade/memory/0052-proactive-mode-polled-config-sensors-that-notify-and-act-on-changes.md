@@ -22,3 +22,6 @@ Covers the `[[sensors]]` schema and parsing/merge, the `proactive` module (polli
 ## Impact
 New module `crates/comrade-tui/src/proactive.rs`; `Config` gains a `sensors` field; `SensorCfg`/`SensorMode` are part of comrade-core's public API; README gains a "Proactive mode (sensors)" section. A sensor's `command` runs arbitrary shell via `bash -c` on a timer, so a repo-supplied `.comrade.toml` sensor is a trust boundary like `[hooks]` — a future guard could require confirmation before honouring repo-supplied sensors. `auto` mode starts a run without asking; its autonomy is governed by the sensor's own `mode`, independent of `[security].autonomy`. Follow-ups: per-sensor "seen" state if persistence across restarts is wanted; richer structured sources (e.g. a JSON-mode diff).
 
+
+## Note
+Superseded in part by ADR 0054: a received change is no longer acted on inline. The ask-mode Confirm dialog was removed in favour of a sensors queue panel (M-x sensors-priority-up/down, sensors-discard, sensors-start), and a sensor may now poll a registered tool (MCP/skill/built-in) as well as a `bash -c` command.
