@@ -248,6 +248,11 @@ change, and running it — the agent can hand the triage work to a delegate so t
 main context is not bloated. In `auto` mode Comrade starts the session as soon as
 nothing else is running; in `ask` mode it waits for you.
 
+The session a sensor request opens is short-lived: as soon as its run finishes
+Comrade closes it and deletes its temporary backing file, so recurring proactive
+runs do not pile up in memory or on disk. Sessions you open yourself are left
+untouched.
+
 The queue is managed from the M-x palette: `sensors-next` / `sensors-previous`
 move the selection, `sensors-priority-up` / `sensors-priority-down` reorder it,
 `sensors-discard` drops a request, and `sensors-start` tackles the selected one

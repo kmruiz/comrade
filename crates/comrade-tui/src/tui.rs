@@ -1017,6 +1017,9 @@ struct OpenSession {
     file: Option<std::path::PathBuf>,
     /// Parked live state of a non-active session (None for the active slot).
     live: Option<Box<LiveState>>,
+    /// True when a proactive sensor opened this session; it is auto-dropped
+    /// once its run finishes so sensor handling does not pile up in memory.
+    sensor: bool,
 }
 
 /// The per-session half of the App's state: everything that belongs to one
@@ -2315,6 +2318,7 @@ impl App {
             title: "New session".to_string(),
             file: None,
             live: None,
+            sensor: false,
         });
         self.active = self.open_sessions.len() - 1;
         self.ctrl_x = false;
@@ -2481,6 +2485,7 @@ impl App {
         let title = format!("sensor: {name}");
         if let Some(slot) = self.open_sessions.get_mut(self.active) {
             slot.title = title.clone();
+            slot.sensor = true;
         }
         self.session.set_title(&title);
         let path = std::env::temp_dir().join(format!(
@@ -2512,15 +2517,52 @@ impl App {
             return;
         }
         let killed = self.open_sessions[self.active].title.clone();
-        self.open_sessions.remove(self.active);
-        let idx = self.active.min(self.open_sessions.len() - 1);
-        self.active = idx;
-        if let Some(incoming) = self.open_sessions[idx].live.take() {
-            // Swapping the neighbour in drops the killed session's live state.
-            let _killed = self.swap_live(*incoming);
-            self.chat_rows_cache = None;
-        }
+        self.close_session_at(self.active);
         self.push_meta(format!("closed session \"{killed}\""));
+    }
+
+    /// Remove the session at `idx` from `open_sessions`. When it is the active
+    /// session, the neighbour is activated (its parked live state swapped in), so
+    /// the App always shows a session. No-op for the only session or a bad index.
+    /// The session's backing file is left alone (callers delete their own temp file).
+    fn close_session_at(&mut self, idx: usize) {
+        if self.open_sessions.len() <= 1 || idx >= self.open_sessions.len() {
+            return;
+        }
+        if idx == self.active {
+            self.open_sessions.remove(idx);
+            let next = idx.min(self.open_sessions.len() - 1);
+            self.active = next;
+            if let Some(incoming) = self.open_sessions[next].live.take() {
+                // Swapping the neighbour in drops the closed session's live state.
+                let _closed = self.swap_live(*incoming);
+                self.chat_rows_cache = None;
+            }
+        } else {
+            self.open_sessions.remove(idx);
+            if idx < self.active {
+                self.active -= 1;
+            }
+        }
+    }
+
+    /// Drop a sensor-opened session once its run finishes: remove it from the
+    /// open-session registry (freeing its chat, history and metrics) and delete
+    /// its temporary backing file, so recurring proactive runs do not accumulate
+    /// in memory or on disk. Normal/human sessions are untouched.
+    fn close_finished_sensor_session(&mut self, id: u64) {
+        let Some(idx) = self.session_index(id) else {
+            return;
+        };
+        if !self.open_sessions[idx].sensor || self.open_sessions.len() <= 1 {
+            return;
+        }
+        let title = self.open_sessions[idx].title.clone();
+        if let Some(path) = self.open_sessions[idx].file.clone() {
+            let _ = std::fs::remove_file(&path);
+        }
+        self.close_session_at(idx);
+        self.push_meta(format!("dropped finished sensor session \"{title}\""));
     }
 
     /// Snapshot the active session's observable state into a serializable form.
@@ -2780,8 +2822,12 @@ impl App {
     /// the event to it, and swap it back, so its chat/metrics/plan keep updating
     /// while it runs in the background.
     fn on_agent_event_for(&mut self, id: u64, event: AgentEvent) {
+        let finished = matches!(&event, AgentEvent::RunEnd);
         if id == self.active_id() {
             self.on_agent_event(event);
+            if finished {
+                self.close_finished_sensor_session(id);
+            }
             return;
         }
         let Some(idx) = self.session_index(id) else {
@@ -2803,6 +2849,9 @@ impl App {
             .session
             .title();
         self.handling_bg = None;
+        if finished {
+            self.close_finished_sensor_session(id);
+        }
     }
 
     /// Refresh the ACTIVE slot's (or, while a background event is handled, that
@@ -2861,6 +2910,7 @@ impl App {
                     title: title.clone(),
                     file: Some(path.clone()),
                     live: None,
+                    sensor: false,
                 });
                 self.active = self.open_sessions.len() - 1;
                 self.chat_rows_cache = None;
@@ -2895,6 +2945,7 @@ impl App {
             title: title.clone(),
             file: None,
             live: None,
+            sensor: false,
         });
         self.active = self.open_sessions.len() - 1;
         self.chat_rows_cache = None;
@@ -3953,6 +4004,7 @@ fn build_app(
             title: "New session".to_string(),
             file: None,
             live: None,
+            sensor: false,
         }],
         active: 0,
         next_session_id: 1,
@@ -10730,6 +10782,59 @@ mod tests {
         app.sensor_discard();
         assert!(app.sensor_queue.is_empty());
         assert_eq!(app.sensor_sel, 0);
+    }
+
+    #[tokio::test]
+    async fn a_sensor_session_is_dropped_on_run_end() {
+        let mut app = test_app();
+        app.new_session();
+        let id = app.active_id();
+        let path = std::env::temp_dir().join(format!("comrade-sensor-test-{id}.toml"));
+        std::fs::write(&path, "x").unwrap();
+        {
+            let slot = &mut app.open_sessions[app.active];
+            slot.sensor = true;
+            slot.file = Some(path.clone());
+        }
+        assert_eq!(app.open_sessions.len(), 2);
+        app.on_agent_event_for(id, comrade_core::AgentEvent::RunEnd);
+        assert!(
+            app.session_index(id).is_none(),
+            "the sensor session is dropped"
+        );
+        assert_eq!(app.open_sessions.len(), 1);
+        assert!(!path.exists(), "its temp file is deleted");
+    }
+
+    #[tokio::test]
+    async fn a_normal_session_survives_its_run_end() {
+        let mut app = test_app();
+        app.new_session();
+        let id = app.active_id();
+        app.on_agent_event_for(id, comrade_core::AgentEvent::RunEnd);
+        assert_eq!(app.open_sessions.len(), 2, "a normal session is kept");
+        assert!(app.session_index(id).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_background_sensor_session_is_dropped_on_run_end() {
+        let mut app = test_app();
+        app.new_session();
+        app.open_sessions[app.active].sensor = true; // this parked one is a sensor session
+        let sensor_id = app.active_id();
+        app.new_session(); // a fresh active session; the sensor session is now parked
+        let active_id = app.active_id();
+        app.on_agent_event_for(sensor_id, comrade_core::AgentEvent::RunEnd);
+        assert!(
+            app.session_index(sensor_id).is_none(),
+            "the parked sensor session is dropped"
+        );
+        assert_eq!(
+            app.active_id(),
+            active_id,
+            "the active session is untouched"
+        );
+        assert!(app.session_index(active_id).is_some());
     }
 
     #[tokio::test]
