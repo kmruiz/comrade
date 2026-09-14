@@ -176,7 +176,7 @@ impl Default for AgentCfg {
             max_iterations: 30,
             tool_timeout_secs: 0,
             run_timeout_secs: 0,
-            delegate_timeout_secs: 60,
+            delegate_timeout_secs: 300,
         }
     }
 }

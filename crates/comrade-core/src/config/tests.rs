@@ -475,9 +475,9 @@ fn no_repo_config_leaves_base_unchanged() {
 }
 
 #[test]
-fn delegate_timeout_defaults_to_a_minute_and_parses() {
+fn delegate_timeout_defaults_to_five_minutes_and_parses() {
     let d = Config::load(Some(&write_tmp(""))).unwrap().config;
-    assert_eq!(d.agent.delegate_timeout_secs, 60);
+    assert_eq!(d.agent.delegate_timeout_secs, 300);
     let p = write_tmp("[agent]\ndelegate_timeout_secs = 0\n");
     let c = Config::load(Some(&p)).unwrap().config;
     let _ = std::fs::remove_file(&p);
