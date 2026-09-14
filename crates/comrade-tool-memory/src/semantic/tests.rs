@@ -430,3 +430,67 @@ fn reparse_of_an_unchanged_dirty_file_reports_no_change() {
     assert!(same_docs(&s1.docs, &s2.docs));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Timing benchmark (NOT a correctness test). Run explicitly with:
+/// `cargo test -p comrade-tool-memory --release -- --ignored --nocapture bench_semantic`
+///
+/// It measures, on this repo's real memory+code index, the costs that make up a
+/// `semantic_search` call: loading the store from disk (per-process cold start),
+/// initialising the embedded model (first embed), a code-index refresh (tree
+/// walk + parse + embed), the memory index build, and steady-state query
+/// latency (embed + dot scan) repeated a few times.
+#[test]
+#[ignore = "timing benchmark; run with --ignored --nocapture"]
+fn bench_semantic() {
+    use std::time::Instant;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+    // 1. Per-process cold start: every fresh search process loads the store once.
+    let t = Instant::now();
+    let cached = load_store(&code_index_path(&root));
+    eprintln!(
+        "load code store from disk  : {:>9.2?} ({} docs)",
+        t.elapsed(),
+        cached.docs.len()
+    );
+
+    // 2. Model init: inflate assets + build the ONNX session, on the first embed.
+    let t = Instant::now();
+    let _ = FastEmbedder.embed(&["warm up the model".to_string()]).unwrap();
+    eprintln!("model init (first embed)   : {:>9.2?}", t.elapsed());
+
+    // 3. Code-index refresh: walk + parse the tree and embed only new chunks.
+    let t = Instant::now();
+    let (cstore, _) = code_refresh(&root, &cached, &FastEmbedder).unwrap();
+    eprintln!(
+        "code refresh               : {:>9.2?} ({} docs)",
+        t.elapsed(),
+        cstore.docs.len()
+    );
+
+    // 4. Memory-index build (ADRs + glossary).
+    let docs = documents(&root).unwrap();
+    let t = Instant::now();
+    let (mstore, _) = refresh(&docs, &Store::default(), &FastEmbedder).unwrap();
+    eprintln!(
+        "memory index build         : {:>9.2?} ({} docs)",
+        t.elapsed(),
+        mstore.docs.len()
+    );
+
+    // 5. Steady state: warm model, resident stores, one embed + two dot scans.
+    let query = "finding a past decision by meaning rather than keywords";
+    for i in 1..=5 {
+        let t = Instant::now();
+        let mut qvec = FastEmbedder.embed(&[query.to_string()]).unwrap().remove(0);
+        normalize(&mut qvec);
+        let code = rank(&cstore.docs, &qvec, 5, None);
+        let mem = rank(&mstore.docs, &qvec, 5, None);
+        eprintln!(
+            "warm search #{i}              : {:>9.2?} ({} code + {} mem hits)",
+            t.elapsed(),
+            code.len(),
+            mem.len()
+        );
+    }
+}
