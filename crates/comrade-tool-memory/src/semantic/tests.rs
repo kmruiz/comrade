@@ -67,7 +67,7 @@ fn refresh_reuses_unchanged_docs_and_ranks_by_meaning() {
     // embedder so the query embed does not skew the call count).
     let qemb = StubEmbedder::default();
     let q = qemb.embed(&["alpha".into()]).unwrap().remove(0);
-    let hits = rank(&again.docs, &q, 5, None);
+    let hits = rank(&again.docs, &q, 5, None, None);
     assert_eq!(hits[0].1.id, "adr:0001");
 
     // Changing one doc only re-embeds that one (not the unchanged sibling).
@@ -85,9 +85,46 @@ fn rank_filters_by_kind() {
     let emb = StubEmbedder::default();
     let (store, _) = refresh(&docs, &Store::default(), &emb).unwrap();
     let q = emb.embed(&["alpha".into()]).unwrap().remove(0);
-    let only_glossary = rank(&store.docs, &q, 5, Some("glossary"));
+    let only_glossary = rank(&store.docs, &q, 5, Some("glossary"), None);
     assert_eq!(only_glossary.len(), 1);
     assert_eq!(only_glossary[0].1.kind, "glossary");
+}
+
+#[test]
+fn path_matches_file_and_directory() {
+    let id = "code:crates/comrade-tool-memory/src/semantic/mod.rs:199:cosine";
+    assert!(path_matches(id, "crates/comrade-tool-memory"));
+    assert!(path_matches(
+        id,
+        "crates/comrade-tool-memory/src/semantic/mod.rs"
+    ));
+    assert!(path_matches(id, "mod.rs"));
+    assert!(path_matches(id, "./crates/comrade-tool-memory/"));
+    assert!(!path_matches(id, "comrade-core"));
+    assert!(!path_matches(id, "src/main.rs"));
+    // Memory documents have no file and never match a path filter.
+    assert!(!path_matches("adr:0001", "crates"));
+    assert!(!path_matches("term:ToolSpec", "crates"));
+}
+
+#[test]
+fn rank_filters_by_path() {
+    let mut a = doc("code:src/lib.rs:1:alpha_fn", "alpha thing");
+    a.kind = "code".into();
+    let mut b = doc("code:other/main.rs:2:beta_fn", "alpha thing");
+    b.kind = "code".into();
+    let docs = vec![a, b];
+    let emb = StubEmbedder::default();
+    let (store, _) = refresh(&docs, &Store::default(), &emb).unwrap();
+    let q = emb.embed(&["alpha".into()]).unwrap().remove(0);
+
+    let hits = rank(&store.docs, &q, 5, None, Some("src"));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].1.id, "code:src/lib.rs:1:alpha_fn");
+    assert_eq!(rank(&store.docs, &q, 5, None, Some("other")).len(), 1);
+    assert_eq!(rank(&store.docs, &q, 5, None, Some("src")).len(), 1);
+    // No filter returns both.
+    assert_eq!(rank(&store.docs, &q, 5, None, None).len(), 2);
 }
 
 fn scratch(tag: &str) -> PathBuf {
@@ -217,7 +254,7 @@ fn real_model_ranks_code_by_meaning() {
         .embed(&["a function that greets a person".into()])
         .unwrap()
         .remove(0);
-    let hits = rank(&store.docs, &q, 2, Some("code"));
+    let hits = rank(&store.docs, &q, 2, Some("code"), None);
     assert!(
         hits[0].1.title.contains("greet.rs:"),
         "greeting code should rank first: {:?}",
@@ -271,7 +308,7 @@ fn embedded_model_ranks_this_repos_memory() {
         .embed(&["finding a past decision by meaning rather than keywords".into()])
         .unwrap()
         .remove(0);
-    let hits = rank(&store.docs, &query, 5, None);
+    let hits = rank(&store.docs, &query, 5, None, None);
     let ids: Vec<String> = hits.iter().map(|(_, d)| d.id.clone()).collect();
     assert!(!hits.is_empty(), "no hits");
     assert!(
@@ -584,8 +621,8 @@ fn bench_semantic() {
         let t = Instant::now();
         let mut qvec = FastEmbedder.embed(&[query.to_string()]).unwrap().remove(0);
         normalize(&mut qvec);
-        let code = rank(&cstore.docs, &qvec, 5, None);
-        let mem = rank(&mstore.docs, &qvec, 5, None);
+        let code = rank(&cstore.docs, &qvec, 5, None, None);
+        let mem = rank(&mstore.docs, &qvec, 5, None, None);
         eprintln!(
             "warm search #{i}              : {:>9.2?} ({} code + {} mem hits)",
             t.elapsed(),

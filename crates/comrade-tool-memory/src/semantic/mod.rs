@@ -330,6 +330,31 @@ fn code_doc(rel: &str, line: usize, kind: &str, name: &str, text: String) -> Doc
     }
 }
 
+/// The source file a code document came from, parsed out of its
+/// `code:<rel>:<line>:<name>` id. `None` for memory documents.
+fn code_rel(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("code:")?;
+    let (rel_line, _name) = rest.rsplit_once(':')?;
+    let (rel, _line) = rel_line.rsplit_once(':')?;
+    Some(rel)
+}
+
+/// Does a code document match a `path` filter? The filter is normalised (a
+/// leading `./` and a trailing `/` are dropped) and matches when the document's
+/// file is exactly it, lives under it (`dir/...`), or ends with it (`/name.rs`),
+/// so both `crates/comrade-tool-memory` and a bare `mod.rs` work. Memory
+/// documents have no file, so they never match a path filter.
+fn path_matches(id: &str, wanted: &str) -> bool {
+    let Some(rel) = code_rel(id) else {
+        return false;
+    };
+    let wanted = wanted.trim().trim_start_matches("./").trim_end_matches('/');
+    if wanted.is_empty() {
+        return true;
+    }
+    rel == wanted || rel.starts_with(&format!("{wanted}/")) || rel.ends_with(&format!("/{wanted}"))
+}
+
 /// Rebuild `existing` against `docs`, re-embedding only new/changed documents.
 /// Returns the new store and whether it differs from `existing` (so the caller
 /// only writes the cache when something actually changed).
@@ -411,10 +436,12 @@ fn rank<'a>(
     query: &[f32],
     limit: usize,
     kind: Option<&str>,
+    path: Option<&str>,
 ) -> Vec<(f32, &'a StoredDoc)> {
     let mut scored: Vec<(f32, &StoredDoc)> = docs
         .iter()
         .filter(|d| kind.is_none_or(|k| d.kind.eq_ignore_ascii_case(k)))
+        .filter(|d| path.is_none_or(|p| path_matches(&d.id, p)))
         .map(|d| (dot(query, &d.vec), d))
         .collect();
     scored.sort_by(|a, b| {
@@ -999,13 +1026,14 @@ struct SemanticSearch;
 static SEMANTIC_SEARCH_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
         name: "semantic_search".into(),
-        description: "Search project memory (ADR decisions + glossary) AND source code by MEANING, not keywords: returns the closest hits with a similarity score. Code hits are tree-sitter symbols/line windows carrying file:line. Reach for it EARLY to locate things when you know the domain but not yet the exact symbol, file or string - it is the first choice whenever you know WHAT you want but not WHERE it lives, NOT a fallback; find_adr/ts_find_symbol/fs_rgrep only help once you already hold a name. Searches memory and code by default; pass `scope` to narrow to memory or code. Locally embedded model + vector index; no network for search; the index is rebuilt incrementally and only changed files are re-parsed.".into(),
+        description: "Search project memory (ADR decisions + glossary) AND source code by MEANING, not keywords: returns the closest hits with a similarity score. Code hits are tree-sitter symbols/line windows carrying file:line. Reach for it EARLY to locate things when you know the domain but not yet the exact symbol, file or string - it is the first choice whenever you know WHAT you want but not WHERE it lives, NOT a fallback; find_adr/ts_find_symbol/fs_rgrep only help once you already hold a name. Searches memory and code by default; pass `scope` to narrow to memory or code. Pass `path` to restrict code hits to one file or directory. Locally embedded model + vector index; no network for search; the index is rebuilt incrementally and only changed files are re-parsed.".into(),
         json_schema: json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "What you are looking for, in natural language." },
                 "scope": { "type": "string", "enum": ["memory", "code", "all"], "default": "all", "description": "Search project memory, source code, or both (default: both)." },
                 "kind": { "type": "string", "enum": ["adr", "glossary", "code"], "description": "Restrict to one hit kind (default: any in scope)." },
+                "path": { "type": "string", "description": "Restrict code hits to this file or directory (e.g. `crates/comrade-tool-memory` or `mod.rs`). Memory hits (ADR/glossary) have no file and are excluded when set." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 30, "default": 5, "description": "Max results." },
                 "rebuild": { "type": "boolean", "default": false, "description": "Force a full re-embed of the index (rarely needed; it rebuilds incrementally)." }
             },
@@ -1029,6 +1057,8 @@ impl Tool for SemanticSearch {
             scope: Option<String>,
             #[serde(default)]
             kind: Option<String>,
+            #[serde(default)]
+            path: Option<String>,
             #[serde(default = "default_limit")]
             limit: usize,
             #[serde(default)]
@@ -1048,6 +1078,7 @@ impl Tool for SemanticSearch {
         }
         let root = ctx.project_root.clone();
         let kind = args.kind.clone();
+        let path = args.path.filter(|p| !p.trim().is_empty());
         let limit = args.limit;
         let rebuild = args.rebuild;
 
@@ -1125,12 +1156,24 @@ impl Tool for SemanticSearch {
             // Rank each resident index, then merge — no vectors are cloned.
             let mut hits: Vec<Hit> = Vec::new();
             if want_memory {
-                for (score, d) in rank(&mem_guard[&root].docs, &qvec, limit, kind.as_deref()) {
+                for (score, d) in rank(
+                    &mem_guard[&root].docs,
+                    &qvec,
+                    limit,
+                    kind.as_deref(),
+                    path.as_deref(),
+                ) {
                     hits.push(Hit::of(score, d));
                 }
             }
             if want_code {
-                for (score, d) in rank(&code_guard[&root].docs, &qvec, limit, kind.as_deref()) {
+                for (score, d) in rank(
+                    &code_guard[&root].docs,
+                    &qvec,
+                    limit,
+                    kind.as_deref(),
+                    path.as_deref(),
+                ) {
                     hits.push(Hit::of(score, d));
                 }
             }
@@ -1142,7 +1185,10 @@ impl Tool for SemanticSearch {
             });
             hits.truncate(limit.max(1));
             if hits.is_empty() {
-                return Ok(format!("No results for {query:?} in scope {scope}."));
+                return Ok(match &path {
+                    Some(p) => format!("No results for {query:?} in scope {scope} under {p:?}."),
+                    None => format!("No results for {query:?} in scope {scope}."),
+                });
             }
             let has_code = hits.iter().any(|h| h.kind == "code");
             let has_memory = hits.iter().any(|h| h.kind != "code");
