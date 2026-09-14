@@ -527,13 +527,40 @@ pub fn stale(root: &Path) -> Result<Vec<(EntryMeta, Vec<String>)>> {
         };
         let missing: Vec<String> = extract_paths(&text)
             .into_iter()
-            .filter(|p| !root.join(p).exists() && !root.join(p.trim_start_matches("./")).exists())
+            .filter(|p| match repo_path(p) {
+                // Home-relative (`~/`, `$HOME/`) or absolute (`/`) refs cannot live
+                // under the project root, so they are never reported as stale.
+                None => false,
+                Some(rel) => {
+                    !root.join(rel).exists() && !root.join(rel.trim_start_matches("./")).exists()
+                }
+            })
             .collect();
         if !missing.is_empty() {
             out.push((meta, missing));
         }
     }
     Ok(out)
+}
+
+/// The repo-relative path to existence-check for an extracted reference, or
+/// `None` when the reference is not repo-relative. A trailing `:line` or
+/// `:line:col` location suffix (e.g. `crates/foo/src/lib.rs:251`) is stripped,
+/// so a line-pinned reference is checked against the file itself.
+fn repo_path(p: &str) -> Option<&str> {
+    if p.starts_with('~') || p.starts_with('$') || p.starts_with('/') {
+        return None;
+    }
+    let mut rel = p;
+    for _ in 0..2 {
+        match rel.rsplit_once(':') {
+            Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
+                rel = head;
+            }
+            _ => break,
+        }
+    }
+    Some(rel)
 }
 
 #[cfg(test)]
@@ -798,6 +825,40 @@ mod tests {
                 .1
                 .contains(&"crates/nope/missing.rs".to_string())
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_ignores_location_suffixes_and_non_repo_refs() {
+        let root = scratch();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/keep.rs"), "fn x() {}\n").unwrap();
+        write(
+            &root,
+            draft(
+                "Doc",
+                "s",
+                Some("ok `sub/keep.rs:12`, home `~/cache/x`, abs `/etc/hosts`, env `$HOME/y`"),
+                None,
+                vec![],
+            ),
+        )
+        .unwrap();
+        // A `:line` ref to an existing file is not stale, and neither are the
+        // home-relative or absolute refs (they cannot live under the root).
+        let stale_list = stale(&root).unwrap();
+        assert!(stale_list.is_empty(), "{stale_list:?}");
+
+        // Stripping the suffix must not hide drift: the file itself is gone.
+        let id = write(
+            &root,
+            draft("Doc2", "s", Some("gone `sub/gone.rs:12`"), None, vec![]),
+        )
+        .unwrap();
+        let stale_list = stale(&root).unwrap();
+        assert_eq!(stale_list.len(), 1, "{stale_list:?}");
+        assert_eq!(stale_list[0].0.id, id);
+        assert!(stale_list[0].1.contains(&"sub/gone.rs:12".to_string()));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

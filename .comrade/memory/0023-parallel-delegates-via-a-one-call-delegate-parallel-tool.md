@@ -45,7 +45,7 @@ Serialize writes with a mutex/keyed lock — rejected: does not stop two jobs ed
 delegate_parallel job isolation only.
 
 ## Impact
-Parallel delegates can safely edit overlapping files when isolated. New schema field `isolate` on delegate_parallel jobs. Worktrees live under `.comrade/worktrees/` (should be git-ignored). Follow-up: an explicit merge/apply step and cleaning stale worktrees.
+Parallel delegates can safely edit overlapping files when isolated. New schema field `isolate` on delegate_parallel jobs. Worktrees live under `.comrade/worktrees/<id>/` (should be git-ignored). Follow-up: an explicit merge/apply step and cleaning stale worktrees.
 
 ## Note
 Rollup of parallel delegation: this ADR adds delegate_parallel (up to 8 concurrent jobs); #0038 adds isolate=true so jobs run in detached git worktrees. Body preserved under "Merged from".

@@ -37,7 +37,7 @@ Loaded by crates/comrade-core/src/instructions.rs (load_project_instructions) an
 **References:**
 - `crates/comrade-core/src/config.rs`
 - `crates/comrade-core/src/delegate.rs (enforce_approval, cfg_line)`
-- `crates/comrade-core/src/advise.rs`
+- `crates/comrade-core/src/advise/mod.rs`
 - `.comrade/memory/0003-per-delegate-approval-policy-for-delegateask-advise.md`
 
 **Notes:**
@@ -47,7 +47,7 @@ Reuses the Autonomy enum (ask/auto/deny). Delegates with ask/deny are annotated 
 > Consultations normally need no approval, but the chosen delegate's `approval` policy applies (see "approval ([[delegates]])"): `ask` pauses for human approval before the advice runs, `deny` refuses outright.
 
 **References:**
-- `crates/comrade-core/src/advise.rs`
+- `crates/comrade-core/src/advise/mod.rs`
 - `.comrade/memory/0003-per-delegate-approval-policy-for-delegateask-advise.md`
 
 **Notes:**
@@ -75,7 +75,7 @@ Enabled by the UserPrompt::Form(FormSpec) / UserReply::Form(BTreeMap<String,Stri
 The dialog wraps its body to the popup's real inner width (popup = min(area.width-2, 100) wide, minus 2 border cols), sizes its height to body.len() + 4 (2 borders + input row + hint row) clamped to the terminal, and anchors the body to the TOP so the action/question is never scrolled out of view. Forms edit inline in the body (up/down field, left/right adjust, space toggle, enter submit); a confirm uses y/n, `?` asks the model about the action, esc cancels.
 
 ## background job (BgHub)
-> The background-process tools `run_bg`/`bg_status`/`bg_tail`/`bg_kill` (comrade-tool-project `src/bg.rs`): they start a detached `bash -c` job and poll/kill it. One `BgHub` (jobs map + id counter) per `all()` call is shared by the four tools.
+> The background-process tools `run_bg`/`bg_status`/`bg_tail`/`bg_kill` (`crates/comrade-tool-project/src/bg.rs`): they start a detached `bash -c` job and poll/kill it. One `BgHub` (jobs map + id counter) per `all()` call is shared by the four tools.
 
 **References:**
 - `crates/comrade-tool-project/src/bg.rs`
@@ -119,7 +119,7 @@ Branch protection on `main` (kmruiz/comrade) requires the status-check context "
 
 **References:**
 - `crates/comrade-tool-syntax/src/chunks.rs`
-- `crates/comrade-tool-memory/src/semantic.rs`
+- `crates/comrade-tool-memory/src/semantic/mod.rs`
 
 ## CommandLine (Program/Shell)
 > `tasks::CommandLine` in crates/comrade-tool-project/src/tasks.rs: how a resolved task runs. `Program { program, args }` (e.g. cargo, npm, mvn) or `Shell { script }` (run with bash -c). Generalized from the old cargo-only variant so a non-Cargo Ecosystem emits its own tool.
@@ -197,7 +197,7 @@ Each job's approval policy is enforced before any run starts; it never touches t
 > A repository may host several build systems (a Cargo.toml AND a package.json). ecosystem::detect_all(root) returns every present backend in priority order (Cargo, then npm); ecosystem::pick(root, ecosystem, verb) selects one: an explicit `ecosystem` name, else the sole backend, else the single backend whose `supports(root, verb)` is true, else an error asking for an explicit choice. `detect` (single) prefers Cargo. pom_model renders ALL detected ecosystems; pom_run_task/pom_run_tests/pom_check/pom_format_code take an `ecosystem` arg.
 
 **References:**
-- `crates/comrade-tool-project/src/ecosystem.rs`
+- `crates/comrade-tool-project/src/ecosystem/mod.rs`
 - `crates/comrade-tool-project/src/node.rs`
 
 ## diff_choice
@@ -218,10 +218,10 @@ Defined via a `FieldKind::DiffChoice { options: Vec<DiffOption> }` variant; seed
 - `.comrade/memory/0037-tool-dispatch-prepost-hooks-per-tool-timeout-per-run-budget.md`
 
 ## Ecosystem (pom_*)
-> The trait (crates/comrade-tool-project/src/ecosystem.rs) backing the `pom_*` tools. A backend knows its manifest, the project model, how to map a logical verb to a command, the check command, and how to parse diagnostics/test output. `detect(root)` returns `Box<dyn Ecosystem>` (Cargo today, keyed on `Cargo.toml`).
+> The trait (crates/comrade-tool-project/src/ecosystem/mod.rs) backing the `pom_*` tools. A backend knows its manifest, the project model, how to map a logical verb to a command, the check command, and how to parse diagnostics/test output. `detect(root)` returns `Box<dyn Ecosystem>` (Cargo today, keyed on `Cargo.toml`).
 
 **References:**
-- `crates/comrade-tool-project/src/ecosystem.rs`
+- `crates/comrade-tool-project/src/ecosystem/mod.rs`
 - `crates/comrade-tool-project/src/lib.rs`
 - `.comrade/memory/0030-multi-language-tree-sitter-support-and-multi-ecosystem-polyglot-pom-detection.md`
 
@@ -292,7 +292,7 @@ Defaults let a minimal backend implement only model/resolve/format_command: `che
 Redesigned to be compact: previously 3 inner rows (name / gauge / usage) plus a wasted blank row; the '(api)' suffix was dropped (api is the default; only 'est' is shown).
 
 ## module tree convention
-> The convention for keeping Comrade's source files small: any file over 1000 lines is turned into a module tree. Either `foo/mod.rs` (module docs + shared `use` block + type definitions + `mod bar; pub use bar::*;`) or the modern `foo.rs` + `foo/bar.rs` layout (Rust 2018 resolves `mod bar;` in `foo.rs` to `foo/bar.rs`, so no file has to be deleted). Each moved submodule starts with `use super::*;`. Items reached through a parent re-export must be `pub(crate)` or more visible. Test modules move to their own file and are declared `#[cfg(test)] mod tests;`.
+> The convention for keeping Comrade's source files small: any file over 1000 lines is turned into a module tree. Either `<name>/mod.rs` (module docs + shared `use` block + type definitions + `mod sub; pub use sub::*;`) or the modern `<name>.rs` + `<name>/<sub>.rs` layout (Rust 2018 resolves `mod sub;` in `<name>.rs` to `<name>/<sub>.rs`, so no file has to be deleted). Each moved submodule starts with `use super::*;`. Items reached through a parent re-export must be `pub(crate)` or more visible. Test modules move to their own file and are declared `#[cfg(test)] mod tests;`.
 
 **References:**
 - `crates/comrade-core/src/advise/mod.rs`
@@ -310,7 +310,7 @@ Private items cannot be re-exported, so a moved item used by a sibling submodule
 
 **References:**
 - `crates/comrade-tool-project/src/node.rs`
-- `crates/comrade-tool-project/src/ecosystem.rs`
+- `crates/comrade-tool-project/src/ecosystem/mod.rs`
 
 ## path completion (session prompt)
 > Emacs find-file style Tab completion in the Ctrl-x C-s / Ctrl-x C-f session path minibuffer (crates/comrade-tui/src/tui.rs). KeyCode::Tab in handle_path_prompt_key runs complete_path(input, base = app root): it splits the typed path at the last `/` (split_dir_prefix) into a verbatim directory part and a partial name, reads the resulting directory (read_dir_entries; dirs carry a trailing `/`), and extends the name via complete_names — one match completes fully, several extend to their longest common prefix (longest_common_prefix, built on common_prefix from the M-x palette). `~` expands (expand_tilde); a path with no directory part is completed relative to the project root. Matches live in PathPrompt.matches and are drawn by draw_path_matches (a popup like draw_mx_list); cleared on the next edit.
@@ -369,7 +369,7 @@ Mistral (https://api.mistral.ai/v1) is fully OpenAI-compatible: Bearer auth, /ch
 > ask_advise step=<id> — readiness-check mode of the ask_advise tool: consults the step's OWN delegate (read-only) about whether the step's context suffices to pick it up. Delegate closes with `VERDICT: READY` (step -> PlanStatus::Ready) or `VERDICT: NEEDS_MORE: <requests>` (step stays pending, note "awaiting context: ..."). Fire one call per delegate step in parallel after self_set_plan.
 
 **References:**
-- `crates/comrade-core/src/advise.rs (AskAdviseTool::invoke)`
+- `crates/comrade-core/src/advise/mod.rs (AskAdviseTool::invoke)`
 - `crates/comrade-core/prompts/advise-system.md`
 - `crates/comrade-core/src/delegate.rs (DENIED_FOR_DELEGATES)`
 
@@ -381,7 +381,7 @@ Mutually exclusive with model/question/context args. The delegate tool descripti
 
 **References:**
 - `crates/comrade-tool/src/plan.rs (PlanStatus enum)`
-- `crates/comrade-core/src/advise.rs (readiness_verdict, step-mode invoke)`
+- `crates/comrade-core/src/advise/mod.rs (readiness_verdict, step-mode invoke)`
 - `crates/comrade-tool-session/src/lib.rs (self_set_step_context tool)`
 - `crates/comrade-tui/src/tui.rs (plan_glyph)`
 
@@ -474,7 +474,7 @@ Added by ADR #36. deny wins over allow: any command containing a deny string is 
 > Memory tool (comrade-tool-memory, `semantic_search`) that finds ADRs/glossary terms by MEANING using a locally run embedding model, complementing the keyword tools find_adr/find_glossary.
 
 **References:**
-- `crates/comrade-tool-memory/src/semantic.rs`
+- `crates/comrade-tool-memory/src/semantic/mod.rs`
 - `.comrade/memory/0022-semantic-memory-search-fastembed-model-persisted-flat-cosine-index.md`
 
 **Notes:**
@@ -498,7 +498,7 @@ SessionFile is the on-disk JSON form (version/title/status/plan/delegated/finish
 - `crates/comrade-tui/src/tui.rs`
 
 ## skill
-> A Claude-format skill: a directory `<name>/SKILL.md` with optional YAML frontmatter (`name`, `description`) and a markdown body of instructions (possibly referencing bundled files beside it). Comrade discovers skills under `.comrade/skills` (its default), `.claude/skills` (project) and `~/.comrade/skills` + `~/.claude/skills` (personal), project dirs winning on a name clash. Each skill is exposed to the model as a tool named `skill_<name>` whose description is the skill's one-line blurb; invoking it returns the SKILL.md body (progressive disclosure).
+> A Claude-format skill: a directory `<name>/SKILL.md` with optional YAML frontmatter (`name`, `description`) and a markdown body of instructions (possibly referencing bundled files beside it). Comrade discovers skills under `.comrade/skills/<name>/SKILL.md` (its default), `.claude/skills/<name>/SKILL.md` (project) and `~/.comrade/skills/<name>/SKILL.md` + `~/.claude/skills/<name>/SKILL.md` (personal), project dirs winning on a name clash. Each skill is exposed to the model as a tool named `skill_<name>` whose description is the skill's one-line blurb; invoking it returns the SKILL.md body (progressive disclosure).
 
 **References:**
 - `crates/comrade-tool-skill/src/lib.rs`
@@ -506,6 +506,12 @@ SessionFile is the on-disk JSON form (version/title/status/plan/delegated/finish
 
 **Notes:**
 Frontmatter is parsed by hand (no YAML crate in the workspace). Discovery/parse live in crates/comrade-tool-skill (parse_skill_md, discover_in, discover, all); the TUI registers the tools in main.rs build_tools/delegate_registry/advise_registry, which now take the project root.
+
+## stale reference check
+> How `stale_memory` decides a reference is missing (crates/comrade-tool-memory/src/store.rs): it extracts BACKTICK-QUOTED spans (`extract_paths`) that look like paths (contain `/` or end in a source/doc extension, and have no spaces/globs/placeholders), then reports those that don't exist under the project root. It ignores a token that starts with `~`, `$` or `/` (home-relative/absolute — not repo paths) and strips a trailing `:line` or `:line:col` suffix (`repo_path`), so `crates/…/lib.rs:251` is checked as `crates/…/lib.rs`. So the memory convention is: a real file reference is written as a backticked repo-relative path; prose mentions, placeholders (`<name>.rs`) and locations outside the repo are not checked.
+
+**References:**
+- `crates/comrade-tool-memory/src/store.rs`
 
 ## summarise
 > A tech-lead-only tool (crates/comrade-core/src/summarise.rs, `SummariseTool`) that runs ONE command whose output is expected to be large/noisy and returns a DELEGATE-WRITTEN summary of that output instead of the raw text. Takes EITHER `command` (raw shell, run behind the same policy + approval gate as `shell`: comrade_tool::check_command + ctx.confirm) OR `task` (a project task verb/alias resolved via `comrade_tool::TaskRunner`, optionally scoped with `subproject`/`ecosystem`, run WITHOUT approval like pom_run_task) - the two are mutually exclusive. Full output (uncapped) is saved to `<root>/.comrade/artifacts/<secs>-<slug>.txt` (gitignored) and its path returned, then a [[delegates]] model summarises it (one LlmClient::chat). The delegate is chosen by `model`, else auto-picked (best-fit blurb); an `approval = \"deny\"` delegate is refused. Denied for delegates.
