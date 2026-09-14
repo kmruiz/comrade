@@ -174,6 +174,7 @@ fn build_tools(
             max_iterations: cfg.agent.max_iterations,
             budget_tokens: cfg.context.budget_tokens,
             max_tool_output_chars: cfg.context.max_tool_output_chars,
+            timeout: std::time::Duration::from_secs(cfg.agent.delegate_timeout_secs),
         },
     )? {
         reg.register(Box::new(delegate));
@@ -187,6 +188,7 @@ fn build_tools(
             max_iterations: cfg.agent.max_iterations,
             budget_tokens: cfg.context.budget_tokens,
             max_tool_output_chars: cfg.context.max_tool_output_chars,
+            timeout: std::time::Duration::from_secs(cfg.agent.delegate_timeout_secs),
         },
     )? {
         reg.register(Box::new(parallel));
@@ -201,6 +203,7 @@ fn build_tools(
             max_iterations: cfg.agent.max_iterations,
             budget_tokens: cfg.context.budget_tokens,
             max_tool_output_chars: cfg.context.max_tool_output_chars,
+            timeout: std::time::Duration::from_secs(cfg.agent.delegate_timeout_secs),
         },
     )? {
         reg.register(Box::new(advise));

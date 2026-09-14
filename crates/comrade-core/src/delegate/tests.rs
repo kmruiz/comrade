@@ -1330,6 +1330,143 @@ fn delegate_read_guard_resets_after_an_action() {
     assert_eq!(reads, 1);
 }
 
+/// `timeout_answer` returns a notice with the partial answer when the delegate
+/// had produced text, and a plain "did not finish" notice when it had none.
+#[test]
+fn timeout_answer_reports_a_partial_or_missing_result() {
+    let d = std::time::Duration::from_secs(60);
+    let partial = timeout_answer("cheap", d, "I found the bug in fs.rs");
+    assert!(partial.contains("60s"), "{partial}");
+    assert!(partial.contains("I found the bug in fs.rs"), "{partial}");
+
+    let none = timeout_answer("cheap", d, "   ");
+    assert!(none.contains("without a final answer"), "{none}");
+    assert!(none.contains("unavailable"), "{none}");
+}
+
+/// A delegate whose model never answers must still return within its wall-clock
+/// budget (a slow or hung model request used to hold the parent run open
+/// indefinitely), replying with a notice instead of blocking forever.
+#[tokio::test]
+async fn a_delegate_that_never_answers_times_out_within_its_budget() {
+    // The server reads the request and then holds the connection open without
+    // ever replying: the delegate's single model request would hang.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let mut used = 0usize;
+        loop {
+            let n = stream.read(&mut buf[used..]).unwrap();
+            if n == 0 {
+                break;
+            }
+            used += n;
+            if buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    });
+    let base = format!("http://127.0.0.1:{port}/v1");
+    let mut d = delegate("slow", &base);
+    // The client timeout must not be what saves us: make it far larger than the
+    // delegate budget we are testing.
+    d.llm.timeout_secs = 30;
+    let cfg = Config {
+        delegates: vec![d],
+        ..Config::default()
+    };
+    let limits = DelegateLimits {
+        timeout: std::time::Duration::from_millis(150),
+        ..DelegateLimits::default()
+    };
+    let tool = DelegateTool::new(&cfg.delegates, ToolRegistry::new(), limits)
+        .unwrap()
+        .unwrap();
+    let ctx = test_ctx();
+
+    let started = std::time::Instant::now();
+    let out = tool
+        .invoke(&ctx, json!({"model": "slow", "task": "do the thing"}))
+        .await
+        .expect("a timed-out delegate returns a notice, not an error");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the delegate must be cut off, took {elapsed:?}"
+    );
+    assert!(out.contains("time budget"), "{out}");
+}
+
+/// The same budget applies to a tool call that hangs: a delegate that reads from
+/// a tool which never returns is stopped at its deadline, not left hanging.
+#[tokio::test]
+async fn a_delegate_stuck_in_a_hanging_tool_times_out() {
+    /// A tool whose `invoke` never resolves.
+    struct HangingTool;
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn spec(&self) -> &ToolSpec {
+            &HANGING_SPEC
+        }
+        async fn invoke(&self, _ctx: &ToolContext, _args: Value) -> Result<String> {
+            std::future::pending::<Result<String>>().await
+        }
+    }
+    static HANGING_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| ToolSpec {
+        name: "fs_read_file".into(),
+        description: "hangs forever".into(),
+        json_schema: json!({"type": "object"}),
+    });
+
+    // The model asks for the hanging read, then (after it is cut off) is never
+    // reached again because the delegate's budget expires during the call.
+    let turn = json!({
+        "choices": [{
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_0",
+                    "function": { "name": "fs_read_file", "arguments": "{}" }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let base = scripted_server(vec![turn]);
+    let mut d = delegate("reader", &base);
+    d.llm.protocol = Protocol::Native;
+    d.llm.timeout_secs = 30;
+    let cfg = Config {
+        delegates: vec![d],
+        ..Config::default()
+    };
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(HangingTool));
+    let limits = DelegateLimits {
+        timeout: std::time::Duration::from_millis(150),
+        ..DelegateLimits::default()
+    };
+    let tool = DelegateTool::new(&cfg.delegates, registry, limits)
+        .unwrap()
+        .unwrap();
+    let ctx = test_ctx();
+
+    let started = std::time::Instant::now();
+    let out = tool
+        .invoke(&ctx, json!({"model": "reader", "task": "read the file"}))
+        .await
+        .expect("a timed-out delegate returns a notice");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "a hanging tool must be cut off, took {elapsed:?}"
+    );
+    assert!(out.contains("time budget"), "{out}");
+}
+
 /// A native-mode delegate that does nothing but read different files for 21
 /// consecutive turns has its 21st read refused: the tool is only ever
 /// reached 20 times, and the run still ends with a normal final answer.

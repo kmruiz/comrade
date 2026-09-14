@@ -163,6 +163,11 @@ pub struct AgentCfg {
     /// Stop a whole agent run after this many seconds of wall-clock time
     /// (0 = no limit). Checked at each rest point, so the run ends gracefully.
     pub run_timeout_secs: u64,
+    /// Wall-clock budget for one delegated sub-agent run, in seconds. A delegate
+    /// that has not produced a final answer within it is stopped and replies
+    /// with whatever it had gathered, so a slow or stuck delegate cannot hold the
+    /// parent run open forever. `0` disables the limit.
+    pub delegate_timeout_secs: u64,
 }
 
 impl Default for AgentCfg {
@@ -171,6 +176,7 @@ impl Default for AgentCfg {
             max_iterations: 30,
             tool_timeout_secs: 0,
             run_timeout_secs: 0,
+            delegate_timeout_secs: 60,
         }
     }
 }

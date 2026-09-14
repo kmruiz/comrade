@@ -27,6 +27,8 @@
 //!   `approval = "ask"` pauses for human approval before it runs, and one set
 //!   to `approval = "deny"` is refused outright (see [`enforce_approval`]).
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use comrade_tool::{PlanStatus, PlanTarget, Tool, ToolContext, ToolRegistry, ToolSpec};
@@ -93,6 +95,11 @@ pub struct DelegateLimits {
     pub max_iterations: usize,
     pub budget_tokens: usize,
     pub max_tool_output_chars: usize,
+    /// Wall-clock budget for the whole delegated run. Every model request and
+    /// tool call is bounded by what is left of it; when it runs out the delegate
+    /// is stopped and returns whatever it had gathered, so a slow or stuck
+    /// delegate cannot hang the parent. [`Duration::ZERO`] disables the limit.
+    pub timeout: Duration,
 }
 
 impl Default for DelegateLimits {
@@ -101,6 +108,7 @@ impl Default for DelegateLimits {
             max_iterations: 30,
             budget_tokens: 6000,
             max_tool_output_chars: 5000,
+            timeout: Duration::from_secs(60),
         }
     }
 }
@@ -719,6 +727,19 @@ pub(crate) async fn run_delegate_subagent(
     // Read guard: consecutive read-only calls since the last state change; the
     // delegate is nudged to implement once it has read too long without acting.
     let mut consecutive_reads = 0usize;
+    // Wall-clock budget for the whole run (see [`DelegateLimits::timeout`]): every
+    // model request and tool call is bounded by what is left, so a single slow or
+    // hung request (or a long chain of turns) cannot hold the parent run open
+    // forever. On expiry the delegate answers with whatever it has.
+    let deadline = if limits.timeout.is_zero() {
+        None
+    } else {
+        Some(Instant::now() + limits.timeout)
+    };
+    let budget_left = || deadline.map(|d| d.saturating_duration_since(Instant::now()));
+    // The most recent non-empty assistant text, returned as a best-effort answer
+    // if the budget runs out before the delegate produces a final answer.
+    let mut last_text = String::new();
     // The run's cancel token, set by the main agent loop (agent.rs). When the
     // human interrupts the parent, a delegate stuck waiting on its model
     // request must abort instead of holding the whole run at "working".
@@ -742,21 +763,31 @@ pub(crate) async fn run_delegate_subagent(
             None
         };
 
-        let turn = match &stop {
-            Some(stop) => {
-                tokio::select! {
-                    r = client.chat_turn_once(ctxm.messages(), specs.as_deref()) => r,
-                    _ = stop.cancelled() => {
-                        bail!("delegate interrupted: the run was cancelled while waiting for the model")
+        // Every model request is bounded by what is left of the budget.
+        let model_call = async {
+            match &stop {
+                Some(stop) => {
+                    tokio::select! {
+                        r = client.chat_turn_once(ctxm.messages(), specs.as_deref()) => r,
+                        _ = stop.cancelled() => {
+                            bail!("delegate interrupted: the run was cancelled while waiting for the model")
+                        }
                     }
                 }
+                None => {
+                    client
+                        .chat_turn_once(ctxm.messages(), specs.as_deref())
+                        .await
+                }
             }
-            None => {
-                client
-                    .chat_turn_once(ctxm.messages(), specs.as_deref())
-                    .await
-            }
-        }?;
+        };
+        let Some(res) = invoke_within(budget_left(), model_call).await else {
+            return Ok(timeout_answer(author, limits.timeout, &last_text));
+        };
+        let turn = res?;
+        if !turn.content.trim().is_empty() {
+            last_text = turn.content.clone();
+        }
 
         // Native tool calls: dispatch all of them like the main loop does.
         if !turn.tool_calls.is_empty() {
@@ -791,7 +822,14 @@ pub(crate) async fn run_delegate_subagent(
                 let output = match tools.get(&tc.name) {
                     Some(tool) => {
                         dctx.events.tool_call(author, &tc.name, &args_pretty).await;
-                        let r = match tool.invoke(&dctx, args).await {
+                        // Bound the tool call by the remaining budget too, so a
+                        // hanging tool cannot outlive the delegate's deadline.
+                        let Some(ran) =
+                            invoke_within(budget_left(), tool.invoke(&dctx, args)).await
+                        else {
+                            return Ok(timeout_answer(author, limits.timeout, &last_text));
+                        };
+                        let r = match ran {
                             Ok(out) => (out, true),
                             Err(e) => (format!("ERROR: {e:#}"), false),
                         };
@@ -865,7 +903,11 @@ pub(crate) async fn run_delegate_subagent(
         dctx.events
             .tool_call(author, &tool_call.name, &args_pretty)
             .await;
-        let (output, ok) = match tool.invoke(&dctx, tool_call.args).await {
+        let Some(ran) = invoke_within(budget_left(), tool.invoke(&dctx, tool_call.args)).await
+        else {
+            return Ok(timeout_answer(author, limits.timeout, &last_text));
+        };
+        let (output, ok) = match ran {
             Ok(out) => (out, true),
             Err(e) => (format!("ERROR: {e:#}"), false),
         };
@@ -885,6 +927,40 @@ pub(crate) async fn run_delegate_subagent(
         "delegate reached max_iterations ({}) without a final answer",
         limits.max_iterations
     );
+}
+
+/// Run a future under an optional remaining budget: `Some(left)` bounds it and
+/// yields `None` if it does not finish in time, `None` runs it unbounded. Gives
+/// every model request and tool call inside a delegate its slice of the
+/// delegate's wall-clock budget (see [`DelegateLimits::timeout`]).
+async fn invoke_within<F: std::future::Future>(
+    left: Option<Duration>,
+    fut: F,
+) -> Option<F::Output> {
+    match left {
+        Some(left) => tokio::time::timeout(left, fut).await.ok(),
+        None => Some(fut.await),
+    }
+}
+
+/// The best-effort reply a delegate returns when it runs out of its wall-clock
+/// budget: whatever partial answer it had, or a clear notice that it did not
+/// finish, so the parent can carry on instead of waiting forever.
+fn timeout_answer(author: &str, timeout: Duration, last: &str) -> String {
+    let secs = timeout.as_secs();
+    let head = format!(
+        "[delegate {author}: stopped after {secs}s without a final answer — it reached its time \
+         budget]"
+    );
+    let last = last.trim();
+    if last.is_empty() {
+        format!(
+            "{head} It had not produced an answer yet, so treat its result as unavailable and \
+             continue without it (re-delegate a smaller, tightly-scoped task if you still need it)."
+        )
+    } else {
+        format!("{head}\n\nBest effort with what it had gathered so far:\n\n{last}")
+    }
 }
 
 /// How many failed fix rounds a plan step has already been through, read from

@@ -161,7 +161,10 @@ The model the agent talks to.
 One table per developer model the tech lead may hand sub-tasks to (the
 `delegate` / `ask_advise` tools). Keys: `name`, `description`, `enabled`
 (`true`), `approval` (`auto` \| `ask` \| `deny`, default `auto`), plus the inline
-`[llm]` keys (`provider`, `model`, `api_key`, `temperature`, …).
+`[llm]` keys (`provider`, `model`, `api_key`, `temperature`, …). Every delegate
+run is bounded by `[agent].delegate_timeout_secs` (default `60`): a delegate that
+has not produced a final answer by then is stopped and replies with whatever it
+had gathered, so a slow or stuck delegate can never hang the parent run.
 
 ### `[agent]`
 
@@ -170,6 +173,7 @@ One table per developer model the tech lead may hand sub-tasks to (the
 | `max_iterations` | `30` | Tool-use turns per run. |
 | `tool_timeout_secs` | `0` | Kill a single tool after N seconds (`0` = no limit). |
 | `run_timeout_secs` | `0` | Stop a whole run after N seconds (`0` = no limit). |
+| `delegate_timeout_secs` | `60` | Wall-clock budget for one delegate run; a delegate that misses it replies with what it has (`0` = no limit). |
 
 ### `[context]`
 
