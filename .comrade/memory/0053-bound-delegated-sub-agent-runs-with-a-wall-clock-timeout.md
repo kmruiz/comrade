@@ -28,3 +28,6 @@ Observed in practice: the configured coding delegate (qwen/qwen3.6-35b-a3b) exha
 
 ## Note
 Confirmed again in practice: with the default 60s budget the delegate cannot even finish a READ-ONLY readiness check (`ask_advise step=N`) on a large file — the check for a crates/comrade-tui/src/tui.rs (~12k lines) step timed out. While the budget stays at 60s, don't plan delegate steps that must read/edit/unittest that file: do them directly, or first add `[agent] delegate_timeout_secs = 600` to the project `.comrade.toml` (layered over the user config; needs Ctrl-R / M-x reload-config, or just the next start, to take effect — a reload is refused while a run is in flight).
+
+## Note
+Default raised from 60s to 300s (2026-09-14). The 60s default proved too aggressive in practice for the configured delegate (qwen/qwen3.6-35b-a3b): it consistently ran out of budget on multi-file steps and even on read-only `ask_advise step=N` readiness checks over large files (see the two notes below). The limit still exists (a delegate cannot hang the parent forever); only its default changed. `[agent].delegate_timeout_secs = 0` still disables it entirely. The Decision/Rationale above still reference the original "60s / in a minute" figure — the mechanism is unchanged, only the default value.

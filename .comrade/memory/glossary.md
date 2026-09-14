@@ -204,7 +204,7 @@ The project declares `license = "MIT OR Apache-2.0"` in Cargo.toml but only an A
 Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by render_row_line's `sub: Option<Color>` param. Folded MsgKind::Run digests keep no sub-chat styling.
 
 ## Delegate timeout
-> A wall-clock budget (`[agent].delegate_timeout_secs`, default 60s) applied to every delegated sub-agent run (`delegate`, `delegate_parallel`, `ask_advise`). Enforced in `crates/comrade-core/src/delegate.rs::run_delegate_subagent`: each model request and tool call is bounded by the time left, and when the budget runs out the delegate returns `timeout_answer(...)` — a partial answer if it had one, else a notice that it did not finish. Prevents a slow/hung model request or hanging tool from holding the parent run open.
+> A wall-clock budget (`[agent].delegate_timeout_secs`, default **300s / 5 minutes**; `0` = no limit) applied to every delegated sub-agent run (`delegate`, `delegate_parallel`, `ask_advise`). Enforced in `crates/comrade-core/src/delegate.rs::run_delegate_subagent`: each model request and tool call is bounded by the time left, and when the budget runs out the delegate returns `timeout_answer(...)` — a partial answer if it had one, else a notice that it did not finish. Prevents a slow/hung model request or hanging tool from holding the parent run open. (Originally 60s; raised to 300s on 2026-09-14 — the 60s default was too aggressive.)
 
 **References:**
 - `crates/comrade-core/src/delegate.rs`
