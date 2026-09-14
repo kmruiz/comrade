@@ -22,3 +22,6 @@ The delegate sub-agent loop and the config/limits that feed it. Applies to every
 ## Impact
 A stuck/slow delegate can no longer hang the parent run; it is cut off at the budget and the parent receives a usable (possibly partial) result rather than a hang. New public field `DelegateLimits::timeout` and new config key `[agent].delegate_timeout_secs`; README + glossary updated. Trade-off: a legitimately long delegate task now needs a larger `delegate_timeout_secs`. A tool that is cut off mid-flight has its future dropped (same as the main loop's `tool_timeout_secs`), which for `shell`/`run_bg` may leave a detached child process. Follow-ups: a reserved final "answer now" grace round; surfacing the timeout as an explicit event so the transcript shows it.
 
+
+## Note
+Observed in practice: the configured coding delegate (qwen/qwen3.6-35b-a3b) exhausts the default 60s budget and returns "stopped after 60s without a final answer" on a step that edits two files (the semantic_search `path` feature). Readiness checks (ask_advise step=N) hit the same cap. For this delegate, either raise [agent].delegate_timeout_secs or hand it a smaller step (one file / one function); a two-file implementation is faster to do directly.
