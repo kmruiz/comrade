@@ -14,11 +14,21 @@
 //! documents, where exact cosine over all vectors is instantaneous and needs no
 //! extra native dependency or index-tuning. The index is loaded once and kept
 //! resident per project root (so repeated searches neither re-read nor re-parse
-//! it), is written back only when something changed, and skips the file walk
-//! entirely when the repo is clean at the recorded HEAD. The index also only
-//! re-embeds documents whose text hash changed, so steady-state calls cost one
-//! query embedding. (An ANN structure remains a future option if a project ever
-//! grows large enough that the linear scan matters.)
+//! it), and is written back only when its CONTENT actually changed — a dirty
+//! working tree whose files re-parse to identical chunks is not a change, so an
+//! editing agent no longer rewrites the whole cache on every search. It also
+//! skips the file walk entirely when the repo is clean at the recorded HEAD and
+//! only re-embeds documents whose text hash changed, so a steady-state call
+//! costs one query embedding. Vectors are stored pre-normalised (L2), so ranking
+//! is a plain dot product with no per-document norm or `sqrt`. (An ANN structure
+//! remains a future option if a project ever grows large enough that the linear
+//! scan matters.)
+//!
+//! The cache is a compact, self-describing binary blob (`CSMV` magic, raw
+//! little-endian `f32` vectors) rather than JSON: raw f32 is ~4 bytes per
+//! component where JSON's text floats cost ~7, which cut the code index for this
+//! repo from ~11.6 MB to ~4.1 MB. A legacy `.json` cache is still read once and
+//! re-saved in the binary form.
 //!
 //! The code index is incremental and git-driven: it records the HEAD it was
 //! built at plus a per-file stamp, and `git::dirty_files` says what changed
@@ -91,7 +101,7 @@ struct StoredDoc {
 
 /// Per-file stat stamp + the ids of the documents it produced, so an unchanged
 /// file can be reused without reading or parsing it again.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FileStamp {
     /// Modification time in nanoseconds since the UNIX epoch (0 if unavailable).
     mtime: u64,
@@ -152,7 +162,40 @@ fn fnv(text: &str) -> u64 {
     h
 }
 
-/// Cosine similarity in [-1, 1]; 0 when either vector is zero.
+/// Squared L2 length of a vector.
+fn norm2(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>()
+}
+
+/// Scale `v` to unit length in place (a no-op for a zero or non-finite vector),
+/// so ranking against it becomes a plain dot product.
+fn normalize(v: &mut [f32]) {
+    let n = norm2(v).sqrt();
+    if n > 0.0 && n.is_finite() {
+        for x in v.iter_mut() {
+            *x /= n;
+        }
+    }
+}
+
+/// Normalise every vector in a store; applied on load so caches written before
+/// vectors were stored pre-normalised still rank correctly.
+fn normalize_store(store: &mut Store) {
+    for doc in &mut store.docs {
+        normalize(&mut doc.vec);
+    }
+}
+
+/// Dot product: on unit vectors this is exactly the cosine similarity, which is
+/// why the index stores normalised vectors (it removes a norm + two `sqrt` per
+/// document from every query).
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Cosine similarity in [-1, 1]; 0 when either vector is zero. Kept for tests
+/// that check raw model output; ranking uses [`dot`] on pre-normalised vectors.
+#[cfg(test)]
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0f32;
     let mut na = 0.0f32;
@@ -177,6 +220,21 @@ fn preview_of(text: &str) -> String {
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .unwrap_or("");
     line.chars().take(160).collect()
+}
+
+/// Whether two stores hold the same documents, compared order-independently by
+/// `(id, hash)`. The hash captures the embedded text, so equal signatures mean
+/// equal vectors — this is how a re-parsed file that produced identical chunks
+/// is recognised as "no change" instead of forcing a full cache rewrite.
+fn same_docs(a: &[StoredDoc], b: &[StoredDoc]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut x: Vec<(&str, u64)> = a.iter().map(|d| (d.id.as_str(), d.hash)).collect();
+    let mut y: Vec<(&str, u64)> = b.iter().map(|d| (d.id.as_str(), d.hash)).collect();
+    x.sort_unstable();
+    y.sort_unstable();
+    x == y
 }
 
 /// Build the documents to index from the memory store and the glossary.
@@ -314,6 +372,8 @@ fn refresh(docs: &[Doc], existing: &Store, embedder: &dyn Embedder) -> Result<(S
             );
         }
         for ((i, doc), vec) in todo.iter().zip(vectors) {
+            let mut vec = vec;
+            normalize(&mut vec);
             slots[*i] = Some(StoredDoc {
                 id: doc.id.clone(),
                 kind: doc.kind.clone(),
@@ -331,7 +391,7 @@ fn refresh(docs: &[Doc], existing: &Store, embedder: &dyn Embedder) -> Result<(S
         .map(|d| d.vec.len())
         .max()
         .unwrap_or(existing.dim);
-    let changed = stale_model || !todo.is_empty() || docs.len() != existing.docs.len();
+    let changed = stale_model || !same_docs(&docs, &existing.docs);
     Ok((
         Store {
             model: MODEL_ID.into(),
@@ -343,8 +403,9 @@ fn refresh(docs: &[Doc], existing: &Store, embedder: &dyn Embedder) -> Result<(S
     ))
 }
 
-/// Rank documents by cosine similarity to `query`, ties broken by id,
-/// optionally filtered by `kind`.
+/// Rank documents by similarity to `query` (a dot product: the query and every
+/// stored vector are unit-length), ties broken by id, optionally filtered by
+/// `kind`.
 fn rank<'a>(
     docs: &'a [StoredDoc],
     query: &[f32],
@@ -354,7 +415,7 @@ fn rank<'a>(
     let mut scored: Vec<(f32, &StoredDoc)> = docs
         .iter()
         .filter(|d| kind.is_none_or(|k| d.kind.eq_ignore_ascii_case(k)))
-        .map(|d| (cosine(query, &d.vec), d))
+        .map(|d| (dot(query, &d.vec), d))
         .collect();
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
@@ -380,9 +441,7 @@ fn cache_dir() -> PathBuf {
 /// project path, so the repo stays clean.
 fn index_path(root: &Path) -> PathBuf {
     let key = fnv(&root.to_string_lossy());
-    cache_dir()
-        .join("semantic")
-        .join(format!("{key:016x}.json"))
+    cache_dir().join("semantic").join(format!("{key:016x}.bin"))
 }
 
 /// Where the code index for `root` is cached (separate from the memory index so
@@ -391,14 +450,199 @@ fn code_index_path(root: &Path) -> PathBuf {
     let key = fnv(&root.to_string_lossy());
     cache_dir()
         .join("semantic")
-        .join(format!("{key:016x}-code.json"))
+        .join(format!("{key:016x}-code.bin"))
 }
 
+/// Magic + version marking the compact binary index format (see [`encode_store`]).
+const STORE_MAGIC: &[u8; 4] = b"CSMV";
+const STORE_VERSION: u16 = 1;
+
+/// Append a length-prefixed UTF-8 string to the buffer.
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Serialise a store to a compact, dependency-free binary blob: length-prefixed
+/// strings and vectors of raw little-endian `f32`, instead of the ~3.5x-bloated
+/// text-f32 JSON that dominated both cache size and cold-start parse time.
+fn encode_store(store: &Store) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(STORE_MAGIC);
+    out.extend_from_slice(&STORE_VERSION.to_le_bytes());
+    put_str(&mut out, &store.model);
+    out.extend_from_slice(&(store.dim as u32).to_le_bytes());
+    out.extend_from_slice(&(store.docs.len() as u32).to_le_bytes());
+    for d in &store.docs {
+        put_str(&mut out, &d.id);
+        put_str(&mut out, &d.kind);
+        put_str(&mut out, &d.title);
+        put_str(&mut out, &d.preview);
+        out.extend_from_slice(&d.hash.to_le_bytes());
+        out.extend_from_slice(&(d.vec.len() as u32).to_le_bytes());
+        for v in &d.vec {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&(store.files.len() as u32).to_le_bytes());
+    for (key, stamp) in &store.files {
+        put_str(&mut out, key);
+        out.extend_from_slice(&stamp.mtime.to_le_bytes());
+        out.extend_from_slice(&stamp.size.to_le_bytes());
+        out.extend_from_slice(&(stamp.doc_ids.len() as u32).to_le_bytes());
+        for id in &stamp.doc_ids {
+            put_str(&mut out, id);
+        }
+    }
+    match &store.head {
+        Some(h) => {
+            out.push(1);
+            put_str(&mut out, h);
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+/// A bounds-checked little-endian reader over a byte slice.
+struct Rd<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Rd<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let s = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(s)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn string(&mut self) -> Option<String> {
+        let n = self.u32()? as usize;
+        Some(std::str::from_utf8(self.take(n)?).ok()?.to_string())
+    }
+}
+
+/// Parse a blob produced by [`encode_store`], or `None` if it is not a valid
+/// index of this version (the caller then falls back to a JSON cache or a
+/// rebuild).
+fn decode_store(bytes: &[u8]) -> Option<Store> {
+    let mut r = Rd::new(bytes);
+    if r.take(4)? != STORE_MAGIC {
+        return None;
+    }
+    if u16::from_le_bytes(r.take(2)?.try_into().ok()?) != STORE_VERSION {
+        return None;
+    }
+    let model = r.string()?;
+    let dim = r.u32()? as usize;
+    let ndocs = r.u32()? as usize;
+    let mut docs = Vec::with_capacity(ndocs.min(1 << 20));
+    for _ in 0..ndocs {
+        let id = r.string()?;
+        let kind = r.string()?;
+        let title = r.string()?;
+        let preview = r.string()?;
+        let hash = r.u64()?;
+        let n = r.u32()? as usize;
+        let mut vec = Vec::with_capacity(n.min(1 << 20));
+        for _ in 0..n {
+            vec.push(r.f32()?);
+        }
+        docs.push(StoredDoc {
+            id,
+            kind,
+            title,
+            preview,
+            hash,
+            vec,
+        });
+    }
+    let nfiles = r.u32()? as usize;
+    let mut files = BTreeMap::new();
+    for _ in 0..nfiles {
+        let key = r.string()?;
+        let mtime = r.u64()?;
+        let size = r.u64()?;
+        let nids = r.u32()? as usize;
+        let mut doc_ids = Vec::with_capacity(nids.min(1 << 20));
+        for _ in 0..nids {
+            doc_ids.push(r.string()?);
+        }
+        files.insert(
+            key,
+            FileStamp {
+                mtime,
+                size,
+                doc_ids,
+            },
+        );
+    }
+    let head = match r.u8()? {
+        0 => None,
+        1 => Some(r.string()?),
+        _ => return None,
+    };
+    Some(Store {
+        model,
+        dim,
+        docs,
+        files,
+        head,
+    })
+}
+
+/// Load the resident store from disk: the compact binary format first, then a
+/// legacy JSON cache (so an existing index is migrated, not discarded), else an
+/// empty store the caller will rebuild.
 fn load_store(path: &Path) -> Store {
-    std::fs::read_to_string(path)
+    let mut store = read_store(path);
+    // Caches written before vectors were stored pre-normalised still rank
+    // correctly once their vectors are made unit-length here.
+    normalize_store(&mut store);
+    store
+}
+
+fn read_store(path: &Path) -> Store {
+    let current = std::fs::read(path).ok().and_then(|bytes| {
+        if bytes.starts_with(STORE_MAGIC) {
+            decode_store(&bytes)
+        } else {
+            serde_json::from_slice::<Store>(&bytes).ok()
+        }
+    });
+    if let Some(store) = current {
+        return store;
+    }
+    // Migrate a legacy `.json` cache written before the binary format.
+    let legacy = std::fs::read_to_string(path.with_extension("json"))
         .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+        .and_then(|text| serde_json::from_str::<Store>(&text).ok());
+    if let Some(store) = legacy {
+        return store;
+    }
+    Store::default()
 }
 
 /// The resident memory index per project root: loaded once and kept in memory,
@@ -421,8 +665,8 @@ fn save_store(path: &Path, store: &Store) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
-    let text = serde_json::to_string(store)?;
-    std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))?;
+    let bytes = encode_store(store);
+    std::fs::write(path, bytes).with_context(|| format!("cannot write {}", path.display()))?;
     Ok(())
 }
 
@@ -439,7 +683,6 @@ fn code_refresh(root: &Path, existing: &Store, embedder: &dyn Embedder) -> Resul
     let mut files: BTreeMap<String, FileStamp> = BTreeMap::new();
     let mut docs: Vec<StoredDoc> = Vec::new();
     let mut todo: Vec<(String, String, String)> = Vec::new(); // (id, title, text)
-    let mut changed = stale_model;
 
     for (rel, abs, mtime, size) in code_files(root) {
         let reusable = !stale_model
@@ -468,10 +711,6 @@ fn code_refresh(root: &Path, existing: &Store, embedder: &dyn Embedder) -> Resul
             );
             continue;
         }
-        // A file we had to re-parse means the index is not identical to the
-        // cached one, so it must be written back.
-        changed = true;
-
         let Ok(bytes) = std::fs::read(&abs) else {
             continue;
         };
@@ -512,6 +751,8 @@ fn code_refresh(root: &Path, existing: &Store, embedder: &dyn Embedder) -> Resul
             );
         }
         for ((id, title, text), vec) in todo.into_iter().zip(vectors) {
+            let mut vec = vec;
+            normalize(&mut vec);
             docs.push(StoredDoc {
                 id,
                 kind: "code".into(),
@@ -528,9 +769,15 @@ fn code_refresh(root: &Path, existing: &Store, embedder: &dyn Embedder) -> Resul
         .map(|d| d.vec.len())
         .max()
         .unwrap_or(existing.dim);
-    // Also changed if the file set or the recorded HEAD moved.
+    // Changed only when the resulting content actually differs from the cached
+    // index: the document set, the per-file stamps or the recorded HEAD. A file
+    // re-parsed to identical chunks (the common dirty-tree case) is not a change,
+    // so a search never rewrites the whole cache just because the tree is dirty.
     let head = crate::git::head_sha(root);
-    changed = changed || files.len() != existing.files.len() || head != existing.head;
+    let changed = stale_model
+        || !same_docs(&docs, &existing.docs)
+        || files != existing.files
+        || head != existing.head;
     Ok((
         Store {
             model: MODEL_ID.into(),
@@ -733,11 +980,12 @@ impl Tool for SemanticSearch {
                 });
             }
 
-            let qvec = FastEmbedder
+            let mut qvec = FastEmbedder
                 .embed(std::slice::from_ref(&query))?
                 .into_iter()
                 .next()
                 .context("no query embedding")?;
+            normalize(&mut qvec);
 
             // Rank each resident index, then merge — no vectors are cloned.
             let mut hits: Vec<Hit> = Vec::new();

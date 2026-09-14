@@ -280,3 +280,153 @@ fn embedded_model_ranks_this_repos_memory() {
         "expected a semantic-search ADR among {ids:?}"
     );
 }
+
+fn stored_doc(vec: Vec<f32>) -> StoredDoc {
+    StoredDoc {
+        id: "code:src/lib.rs:1:f".into(),
+        kind: "code".into(),
+        title: "src/lib.rs:1  fn f".into(),
+        preview: "fn f() {}".into(),
+        hash: 0xdead_beef,
+        vec,
+    }
+}
+
+#[test]
+fn binary_store_round_trips() {
+    let mut files = BTreeMap::new();
+    files.insert(
+        "src/lib.rs".to_string(),
+        FileStamp {
+            mtime: 42,
+            size: 7,
+            doc_ids: vec!["code:src/lib.rs:1:f".into()],
+        },
+    );
+    let store = Store {
+        model: MODEL_ID.into(),
+        dim: 3,
+        docs: vec![
+            stored_doc(vec![0.1, -0.25, 0.75]),
+            StoredDoc {
+                id: "adr:0001".into(),
+                kind: "adr".into(),
+                title: "#0001 [accepted] x".into(),
+                preview: "p".into(),
+                hash: 1,
+                vec: vec![1.0, 0.0, 0.0],
+            },
+        ],
+        files: files.clone(),
+        head: Some("abc123".into()),
+    };
+    let bytes = encode_store(&store);
+    let back = decode_store(&bytes).expect("round-trip must succeed");
+    assert_eq!(back.model, store.model);
+    assert_eq!(back.dim, 3);
+    assert_eq!(back.head.as_deref(), Some("abc123"));
+    assert_eq!(back.files, files);
+    assert_eq!(back.docs.len(), 2);
+    for (a, b) in back.docs.iter().zip(&store.docs) {
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.kind, b.kind);
+        assert_eq!(a.title, b.title);
+        assert_eq!(a.preview, b.preview);
+        assert_eq!(a.hash, b.hash);
+        assert_eq!(a.vec, b.vec);
+    }
+    // Raw f32 must be compact: ~4 bytes per float, not JSON's ~7 text bytes.
+    let vec_bytes = store.docs.iter().map(|d| d.vec.len()).sum::<usize>() * 4;
+    assert!(
+        bytes.len() < vec_bytes + 512,
+        "binary store is too large: {} bytes for {vec_bytes} vector bytes",
+        bytes.len()
+    );
+}
+
+#[test]
+fn binary_store_rejects_garbage_and_round_trips_empty() {
+    assert!(decode_store(b"").is_none());
+    assert!(decode_store(b"not a store").is_none());
+    // Right magic, wrong version.
+    assert!(decode_store(b"CSMV\x02\x00").is_none());
+    // Truncated payload.
+    assert!(decode_store(b"CSMV\x01\x00").is_none());
+
+    let empty = Store::default();
+    let back = decode_store(&encode_store(&empty)).expect("empty store round-trips");
+    assert!(back.docs.is_empty());
+    assert!(back.files.is_empty());
+    assert_eq!(back.head, None);
+}
+
+#[test]
+fn load_store_normalises_vectors_and_reads_legacy_json() {
+    let dir = scratch("load-norm");
+    let path = dir.join("idx.bin");
+    let legacy = Store {
+        model: MODEL_ID.into(),
+        dim: 2,
+        docs: vec![stored_doc(vec![3.0, 4.0])], // deliberately not unit length
+        ..Store::default()
+    };
+    // A pre-binary cache used the `.json` extension next to the binary path.
+    std::fs::write(dir.join("idx.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let loaded = load_store(&path);
+    assert_eq!(loaded.docs.len(), 1, "legacy JSON cache must still load");
+    let n = norm2(&loaded.docs[0].vec).sqrt();
+    assert!((n - 1.0).abs() < 1e-6, "legacy vector not normalised: {n}");
+
+    // The binary path normalises on load too.
+    save_store(&path, &legacy).unwrap();
+    let loaded = load_store(&path);
+    let v = &loaded.docs[0].vec;
+    assert!(
+        (v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6,
+        "{v:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn refresh_stores_unit_vectors() {
+    let docs = vec![doc("adr:0001", "alpha"), doc("adr:0002", "beta")];
+    let emb = StubEmbedder::default();
+    let (store, _) = refresh(&docs, &Store::default(), &emb).unwrap();
+    for d in &store.docs {
+        let n = norm2(&d.vec).sqrt();
+        assert!((n - 1.0).abs() < 1e-6, "{} not unit length: {n}", d.id);
+    }
+}
+
+/// A file that is dirty but re-parses to identical chunks must NOT force a cache
+/// rewrite (the normal state while an agent edits): this was the main remaining
+/// per-search cost — rewriting the whole index on every dirty-tree search.
+#[test]
+fn reparse_of_an_unchanged_dirty_file_reports_no_change() {
+    let dir = scratch("dirty-reparse");
+    git(&dir, &["init", "-q"]);
+    git(&dir, &["config", "user.email", "t@example.com"]);
+    git(&dir, &["config", "user.name", "Test"]);
+    std::fs::write(dir.join("a.rs"), "fn alpha() {}\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+
+    // Dirty the tree AFTER the commit, then index that dirty state.
+    std::fs::write(dir.join("a.rs"), "fn alpha() { let x = 1; }\n").unwrap();
+    let emb = StubEmbedder::default();
+    let (s1, changed1) = code_refresh(&dir, &Store::default(), &emb).unwrap();
+    assert!(changed1, "the first index of a dirty tree is a change");
+
+    // Re-run on the still-dirty tree: a.rs is re-parsed, but its chunks hash the
+    // same, so nothing is re-embedded and the index is not rewritten.
+    emb.calls.store(0, Ordering::SeqCst);
+    let (s2, changed2) = code_refresh(&dir, &s1, &emb).unwrap();
+    assert!(
+        !changed2,
+        "a re-parsed file with identical chunks must not force a rewrite"
+    );
+    assert_eq!(emb.calls.load(Ordering::SeqCst), 0, "no chunk re-embedded");
+    assert!(same_docs(&s1.docs, &s2.docs));
+    let _ = std::fs::remove_dir_all(&dir);
+}
