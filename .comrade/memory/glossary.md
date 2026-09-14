@@ -554,6 +554,12 @@ Backed by fastembed (quantized BGE-small-en-v1.5, in-process ONNX) + a flat cosi
 - `crates/comrade-tui/src/proactive.rs`
 - `crates/comrade-core/src/config.rs`
 
+## Sensor session
+> A session a proactive sensor opens to handle a detected change: titled `sensor: <name>` and backed by a `std::env::temp_dir()` file. Since ADR 0056 it is auto-closed (and its temp file deleted) as soon as its run finishes, so recurring sensor runs do not accumulate. Distinguished from human sessions by the `OpenSession.sensor` flag.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs`
+
 ## Sensors queue
 > A panel in the TUI's right column (between the model panel and the plan, drawn by draw_sensors) listing every proactive sensor request received but not yet handled, oldest/highest-priority first. The selected row is highlighted; M-x commands sensors-next/previous (selection), sensors-priority-up/down (reorder), sensors-discard (drop) and sensors-start (tackle now) manage it. `auto` entries are started automatically once the app is idle.
 
