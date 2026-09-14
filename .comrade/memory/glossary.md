@@ -254,7 +254,7 @@ Why a larger batch size makes the cold build slower, not faster. Measured on thi
 - `crates/comrade-tui/src/tui.rs`
 
 ## focus mode
-> A chat view filter in the TUI, toggled by M-f or M-x focus-mode (same chord turns it off). When on it hides tool noise so the chat reads as pure conversation: it keeps MsgKind::User, MsgKind::Assistant, MsgKind::Delegate (advisories) and MsgKind::Reasoning, and drops MsgKind::Tool, MsgKind::Failure, MsgKind::Meta and the folded MsgKind::Run digest's summary row — but a folded Run still renders the Reasoning children inside it. While a run is in flight in focus mode, the bottom chat row shows a rotating activity spinner (`activity_line`) so a silent tool run never looks frozen.
+> A chat view filter in the TUI, toggled by M-f or M-x focus-mode (same chord turns it off). It is ON by default at startup (build_app sets focus_mode: true). When on it hides tool noise so the chat reads as pure conversation: it keeps MsgKind::User, MsgKind::Assistant, MsgKind::Delegate (advisories) and MsgKind::Reasoning, and drops MsgKind::Tool, MsgKind::Failure, MsgKind::Meta and the folded MsgKind::Run digest's summary row — but a folded Run still renders the Reasoning children inside it. While a run is in flight in focus mode, the bottom chat row shows a rotating activity spinner (activity_line) so a silent tool run never looks frozen. The mode line (bottom status bar) shows "focus mode enabled" (bold green) when on and "focus mode disabled" (dim gray) when off, right after the auto/ask token.
 
 **References:**
 - `crates/comrade-tui/src/tui.rs`

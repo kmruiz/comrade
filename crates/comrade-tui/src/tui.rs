@@ -3601,7 +3601,9 @@ fn build_app(
         run_cancelled: false,
         last_draw: std::time::Instant::now(),
         auto_accept: false,
-        focus_mode: false,
+        // Focus mode is on by default so the chat opens as pure conversation;
+        // M-f / M-x focus-mode toggles it off.
+        focus_mode: true,
         git: GitBarInfo::default(),
         git_rx,
         git_tx,
@@ -4799,6 +4801,26 @@ fn draw(app: &mut App, frame: &mut Frame) {
     spans.push(Span::styled(
         if auto { "auto" } else { "ask" },
         bar_style.add_modifier(Modifier::BOLD),
+    ));
+    // Focus mode state, next to the auto/ask mode token.
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        if app.focus_mode {
+            "focus mode enabled"
+        } else {
+            "focus mode disabled"
+        },
+        bar_style
+            .fg(on_auto(if app.focus_mode {
+                Color::LightGreen
+            } else {
+                Color::Gray
+            }))
+            .add_modifier(if app.focus_mode {
+                Modifier::BOLD
+            } else {
+                Modifier::DIM
+            }),
     ));
     if !status_msg.trim().is_empty() {
         spans.push(Span::raw("  "));
@@ -9226,6 +9248,7 @@ mod tests {
     async fn activity_spinner_shows_only_for_a_running_focus_mode_chat() {
         let mut app = test_app();
         assert!(!activity_spinner_visible(&app), "idle: no spinner");
+        app.focus_mode = false;
         app.running = true;
         assert!(
             !activity_spinner_visible(&app),
