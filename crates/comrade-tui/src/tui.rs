@@ -1105,18 +1105,6 @@ fn sanitize_session_name(name: &str) -> String {
         .collect()
 }
 
-/// A bounded preview of a sensor's raw output, used as the body of the `ask`
-/// confirmation dialog so the change can be seen without opening the session.
-fn truncate_preview(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_string()
-    } else {
-        let mut out: String = text.chars().take(max_chars).collect();
-        out.push_str("\n…");
-        out
-    }
-}
-
 /// The seed prompt a sensor-opened session starts with: the configured prompt
 /// when given, then a description of the detected change.
 fn sensor_seed(name: &str, prompt: Option<&str>, delta: &crate::proactive::Delta) -> String {
@@ -5224,19 +5212,34 @@ fn draw(app: &mut App, frame: &mut Frame) {
     let delegate_block = delegate_rows.as_ref().map_or(0, |r| r.len() as u16);
     let stats_h = (MODEL_PANEL_FIXED_ROWS + 2 + delegate_block).min(rows[0].height);
     // The running-background-jobs panel sits below the plan, sized to its rows
-    // (and hidden entirely when nothing runs).
+    // (and hidden entirely when nothing runs). A long command wraps onto several
+    // rows, so the height counts the wrapped rows, not the jobs.
     let run_jobs = app.jobs.running();
     let jobs_h = if run_jobs.is_empty() {
         0
     } else {
-        (run_jobs.len().min(MAX_JOB_ROWS) as u16) + 2
+        let w = usize::from(cols[1].width.saturating_sub(2)).max(8);
+        let rows_n: usize = run_jobs
+            .iter()
+            .take(MAX_JOB_ROWS)
+            .map(|j| job_lines(j, w).len())
+            .sum::<usize>()
+            + usize::from(run_jobs.len() > MAX_JOB_ROWS); // the "…+N more" marker
+        (rows_n as u16 + 2).min(rows[0].height)
     };
     // The sensors queue sits between the model panel and the plan; shown only
     // when there are configured sensors or pending requests.
     let sensors_h = if app.cfg.sensors.is_empty() && app.sensor_queue.is_empty() {
         0
     } else {
-        app.sensor_queue.len().clamp(1, MAX_SENSOR_ROWS) as u16 + 2
+        let w = usize::from(cols[1].width.saturating_sub(2)).max(8);
+        let rows_n: usize = app
+            .sensor_queue
+            .iter()
+            .take(MAX_SENSOR_ROWS)
+            .map(|e| wrap_toks(&sensor_toks(e), w).len())
+            .sum();
+        (rows_n.max(1) as u16 + 2).min(rows[0].height)
     };
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -6757,7 +6760,8 @@ fn loc_parts(line: &str) -> Option<Vec<StyledPart>> {
 
 /// Wrap styled parts into rows of at most `width` columns, breaking on spaces
 /// and inserting a single space wherever a part asked for one. Parts that do not
-/// (`crates/a.rs`, `:`, `42`) stay glued together.
+/// (`crates/a.rs`, `:`, `42`) stay glued together. A word longer than the whole
+/// width (a long path or URL) is hard-split so it never overflows.
 fn wrap_styled(parts: &[StyledPart], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
@@ -6769,16 +6773,19 @@ fn wrap_styled(parts: &[StyledPart], width: usize) -> Vec<Vec<Span<'static>>> {
                 continue;
             }
             let before = if k == 0 { *space_before } else { true };
-            if !cur.is_empty() && cur_len + usize::from(before) + word.chars().count() > width {
-                rows.push(std::mem::take(&mut cur));
-                cur_len = 0;
+            for chunk in hard_cut(word, width) {
+                if !cur.is_empty() && cur_len + usize::from(before) + chunk.chars().count() > width
+                {
+                    rows.push(std::mem::take(&mut cur));
+                    cur_len = 0;
+                }
+                if !cur.is_empty() && before {
+                    cur.push(Span::styled(" ".to_string(), Style::default()));
+                    cur_len += 1;
+                }
+                cur_len += chunk.chars().count();
+                cur.push(Span::styled(chunk, *style));
             }
-            if !cur.is_empty() && before {
-                cur.push(Span::styled(" ".to_string(), Style::default()));
-                cur_len += 1;
-            }
-            cur.push(Span::styled(word.to_string(), *style));
-            cur_len += word.chars().count();
         }
     }
     if !cur.is_empty() {
@@ -7226,47 +7233,63 @@ fn draw_sensors(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 
     let width = usize::from(inner.width).max(8);
-    let lines: Vec<Line> = app
-        .sensor_queue
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let glyph = match e.mode {
-                comrade_core::SensorMode::Auto => "AUTO",
-                comrade_core::SensorMode::Ask => "ASK ",
-            };
-            let summary = e
-                .delta
-                .added
-                .first()
-                .map(|s| format!(": {s}"))
-                .or_else(|| e.delta.removed.first().map(|s| format!(" (-{s})")))
-                .unwrap_or_default();
-            let text = truncate_preview(
-                &format!("{:>3} {} {} {}", e.id, glyph, e.name, summary),
-                width,
-            );
-            let style = if i == app.sensor_sel {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            Line::from(Span::styled(text, style))
-        })
-        .collect();
-
-    // Keep the selected row in view.
-    let view = usize::from(inner.height).max(1);
-    if app.sensor_sel < usize::from(app.sensor_scroll) {
-        app.sensor_scroll = app.sensor_sel as u16;
+    let mut lines: Vec<Line> = Vec::new();
+    // Line index where each entry starts, so the selection highlight covers all
+    // of an entry's wrapped rows and the scroll keeps the whole entry in view.
+    let mut starts: Vec<usize> = Vec::with_capacity(app.sensor_queue.len());
+    for (i, e) in app.sensor_queue.iter().enumerate() {
+        starts.push(lines.len());
+        let selected = i == app.sensor_sel;
+        for mut row in wrap_toks(&sensor_toks(e), width) {
+            if selected {
+                for t in &mut row {
+                    t.style = selected_sensor_style();
+                }
+            }
+            push_tok_line(&mut lines, &row);
+        }
     }
-    let bottom = app.sensor_sel + 1;
-    if bottom > usize::from(app.sensor_scroll) + view {
-        app.sensor_scroll = (bottom - view) as u16;
+
+    // Keep the selected entry — every row of it — in view.
+    let view = usize::from(inner.height).max(1);
+    let sel = app.sensor_sel.min(starts.len() - 1);
+    let sel_start = starts[sel];
+    let sel_end = starts.get(sel + 1).copied().unwrap_or(lines.len());
+    if sel_start < usize::from(app.sensor_scroll) {
+        app.sensor_scroll = sel_start as u16;
+    }
+    if sel_end > usize::from(app.sensor_scroll) + view {
+        app.sensor_scroll = sel_end.saturating_sub(view) as u16;
     }
     let max = lines.len().saturating_sub(view) as u16;
     app.sensor_scroll = app.sensor_scroll.min(max);
     frame.render_widget(Paragraph::new(lines).scroll((app.sensor_scroll, 0)), inner);
+}
+
+/// The highlight style of the selected sensor-queue entry.
+fn selected_sensor_style() -> Style {
+    Style::default().fg(Color::Black).bg(Color::Cyan)
+}
+
+/// The styled tokens for one queued sensor request: its id, mode glyph, name and
+/// a one-item summary of the detected change. Wrapped by the caller so a long
+/// name or summary flows onto several panel rows instead of being truncated.
+fn sensor_toks(e: &SensorEntry) -> Vec<Tok> {
+    let glyph = match e.mode {
+        comrade_core::SensorMode::Auto => "AUTO",
+        comrade_core::SensorMode::Ask => "ASK ",
+    };
+    let summary = e
+        .delta
+        .added
+        .first()
+        .map(|s| format!(": {s}"))
+        .or_else(|| e.delta.removed.first().map(|s| format!(" (-{s})")))
+        .unwrap_or_default();
+    vec![tok(
+        format!("{:>3} {} {} {}", e.id, glyph, e.name, summary),
+        Style::default().fg(Color::White),
+    )]
 }
 
 fn draw_plan(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -7573,6 +7596,25 @@ fn draw_session_pick(pick: &SessionPick, app: &App, frame: &mut Frame) {
 /// a "+N more" hint.
 const MAX_JOB_ROWS: usize = 4;
 
+/// The wrapped rows for one background job: the id, then the command, then the
+/// status/duration tail, word-wrapped to `width` so a long command flows onto
+/// several panel rows instead of being truncated with `.take(...)`.
+fn job_lines(job: &comrade_tool_project::BgJobInfo, width: usize) -> Vec<Line<'static>> {
+    let toks = vec![
+        tok(format!("{}  ", job.id), Style::default().fg(Color::Yellow)),
+        tok(flat(&job.command), Style::default().fg(Color::Gray)),
+        tok(
+            format!("  {}  {:.0}s", job.status, job.elapsed_secs),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    let mut lines = Vec::new();
+    for row in wrap_toks(&toks, width.max(1)) {
+        push_tok_line(&mut lines, &row);
+    }
+    lines
+}
+
 /// The running-background-jobs panel, drawn under the plan.
 fn draw_jobs(jobs: &[comrade_tool_project::BgJobInfo], frame: &mut Frame, area: Rect) {
     let block = Block::default()
@@ -7583,15 +7625,7 @@ fn draw_jobs(jobs: &[comrade_tool_project::BgJobInfo], frame: &mut Frame, area: 
     let width = usize::from(inner.width).max(8);
     let mut lines: Vec<Line> = Vec::new();
     for job in jobs.iter().take(MAX_JOB_ROWS) {
-        let prefix = format!("{}  ", job.id);
-        let suffix = format!("  {}  {:.0}s", job.status, job.elapsed_secs);
-        let budget = width.saturating_sub(prefix.chars().count() + suffix.chars().count());
-        let cmd: String = job.command.chars().take(budget).collect();
-        lines.push(Line::from(vec![
-            Span::styled(prefix, Style::default().fg(Color::Yellow)),
-            Span::styled(cmd, Style::default().fg(Color::Gray)),
-            Span::styled(suffix, Style::default().fg(Color::DarkGray)),
-        ]));
+        lines.extend(job_lines(job, width));
     }
     if jobs.len() > MAX_JOB_ROWS {
         lines.push(Line::from(Span::styled(
@@ -8274,19 +8308,24 @@ fn base_style() -> Style {
     Style::default().fg(Color::White)
 }
 
-/// Wrap a plain string into lines of at most `width` chars.
+/// Wrap a plain string into lines of at most `width` chars, hard-splitting a word
+/// longer than the width (a long URL, path or command) so nothing overflows the
+/// panel edge.
 fn plain_wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     let mut out = Vec::new();
     let mut cur = String::new();
     for word in text.split_whitespace() {
-        if cur.is_empty() {
-            cur.push_str(word);
-        } else if cur.chars().count() + 1 + word.chars().count() <= width {
-            cur.push(' ');
-            cur.push_str(word);
-        } else {
-            out.push(std::mem::take(&mut cur));
-            cur.push_str(word);
+        for chunk in hard_cut(word, width) {
+            if cur.is_empty() {
+                cur.push_str(&chunk);
+            } else if cur.chars().count() + 1 + chunk.chars().count() <= width {
+                cur.push(' ');
+                cur.push_str(&chunk);
+            } else {
+                out.push(std::mem::take(&mut cur));
+                cur.push_str(&chunk);
+            }
         }
     }
     if !cur.is_empty() {
@@ -8295,7 +8334,11 @@ fn plain_wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Cut a line into chunks of at most `width` chars, never splitting a run
+/// shorter than the width. `width` is clamped to at least 1 so `chunks` cannot
+/// panic.
 fn hard_cut(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     if line.chars().count() <= width {
         return vec![line.to_string()];
     }
@@ -8723,8 +8766,10 @@ fn inline_toks(text: &str, base: Style) -> Vec<Tok> {
     out
 }
 
-/// Wrap styled tokens into lines of at most `width` chars, word-aware.
+/// Wrap styled tokens into lines of at most `width` chars, word-aware. A word
+/// longer than the whole width is hard-split so it never overflows the panel.
 fn wrap_toks(tokens: &[Tok], width: usize) -> Vec<Vec<Tok>> {
+    let width = width.max(1);
     let mut out = Vec::new();
     let mut cur: Vec<Tok> = Vec::new();
     let mut cur_len = 0usize;
@@ -8735,21 +8780,20 @@ fn wrap_toks(tokens: &[Tok], width: usize) -> Vec<Vec<Tok>> {
             if word.is_empty() {
                 continue;
             }
-            let need = if first { 0 } else { 1 };
-            if cur_len + need + word.chars().count() > width && !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-                cur_len = 0;
-                cur.push(tok(word.to_string(), t.style));
-                cur_len += word.chars().count();
-            } else {
-                if !first {
+            for chunk in hard_cut(word, width) {
+                let need = if first { 0 } else { 1 };
+                if cur_len + need + chunk.chars().count() > width && !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    cur_len = 0;
+                }
+                if !cur.is_empty() && !first {
                     cur.push(tok(" ".to_string(), Style::default()));
                     cur_len += 1;
                 }
-                cur.push(tok(word.to_string(), t.style));
-                cur_len += word.chars().count();
+                cur_len += chunk.chars().count();
+                cur.push(tok(chunk, t.style));
+                first = false;
             }
-            first = false;
         }
     }
     if !cur.is_empty() {
@@ -10452,6 +10496,119 @@ mod tests {
         }
         // No delegate configured → the panel keeps its legacy fixed height.
         assert!(delegate_panel_rows(&[], &ModelColors::new(), 24).is_none());
+    }
+
+    #[test]
+    fn plain_wrap_hard_splits_a_word_longer_than_the_width() {
+        // A 59-char unbroken token (URL/path/command) must be hard-chopped so no
+        // row ever exceeds the width, and not one char may be lost.
+        let long = "a".repeat(59);
+        let rows = plain_wrap(&format!("x {long} y"), 20);
+        assert!(
+            rows.len() >= 4,
+            "long token must span several rows: {rows:?}"
+        );
+        for r in &rows {
+            assert!(r.chars().count() <= 20, "row wider than width: {r:?}");
+        }
+        let joined: String = rows.join("");
+        assert!(joined.contains(&long), "lost the long token in {rows:?}");
+    }
+
+    #[test]
+    fn wrap_toks_hard_splits_a_word_longer_than_the_width() {
+        let long = "z".repeat(30);
+        let toks = vec![tok(format!("short {long}"), Style::default())];
+        let rows = wrap_toks(&toks, 12);
+        let text_of = |r: &[Tok]| r.iter().map(|t| t.text.as_str()).collect::<String>();
+        for r in &rows {
+            assert!(
+                text_of(r).chars().count() <= 12,
+                "row wider than width: {:?}",
+                text_of(r)
+            );
+        }
+        let joined: String = rows.iter().map(|r| text_of(r)).collect();
+        assert!(joined.contains(&long), "lost the long token in {joined:?}");
+    }
+
+    #[test]
+    fn wrap_styled_hard_splits_a_word_longer_than_the_width() {
+        let parts: Vec<StyledPart> = vec![
+            ("p/".to_string(), Style::default(), false),
+            ("q".repeat(25), Style::default(), false),
+        ];
+        let rows = wrap_styled(&parts, 10);
+        assert!(rows.len() > 1, "long glued part must wrap: {rows:?}");
+        for r in &rows {
+            let w: usize = r.iter().map(|s| s.content.chars().count()).sum();
+            assert!(w <= 10, "row wider than width: {w}");
+        }
+    }
+
+    #[test]
+    fn background_job_command_wraps_instead_of_truncating() {
+        let job = comrade_tool_project::BgJobInfo {
+            id: "bg-1".into(),
+            command: "echo a very long command line that cannot possibly fit here".into(),
+            status: "running".into(),
+            running: true,
+            elapsed_secs: 12.0,
+        };
+        let lines = job_lines(&job, 24);
+        assert!(
+            lines.len() > 1,
+            "a long command must wrap onto several rows"
+        );
+        let joined: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        for word in ["bg-1", "echo", "fit", "running", "12s"] {
+            assert!(joined.contains(word), "lost {word} in {joined:?}");
+        }
+        for l in &lines {
+            assert!(l.width() <= 24, "row wider than the panel: {l:?}");
+        }
+    }
+
+    #[test]
+    fn sensor_entry_wraps_instead_of_truncating() {
+        let e = SensorEntry {
+            id: 7,
+            name: "gh-issues-sensor-with-a-very-long-name".into(),
+            mode: comrade_core::SensorMode::Ask,
+            prompt: None,
+            delta: crate::proactive::Delta {
+                added: vec!["a long detected change that cannot fit on one line".into()],
+                removed: Vec::new(),
+            },
+        };
+        let rows = wrap_toks(&sensor_toks(&e), 30);
+        assert!(rows.len() > 1, "a long entry must wrap onto several rows");
+        let text_of = |r: &[Tok]| r.iter().map(|t| t.text.as_str()).collect::<String>();
+        let joined: String = rows.iter().map(|r| text_of(r)).collect();
+        for word in [
+            "7",
+            "ASK",
+            "gh-issues-sensor-with-a-very-long-name",
+            "detected",
+        ] {
+            assert!(joined.contains(word), "lost {word} in {joined:?}");
+        }
+        for r in &rows {
+            assert!(
+                text_of(r).chars().count() <= 30,
+                "row wider than the panel: {:?}",
+                text_of(r)
+            );
+        }
     }
 
     #[test]
