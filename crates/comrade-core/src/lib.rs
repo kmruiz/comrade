@@ -27,7 +27,7 @@ pub use agent::{build_session_context, run_agent, run_agent_with_history};
 pub use compact::{CompactReport, compact_history};
 pub use config::{
     Autonomy, Config, DelegateCfg, LoadedConfig, McpAuth, McpConfig, McpServerCfg, McpTransport,
-    expand_env_value,
+    SensorCfg, SensorMode, expand_env_value,
 };
 pub use context::{ContextManager, estimate_tokens};
 pub use delegate::{DelegateLimits, DelegateParallelTool, DelegateTool};

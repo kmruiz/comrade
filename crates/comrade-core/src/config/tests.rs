@@ -473,3 +473,133 @@ fn no_repo_config_leaves_base_unchanged() {
 
     let _ = std::fs::remove_file(&user);
 }
+
+#[test]
+fn sensors_default_to_none() {
+    let c = Config::default();
+    assert!(c.sensors.is_empty());
+    let p = write_tmp("[llm]\nprovider=\"ollama\"\nmodel=\"x\"\n");
+    let c = Config::load(Some(&p)).unwrap().config;
+    let _ = std::fs::remove_file(&p);
+    assert!(c.sensors.is_empty());
+}
+
+#[test]
+fn sensors_parse_all_fields_and_defaults() {
+    let p = write_tmp(
+        r#"
+        [[sensors]]
+        name = "gh-issues"
+        command = "gh issue list --state open"
+        interval_secs = 120
+        mode = "auto"
+        prompt = "Triage the new issues."
+        enabled = true
+
+        [[sensors]]
+        name = "minimal"
+        command = "echo hi"
+        "#,
+    );
+    let c = Config::load(Some(&p)).unwrap().config;
+    let _ = std::fs::remove_file(&p);
+    assert_eq!(c.sensors.len(), 2);
+
+    let gh = &c.sensors[0];
+    assert_eq!(gh.name, "gh-issues");
+    assert_eq!(gh.command, "gh issue list --state open");
+    assert_eq!(gh.interval_secs, 120);
+    assert_eq!(gh.mode, SensorMode::Auto);
+    assert_eq!(gh.prompt.as_deref(), Some("Triage the new issues."));
+    assert!(gh.enabled);
+
+    // Omitted fields fall back to the documented defaults.
+    let minimal = &c.sensors[1];
+    assert_eq!(minimal.interval_secs, 300);
+    assert_eq!(minimal.mode, SensorMode::Ask);
+    assert_eq!(minimal.prompt, None);
+    assert!(minimal.enabled);
+}
+
+#[test]
+fn sensor_disabled_flag_parses() {
+    let p = write_tmp(
+        "[[sensors]]\nname = \"off\"\ncommand = \"true\"\nenabled = false\nmode = \"ask\"\n",
+    );
+    let c = Config::load(Some(&p)).unwrap().config;
+    let _ = std::fs::remove_file(&p);
+    assert_eq!(c.sensors.len(), 1);
+    assert!(!c.sensors[0].enabled);
+    assert_eq!(c.sensors[0].mode, SensorMode::Ask);
+}
+
+#[test]
+fn sensor_effective_interval_floors_at_ten() {
+    let mk = |interval_secs| SensorCfg {
+        interval_secs,
+        ..Default::default()
+    };
+    assert_eq!(mk(0).effective_interval_secs(), 10);
+    assert_eq!(mk(5).effective_interval_secs(), 10);
+    assert_eq!(mk(10).effective_interval_secs(), 10);
+    assert_eq!(mk(120).effective_interval_secs(), 120);
+}
+
+#[test]
+fn sensor_mode_as_str() {
+    assert_eq!(SensorMode::Ask.as_str(), "ask");
+    assert_eq!(SensorMode::Auto.as_str(), "auto");
+}
+
+#[test]
+fn repo_config_merges_sensors_by_name() {
+    let user = write_tmp(
+        r#"
+[llm]
+provider = "ollama"
+model = "x"
+
+[[sensors]]
+name = "a"
+command = "echo a"
+interval_secs = 60
+mode = "ask"
+"#,
+    );
+    let proj = tmp_dir("merge_sensors");
+    let repo_cfg = proj.join(PROJECT_CONFIG_FILE);
+    std::fs::write(
+        &repo_cfg,
+        r#"
+[[sensors]]
+name = "a"
+command = "echo a-v2"
+interval_secs = 90
+mode = "auto"
+
+[[sensors]]
+name = "c"
+command = "echo c"
+"#,
+    )
+    .unwrap();
+
+    let loaded = Config::load_layered(Some(&user), Some(&proj)).unwrap();
+
+    let names: Vec<&str> = loaded
+        .config
+        .sensors
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["a", "c"]);
+    // The project entry supersedes the user one in place...
+    assert_eq!(loaded.config.sensors[0].command, "echo a-v2");
+    assert_eq!(loaded.config.sensors[0].interval_secs, 90);
+    assert_eq!(loaded.config.sensors[0].mode, SensorMode::Auto);
+    // ...and the new name is appended.
+    assert_eq!(loaded.config.sensors[1].command, "echo c");
+
+    let _ = std::fs::remove_file(&user);
+    let _ = std::fs::remove_dir_all(&proj);
+}

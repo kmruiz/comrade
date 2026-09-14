@@ -113,11 +113,11 @@ When no file is found, built-in defaults apply. Every table below is optional.
 
 A **project-level `.comrade.toml`** at the project root (the `--dir` directory,
 else the current directory) is then layered on top of the resolved file. Project
-values supersede it key by key; `[[delegates]]` and `[[mcp.servers]]` entries
-merge by `name` (a project entry with the same name replaces the user's entry,
-new names are appended); every other array is replaced wholesale. Because it
-comes from the repository, a `.comrade.toml` can also set `[security]` and
-`[hooks]` — treat it as trusted input.
+values supersede it key by key; `[[delegates]]`, `[[mcp.servers]]` and
+`[[sensors]]` entries merge by `name` (a project entry with the same name
+replaces the user's entry, new names are appended); every other array is
+replaced wholesale. Because it comes from the repository, a `.comrade.toml` can
+also set `[security]` and `[hooks]` — treat it as trusted input.
 
 ```toml
 # .comrade.toml — project overrides, layered on top of the user config
@@ -214,6 +214,45 @@ expanded from the environment.
 Shell hooks run around every tool call. `on` matches `*`, an exact tool name
 (`fs_edit`) or a prefix (`fs_*`); `run` is the command executed via `bash -c`. A
 non-zero `pre_tool` exit aborts the call; a non-zero `post_tool` exit only warns.
+
+### `[[sensors]]` — proactive mode
+
+Proactive mode lets Comrade watch external sources (JIRA tickets, GitHub issues,
+a queue, …) without being asked. Each `[[sensors]]` table names a shell command
+that is polled on an interval; when its output changes Comrade notifies you, and
+— depending on `mode` — either asks what to do or starts a session to handle it.
+
+| Key | Default | Notes |
+|---|---|---|
+| `name` | – | Unique sensor id; also names the session Comrade opens. |
+| `command` | – | Shell command run through `bash -c`; its stdout is watched. |
+| `interval_secs` | `300` | Poll period (floored at 10 seconds). |
+| `mode` | `ask` | `ask` = notify and wait for you; `auto` = handle it on its own. |
+| `prompt` | – | Optional seed prompt for the session Comrade opens. |
+| `enabled` | `true` | Set `false` to keep the entry but stop polling it. |
+
+The first poll only establishes a baseline. A change is diffed line by line
+(blank lines and surrounding whitespace are ignored) and reported in the
+transcript. In `auto` mode Comrade opens a new session titled `sensor: <name>`,
+**backed by a temporary file** and seeded with the detected change, and runs it —
+the agent can hand the listening/triage work to a delegate so the main context
+is not bloated. In `ask` mode a confirmation dialog appears first and nothing is
+started unless you agree.
+
+```toml
+[[sensors]]
+name = "gh-issues"
+command = "gh issue list --state open"
+interval_secs = 120
+mode = "ask"
+
+[[sensors]]
+name = "jira"
+command = "jira issue list --jql 'assignee = currentUser()'"
+interval_secs = 300
+mode = "auto"
+prompt = "Triage these tickets and delegate the small fixes."
+```
 
 ### Example
 

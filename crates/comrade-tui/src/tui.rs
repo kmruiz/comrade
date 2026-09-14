@@ -1043,6 +1043,56 @@ struct JobsPick {
 }
 
 /// Expand a leading `~/` in a typed path to the user's home directory.
+/// Make a sensor name safe to use inside a file name.
+fn sanitize_session_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// A bounded preview of a sensor's raw output, used as the body of the `ask`
+/// confirmation dialog so the change can be seen without opening the session.
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let mut out: String = text.chars().take(max_chars).collect();
+        out.push_str("\n…");
+        out
+    }
+}
+
+/// The seed prompt a sensor-opened session starts with: the configured prompt
+/// when given, then a description of the detected change.
+fn sensor_seed(name: &str, prompt: Option<&str>, delta: &crate::proactive::Delta) -> String {
+    let mut seed = String::new();
+    if let Some(p) = prompt.map(str::trim).filter(|p| !p.is_empty()) {
+        seed.push_str(p);
+        seed.push_str("\n\n");
+    }
+    seed.push_str(&format!("Proactive sensor \"{name}\" detected changes:"));
+    if !delta.added.is_empty() {
+        seed.push_str("\nAdded:");
+        for line in delta.added.iter().take(50) {
+            seed.push_str(&format!("\n  + {line}"));
+        }
+    }
+    if !delta.removed.is_empty() {
+        seed.push_str("\nRemoved:");
+        for line in delta.removed.iter().take(50) {
+            seed.push_str(&format!("\n  - {line}"));
+        }
+    }
+    seed.push_str("\n\nInvestigate and handle these changes.");
+    seed
+}
+
 fn expand_tilde(input: &str) -> String {
     if let Some(rest) = input.strip_prefix("~/")
         && let Ok(home) = std::env::var("HOME")
@@ -1187,6 +1237,16 @@ struct App {
     /// Sender end of the in-flight run's steering pipe (`None` while idle).
     /// Sending fails once the run has ended and dropped its receiver.
     steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Receiver of proactive-mode sensor events (a polled command changed, or a
+    /// poll failed); drained in the main loop. Never closes while `sensor_tx`
+    /// holds a sender, so even with no sensors configured the arm stays idle.
+    sensor_rx: tokio::sync::mpsc::UnboundedReceiver<crate::proactive::SensorEvent>,
+    /// A sender for `sensor_rx`, kept alive so the channel never closes and used
+    /// to feed a human-confirmed `ask`-mode action back into the loop.
+    sensor_tx: tokio::sync::mpsc::UnboundedSender<crate::proactive::SensorEvent>,
+    /// Owning handle of the running sensor polling tasks, held for the whole
+    /// session so the tasks are not dropped.
+    sensor_runtime: Option<crate::proactive::SensorRuntime>,
     /// One-shot "compact the context now" request handed to the running loop
     /// (`None` while idle).
     compact: Option<comrade_tool::CompactRequest>,
@@ -2214,6 +2274,120 @@ impl App {
         self.path_prompt = None;
         self.session_pick = None;
         self.push_meta("opened a new session");
+    }
+
+    /// React to a proactive-mode sensor event: note it, then either start a
+    /// session to handle it (`auto`) or ask the human first (`ask`).
+    fn on_sensor_event(&mut self, ev: crate::proactive::SensorEvent) {
+        use crate::proactive::SensorEvent;
+        match ev {
+            SensorEvent::Error { name, message } => {
+                self.push_meta(format!("sensor \"{name}\" failed: {message}"));
+            }
+            SensorEvent::Changed {
+                name,
+                mode,
+                prompt,
+                delta,
+                raw,
+            } => {
+                self.notify_sensor(&name, &delta);
+                match mode {
+                    comrade_core::SensorMode::Auto => {
+                        self.start_sensor_session(&name, prompt.as_deref(), &delta);
+                    }
+                    comrade_core::SensorMode::Ask => {
+                        self.ask_about_sensor(name, prompt, delta, raw);
+                    }
+                }
+            }
+            SensorEvent::Confirmed {
+                name,
+                prompt,
+                delta,
+            } => {
+                self.start_sensor_session(&name, prompt.as_deref(), &delta);
+            }
+        }
+    }
+
+    /// Record a sensor change in the transcript: a summary meta row plus the
+    /// added/removed lines (bounded, so a huge diff cannot flood the chat).
+    fn notify_sensor(&mut self, name: &str, delta: &crate::proactive::Delta) {
+        self.push_meta(format!(
+            "\u{1F514} sensor \"{name}\": {} added, {} removed",
+            delta.added.len(),
+            delta.removed.len()
+        ));
+        for line in delta.added.iter().take(20) {
+            self.push_msg(Msg::text(MsgKind::Meta, format!("  + {line}")));
+        }
+        for line in delta.removed.iter().take(20) {
+            self.push_msg(Msg::text(MsgKind::Meta, format!("  - {line}")));
+        }
+    }
+
+    /// Ask the human whether to tackle a sensor change (`ask` mode). A background
+    /// task feeds a `Confirmed` event back into the loop if they say yes, which
+    /// is what opens the session — so nothing starts without consent.
+    fn ask_about_sensor(
+        &mut self,
+        name: String,
+        prompt: Option<String>,
+        delta: crate::proactive::Delta,
+        raw: String,
+    ) {
+        let title = format!("Sensor \"{name}\" reported changes; tackle them now?");
+        let diff = (!raw.trim().is_empty()).then(|| truncate_preview(&raw, 4000));
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.dialogs.push(Dialog {
+            prompt: UserPrompt::Confirm { title, diff },
+            buf: String::new(),
+            reply: reply_tx,
+            session: self.active_id(),
+            form: None,
+        });
+        let tx = self.sensor_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(comrade_tool::UserReply::Answer(answer)) = reply_rx.await
+                && answer.trim().eq_ignore_ascii_case("yes")
+            {
+                let _ = tx.send(crate::proactive::SensorEvent::Confirmed {
+                    name,
+                    prompt,
+                    delta,
+                });
+            }
+        });
+    }
+
+    /// Open a fresh session to handle a sensor change, back it with a temporary
+    /// file, seed it with the change context and start its run.
+    fn start_sensor_session(
+        &mut self,
+        name: &str,
+        prompt: Option<&str>,
+        delta: &crate::proactive::Delta,
+    ) {
+        self.new_session();
+        let title = format!("sensor: {name}");
+        if let Some(slot) = self.open_sessions.get_mut(self.active) {
+            slot.title = title.clone();
+        }
+        self.session.set_title(&title);
+        let path = std::env::temp_dir().join(format!(
+            "comrade-sensor-{}-{}.toml",
+            sanitize_session_name(name),
+            self.active_id()
+        ));
+        self.session_file = Some(path.clone());
+        let seed = sensor_seed(name, prompt, delta);
+        self.push_msg(Msg::authored(MsgKind::User, "you", seed.clone()));
+        self.refresh_active_slot();
+        // Back the new session with its temporary file straight away.
+        let snapshot = self.session_snapshot();
+        let _ = crate::session_store::save(&path, &snapshot);
+        self.start_run(seed);
     }
 
     /// Close the active session (emacs `C-x k`): discard its slot and activate a
@@ -3575,6 +3749,10 @@ fn build_app(
     agent_names.push(deps.cfg.llm.display());
     model_colors.assign(&agent_names);
 
+    // Placeholder proactive-mode channel; `run` rewires it to the configured
+    // sensors. A sender kept in the App means `sensor_rx` never closes.
+    let (sensor_tx, sensor_rx) = tokio::sync::mpsc::unbounded_channel();
+
     App {
         cfg: deps.cfg.clone(),
         client: deps.client.clone(),
@@ -3599,6 +3777,9 @@ fn build_app(
         run_handle: None,
         running: false,
         steer_tx: None,
+        sensor_rx,
+        sensor_tx,
+        sensor_runtime: None,
         compact: None,
         queued_prompt: None,
         run_cancelled: false,
@@ -3678,6 +3859,13 @@ pub async fn run(deps: &Deps) -> Result<()> {
         deps, events_tx, events_rx, run_tx, asks_tx, asks_rx, git_tx, git_rx,
     );
     app.dialog_ask_tx = Some(dialog_ans_tx);
+
+    // Start polling the configured proactive-mode sensors. The receiver is
+    // drained by the main loop; the runtime is held for the session's lifetime.
+    let (sensor_runtime, sensor_rx) = crate::proactive::SensorRuntime::start(&deps.cfg.sensors);
+    app.sensor_tx = sensor_runtime.sender();
+    app.sensor_rx = sensor_rx;
+    app.sensor_runtime = Some(sensor_runtime);
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
@@ -3786,6 +3974,11 @@ pub async fn run(deps: &Deps) -> Result<()> {
                 match git {
                     Some(info) => app.on_git(info),
                     None => break Err(anyhow::anyhow!("git refresh channel closed")),
+                }
+            }
+            se = app.sensor_rx.recv() => {
+                if let Some(ev) = se {
+                    app.on_sensor_event(ev);
                 }
             }
             _ = spin.tick(), if app.any_running() => {
@@ -8406,6 +8599,44 @@ fn strip_react_scaffolding(text: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod proactive_ui_tests {
+    use super::*;
+    use crate::proactive::Delta;
+
+    #[test]
+    fn sanitize_keeps_safe_chars_and_replaces_others() {
+        assert_eq!(sanitize_session_name("gh-issues"), "gh-issues");
+        assert_eq!(sanitize_session_name("jira/PR 12:x"), "jira_PR_12_x");
+        assert_eq!(sanitize_session_name(""), "");
+    }
+
+    #[test]
+    fn seed_uses_the_configured_prompt_then_describes_the_change() {
+        let delta = Delta {
+            added: vec!["new ticket".into()],
+            removed: vec!["old".into()],
+        };
+        let seed = sensor_seed("jira", Some("Triage now."), &delta);
+        assert!(seed.starts_with("Triage now."));
+        assert!(seed.contains("Proactive sensor \"jira\" detected changes:"));
+        assert!(seed.contains("+ new ticket"));
+        assert!(seed.contains("- old"));
+    }
+
+    #[test]
+    fn seed_without_a_prompt_still_describes_the_change() {
+        let delta = Delta {
+            added: vec!["x".into()],
+            removed: vec![],
+        };
+        let seed = sensor_seed("gh", None, &delta);
+        assert!(seed.contains("Proactive sensor \"gh\""));
+        assert!(seed.contains("+ x"));
+        assert!(!seed.contains("Removed:"));
+    }
 }
 
 #[cfg(test)]

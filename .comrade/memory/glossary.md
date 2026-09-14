@@ -381,6 +381,14 @@ Private items cannot be re-exported, so a moved item used by a sibling submodule
 **Notes:**
 Runs with `--message-format=json`; `parse_check_json`/`format_diagnostic` parse it. Falls back to human-readable error lines when no JSON diagnostics parse. `tasks::exec` returns uncapped output so parsing sees the whole stream.
 
+## Proactive mode
+> Comrade's config-driven polling of external sources (JIRA tickets, GitHub issues, queues, …). Declared as `[[sensors]]`; a change posts a notification and, depending on each sensor's `mode`, either asks the human (`ask`) or opens a new session backed by a temporary file and runs it (`auto`). Implemented in the `proactive` module (one tokio task per enabled sensor) and drained in the TUI's main loop.
+
+**References:**
+- `crates/comrade-tui/src/proactive.rs`
+- `crates/comrade-core/src/config.rs`
+- `README.md`
+
 ## prompt caching
 > `[llm] prompt_caching` (default false): when on, `ChatRequest` sends a non-standard `cache_control: {"type":"ephemeral"}` marker on the serialized system message and the last tool definition so cache-aware (Anthropic/OpenRouter-style) providers can reuse the stable prefix. Providers that don't support it ignore the unknown field.
 
@@ -522,6 +530,14 @@ Added by ADR #36. deny wins over allow: any command containing a deny string is 
 
 **Notes:**
 Backed by fastembed (quantized BGE-small-en-v1.5, in-process ONNX) + a flat cosine index persisted in the user cache dir and rebuilt incrementally by text hash; see ADR #22. Read-only for the loop (advisors/delegates may call it).
+
+## Sensor
+> A `[[sensors]]` entry in `config.toml`: a shell command Comrade polls on `interval_secs`; when the command's stdout changes (diffed line-by-line) it emits a `SensorEvent`, and per its `mode` Comrade either notifies+asks (`ask`) or opens a session to handle it (`auto`). Fields: name, command, interval_secs (default 300, floored 10), mode, prompt, enabled.
+
+**References:**
+- `crates/comrade-core/src/config.rs`
+- `crates/comrade-tui/src/proactive.rs`
+- `README.md`
 
 ## session (TUI)
 > A named unit owning its own plan and chat. In the TUI the active session's live state is the App's own fields (AgentSession plan/title, ContextManager history, Vec<Msg> chat); every other opened session is an OpenSession slot holding a Box<SessionFile> snapshot. Ctrl-x C-b switches, C-s saves, C-f loads, C-k closes (kill-session) and C-w forks; the M-x names are switch-session/save-session/load-session/kill-session/fork-session.

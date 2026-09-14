@@ -238,6 +238,73 @@ impl SecurityCfg {
     }
 }
 
+/// What the agent should do when a sensor reports a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SensorMode {
+    /// Notify the human and ask whether Comrade should tackle the change.
+    #[default]
+    Ask,
+    /// Proactive: handle the change on its own (start a session) without asking.
+    Auto,
+}
+
+impl SensorMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SensorMode::Ask => "ask",
+            SensorMode::Auto => "auto",
+        }
+    }
+}
+
+/// A "proactive mode" sensor: a shell command Comrade polls on an interval to
+/// detect external changes (JIRA tickets, GitHub issues, a queue, …). When the
+/// polled output changes, the sensor emits a notification and — depending on
+/// [`SensorMode`] — Comrade either asks the human what to do or proactively
+/// starts a session to handle it. One `[[sensors]]` entry per sensor.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SensorCfg {
+    /// Unique name the human uses to recognise this sensor, e.g. `jira-tickets`.
+    pub name: String,
+    /// Shell command polled via `bash -c`. Its stdout is what is watched for
+    /// changes; a non-zero exit is reported as a sensor error, not a change.
+    pub command: String,
+    /// How often to poll, in seconds. Clamped to a 10s floor at runtime.
+    pub interval_secs: u64,
+    /// `ask` (notify and wait for the human) or `auto` (handle the change on its
+    /// own).
+    pub mode: SensorMode,
+    /// Optional task prompt handed to the session Comrade opens for a change.
+    /// When unset a default prompt describing the detected change is used.
+    pub prompt: Option<String>,
+    /// Whether this sensor is polled. Defaults to `true`; set `enabled = false`
+    /// to keep the entry but switch it off.
+    pub enabled: bool,
+}
+
+impl Default for SensorCfg {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            command: String::new(),
+            interval_secs: 300,
+            mode: SensorMode::Ask,
+            prompt: None,
+            enabled: true,
+        }
+    }
+}
+
+impl SensorCfg {
+    /// The effective poll period, with a 10s floor so a misconfigured `0` (or a
+    /// tiny value) cannot hammer the command.
+    pub fn effective_interval_secs(&self) -> u64 {
+        self.interval_secs.max(10)
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -248,6 +315,8 @@ pub struct Config {
     /// Extra developer models the tech lead can delegate sub-tasks to (see the
     /// `delegate` tool).
     pub delegates: Vec<DelegateCfg>,
+    /// Proactive-mode sensors polled for external changes (see [`SensorCfg`]).
+    pub sensors: Vec<SensorCfg>,
     /// External MCP servers whose tools are bridged into the agent.
     pub mcp: McpConfig,
     /// Pre/post-tool shell hooks run around every tool invocation.
@@ -534,7 +603,7 @@ fn merge_tables(
 ) -> toml::map::Map<String, toml::Value> {
     for (key, value) in over {
         let merged = match base.remove(&key) {
-            Some(existing) if matches!(key.as_str(), "delegates" | "servers") => {
+            Some(existing) if matches!(key.as_str(), "delegates" | "servers" | "sensors") => {
                 merge_named_lists(existing, value)
             }
             Some(existing) => merge_toml_values(existing, value),
