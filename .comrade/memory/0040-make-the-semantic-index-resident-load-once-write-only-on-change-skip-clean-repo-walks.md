@@ -1,5 +1,5 @@
 # 0040 - Make the semantic index resident: load once, write only on change, skip clean-repo walks
-status: accepted
+status: superseded
 date: 2026-09-13
 tags: semantic-search, performance, memory, index
 summary: semantic_search now keeps its memory+code index resident per project (loaded once), writes the cache only when something changed, and skips the file walk on a clean repo — removing the per-query re-parse/re-write that made it slow; exact cosine search is retained and ANN/mmap are deferred.
@@ -28,3 +28,6 @@ Steady-state searches no longer re-parse or rewrite the on-disk index and, on a 
 
 ## Note
 2026-09-15 implemented fixes (1)-(4) from the note above. (1) Change detection is now content-based: `refresh`/`code_refresh` report `changed` from a comparison of the resulting store (order-independent `(id, hash)` signatures via `same_docs`, the per-file `FileStamp` map, and the recorded HEAD) instead of "any file was re-parsed". A dirty working tree whose files re-parse to identical chunks no longer rewrites the whole cache — measured on the real index, deflate aside, this removes the per-search 11.6 MB write. (2) The on-disk store is now a compact dependency-free binary blob (`encode_store`/`decode_store`: magic `CSMV`, u16 version, length-prefixed strings, raw little-endian f32 vectors) written to `<key>.bin`; `load_store` still reads a legacy `<key>.json` once and re-saves it in binary form. Measured on this repo's code index: JSON 11,587,403 -> binary 4,129,692 bytes (3.5 MB of that is the raw vectors). (3) Vectors are stored pre-normalised (`normalize` at creation, `normalize_store` on load for old caches) so ranking is a plain dot product (`dot`) — no per-document norm or two `sqrt` per query; the query vector is normalised too. (4) The `documents()` cache is NOT yet done (still re-reads ADRs + glossary per memory search) — only the memory index is small (520 KB) so it was left out of this pass. Explicitly NOT taken, per the human's decision: bson (not in Cargo.lock, needs a network fetch; BSON has no f32 scalar so serde doubles every component, and it repeats field names per doc — no size win) and flate2 compression on top of the binary blob (flate2 is already a dependency and the model assets use raw deflate, but measured it only shaves 4.13 -> 3.47 MB, ~16 %, because the payload is dominated by incompressible f32; it would not speed up the resident query path and would make the cache opaque). memmap2 and ANN remain deferred.
+
+## Note
+merged into #0022

@@ -1,5 +1,5 @@
 # 0026 - Ecosystem seam for the pom_* tools (Cargo backend, npm/Maven/Go later)
-status: accepted
+status: superseded
 date: 2026-09-13
 tags: project, ecosystem, architecture, tools
 summary: Route all `pom_*` tools through an `Ecosystem` trait (`detect` picks Cargo by manifest); generalize `CommandLine` to `Program{program,args}` and let backends own verb resolution, the check command, and diagnostics parsing.
@@ -22,3 +22,6 @@ Covers the `pom_*` build/run/check/format surface of `comrade-tool-project`. Doe
 ## Impact
 Adding npm/Maven/Go later is "implement `Ecosystem` + one arm in `detect`" with no `pom_*` tool change; `pom_check` degrades gracefully via `generic_error_lines` for toolchains without structured diagnostics. Cargo behaviour is unchanged (existing tests still pass, plus new ecosystem tests). The trait is a compile-time seam (no dynamic loading).
 
+
+## Note
+merged into #0030

@@ -1,5 +1,5 @@
 # 0034 - Auto-compaction in the agent loop (CtxCfg.auto_compact, default on)
-status: accepted
+status: superseded
 date: 2026-09-13
 tags: context, agent-loop, compaction
 summary: The agent loop auto-compacts an over-budget history into a model-written summary (once per over-budget episode, gated by CtxCfg.auto_compact, default on) instead of letting enforce_budget degrade it lossily.
@@ -22,3 +22,6 @@ Covers the agent loop's automatic context compaction and its config flag. Does N
 ## Impact
 Over-budget long runs are now summarised by the model instead of degraded lossily. Costs one extra (non-streaming) model call per over-budget episode. Set `[context] auto_compact = false` to restore manual-only behaviour. Files: crates/comrade-core/src/agent.rs, context.rs, config.rs; tests: agent::tests::over_budget_history_is_auto_compacted, context::tests::needs_auto_compaction_tracks_the_trim_target, config::tests::auto_compact_defaults_on_and_can_be_disabled.
 
+
+## Note
+merged into #0020

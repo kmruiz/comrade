@@ -1,5 +1,5 @@
 # 0027 - Semantic code search: semantic_search scope=code over tree-sitter chunks, git-incremental index, M-x reindex
-status: accepted
+status: superseded
 date: 2026-09-13
 tags: memory, search, syntax, tools, index
 summary: Extend `semantic_search` with `scope: memory|code|all`; code hits come from tree-sitter symbol chunks carrying file:line, indexed in a separate per-project flat index that is reindexed incrementally from git changes, plus a palette-only M-x `reindex-semantic-search` command.
@@ -31,3 +31,6 @@ Follow-up (deferred, requested by the human): `semantic_search` is too slow in p
 
 ## Note
 Addressed in #40: the index is now resident (loaded once per project root), written only when it changed, and the code file walk is skipped on a clean repo — the per-query disk I/O and tree walk that made semantic_search slow are gone. A binary/mmap vector blob and an ANN structure remain deferred (memmap2 is not currently a dependency).
+
+## Note
+merged into #0022

@@ -25,3 +25,6 @@ Delegating now has no human checkpoint: the lead can spawn sub-agents that auto-
 
 ## Note
 Superseded by #3: delegation is no longer unconditionally approval-free. Each [[delegates]] entry can opt back into an approval pause (`approval = "ask"`) or a hard refusal (`approval = "deny"`); the default (`"auto"`) keeps ADR #2's ungated behaviour. delegate.rs/advise.rs enforce the per-delegate gate with ctx.confirm before running.
+
+## Note
+merged into #0001

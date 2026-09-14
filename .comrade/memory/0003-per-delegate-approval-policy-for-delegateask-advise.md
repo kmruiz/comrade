@@ -1,5 +1,5 @@
 # 0003 - Per-delegate approval policy for delegate/ask_advise
-status: accepted
+status: superseded
 date: 2026-09-09
 tags: tools, delegate, ask_advise, approval, config, security
 summary: Each [[delegates]] entry gets `approval = "ask"/"auto"/"deny"` (default "auto"); delegate and ask_advise enforce it with ctx.confirm before a run, so expensive/risky models can require human approval while cheap ones stay ungated.
@@ -22,3 +22,6 @@ Covers the config field on [[delegates]], enforcement inside DelegateTool::invok
 ## Impact
 A user with a cheap + expensive model pair writes `approval = "ask"` on the expensive [[delegates]] entry; every delegate/ask_advise use of it then pauses for the human while the cheap one stays automatic. The model's justification line is NOT surfaced on these dialogs (deliberately: no ApprovalNotes plumbing for dynamically-gated calls); the dialog shows the delegate name plus the task/question preview. Follow-ups: optionally surface the lead's Justification on ask-gated dialogs; a docs/config example for the cheap/expensive setup.
 
+
+## Note
+merged into #0001

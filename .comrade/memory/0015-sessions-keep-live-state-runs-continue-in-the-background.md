@@ -1,5 +1,5 @@
 # 0015 - Sessions keep live state; runs continue in the background
-status: accepted
+status: superseded
 date: 2026-09-13
 tags: tui, session, concurrency, events
 summary: Each open session owns a LiveState (swappable into the App); events are id-tagged per session, so new/switch/load/kill work mid-run and a parked session keeps running.
@@ -25,3 +25,6 @@ New/switch/load/kill now work while runs are in flight; a parked session keeps s
 
 ## Note
 Follow-up implemented: dialogs/asks are now attributed to their owning session. Each session gets its own TuiUserIo (built in App::make_ctx_base with the session id; stored asks_tx on App), so PendingAsk and Dialog carry `session: u64`. A session whose run is blocked on a user dialog is shown as "waiting": the mode-line session-count label buckets open sessions into a mutually-exclusive running/blocked/idle partition via fn session_status_marker (waiting takes precedence over running), and the Ctrl-x C-b switcher appends "  [waiting]" instead of "  [running]".
+
+## Note
+merged into #0013

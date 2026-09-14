@@ -1,5 +1,5 @@
 # 0004 - Plan-step readiness handshake before delegation
-status: accepted
+status: superseded
 date: 2026-09-09
 tags: delegate, plan, ask_advise, readiness, plan-status
 summary: ask_advise gained a step= readiness mode that marks a delegate-assigned plan step `ready` when its delegate confirms the context suffices; set_step_context lets the lead feed missing context back in.
@@ -22,3 +22,6 @@ PlanStatus lifecycle and session tooling across comrade-tool (plan.rs), comrade-
 ## Impact
 Plan steps assigned to delegates now move pending -> ready -> in_progress; ready is visible in the TUI (blue ●). Reassigning a ready step's model or rewriting its context resets it to pending (readiness is stale). set_step_context and ask_advise step= are denied to delegate sub-agents. Future: could make the gate hard (refuse delegating non-ready steps) once flows mature.
 
+
+## Note
+merged into #0001

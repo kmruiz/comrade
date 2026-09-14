@@ -1,5 +1,5 @@
 # 0018 - Per-delegate `enabled` flag to disable a model without removing it
-status: accepted
+status: superseded
 date: 2026-09-13
 tags: config, delegate, ask_advise, tui, models
 summary: Each [[delegates]] entry gained `enabled = true|false` (default true); a disabled delegate is dropped from delegate/ask_advise targets + model enum + advertised listing (and from the Ctrl-A picker), but kept in config and shown dimmed in the model panel.
@@ -22,3 +22,6 @@ Covers the config field, the fill/parse behaviour, build_targets/DelegateTool::n
 ## Impact
 A user writes `enabled = false` on a [[delegates]] entry to park a model: it disappears from the delegate/ask_advise options and the Ctrl-A picker but stays visible (dimmed, ` (disabled)`) in the model panel and remains in config.toml to flip back on. Applies to both `delegate` and `ask_advise`. Follow-up: the TUI model panel test covers the marker; a docs/config example could mention `enabled`.
 
+
+## Note
+merged into #0001

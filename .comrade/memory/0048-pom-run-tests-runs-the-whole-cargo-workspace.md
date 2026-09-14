@@ -1,5 +1,5 @@
 # 0048 - pom_run_tests runs the whole Cargo workspace
-status: accepted
+status: superseded
 date: 2026-09-14
 tags: pom, cargo, tools, workspace
 summary: pom_run_tests adds `--workspace` for a root-level Cargo `test` when the manifest declares a [workspace], so the summary covers every member; subproject-scoped runs keep --manifest-path only.
@@ -22,3 +22,6 @@ Covers the Cargo backend's verb resolution for `test` (crates/comrade-tool-proje
 ## Impact
 A root-level pom_run_tests on a workspace now returns the aggregate pass/fail + failing test names of every member in one call. Existing subproject-scoped runs and all other verbs are unchanged. Bundled into v0.2.0.
 
+
+## Note
+merged into #0033

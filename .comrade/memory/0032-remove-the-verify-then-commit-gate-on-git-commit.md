@@ -1,5 +1,5 @@
 # 0032 - Remove the verify-then-commit gate on git_commit
-status: accepted
+status: superseded
 date: 2026-09-13
 tags: agent-loop, git, guard
 summary: Removed the agent-loop gate that refused `git_commit` until the last change was backed by a green test run, since it misfired on formatter-originated edits; the prompts still advise verifying before committing.
@@ -22,3 +22,6 @@ Covers the verify-then-commit enforcement inside the agent loop only. Does NOT c
 ## Impact
 The model can commit without a preceding green test run in the same turn; it must judge for itself when the suite is green. The false refusals disappear. The guidance to verify before committing remains in the prompts (crates/comrade-core/prompts/*), so the behaviour is unchanged when the model follows its instructions. `git_commit`'s own argument validation (git_diff/git_status advice, path scoping) is untouched.
 
+
+## Note
+merged into #0047

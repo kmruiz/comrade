@@ -1,5 +1,5 @@
 # 0008 - Ungate ADR/glossary memory writes (record_adr, amend_adr, record_glossary)
-status: accepted
+status: superseded
 date: 2026-09-09
 tags: approval, memory, tools, autonomy
 summary: record_adr, amend_adr and record_glossary are fully ungated: removed from APPROVAL_GATED_TOOLS and their ctx.confirm dialogs deleted, since they only write the agent's own .comrade/memory.
@@ -22,3 +22,6 @@ Covers the three memory tools' approval classification in agent.rs (APPROVAL_GAT
 ## Impact
 The agent can now record and amend ADRs and glossary terms with no human checkpoint, matching git_commit/pom_run_tests/delegate. The remaining approval-gated tools are fs_write_file, ts_rename and shell. If unattended memory writes ever need a checkpoint, a config knob (like the delegate approval policy in ADR #3) is the follow-up.
 
+
+## Note
+merged into #0047

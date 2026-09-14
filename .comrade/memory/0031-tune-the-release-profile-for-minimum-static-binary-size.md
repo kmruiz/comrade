@@ -1,5 +1,5 @@
 # 0031 - Tune the release profile for minimum static binary size
-status: accepted
+status: superseded
 date: 2026-09-13
 tags: release, size, profile, static-binary
 summary: Release profile tuned for minimum static binary size (opt-level=z, fat LTO, codegen-units=1, panic=abort, strip), shrinking the binary ~13.8% (70->60 MB) with no dynamic libraries.
@@ -22,3 +22,6 @@ Covers only the release build profile in the root Cargo.toml. Does NOT change de
 ## Impact
 Release binary 72,518,632 B -> 62,493,216 B (-10,025,416 B, ~13.8%; 70 MB -> 60 MB). Trade-offs: release builds are slower (fat LTO + 1 codegen unit; the observed build was ~1m19s) and the binary may run marginally slower (opt-level z). panic=abort means no unwinding in release builds, so `cargo test --release` will not build (dev `cargo test` uses the test profile and is unaffected); do not reintroduce catch_unwind/panic-recovery in release-only paths. The embedded model (~24 MB deflated) and ONNX Runtime dominate the remainder and are not reducible by profile settings.
 
+
+## Note
+merged into #0045

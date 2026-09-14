@@ -31,3 +31,34 @@ Superseded in part by ADR 0015: new-session/switch/load/kill are no longer refus
 
 ## Note
 The Ctrl-x C-s / C-f path minibuffer now does emacs find-file style Tab completion (crates/comrade-tui/src/tui.rs): KeyCode::Tab in handle_path_prompt_key calls the free fn complete_path(input, base=self.root), which splits the typed path into (dir_part, prefix) via split_dir_prefix, reads that directory (read_dir_entries, dirs marked with a trailing `/`), and extends the name with complete_names — a single match completes fully (dir => trailing `/`), several matches extend to their longest common prefix (longest_common_prefix, reusing common_prefix from the M-x palette). `~` is expanded (expand_tilde) and a path with no directory part is read relative to the project root. Candidates are stored in PathPrompt.matches and shown by draw_path_matches (a popup modelled on draw_mx_list); they are cleared on the next Char/Backspace edit. All logic is pure/testable (complete_names/split_dir_prefix/complete_path unit tests).
+
+## Merged from #0015 - Sessions keep live state; runs continue in the background
+status: accepted
+date: 2026-09-13
+tags: tui, session, concurrency, events
+summary: Each open session owns a LiveState (swappable into the App); events are id-tagged per session, so new/switch/load/kill work mid-run and a parked session keeps running.
+
+## Context
+ADR 0013 modelled background sessions as serialized SessionFile snapshots and refused new-session/switch/save/load/fork/kill while a run was in flight. The human reported they could not open a new session while tasks were in flight, and asked that it work anyway. The blocker was structural: the App kept the active session's fields directly and a single untyped AgentEvent channel, so an in-flight run's events could not be routed away from a session the user switched to.
+
+## Decision
+Give every session (a) a stable u64 id and (b) its own bounded run-facing event channel relayed, tagged with that id, into the App's single central unbounded queue (`TaggedEvent = (u64, AgentEvent)`, `spawn_tagged_relay` in main.rs). Keep the active session's fields in the App as before, but add a `LiveState` struct holding every per-session field (session Arc, ctx_base, history, run_tx, stop, run_handle, running, steer_tx, queued_prompt, run_cancelled, chat, section_collapsed, chat_epoch, chat_rows_cache, stream, ctx_* , activity, session_file, sel, scroll_top, follow, was_at_bottom, search). `App::swap_live` mem::swaps those fields with a LiveState, so a session can be parked/activated in O(1) moves. `OpenSession { id, title, file, live: Option<Box<LiveState>> }`; invariant: the active slot's `live` is None. `on_agent_event_for(id, ev)` applies an event to the active session directly, or swaps a background session in, applies, and swaps back (handling_bg tracks the slot so refresh_active_slot writes to the right one). SessionFile serialization stays only for disk save/load. The "run in flight" refusals are removed for new-session/switch/load/kill and for the load prompt; save and fork still refuse when the ACTIVE session runs because they snapshot its rolling history, whose mutex the run holds.
+
+## Rationale
+Tagged, per-session event channels + a swappable per-session state struct is the minimum change that lets a run keep running while its session is off-screen: events stay attributed, and applying a background event reuses every existing handler unchanged (no rewrite of the ~hundreds of self.chat/self.session references). Holding several live AgentSession/ContextManager pairs is cheap (Arc + mutex), reversing the snapshot-only constraint of ADR 0013 as far as required.
+
+## Alternatives considered
+(a) Defer the new-session request until the run ends: does not give a usable session now. (b) Refactor App to hold `live: LiveState` for every session and rename all `self.chat` accesses: enormous, risky churn. (c) Tag events by extending AgentEvent in comrade-core: invasive and leaks UI routing into the core. (d) Per-session channels polled by a dynamic tokio::select set: awkward; a single tagged queue is simpler.
+
+## Scope
+Comrade TUI session lifecycle and event routing (crates/comrade-tui: tui.rs, main.rs). Does not change headless mode (still one throwaway session via main.rs::new_session) or the on-disk session format.
+
+## Impact
+New/switch/load/kill now work while runs are in flight; a parked session keeps streaming into its own chat and shows a [running] marker in the session switcher. Save/fork of the active session still require it to be idle. Approvals for a background run surface in the shared dialog and their meta note lands in the active chat (follow-up: attribute dialogs to the owning session). Cancel (Esc) cancels the active session's run only. Adds `LiveState`, `swap_live`, `on_agent_event_for`, `spawn_tagged_relay`, `session_bundle`, `build_app`; supersedes the snapshot-only and in-flight-refusal parts of ADR 0013.
+
+
+## Note
+Follow-up implemented: dialogs/asks are now attributed to their owning session. Each session gets its own TuiUserIo (built in App::make_ctx_base with the session id; stored asks_tx on App), so PendingAsk and Dialog carry `session: u64`. A session whose run is blocked on a user dialog is shown as "waiting": the mode-line session-count label buckets open sessions into a mutually-exclusive running/blocked/idle partition via fn session_status_marker (waiting takes precedence over running), and the Ctrl-x C-b switcher appends "  [waiting]" instead of "  [running]".
+
+## Note
+Rollup of the session architecture: this ADR made sessions file-backed (switch/save/load/fork); #0015 gives each open session a live state so runs continue in the background and events are id-tagged per session. Body preserved under "Merged from".

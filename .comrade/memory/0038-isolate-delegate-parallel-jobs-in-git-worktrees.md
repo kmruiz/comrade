@@ -1,5 +1,5 @@
 # 0038 - Isolate delegate_parallel jobs in git worktrees
-status: accepted
+status: superseded
 date: 2026-09-13
 tags: delegate, worktree, git, roadmap
 summary: delegate_parallel jobs can set isolate=true to run in their own detached git worktree (<repo>/.comrade/worktrees/<id>), keeping overlapping edits safe; changed worktrees are kept for review, unchanged ones removed.
@@ -22,3 +22,6 @@ delegate_parallel job isolation only.
 ## Impact
 Parallel delegates can safely edit overlapping files when isolated. New schema field `isolate` on delegate_parallel jobs. Worktrees live under `.comrade/worktrees/` (should be git-ignored). Follow-up: an explicit merge/apply step and cleaning stale worktrees.
 
+
+## Note
+merged into #0023

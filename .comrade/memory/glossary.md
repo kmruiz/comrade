@@ -2,6 +2,15 @@
 
 Project keywords and their meaning, with references to the code or documentation where they appear. One `## term` section per keyword, sorted alphabetically. Look terms up with read_glossary, search with find_glossary, add or update with record_glossary.
 
+## ADR rollup
+> A canonical ADR that has absorbed several closely-related decisions about one feature or thread, so the memory holds one entry per topic instead of many fragments. Produced by merge_adr: each source's full body is appended to the target under a `## Merged from #NNNN` heading and the source is marked status `superseded` but KEPT on disk, so existing ADR/glossary references to it still resolve (stale_memory stays green). Read the canonical entry; a superseded rollup is still searchable and its body is intact. Example rollups: #0022 (semantic_search), #0001 (delegation/approval model), #0020 (context compaction), #0047 (approval-gate simplifications), #0030 (polyglot POM), #0033 (pom_run_tests output), #0045 (release), #0013 (sessions), #0023 (parallel delegates).
+
+**References:**
+- `.comrade/memory/0022-semantic-memory-search-fastembed-model-persisted-flat-cosine-index.md`
+- `.comrade/memory/0020-user-triggered-context-compaction-m-c-replaces-the-history-with-a-model-summary.md`
+- `.comrade/memory/0047-remove-the-justification-argument-from-the-approval-gate.md`
+- `.comrade/memory/0030-multi-language-tree-sitter-support-and-multi-ecosystem-polyglot-pom-detection.md`
+
 ## agent color
 > A stable palette hue assigned to each model (main agent + every configured delegate) by ModelColors when the app starts; used to color the model's name everywhere and, dimmed via band_color, as its sub-chat band.
 
@@ -139,7 +148,7 @@ Carried on `ToolContext.compact: Option<CompactRequest>`; mirrors the `Steer` co
 - `crates/comrade-core/src/context.rs`
 - `crates/comrade-core/src/agent.rs`
 - `crates/comrade-core/src/config.rs`
-- `.comrade/memory/0034-auto-compaction-in-the-agent-loop-ctxcfgauto-compact-default-on.md`
+- `.comrade/memory/0020-user-triggered-context-compaction-m-c-replaces-the-history-with-a-model-summary.md`
 
 **Notes:**
 Mid-run it is requested via `comrade_tool::CompactRequest` and honoured by `run_agent_loop` at its rest point before `enforce_budget()`; while idle the TUI runs `compact_history` in a background task. `ContextManager::compact` keeps the system message and folds the summary into the "Earlier context (compacted)" rollup. The automatic path was added in ADR #34; disable with `[context] auto_compact = false`.
@@ -161,7 +170,7 @@ The project declares `license = "MIT OR Apache-2.0"` in Cargo.toml but only an A
 
 **References:**
 - `crates/comrade-tool-memory/src/semantic/mod.rs`
-- `.comrade/memory/0040-make-the-semantic-index-resident-load-once-write-only-on-change-skip-clean-repo-walks.md`
+- `.comrade/memory/0022-semantic-memory-search-fastembed-model-persisted-flat-cosine-index.md`
 
 ## delegate sub-chat
 > The chat rows authored by a delegate model (its tool cards and its reply), rendered indented 2 columns under a "| " rule in the delegate's agent color with a dim per-agent background band, visually nested under the parent's delegate tool call.
@@ -214,7 +223,7 @@ Defined via a `FieldKind::DiffChoice { options: Vec<DiffOption> }` variant; seed
 **References:**
 - `crates/comrade-tool-project/src/ecosystem.rs`
 - `crates/comrade-tool-project/src/lib.rs`
-- `.comrade/memory/0026-ecosystem-seam-for-the-pom-tools-cargo-backend-npmmavengo-later.md`
+- `.comrade/memory/0030-multi-language-tree-sitter-support-and-multi-ecosystem-polyglot-pom-detection.md`
 
 **Notes:**
 Defaults let a minimal backend implement only model/resolve/format_command: `check_command` defaults to None, `parse_diagnostics` to the generic error-line scan, `simplify_tests` to passthrough, `is_test_command` to false. Adding npm/Maven/Go = implement the trait + one arm in `detect`. See ADR #26.
@@ -477,7 +486,7 @@ Backed by fastembed (quantized BGE-small-en-v1.5, in-process ONNX) + a flat cosi
 **References:**
 - `crates/comrade-tui/src/session_store.rs`
 - `crates/comrade-tui/src/tui.rs`
-- `.comrade/memory/0013-tui-sessions-file-backed-switchsavefork-with-ctrl-x-chords.md`
+- `.comrade/memory/0013-tui-sessions-file-backed-switchsaveloadfork-with-ctrl-x-chords.md`
 
 **Notes:**
 SessionFile is the on-disk JSON form (version/title/status/plan/delegated/finished/chat/section_collapsed/ctx_*/history/rollup/evicted). Save/load prompt for a file path each time (find-file semantics). Ctrl-x is a prefix key handled in handle_event; PathPrompt and SessionPick are the two modals it drives. AgentSession::restore and ContextManager::from_parts rebuild the live session on load/switch/fork. new-session is non-destructive: it stashes the current session and opens a fresh empty slot (emacs scratch-buffer semantics); kill-session discards the active slot and activates a neighbour and refuses to close the only session.
@@ -582,5 +591,5 @@ Practical consequence: a full-suite `pom_run_tests` output is often truncated by
 **References:**
 - `crates/comrade-core/src/worktree.rs`
 - `crates/comrade-core/src/delegate.rs`
-- `.comrade/memory/0038-isolate-delegate-parallel-jobs-in-git-worktrees.md`
+- `.comrade/memory/0023-parallel-delegates-via-a-one-call-delegate-parallel-tool.md`
 
