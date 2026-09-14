@@ -431,6 +431,51 @@ fn reparse_of_an_unchanged_dirty_file_reports_no_change() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Length-sorted batching must not scramble the caller's order: embedding a
+/// mixed-length batch must equal embedding each text on its own.
+#[test]
+fn real_model_preserves_order_across_batches() {
+    assert!(
+        FastEmbedder.embed(&["warm up".into()]).is_ok(),
+        "model unavailable"
+    );
+    let texts: Vec<String> = (0..40)
+        .map(|i| {
+            let filler = "// filler about decoding buffers, headers and retrying\n".repeat(i % 7);
+            format!("fn f_{i}() {{\n{filler}}}\n")
+        })
+        .collect();
+    let batched = FastEmbedder.embed(&texts).unwrap();
+    assert_eq!(batched.len(), texts.len());
+    let alone: Vec<Vec<f32>> = texts
+        .iter()
+        .map(|t| {
+            FastEmbedder
+                .embed(std::slice::from_ref(t))
+                .unwrap()
+                .remove(0)
+        })
+        .collect();
+    for (i, b) in batched.iter().enumerate() {
+        let mut scored: Vec<(usize, f32)> = alone
+            .iter()
+            .enumerate()
+            .map(|(j, a)| (j, cosine(b, a)))
+            .collect();
+        scored.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
+        let (best, top) = scored[0];
+        let second = scored.get(1).map(|s| s.1).unwrap_or(0.0);
+        assert_eq!(
+            best, i,
+            "batched[{i}] best-matches slot {best} (cos {top:.4}); order was scrambled"
+        );
+        assert!(
+            top - second > 0.02,
+            "batched[{i}] is ambiguous: {top:.4} vs {second:.4}"
+        );
+    }
+}
+
 /// Timing benchmark (NOT a correctness test). Run explicitly with:
 /// `cargo test -p comrade-tool-memory --release -- --ignored --nocapture bench_semantic`
 ///
@@ -456,14 +501,17 @@ fn bench_semantic() {
 
     // 2. Model init: inflate assets + build the ONNX session, on the first embed.
     let t = Instant::now();
-    let _ = FastEmbedder.embed(&["warm up the model".to_string()]).unwrap();
+    let _ = FastEmbedder
+        .embed(&["warm up the model".to_string()])
+        .unwrap();
     eprintln!("model init (first embed)   : {:>9.2?}", t.elapsed());
 
-    // 3. Code-index refresh: walk + parse the tree and embed only new chunks.
+    // 3. Code-index rebuild from scratch: walk + parse the tree and embed every
+    //    chunk (the cold path that makes the first search slow).
     let t = Instant::now();
-    let (cstore, _) = code_refresh(&root, &cached, &FastEmbedder).unwrap();
+    let (cstore, _) = code_refresh(&root, &Store::default(), &FastEmbedder).unwrap();
     eprintln!(
-        "code refresh               : {:>9.2?} ({} docs)",
+        "code rebuild (cold)        : {:>9.2?} ({} docs)",
         t.elapsed(),
         cstore.docs.len()
     );
@@ -492,5 +540,97 @@ fn bench_semantic() {
             code.len(),
             mem.len()
         );
+    }
+}
+
+/// Thread-scaling check (NOT a correctness test): is one ONNX session actually
+/// using the cores? Run: `cargo test -p comrade-tool-memory --release --
+/// --ignored --nocapture bench_threads`
+#[test]
+#[ignore = "timing benchmark; run with --ignored --nocapture"]
+fn bench_threads() {
+    use std::time::Instant;
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let filler = "// decode the buffer, walk the records, validate each header and \
+                  accumulate the counters for the running session ";
+    let mut texts = Vec::new();
+    for i in 0..128 {
+        let mut s = format!("fn worker_{i}() {{\n");
+        while s.len() < 800 {
+            s.push_str(filler);
+        }
+        s.push_str("}\n");
+        texts.push(s);
+    }
+    eprintln!("cores={cores} texts={} (≈800 chars each)", texts.len());
+    for (label, threads) in [
+        ("intra=1", Some(1usize)),
+        ("intra=2", Some(2)),
+        ("intra=4", Some(4)),
+        ("intra=default", None),
+    ] {
+        let mut m = build_embedding(threads).unwrap();
+        let t = Instant::now();
+        let _ = m.embed(&texts, Some(EMBED_BATCH)).unwrap();
+        eprintln!("{label:<14}: {:>9.2?}", t.elapsed());
+    }
+}
+
+/// Chunk-length distribution + batching-padding simulation (NOT a correctness
+/// test). Run: `cargo test -p comrade-tool-memory --release -- --ignored
+/// --nocapture bench_chunk_stats`
+#[test]
+#[ignore = "diagnostic benchmark; run with --ignored --nocapture"]
+fn bench_chunk_stats() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut lens: Vec<usize> = Vec::new();
+    for (rel, abs, _, _) in code_files(&root) {
+        let Ok(bytes) = std::fs::read(&abs) else {
+            continue;
+        };
+        if bytes.len() as u64 > MAX_CODE_BYTES || bytes.contains(&0) {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        for c in comrade_tool_syntax::chunks_of_file(&rel, &text) {
+            lens.push(c.text.chars().count());
+        }
+    }
+    let n = lens.len();
+    if n == 0 {
+        return;
+    }
+    let mut sorted = lens.clone();
+    sorted.sort_unstable();
+    let sum: usize = lens.iter().sum();
+    let pct = |p: f64| sorted[((n as f64 - 1.0) * p).round() as usize];
+    eprintln!(
+        "chunks={n} total_chars={sum} avg={:.0} p50={} p90={} p99={} max={}",
+        sum as f64 / n as f64,
+        pct(0.5),
+        pct(0.9),
+        pct(0.99),
+        sorted[n - 1]
+    );
+    let padded = |order: &[usize], batch: usize| -> usize {
+        order
+            .chunks(batch)
+            .map(|c| c.iter().copied().max().unwrap_or(0) * c.len())
+            .sum()
+    };
+    for batch in [8usize, 16] {
+        eprintln!(
+            "batch {batch}: actual_chars={sum} padded_in_order={} padded_sorted={}",
+            padded(&lens, batch),
+            padded(&sorted, batch)
+        );
+    }
+    for cap in [2000usize, 1500, 1000] {
+        let capped: usize = lens.iter().map(|c| (*c).min(cap)).sum();
+        eprintln!("cap {cap} chars: total={capped} (was {sum})");
     }
 }

@@ -235,6 +235,16 @@ Defaults let a minimal backend implement only model/resolve/format_command: `che
 - `crates/comrade-tool-memory/src/semantic/mod.rs`
 - `crates/comrade-tool-memory/build.rs`
 
+## embedding batch padding
+> ONNX Runtime pads every sequence in a batch to the longest one, so a batch of mixed-length texts costs batch_size × max_length forward passes. On the semantic-search cold index build this padding was ~3x the real content, which is why `embed_ordered` sorts texts by length before embedding and restores the caller's order afterwards.
+
+**References:**
+- `crates/comrade-tool-memory/src/semantic/mod.rs`
+- `crates/comrade-tool-memory/src/semantic/tests.rs`
+
+**Notes:**
+Why a larger batch size makes the cold build slower, not faster. Measured on this repo: 2340 code chunks, real content 1.87M chars but padded to 5.76M at batch 16 in file order; length-sorted it is ~1.93M. See ADR #22.
+
 ## enabled (delegate)
 > Per-[[delegates]] boolean (default true). `enabled = false` keeps the entry in config.toml but removes the model from the `delegate`/`ask_advise` targets, their `model` enum and advertised listing (and from the TUI Ctrl-A picker), so it cannot be delegated to; it still shows dimmed with ` (disabled)` in the model panel. Unlike `approval = "deny"` (listed but refused at run time), a disabled delegate is invisible to the tech lead.
 

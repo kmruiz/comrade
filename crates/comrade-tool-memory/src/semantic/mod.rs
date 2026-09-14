@@ -816,6 +816,9 @@ pub fn reindex(root: &Path) -> Result<String> {
 /// The in-process model, built from the embedded assets on first use.
 static MODEL: OnceLock<Result<Mutex<TextEmbedding>, String>> = OnceLock::new();
 
+/// Batch size for a single ONNX `run`.
+const EMBED_BATCH: usize = 16;
+
 /// Inflate one of the assets `build.rs` deflated into `OUT_DIR`.
 fn inflate(name: &str, data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -825,33 +828,73 @@ fn inflate(name: &str, data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Build one in-process embedding session from the embedded assets. `intra_threads`
+/// is handed to ONNX Runtime (`None` = one thread per available core).
+fn build_embedding(intra_threads: Option<usize>) -> Result<TextEmbedding, String> {
+    let onnx = inflate("model_quantized.onnx", MODEL_ONNX).map_err(|e| e.to_string())?;
+    let tokenizer = TokenizerFiles {
+        tokenizer_file: inflate("tokenizer.json", MODEL_TOKENIZER).map_err(|e| e.to_string())?,
+        config_file: inflate("config.json", MODEL_CONFIG).map_err(|e| e.to_string())?,
+        special_tokens_map_file: inflate("special_tokens_map.json", MODEL_SPECIAL_TOKENS)
+            .map_err(|e| e.to_string())?,
+        tokenizer_config_file: inflate("tokenizer_config.json", MODEL_TOKENIZER_CONFIG)
+            .map_err(|e| e.to_string())?,
+    };
+    // BGE-small uses CLS pooling (matches fastembed's own model config).
+    let model = UserDefinedEmbeddingModel::new(onnx, tokenizer).with_pooling(Pooling::Cls);
+    let mut opts = InitOptionsUserDefined::new();
+    if let Some(n) = intra_threads {
+        opts = opts.with_intra_threads(n);
+    }
+    TextEmbedding::try_new_from_user_defined(model, opts).map_err(|e| e.to_string())
+}
+
 /// The real embedder: the embedded int8 model run in-process via ONNX Runtime.
 struct FastEmbedder;
 
+/// Embed `texts` on the single resident session, batching similar lengths
+/// together. ONNX pads every sequence in a batch to the longest one, so feeding
+/// chunks in ascending length order and restoring the caller's order afterwards
+/// removes most of the wasted compute: for this repo's very uneven chunk lengths
+/// the padding was ~3x the real content, i.e. two thirds of a cold build's work.
+///
+/// A single session with one thread per core already saturates the CPU here —
+/// measured, running several single-threaded sessions in parallel was *slower*
+/// (and a larger batch was slower too, for the same padding reason).
+fn embed_ordered(texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    let cell = MODEL.get_or_init(|| build_embedding(None).map(Mutex::new));
+    let model = cell
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("embedding model unavailable: {e}"))?;
+    let mut guard = model.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Short inputs already fit one batch; order cannot matter.
+    if texts.len() < EMBED_BATCH {
+        return guard.embed(texts, Some(EMBED_BATCH));
+    }
+    let mut order: Vec<usize> = (0..texts.len()).collect();
+    order.sort_by_key(|&i| texts[i].len());
+    let sorted: Vec<&str> = order.iter().map(|&i| texts[i].as_str()).collect();
+    let vectors = guard.embed(sorted.as_slice(), Some(EMBED_BATCH))?;
+    if vectors.len() != texts.len() {
+        anyhow::bail!(
+            "embedder returned {} vectors for {} texts",
+            vectors.len(),
+            texts.len()
+        );
+    }
+    let mut out: Vec<Option<Vec<f32>>> = (0..texts.len()).map(|_| None).collect();
+    for (slot, v) in order.into_iter().zip(vectors) {
+        out[slot] = Some(v);
+    }
+    out.into_iter()
+        .map(|o| o.context("embedder returned fewer vectors than texts"))
+        .collect()
+}
+
 impl Embedder for FastEmbedder {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let cell = MODEL.get_or_init(|| {
-            let onnx = inflate("model_quantized.onnx", MODEL_ONNX).map_err(|e| e.to_string())?;
-            let tokenizer = TokenizerFiles {
-                tokenizer_file: inflate("tokenizer.json", MODEL_TOKENIZER)
-                    .map_err(|e| e.to_string())?,
-                config_file: inflate("config.json", MODEL_CONFIG).map_err(|e| e.to_string())?,
-                special_tokens_map_file: inflate("special_tokens_map.json", MODEL_SPECIAL_TOKENS)
-                    .map_err(|e| e.to_string())?,
-                tokenizer_config_file: inflate("tokenizer_config.json", MODEL_TOKENIZER_CONFIG)
-                    .map_err(|e| e.to_string())?,
-            };
-            // BGE-small uses CLS pooling (matches fastembed's own model config).
-            let model = UserDefinedEmbeddingModel::new(onnx, tokenizer).with_pooling(Pooling::Cls);
-            TextEmbedding::try_new_from_user_defined(model, InitOptionsUserDefined::new())
-                .map(Mutex::new)
-                .map_err(|e| e.to_string())
-        });
-        let model = cell
-            .as_ref()
-            .map_err(|e| anyhow::anyhow!("embedding model unavailable: {e}"))?;
-        let mut guard = model.lock().unwrap_or_else(|e| e.into_inner());
-        guard.embed(texts, Some(16))
+        embed_ordered(texts)
     }
 }
 
