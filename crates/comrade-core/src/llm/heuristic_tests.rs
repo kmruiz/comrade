@@ -31,3 +31,10 @@ fn mistral_family_gets_128k() {
     assert_eq!(heuristic_context("ministral-8b-latest"), Some(131_072));
     assert_eq!(heuristic_context("codestral-latest"), Some(32_768));
 }
+
+#[test]
+fn claude_family_gets_200k() {
+    assert_eq!(heuristic_context("claude-sonnet-4-20250514"), Some(200_000));
+    assert_eq!(heuristic_context("claude-opus-4-1"), Some(200_000));
+    assert_eq!(heuristic_context("claude-3-5-haiku-latest"), Some(200_000));
+}

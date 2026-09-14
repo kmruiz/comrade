@@ -31,6 +31,14 @@ Assigned in App construction and re-assigned in App::reload_config; name_color/b
 **Notes:**
 Loaded by crates/comrade-core/src/instructions.rs (load_project_instructions) and injected in react.rs build_system_prompt. Absent/blank file is a no-op.
 
+## Anthropic OpenAI-compatibility layer
+> Anthropic's official OpenAI-compatibility layer at https://api.anthropic.com/v1 — speaks /chat/completions with Bearer auth, so Claude models work through the existing OpenAI-compatible LlmClient. Selected with `[llm] provider = "anthropic"` (alias `claude`) + `api_key = "sk-ant-..."`. Caveats: no prompt caching (cache_control ignored), tool schema not guaranteed (strict ignored), system/developer messages hoisted/concatenated, temperature capped at 1.
+
+**References:**
+- `crates/comrade-core/src/config.rs (provider_base_url)`
+- `crates/comrade-core/src/llm/context_window.rs (heuristic_context)`
+- `.comrade/memory/0050-support-anthropic-models-via-the-openai-compatibility-provider-preset.md`
+
 ## approval ([[delegates]])
 > Per-[[delegates]] config key (crates/comrade-core/src/config.rs DelegateCfg.approval) controlling whether delegate/ask_advise may run that model without asking: "auto" (default) runs directly, "ask" pauses via ToolContext::confirm (skipped when the context is auto-approved), "deny" refuses to run that model through delegate/ask_advise at all. Enforced by delegate::enforce_approval inside DelegateTool::invoke and AskAdviseTool::invoke before a run starts (and before a delegated plan step is marked working).
 
@@ -368,14 +376,15 @@ Runs with `--message-format=json`; `parse_check_json`/`format_diagnostic` parse 
 - `.comrade/memory/0039-opt-in-prompt-caching-m-x-undo-command.md`
 
 ## provider preset
-> A named provider in `LlmCfg.provider` (ollama, openai, deepseek, mistral, openrouter, groq, together) that resolves to a preset base URL via `provider_base_url()` when the config omits an explicit `base_url`. All providers are spoken to through the single OpenAI-compatible `LlmClient` (Bearer auth, `/chat/completions` with native tool calls).
+> A named provider in `LlmCfg.provider` (ollama, openai, deepseek, mistral, anthropic, openrouter, groq, together) that resolves to a preset base URL via `provider_base_url()` when the config omits an explicit `base_url`. All providers are spoken to through the single OpenAI-compatible `LlmClient` (Bearer auth, `/chat/completions` with native tool calls).
 
 **References:**
-- `crates/comrade-core/src/config.rs (provider_base_url ~345, fill_provider_base_url ~395)`
-- `crates/comrade-core/src/llm.rs (LlmClient ~284, heuristic_context ~709, model_context_from_openai ~740)`
+- `crates/comrade-core/src/config.rs (provider_base_url ~433, fill_provider_base_url ~479)`
+- `crates/comrade-core/src/llm.rs (LlmClient ~350)`
+- `crates/comrade-core/src/llm/context_window.rs (heuristic_context)`
 
 **Notes:**
-Mistral (https://api.mistral.ai/v1) is fully OpenAI-compatible: Bearer auth, /chat/completions, and `GET /models` advertising `max_context_length` (already parsed by model_context_from_openai). `heuristic_context` adds a name-based fallback: 128K (131072) for mistral-*/devstral/pixtral/ministral/magistral, 32K (32768) for codestral. Delegate entries resolve their own provider the same way.
+Mistral (https://api.mistral.ai/v1) is fully OpenAI-compatible: Bearer auth, /chat/completions, and `GET /models` advertising `max_context_length` (already parsed by model_context_from_openai). `anthropic` (alias `claude` -> https://api.anthropic.com/v1) uses Anthropic's OpenAI-compatibility layer; see the "Anthropic OpenAI-compatibility layer" entry. `heuristic_context` adds name-based fallbacks: 128K for mistral-*/devstral/pixtral/ministral/magistral, 32K for codestral, 200K for claude-*. Delegate entries resolve their own provider the same way.
 
 ## read window
 > The 1-based inclusive [start_line, end_line] (or [start,end] range) passed to the fs file readers to select lines; clamped to the file's line count, and an empty/reversed window (hi <= lo) or a start past EOF yields an "empty window" message rather than a slice panic.

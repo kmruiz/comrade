@@ -130,9 +130,9 @@ The model the agent talks to.
 | Key | Default | Notes |
 |---|---|---|
 | `base_url` | `http://localhost:11434/v1` | OpenAI-compatible endpoint. |
-| `api_key` | – | Sent as `Authorization: Bearer …` when set. |
+| `api_key` | – | Sent as `Authorization: Bearer …` when set (for `provider = "anthropic"`, a Claude API key `sk-ant-…`). |
 | `model` | `devstral-small-2` | Model identifier. |
-| `provider` | – | One of `ollama`, `openai`, `deepseek`, `mistral`, `openrouter`, `groq`, `together`; sets `base_url` unless given explicitly. |
+| `provider` | – | One of `ollama`, `openai`, `deepseek`, `mistral`, `anthropic` (alias `claude`), `openrouter`, `groq`, `together`; sets `base_url` unless given explicitly. |
 | `temperature` | `0.2` | |
 | `timeout_secs` | `600` | Response timeout. |
 | `max_retries` | `2` | Retries for transient failures. |
@@ -215,6 +215,13 @@ name = "groq"
 description = "Cheap, fast model for small edits and translations."
 provider = "groq"
 model = "llama-3.3-70b-versatile"
+
+[[delegates]]
+name = "claude"
+description = "Claude for hard reasoning and reviews."
+provider = "anthropic"
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-20250514"
 ```
 
 ## 🔧 Build from source

@@ -41,6 +41,11 @@ pub(crate) fn heuristic_context(model: &str) -> Option<usize> {
     {
         return Some(131_072); // 128K (Large/Medium/Small, Devstral, Nemo, ...)
     }
+    // Anthropic Claude models: the OpenAI-compat layer may not advertise a
+    // /models context length, so fall back to the family default (200K).
+    if m.contains("claude") {
+        return Some(200_000);
+    }
     None
 }
 

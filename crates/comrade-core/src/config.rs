@@ -53,8 +53,9 @@ pub struct LlmCfg {
     pub api_key: Option<String>,
     /// Model identifier, e.g. `devstral-small-2`.
     pub model: String,
-    /// Named provider preset (ollama, openai, deepseek, mistral, openrouter,
-    /// groq, together). Sets `base_url` unless one is given explicitly.
+    /// Named provider preset (ollama, openai, deepseek, mistral, anthropic,
+    /// openrouter, groq, together). Sets `base_url` unless one is given
+    /// explicitly. `claude` is an alias for `anthropic`.
     pub provider: Option<String>,
     pub temperature: f32,
     /// Seconds to wait for a response.
@@ -432,6 +433,7 @@ pub fn provider_base_url(name: &str) -> Option<&'static str> {
         "openai" => Some("https://api.openai.com/v1"),
         "deepseek" => Some("https://api.deepseek.com/v1"),
         "mistral" => Some("https://api.mistral.ai/v1"),
+        "anthropic" | "claude" => Some("https://api.anthropic.com/v1"),
         "openrouter" => Some("https://openrouter.ai/api/v1"),
         "groq" => Some("https://api.groq.com/openai/v1"),
         "together" => Some("https://api.together.xyz/v1"),
@@ -494,7 +496,7 @@ fn fill_provider_base_url(
             Ok(())
         }
         None => anyhow::bail!(
-            "unknown provider {provider:?} in {where_}. Known providers: ollama, openai, deepseek, mistral, openrouter, groq, together"
+            "unknown provider {provider:?} in {where_}. Known providers: ollama, openai, deepseek, mistral, anthropic (alias claude), openrouter, groq, together"
         ),
     }
 }
@@ -724,6 +726,31 @@ run = "echo post"
         assert_eq!(c.llm.api_key.as_deref(), Some("sk-mistral"));
         assert_eq!(c.llm.model, "mistral-large-latest");
         assert_eq!(c.llm.display(), "mistral/mistral-large-latest");
+    }
+
+    #[test]
+    fn preset_lookup_covers_anthropic() {
+        assert_eq!(
+            provider_base_url("anthropic"),
+            Some("https://api.anthropic.com/v1")
+        );
+        assert_eq!(
+            provider_base_url("Claude"),
+            Some("https://api.anthropic.com/v1")
+        );
+    }
+
+    #[test]
+    fn anthropic_provider_fills_base_url() {
+        let p = write_tmp(
+            "[llm]\nprovider = \"anthropic\"\napi_key = \"sk-ant-test\"\nmodel = \"claude-sonnet-4-20250514\"\n",
+        );
+        let c = Config::load(Some(&p)).unwrap().config;
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(c.llm.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(c.llm.api_key.as_deref(), Some("sk-ant-test"));
+        assert_eq!(c.llm.model, "claude-sonnet-4-20250514");
+        assert_eq!(c.llm.display(), "anthropic/claude-sonnet-4-20250514");
     }
 
     #[test]
