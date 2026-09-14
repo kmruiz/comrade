@@ -25,3 +25,18 @@ Done so far (all tests green): comrade-core/src/advise.rs -> advise/ (mod.rs, to
 
 ## Note
 Progress update. DONE (each committed with cargo check --all-targets clean, tests green before the final llm split): advise.rs -> advise/ (mod.rs, tool.rs, readiness.rs, tests.rs); ecosystem.rs -> ecosystem/; semantic.rs -> semantic/; comrade-tool-session lib.rs -> + tests.rs; llm.rs -> 890 lines with llm/{context_window.rs + 8 test files}. STILL OVER 1000 LINES and TODO: crates/comrade-tui/src/tui.rs (11561), crates/comrade-core/src/delegate.rs (2949), crates/comrade-core/src/agent.rs (2931), crates/comrade-tool-fs/src/lib.rs (1771), crates/comrade-tool-syntax/src/lib.rs (1241), crates/comrade-tool-syntax/src/engine.rs (1206). Reusable splitter that makes this mechanical: /tmp/split.py (regenerate it; it is a scratch tool, not committed) with `tests SRC OUTDIR` (moves every top-level `#[cfg(test)] mod N {..}` in place to OUTDIR/N.rs and leaves `#[cfg(test)] mod N;`) and `cut SRC SPEC` (SPEC JSON {move:[[a,b]], groups:{name:[[a,b]]}}); it brace/literal-matches so `mod tests` inside a raw-string fixture is ignored, which matters for comrade-tool-syntax/src/lib.rs. After any move run `cargo fmt --all` (moved bodies are dedented), then `cargo check --workspace --all-targets`, and widen re-exported items to pub(crate) as the compiler asks.
+
+## Note
+Exact remaining plan (line ranges are 1-based, from the pre-split files; use /tmp/split.py which brace-matches with literal awareness):
+
+crates/comrade-core/src/agent.rs (2931): cut [[18,315]] -> agent/guards.rs (tool-classification consts + LoopTracker) and [[1257,1306]] -> agent/headless.rs (run_headless); then `tests agent.rs agent` moves the top-level test mods (tests @1308, loop_tests @2636, loop_tracker_tests @2811, read_guard_tests @2846, monitors_tests @2881, usage_tests @2904) into agent/. Leftover agent.rs = ~958 lines.
+
+crates/comrade-tool-fs/src/lib.rs (1771): cut [[697,924]] -> fs/grep.rs (Matcher/GrepHit/grep/validate/IGNORED_DIRS/walk/glob_*); then `tests lib.rs <crate>/src` moves tests (@1108), patch_tests (@1640), confine_tests (@1682). Leftover ~878 lines.
+
+crates/comrade-tool-syntax/src/lib.rs (1241): just `tests lib.rs <crate>/src` (single top-level `mod tests` @831; a second `mod tests` at 1187 is INSIDE a raw-string fixture and must be skipped). Leftover ~830 lines.
+
+crates/comrade-tool-syntax/src/engine.rs (1206): cut [[14,140]] -> engine/model.rs (MAX_FILE_BYTES/Occurrence/FileEdits/walk_sources/LangId/SUPPORTED_EXTS/lang_of/grammar/language_for/ident_kinds + the RUST/JS/CSS/HTML kind consts); then `tests engine.rs engine`. Leftover ~938 lines.
+
+crates/comrade-tui/src/tui.rs (11561) - NOT STARTED, the big one. Keep the `App` struct definition in the root file so descendant submodules can read its private fields.
+
+NOTE: the extracted test files themselves can exceed 1000 lines (e.g. delegate/tests.rs 1761, agent tests ~1600); the user's "under 1000" rule was applied to source files - decide with the human whether test files must also be split.
