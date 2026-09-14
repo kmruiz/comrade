@@ -1,0 +1,24 @@
+# 0046 - Source files stay under 1000 lines; oversized modules become directory trees
+status: accepted
+date: 2026-09-14
+tags: refactor, convention, module-layout
+summary: Refactoring convention: every source file stays under 1000 lines, achieved by turning an oversized `foo.rs` into a module tree (`foo/mod.rs` + cohesive submodules, or the modern `foo.rs` + `foo/` layout); long match/table functions are kept intact when they read better that way; comments are pruned to only what the code cannot express.
+
+## Context
+The workspace had grown to ~43.5k lines, with a 11.5k-line TUI monolith (crates/comrade-tui/src/tui.rs) and several 1-3k-line modules. This makes the code hard to navigate for humans and for the agent's own tools. The user asked for a refactor that keeps files under 1000 lines with small, easy-to-follow functions, and for redundant comments to be removed.
+
+## Decision
+Adopt a module-tree convention for any file over 1000 lines. Move cohesive clusters out of `foo.rs` into submodules. Two equivalent layouts are allowed: (a) `foo/mod.rs` holding the module docs, the shared `use` block and the type definitions, with `mod chat; mod draw; pub use chat::*; pub use draw::*;`; or (b) keep `foo.rs` as the module root and add `foo/chat.rs` etc. — Rust 2018+ resolves `mod chat;` in `foo.rs` to `foo/chat.rs`, which avoids having to delete/rename the original file. Each moved submodule starts with `use super::*;` so it sees the parent's items and `use` bindings. Items that other submodules or the rest of the crate reach through the parent's re-export must be at least `pub(crate)`, because a private item cannot be re-exported (this is the main mechanical fix-up needed after a move). Prefer keeping type definitions in the module root so descendant submodules can still touch their private fields (privacy in Rust is visible to the defining module and its descendants). Test modules are moved to their own files and declared `#[cfg(test)] mod tests;`. Do NOT change behaviour during a split; it is movement plus visibility only. `include_str!`/`include_bytes!` paths must gain one `../` per added directory level. Long functions that are a single big `match`/table stay as they are.
+
+## Rationale
+Directory modules keep `crate::foo::X` paths and the public API unchanged, so the split is safe and reviewable, and each commit can be verified by `cargo check` + tests. Layout (b) is preferred when a whole-file rename is awkward, since it needs no file deletion. Keeping type definitions in the root preserves the existing (private-field) encapsulation without widening every field to pub(crate).
+
+## Alternatives considered
+Splitting every file into flat sibling modules (rejected: loses grouping and churns `use` paths). Widening all struct fields to pub(crate) (rejected: needless encapsulation loss). Rewriting logic while splitting (rejected: makes review and bisecting impossible). Leaving long `match` functions split for their own sake (rejected: a big match is easier to read whole).
+
+## Scope
+Applies to every crate in the workspace, source and test files alike. Does NOT mandate a specific function length for match/table functions, and does not cover code-gen or vendored files.
+
+## Impact
+Done so far (all tests green): comrade-core/src/advise.rs -> advise/ (mod.rs, tool.rs, readiness.rs, tests.rs); comrade-tool-project/src/ecosystem.rs -> ecosystem/; comrade-tool-memory/src/semantic.rs -> semantic/; comrade-tool-session/src/lib.rs + tests.rs; comrade-core/src/llm.rs grew a llm/ollama.rs submodule (llm.rs still 1593 lines). Still OVER 1000 lines and to be split: crates/comrade-tui/src/tui.rs (11561 - the big one), comrade-core/src/delegate.rs (2949), comrade-core/src/agent.rs (2931), comrade-tool-fs/src/lib.rs (1771), comrade-core/src/llm.rs (1593), comrade-tool-syntax/src/lib.rs (1241), comrade-tool-syntax/src/engine.rs (1206). Note comrade-core/src/llm.rs and comrade-tool-syntax/src/lib.rs contain Rust/JSON fixtures inside raw strings, so any mechanical test-extraction must brace-match with literal awareness; and comrade-tool-syntax/src/lib.rs has a second `mod tests` in a fixture string.
+

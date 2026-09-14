@@ -280,6 +280,20 @@ Deflating the ~35 MB of assets saves ~10 MB of binary; the workspace [profile.re
 **Notes:**
 Redesigned to be compact: previously 3 inner rows (name / gauge / usage) plus a wasted blank row; the '(api)' suffix was dropped (api is the default; only 'est' is shown).
 
+## module tree convention
+> The convention for keeping Comrade's source files small: any file over 1000 lines is turned into a module tree. Either `foo/mod.rs` (module docs + shared `use` block + type definitions + `mod bar; pub use bar::*;`) or the modern `foo.rs` + `foo/bar.rs` layout (Rust 2018 resolves `mod bar;` in `foo.rs` to `foo/bar.rs`, so no file has to be deleted). Each moved submodule starts with `use super::*;`. Items reached through a parent re-export must be `pub(crate)` or more visible. Test modules move to their own file and are declared `#[cfg(test)] mod tests;`.
+
+**References:**
+- `crates/comrade-core/src/advise/mod.rs`
+- `crates/comrade-tool-project/src/ecosystem/mod.rs`
+- `crates/comrade-tool-memory/src/semantic/mod.rs`
+- `crates/comrade-tool-session/src/tests.rs`
+- `crates/comrade-core/src/llm/ollama.rs`
+- `.comrade/memory/0046-source-files-stay-under-1000-lines-oversized-modules-become-directory-trees.md`
+
+**Notes:**
+Private items cannot be re-exported, so a moved item used by a sibling submodule needs pub(crate) — this is the usual fix-up after a move. Keeping struct definitions in the root module preserves private-field access for descendants. Long match/table functions are deliberately kept whole.
+
 ## Node ecosystem (npm)
 > The Node/npm build backend (Ecosystem impl `Node`, name "npm", manifest package.json) plus its parsed model `NodeModel`/`NodePackage`/`NodeScript` (node.rs): name/version/deps/scripts and `workspaces` globs resolved to subproject packages. Verbs map onto npm scripts (a script named the verb, else conventions like run->start/dev, check->typecheck); runs as `npm run <script>` (with `--prefix` for a subproject). check_command is `npx --no-install tsc --noEmit` when a tsconfig.json exists; format is prettier; parse_diagnostics reads tsc `path(line,col): error TSxxxx` lines; simplify_tests reduces jest/vitest/mocha output.
 
