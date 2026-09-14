@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-tool"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-tool-fs"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-tool-git"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-tool-mcp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-tool-memory"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-tool-project"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-tool-session"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-tool-skill"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-tool-syntax"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-tool-web"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "comrade-tui"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "arboard",
