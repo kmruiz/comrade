@@ -95,14 +95,14 @@ struct Deps {
 }
 
 async fn build_deps(cli: &Cli) -> Result<Deps> {
-    let loaded = Config::load(cli.config.as_deref()).context("failed to load config")?;
+    let root = project_root(cli)?;
+    let loaded = Config::load_layered(cli.config.as_deref(), Some(&root))
+        .context("failed to load config")?;
     let config_source = loaded.source;
     let mut cfg = loaded.config;
     if cli.auto {
         cfg.security.autonomy = comrade_core::Autonomy::Auto;
     }
-
-    let root = project_root(cli)?;
 
     let client = Arc::new(LlmClient::new(&cfg.llm)?);
 

@@ -1969,7 +1969,10 @@ impl App {
             self.push_meta("cannot reload config while a run is in flight");
             return;
         }
-        let loaded = match comrade_core::Config::load(self.config_source.as_deref()) {
+        let loaded = match comrade_core::Config::load_layered(
+            self.config_source.as_deref(),
+            Some(&self.root),
+        ) {
             Ok(l) => l,
             Err(e) => {
                 self.push_meta(format!("config reload failed: {e:#}"));

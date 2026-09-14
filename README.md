@@ -111,6 +111,21 @@ Configuration is a single TOML file, resolved in this order:
 
 When no file is found, built-in defaults apply. Every table below is optional.
 
+A **project-level `.comrade.toml`** at the project root (the `--dir` directory,
+else the current directory) is then layered on top of the resolved file. Project
+values supersede it key by key; `[[delegates]]` and `[[mcp.servers]]` entries
+merge by `name` (a project entry with the same name replaces the user's entry,
+new names are appended); every other array is replaced wholesale. Because it
+comes from the repository, a `.comrade.toml` can also set `[security]` and
+`[hooks]` — treat it as trusted input.
+
+```toml
+# .comrade.toml — project overrides, layered on top of the user config
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+```
+
 ### Command line
 
 | Flag | Meaning |

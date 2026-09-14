@@ -2,6 +2,19 @@
 
 Project keywords and their meaning, with references to the code or documentation where they appear. One `## term` section per keyword, sorted alphabetically. Look terms up with read_glossary, search with find_glossary, add or update with record_glossary.
 
+## .comrade.toml
+> Project-level configuration file at the project root (the `--dir` directory, else the cwd), layered on top of the user config by `Config::load_layered`. Tables merge per key (project wins); `[[delegates]]` and `[[mcp.servers]]` merge by `name` (a project entry with the same name replaces the user's in place, new names append); other arrays replace wholesale. `LoadedConfig.repo_source` reports the file if one was found.
+
+**References:**
+- `crates/comrade-core/src/config.rs (PROJECT_CONFIG_FILE, Config::load_layered, merge_toml_values)`
+- `crates/comrade-core/src/config/tests.rs`
+- `crates/comrade-tui/src/main.rs (build_deps)`
+- `crates/comrade-tui/src/tui.rs (reload_config)`
+- `.comrade/memory/0051-layer-a-project-level-comradetoml-over-the-user-config.md`
+
+**Notes:**
+Merged as `toml::Value` trees BEFORE deserializing into `Config`, so key presence (e.g. an explicit `llm.base_url`) survives the merge and `apply_provider` stays correct. Because it comes from the repo it can also set `[security]`/`[hooks]` — treat as trusted input. See ADR #0051.
+
 ## ADR rollup
 > A canonical ADR that has absorbed several closely-related decisions about one feature or thread, so the memory holds one entry per topic instead of many fragments. Produced by merge_adr: each source's full body is appended to the target under a `## Merged from #NNNN` heading and the source is marked status `superseded` but KEPT on disk, so existing ADR/glossary references to it still resolve (stale_memory stays green). Read the canonical entry; a superseded rollup is still searchable and its body is intact. Example rollups: #0022 (semantic_search), #0001 (delegation/approval model), #0020 (context compaction), #0047 (approval-gate simplifications), #0030 (polyglot POM), #0033 (pom_run_tests output), #0045 (release), #0013 (sessions), #0023 (parallel delegates).
 
