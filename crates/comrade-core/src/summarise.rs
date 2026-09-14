@@ -574,7 +574,6 @@ mod tests {
             user: Arc::new(NoopIo),
             undo: Arc::new(MemoryUndo::new(root.to_path_buf())),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,

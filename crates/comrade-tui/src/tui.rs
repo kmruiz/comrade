@@ -4,7 +4,7 @@
 //! - no emojis
 //! - user messages are a soft lighter band (chat background lifted by a touch,
 //!   see `USER_BG_ALPHA`) with a cyan rule on the left of every wrapped line
-//! - agent tool calls render as a compact card (tool + justification); clicking
+//! - agent tool calls render as a compact card; clicking
 //!   (or the mouse wheel) opens the details
 //! - assistant/user text is rendered as markdown
 
@@ -148,7 +148,6 @@ pub(crate) struct ToolCard {
     /// Display name of the model that invoked the tool (None for legacy rows).
     author: Option<String>,
     args: String,
-    justification: Option<String>,
     result: Option<String>,
     ok: bool,
     open: bool,
@@ -2359,7 +2358,6 @@ impl App {
             }),
             undo,
             auto_approve: self.cfg.auto_approve(),
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -2877,12 +2875,7 @@ impl App {
                         .collect();
                 }
             }
-            AgentEvent::ToolCall {
-                name,
-                args,
-                justification,
-                tokens,
-            } => {
+            AgentEvent::ToolCall { name, args, tokens } => {
                 // This turn produced a tool call: keep whatever the model was
                 // saying before the call as a visible reasoning block, then
                 // show a compact card. Important cards (diffs, and
@@ -2895,7 +2888,6 @@ impl App {
                     name,
                     author: Some(self.actor_label()),
                     args,
-                    justification,
                     result: None,
                     ok: true,
                     open: open_default,
@@ -3022,7 +3014,6 @@ impl App {
                     name,
                     author: Some(model),
                     args,
-                    justification: None,
                     result: None,
                     ok: true,
                     open: open_default,
@@ -4544,10 +4535,9 @@ fn msg_searchable(msg: &Msg) -> String {
     let mut s = msg.text.clone();
     if let Some(t) = &msg.tool {
         s.push_str(&format!(
-            "\n{}\n{}\n{}\n{}",
+            "\n{}\n{}\n{}",
             t.name,
             t.args,
-            t.justification.as_deref().unwrap_or(""),
             t.result.as_deref().unwrap_or(""),
         ));
     }
@@ -6497,21 +6487,13 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
     // preview, no result tail — all of that lives behind the card (open it).
     // While the call is still running or awaiting approval its args matter
     // (a pending apply_patch must say what it touches), so the one-line
-    // "what it targets" headline and justification ride along only then.
+    // "what it targets" headline rides along only then.
     let pending = card.result.is_none() && !card.open;
-    if pending {
-        if let Some(h) = tool_headline(&card.name, &card.args) {
-            spans.push(Span::styled(
-                format!("  {h}"),
-                Style::default().fg(if read { Color::DarkGray } else { Color::White }),
-            ));
-        }
-        if let Some(j) = card.justification.as_deref() {
-            spans.push(Span::styled(
-                format!("  · {j}"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
+    if pending && let Some(h) = tool_headline(&card.name, &card.args) {
+        spans.push(Span::styled(
+            format!("  {h}"),
+            Style::default().fg(if read { Color::DarkGray } else { Color::White }),
+        ));
     }
     // Status: a bare pass/fail mark once the call finished — no inline result.
     if card.result.is_some() {
@@ -6546,15 +6528,6 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
     });
     if !card.open {
         return;
-    }
-    if let Some(j) = card.justification.as_deref() {
-        for s in plain_wrap(&format!("justification: {j}"), width) {
-            out.push(RenderRow {
-                rule: None,
-                spans: vec![Span::styled(s, Style::default().fg(Color::DarkGray))],
-                tool_header: None,
-            });
-        }
     }
     let diff_sides = extract_diff_sides(&card.name, &card.args, card.result.as_deref());
     if let Some((old, new)) = &diff_sides {
@@ -9364,7 +9337,6 @@ mod tests {
             name: name.into(),
             author: Some("model".into()),
             args: args.into(),
-            justification: None,
             result: None,
             ok,
             open,
@@ -9560,7 +9532,6 @@ mod tests {
             name: "rgrep".into(),
             author: Some("model".into()),
             args: r#"{"pattern":"fold","glob":"*.rs"}"#.into(),
-            justification: None,
             result: Some("5 matches".into()),
             ok: true,
             open: false,
@@ -9600,7 +9571,6 @@ mod tests {
             name: "apply_patch".into(),
             author: Some("model".into()),
             args: "{}".into(),
-            justification: None,
             result: Some("done".into()),
             ok: true,
             open: false,
@@ -9662,7 +9632,6 @@ mod tests {
                 name: name.into(),
                 author: author.map(String::from),
                 args: "{}".into(),
-                justification: None,
                 result: Some("done".into()),
                 ok: true,
                 open: false,
@@ -9690,7 +9659,6 @@ mod tests {
                 name: "run_tests".into(),
                 author: Some("model".into()),
                 args: "{}".into(),
-                justification: None,
                 result: Some("3 passed".into()),
                 ok: true,
                 open,
@@ -10910,7 +10878,6 @@ mod diff_tests {
             name: "git_diff".into(),
             author: Some("model".into()),
             args: "{}".into(),
-            justification: None,
             result: Some(result.into()),
             ok: true,
             open: true,
@@ -10962,7 +10929,6 @@ mod search_tests {
             name: "run_task".into(),
             author: Some("ollama/x".into()),
             args: r#"{"task":"test"}"#.into(),
-            justification: Some("verify the suite".into()),
             result: Some("3 passed".into()),
             ok: true,
             open: true,
@@ -10971,7 +10937,7 @@ mod search_tests {
             tokens: None,
         });
         assert!(msg_matches(&card, "run_task"));
-        assert!(msg_matches(&card, "verify"));
+        assert!(msg_matches(&card, "task"));
         assert!(msg_matches(&card, "passed"));
 
         let fail = Msg::failure("flaky_test".into(), "assert left == right".into());
@@ -11112,7 +11078,6 @@ mod section_tests {
                 name: "run_tests".into(),
                 author: Some("assistant".into()),
                 args: String::new(),
-                justification: None,
                 result: Some("ok".into()),
                 ok: true,
                 open: false,

@@ -1,10 +1,9 @@
-
 use comrade_tool::PlanStepDraft;
 use comrade_tool::ToolContext;
 use comrade_tool::tool::{UserIo, UserPrompt, UserReply};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::MemoryUndo;
@@ -30,7 +29,6 @@ fn test_ctx() -> ToolContext {
         user: Arc::new(NoopIo),
         undo: Arc::new(MemoryUndo::new("/tmp/x".into())),
         auto_approve: true,
-        approval: Default::default(),
         events: Arc::new(comrade_tool::NoopEvents),
         steer: None,
         compact: None,
@@ -49,7 +47,6 @@ fn ask_ctx(user: Arc<dyn UserIo>) -> ToolContext {
         user,
         undo: Arc::new(MemoryUndo::new("/tmp/x".into())),
         auto_approve: false,
-        approval: Default::default(),
         events: Arc::new(comrade_tool::NoopEvents),
         steer: None,
         compact: None,

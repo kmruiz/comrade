@@ -1,6 +1,6 @@
 use super::*;
 
-mod tests {
+mod cases {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -34,7 +34,6 @@ mod tests {
             user: Arc::new(NoopIo),
             undo: Arc::new(MemoryUndo::new("/tmp/x".into())),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -53,7 +52,6 @@ mod tests {
             user,
             undo: Arc::new(MemoryUndo::new("/tmp/x".into())),
             auto_approve: false,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,

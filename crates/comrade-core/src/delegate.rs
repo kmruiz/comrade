@@ -27,8 +27,6 @@
 //!   `approval = "ask"` pauses for human approval before it runs, and one set
 //!   to `approval = "deny"` is refused outright (see [`enforce_approval`]).
 
-use std::sync::{Arc, Mutex};
-
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use comrade_tool::{PlanStatus, PlanTarget, Tool, ToolContext, ToolRegistry, ToolSpec};
@@ -705,11 +703,10 @@ pub(crate) async fn run_delegate_subagent(
     read_nudge: &str,
 ) -> Result<String> {
     // The delegate inherits the session/user/undo of the parent but runs
-    // auto-approved with a fresh approval slot, so its nested tool calls never
-    // pause for a human confirmation.
+    // auto-approved, so its nested tool calls never pause for a human
+    // confirmation.
     let mut dctx = parent_ctx.clone();
     dctx.auto_approve = true;
-    dctx.approval = Arc::new(Mutex::new(None));
 
     let mut ctxm =
         ContextManager::with_system(system, limits.budget_tokens, limits.max_tool_output_chars);

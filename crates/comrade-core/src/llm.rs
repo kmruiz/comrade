@@ -869,7 +869,7 @@ fn parse_balance(json: &str) -> Option<String> {
 }
 
 mod ollama;
-pub use ollama::*;
+pub(crate) use ollama::*;
 #[cfg(test)]
 mod balance_tests;
 mod context_window;
@@ -887,4 +887,4 @@ mod retry_tests;
 mod serde_tests;
 #[cfg(test)]
 mod tests;
-pub use context_window::*;
+pub(crate) use context_window::*;

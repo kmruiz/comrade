@@ -26,15 +26,13 @@ pub enum AgentEvent {
     Delta(String),
     /// An isolated "Thought:" line from an assistant message.
     Thought(String),
-    /// A tool call began, with the model's supplied reasoning when present.
-    /// `tokens` is the real usage (prompt + completion) the model API reported
-    /// for the request that produced this call, when available; for a turn
-    /// that issued several calls it is attached to the first one only, so the
-    /// UI can sum per-run usage without double counting.
+    /// A tool call began. `tokens` is the real usage (prompt + completion) the
+    /// model API reported for the request that produced this call, when
+    /// available; for a turn that issued several calls it is attached to the
+    /// first one only, so the UI can sum per-run usage without double counting.
     ToolCall {
         name: String,
         args: String,
-        justification: Option<String>,
         tokens: Option<usize>,
     },
     /// A tool call began (legacy marker; details are in `ToolCall`).

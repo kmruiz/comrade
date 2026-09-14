@@ -665,13 +665,15 @@ impl Tool for FsRgrep {
 
         let (hits, total) = grep(
             &ctx.project_root,
-            scope.as_deref(),
-            &args.glob,
-            &args.include,
-            &args.exclude,
             &matcher,
-            args.context,
-            changed.as_ref(),
+            &GrepQuery {
+                scope: scope.as_deref(),
+                glob: &args.glob,
+                include: &args.include,
+                exclude: &args.exclude,
+                context: args.context,
+                only: changed.as_ref(),
+            },
         )?;
 
         let shown = hits.len();
@@ -733,16 +735,18 @@ struct GrepHit {
 /// searched (paths are still reported relative to `root`). `include` (any-of)
 /// overrides `glob` when non-empty; `exclude` always filters. When `only` is
 /// `Some`, only those files are read.
-fn grep(
-    root: &Path,
-    scope: Option<&Path>,
-    glob: &str,
-    include: &[String],
-    exclude: &[String],
-    matcher: &Matcher,
+/// Filters and scope for one [`grep`] call, bundled so the argument list stays
+/// short (see `clippy::too_many_arguments`).
+struct GrepQuery<'a> {
+    scope: Option<&'a Path>,
+    glob: &'a str,
+    include: &'a [String],
+    exclude: &'a [String],
     context: usize,
-    only: Option<&HashSet<PathBuf>>,
-) -> Result<(Vec<GrepHit>, usize)> {
+    only: Option<&'a HashSet<PathBuf>>,
+}
+
+fn grep(root: &Path, matcher: &Matcher, q: &GrepQuery<'_>) -> Result<(Vec<GrepHit>, usize)> {
     fn validate(g: &str) -> Result<String> {
         let g = g.trim().trim_start_matches("./").to_string();
         if g.is_empty() || g.contains('\\') || g.contains("..") {
@@ -750,12 +754,20 @@ fn grep(
         }
         Ok(g)
     }
-    let glob = validate(glob)?;
-    let include: Vec<String> = include.iter().map(|g| validate(g)).collect::<Result<_>>()?;
-    let exclude: Vec<String> = exclude.iter().map(|g| validate(g)).collect::<Result<_>>()?;
+    let glob = validate(q.glob)?;
+    let include: Vec<String> = q
+        .include
+        .iter()
+        .map(|g| validate(g))
+        .collect::<Result<_>>()?;
+    let exclude: Vec<String> = q
+        .exclude
+        .iter()
+        .map(|g| validate(g))
+        .collect::<Result<_>>()?;
 
     let mut files = Vec::new();
-    match scope {
+    match q.scope {
         Some(p) if p.is_dir() => walk(p, &mut files),
         Some(p) if p.is_file() => files.push(p.to_path_buf()),
         Some(_) => {} // a path that does not exist: nothing to search
@@ -766,7 +778,7 @@ fn grep(
     let mut out = Vec::new();
     let mut total = 0usize;
     for file in files {
-        if let Some(set) = only
+        if let Some(set) = q.only
             && !set.contains(&file)
         {
             continue;
@@ -815,8 +827,8 @@ fn grep(
         // Expand each match into the set of lines to print (match + context).
         let mut print: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for &m in &matches {
-            let lo = m.saturating_sub(context).max(1);
-            let hi = (m + context).min(src.len());
+            let lo = m.saturating_sub(q.context).max(1);
+            let hi = (m + q.context).min(src.len());
             print.extend(lo..=hi);
         }
         let match_set: HashSet<usize> = matches.iter().copied().collect();
@@ -1197,31 +1209,55 @@ mod tests {
         };
         let m = super::grep(
             &root,
-            None,
-            "**/*.rs",
-            &[],
-            &[],
             &lit("hello", false),
-            0,
-            None,
+            &super::GrepQuery {
+                scope: None,
+                glob: "**/*.rs",
+                include: &[],
+                exclude: &[],
+                context: 0,
+                only: None,
+            },
         )
         .unwrap()
         .0;
         assert_eq!(m.len(), 2);
         assert!(m.iter().all(|h| h.file.ends_with(".rs")));
         // glob restricts to md
-        let m2 = super::grep(&root, None, "*.md", &[], &[], &lit("hello", true), 0, None)
-            .unwrap()
-            .0;
+        let m2 = super::grep(
+            &root,
+            &lit("hello", true),
+            &super::GrepQuery {
+                scope: None,
+                glob: "*.md",
+                include: &[],
+                exclude: &[],
+                context: 0,
+                only: None,
+            },
+        )
+        .unwrap()
+        .0;
         assert_eq!(m2.len(), 1);
         assert_eq!(m2[0].file, "README.md");
         assert_eq!(m2[0].text, "Hello world");
         // case-sensitive finds nothing in md
         assert!(
-            super::grep(&root, None, "*.md", &[], &[], &lit("hello", false), 0, None)
-                .unwrap()
-                .0
-                .is_empty()
+            super::grep(
+                &root,
+                &lit("hello", false),
+                &super::GrepQuery {
+                    scope: None,
+                    glob: "*.md",
+                    include: &[],
+                    exclude: &[],
+                    context: 0,
+                    only: None,
+                },
+            )
+            .unwrap()
+            .0
+            .is_empty()
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1247,13 +1283,15 @@ mod tests {
         let re = super::Matcher::Regex(Box::new(regex::Regex::new(r"fn \w+").unwrap()));
         let (hits, total) = super::grep(
             &root,
-            None,
-            "**/*",
-            &["**/*.rs".to_string()],
-            &["tests/*".to_string()],
             &re,
-            0,
-            None,
+            &super::GrepQuery {
+                scope: None,
+                glob: "**/*",
+                include: &["**/*.rs".to_string()],
+                exclude: &["tests/*".to_string()],
+                context: 0,
+                only: None,
+            },
         )
         .unwrap();
         assert_eq!(total, 3);
@@ -1265,7 +1303,19 @@ mod tests {
             needle: "beta".into(),
             lower: false,
         };
-        let (hits, total) = super::grep(&root, None, "**/*.rs", &[], &[], &lit, 1, None).unwrap();
+        let (hits, total) = super::grep(
+            &root,
+            &lit,
+            &super::GrepQuery {
+                scope: None,
+                glob: "**/*.rs",
+                include: &[],
+                exclude: &[],
+                context: 1,
+                only: None,
+            },
+        )
+        .unwrap();
         assert_eq!(total, 1);
         assert_eq!(hits.len(), 3, "beta line + one context each side: {hits:?}");
         let beta = hits.iter().find(|h| h.is_match).unwrap();
@@ -1294,13 +1344,15 @@ mod tests {
         // A directory scope searches only that subtree.
         let (hits, _) = super::grep(
             &root,
-            Some(&root.join("src")),
-            "**/*.rs",
-            &[],
-            &[],
             &lit,
-            0,
-            None,
+            &super::GrepQuery {
+                scope: Some(&root.join("src")),
+                glob: "**/*.rs",
+                include: &[],
+                exclude: &[],
+                context: 0,
+                only: None,
+            },
         )
         .unwrap();
         assert!(hits.iter().all(|h| h.file.starts_with("src/")), "{hits:?}");
@@ -1309,13 +1361,15 @@ mod tests {
         // A file scope searches only that file.
         let (hits, _) = super::grep(
             &root,
-            Some(&root.join("src/b.rs")),
-            "**/*",
-            &[],
-            &[],
             &lit,
-            0,
-            None,
+            &super::GrepQuery {
+                scope: Some(&root.join("src/b.rs")),
+                glob: "**/*",
+                include: &[],
+                exclude: &[],
+                context: 0,
+                only: None,
+            },
         )
         .unwrap();
         assert_eq!(hits.len(), 1);
@@ -1324,13 +1378,15 @@ mod tests {
         // A non-existent scope searches nothing.
         let (hits, _) = super::grep(
             &root,
-            Some(&root.join("nope")),
-            "**/*",
-            &[],
-            &[],
             &lit,
-            0,
-            None,
+            &super::GrepQuery {
+                scope: Some(&root.join("nope")),
+                glob: "**/*",
+                include: &[],
+                exclude: &[],
+                context: 0,
+                only: None,
+            },
         )
         .unwrap();
         assert!(hits.is_empty());
@@ -1467,7 +1523,6 @@ mod tests {
             user: Arc::new(StubUser),
             undo: Arc::new(StubUndo),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -1558,7 +1613,6 @@ mod tests {
             user: Arc::new(StubUser),
             undo: Arc::new(StubUndo),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -1740,7 +1794,6 @@ mod confine_tests {
             user: Arc::new(StubUser),
             undo: Arc::new(StubUndo),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,

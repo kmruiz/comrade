@@ -8,14 +8,8 @@ Args: <JSON object with the tool's arguments>
 
 Args MUST be valid strict JSON: quote every key and every string value, e.g. {"path": "src/main.rs"}.
 
-Before running an approval-gated tool — fs_write_file, ts_rename, shell — you MUST also write, between Thought and Tool:
-
-Justification: <why this action should run, one or two short lines>
-
-Non-gated edits (fs_edit) still ask the human to approve the change, but need no Justification line.
+Mutating tools (fs_write_file, ts_rename, shell, run_bg) and non-gated edits (fs_edit) ask the human to approve the change before they run.
 git_commit, pom_run_task, pom_run_tests, delegate, record_adr, amend_adr and record_glossary run directly without approval; ask_advise is read-only and needs none. Every tool call a delegate makes is auto-approved inside its own run. EXCEPTION: a delegate whose `[[delegates]]` entry sets `approval = "ask"` pauses for human approval before delegate/ask_advise runs it; `approval = "deny"` refuses it entirely.
-Approval-gated tools are refused if you omit it — repeat the call with the field present.
-When using native function calls (instead of the Tool/Args text form), pass the justification as an extra `justification` argument on every approval-gated tool.
 After each tool call you will receive:
 
 Observation: <the tool result>

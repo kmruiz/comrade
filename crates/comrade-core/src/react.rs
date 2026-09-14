@@ -7,8 +7,6 @@ use serde_json::Value;
 pub struct ParsedTurn {
     /// Leading "Thought:" prose, when present.
     pub thought: Option<String>,
-    /// Model-supplied reason for the pending action (shown on approval).
-    pub justification: Option<String>,
     /// The requested tool call, if the model asked for one.
     pub tool_call: Option<ToolCall>,
     /// When `tool_call` is `None`, this is the model's final answer.
@@ -118,12 +116,10 @@ fn render_tool(spec: &comrade_tool::ToolSpec) -> String {
 pub fn parse_turn(text: &str) -> Result<ParsedTurn> {
     let trimmed = text.trim();
     let thought = extract_thought(trimmed);
-    let justification = extract_section(trimmed, "Justification:");
 
     let Some(tool_idx) = find_marker(trimmed, "Tool:") else {
         return Ok(ParsedTurn {
             thought,
-            justification,
             tool_call: None,
             final_text: trimmed.to_string(),
         });
@@ -159,43 +155,9 @@ pub fn parse_turn(text: &str) -> Result<ParsedTurn> {
 
     Ok(ParsedTurn {
         thought,
-        justification,
         tool_call: Some(ToolCall { name, args }),
         final_text: trimmed.to_string(),
     })
-}
-
-/// Section markers that end a prose field like `Justification:`.
-const SECTION_STOPS: &[&str] = &[
-    "Thought:",
-    "Tool:",
-    "Args:",
-    "Justification:",
-    "Risk:",
-    "Final:",
-];
-
-/// Extract the (possibly multi-line) text following `marker`, stopping at the
-/// next known section marker or end of input.
-fn extract_section(text: &str, marker: &str) -> Option<String> {
-    let start = find_marker(text, marker)?;
-    let rest = &text[start + marker.len()..];
-    let mut end = rest.len();
-    for stop in SECTION_STOPS {
-        if *stop == marker {
-            continue;
-        }
-        if let Some(off) = rest.find(stop) {
-            // avoid matching a stop inside the content when it appears mid-word
-            end = end.min(off);
-        }
-    }
-    let content = rest[..end].trim();
-    if content.is_empty() {
-        None
-    } else {
-        Some(content.to_string())
-    }
 }
 
 /// Extract the prose right after a leading `Thought:` marker (first line only).
@@ -579,32 +541,6 @@ mod tests {
         // the "note:" inside the string value must NOT be quoted/repaired away
         assert_eq!(call.args["old"], "edition = 2021 note: legacy");
         assert_eq!(call.args["path"], "Cargo.toml");
-    }
-
-    #[test]
-    fn extracts_justification_and_ignores_a_stray_risk_line() {
-        let turn = parse_turn(
-            "Thought: stage the change\nJustification: completes the rename the user asked for\nRisk: modifies one file; reversible via undo\nTool: git_commit\nArgs: {\"message\": \"rename foo\"}",
-        )
-        .unwrap();
-        assert_eq!(
-            turn.justification.as_deref(),
-            Some("completes the rename the user asked for")
-        );
-        assert!(turn.tool_call.is_some());
-    }
-
-    #[test]
-    fn justification_alone_is_parsed() {
-        let turn = parse_turn(
-            "Thought: write it\nJustification: add the requested test file\nTool: write_file\nArgs: {\"path\": \"t.rs\", \"content\": \"x\"}",
-        )
-        .unwrap();
-        assert_eq!(
-            turn.justification.as_deref(),
-            Some("add the requested test file")
-        );
-        assert!(turn.tool_call.is_some());
     }
 
     #[test]

@@ -1,5 +1,3 @@
-use super::*;
-
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -185,7 +183,6 @@ fn ctx(session: StubSession) -> ToolContext {
         user: Arc::new(NoopIo),
         undo: Arc::new(NoopUndo),
         auto_approve: true,
-        approval: Arc::new(Mutex::new(None)),
         events: Arc::new(comrade_tool::NoopEvents),
         steer: None,
         compact: None,
@@ -529,7 +526,6 @@ async fn ask_form_returns_id_equals_value_lines() {
         user: Arc::new(FormStubIo),
         undo: Arc::new(NoopUndo),
         auto_approve: true,
-        approval: Arc::new(Mutex::new(None)),
         events: Arc::new(comrade_tool::NoopEvents),
         steer: None,
         compact: None,
@@ -586,7 +582,6 @@ async fn ask_form_accepts_a_diff_choice_field() {
         user: Arc::new(PickIo),
         undo: Arc::new(NoopUndo),
         auto_approve: true,
-        approval: Arc::new(Mutex::new(None)),
         events: Arc::new(comrade_tool::NoopEvents),
         steer: None,
         compact: None,

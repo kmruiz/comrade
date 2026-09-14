@@ -311,7 +311,6 @@ pub(crate) fn session_bundle(
         user,
         undo: undo.clone(),
         auto_approve: deps.cfg.security.autonomy == comrade_core::Autonomy::Auto,
-        approval: Default::default(),
         events: Arc::new(comrade_tool::NoopEvents),
         steer: None,
         compact: None,

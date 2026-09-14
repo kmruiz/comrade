@@ -25,10 +25,9 @@ fn usage_total(u: &Usage) -> Option<usize> {
     }
 }
 
-/// Tools whose side effects require human approval (and thus mandatory
-/// Justification). Keep in sync with the tool crates.
 /// Tools that mutate the workspace (used by the loop tracker to tell "repeat
-/// but state changed" from "repeat doing nothing").
+/// but state changed" from "repeat doing nothing"). Keep in sync with the tool
+/// crates.
 const MUTATING_TOOLS: &[&str] = &[
     "fs_edit",
     "fs_write_file",
@@ -53,24 +52,6 @@ const MUTATING_TOOLS: &[&str] = &[
     "bg_kill",
     "shell",
 ];
-
-/// Tools that are approval-gated: the model MUST provide a `justification`
-/// before they run (a human approves based on it). `git_commit`,
-/// `pom_run_task`, `pom_run_tests`, `delegate`, `record_adr`, `amend_adr` and
-/// `record_glossary` deliberately are NOT gated: they run directly. The memory
-/// tools are ungated because their writes are confined to `.comrade/memory/`,
-/// which the agent owns. `delegate` runs ungated because it is the lead's
-/// normal way to hand work to sub-agents — a delegate's nested tool calls are
-/// auto-approved inside its own run, so a handoff needs no separate human
-/// confirmation. Individual delegates can opt back into an approval pause (or a
-/// hard refusal) via `approval = "ask"/"deny"` on their `[[delegates]]` entry;
-/// delegate.rs and advise.rs enforce it with a `ctx.confirm` before the
-/// sub-agent runs.
-const APPROVAL_GATED_TOOLS: &[&str] = &["fs_write_file", "ts_rename", "shell", "run_bg"];
-
-fn is_approval_gated(name: &str) -> bool {
-    APPROVAL_GATED_TOOLS.contains(&name)
-}
 
 /// Whether a tool call mutates the workspace (used to tell "repeat but state
 /// changed" apart from "repeat doing nothing").
@@ -196,33 +177,6 @@ fn observation_with_failure_hint(tool_name: &str, ok: bool, output: &str) -> Str
         }
     }
     render_observation(tool_name, &text)
-}
-
-/// Approval-gated tools advertise `justification` as an optional native
-/// argument so the model actually passes it (many models omit fields the
-/// schema forbids via `additionalProperties: false`). The agent strips it
-/// before invoking the tool.
-fn augmented_spec(mut spec: comrade_tool::ToolSpec) -> comrade_tool::ToolSpec {
-    if !is_approval_gated(&spec.name) {
-        return spec;
-    }
-    let obj = spec.json_schema.as_object_mut();
-    if let Some(obj) = obj {
-        obj.remove("additionalProperties"); // allow the injected keys
-        if let Some(props) = obj
-            .get_mut("properties")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            props.insert(
-                "justification".into(),
-                serde_json::json!({
-                    "type": "string",
-                    "description": "Why this action should run (required for approval)."
-                }),
-            );
-        }
-    }
-    spec
 }
 
 pub(crate) const LOOP_WINDOW: usize = 8;
@@ -497,10 +451,6 @@ async fn run_agent_loop(
             });
         }
 
-        // Stale approval notes from a previous turn must not leak into a later
-        // confirmation; the current turn sets them again below.
-        ctx.clear_approval();
-
         // A steer typed while this run was in flight reaches the model at its
         // next rest point, injected BEFORE the budget is enforced so compaction
         // can still make room for it.
@@ -571,10 +521,7 @@ async fn run_agent_loop(
         // Advertise native tools unless the protocol is strictly ReAct.
         let native = cfg.llm.protocol.native_enabled();
         let tool_specs: Option<Vec<comrade_tool::ToolSpec>> = if native {
-            let specs: Vec<_> = tools
-                .iter()
-                .map(|t| augmented_spec(t.spec().clone()))
-                .collect();
+            let specs: Vec<_> = tools.iter().map(|t| t.spec().clone()).collect();
             if specs.is_empty() { None } else { Some(specs) }
         } else {
             None
@@ -775,44 +722,6 @@ async fn run_agent_loop(
             continue;
         };
 
-        // Approval-gated tools (mutations, task runs) MUST be accompanied by a
-        // Justification line, otherwise the human has nothing to reason with.
-        // Ask the model to repeat instead of running them.
-        if is_approval_gated(&tool_call.name) && !ctx.auto_approve {
-            let has_justification = !turn_p
-                .justification
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .is_empty();
-            if !has_justification {
-                let msg = format!(
-                    "tool `{tool}` is approval-gated and was called without a Justification. \
-                     Do NOT call it again without first writing the line above the Tool line:\n\
-                     Justification: <why this action should run>\n\
-                     Repeat the call with that field present.",
-                    tool = tool_call.name,
-                );
-                let _ = tx
-                    .send(AgentEvent::ToolResult {
-                        name: tool_call.name.clone(),
-                        output: msg.clone(),
-                        ok: false,
-                    })
-                    .await;
-                let obs = ctxm.truncate_observation(&format!("ERROR: {msg}"));
-                ctxm.push(ChatMessage::new(
-                    Role::User,
-                    render_observation(&tool_call.name, &obs),
-                ));
-                continue;
-            }
-            // Surface the model's reasoning on the approval prompt.
-            ctx.set_approval(comrade_tool::ApprovalNotes {
-                justification: turn_p.justification.clone().unwrap_or_default(),
-            });
-        }
-
         // Every task opens with a plan. Nudge once if the model started acting
         // without calling set_plan.
         if !plan_nudged && ctx.session.plan().is_empty() {
@@ -896,7 +805,6 @@ async fn run_agent_loop(
             .send(AgentEvent::ToolCall {
                 name: tool_call.name.clone(),
                 args: args_pretty.clone(),
-                justification: turn_p.justification.clone(),
                 tokens: turn.usage.as_ref().and_then(usage_total),
             })
             .await;
@@ -992,7 +900,6 @@ impl Dispatch<'_> {
 
 /// Dispatch a turn's native function calls. The assistant message with all
 /// `tool_calls` is recorded first; each call then gets a `Role::Tool` result.
-/// Approval-gated calls require `justification` in their arguments.
 #[allow(clippy::too_many_arguments)]
 async fn run_native_calls(
     ctxm: &mut ContextManager,
@@ -1014,7 +921,6 @@ async fn run_native_calls(
         id: String,
         name: String,
         args: serde_json::Value,
-        justification: Option<String>,
     }
 
     let mut prepared = Vec::new();
@@ -1022,29 +928,15 @@ async fn run_native_calls(
     for mc in turn.tool_calls {
         let parsed: serde_json::Value = serde_json::from_str(&mc.arguments)
             .unwrap_or(serde_json::Value::Object(Default::default()));
-        let text = |k: &str| {
-            parsed
-                .get(k)
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
-        let justification = text("justification");
-        let mut clean = parsed.clone();
-        if let Some(obj) = clean.as_object_mut() {
-            obj.remove("justification");
-        }
         calls.push(crate::llm::ToolCallMsg {
             id: mc.id.clone(),
             name: mc.name.clone(),
-            arguments: clean.clone(),
+            arguments: parsed.clone(),
         });
         prepared.push(Prepared {
             id: mc.id,
             name: mc.name,
-            args: clean,
-            justification,
+            args: parsed,
         });
     }
 
@@ -1087,31 +979,9 @@ async fn run_native_calls(
             .send(AgentEvent::ToolCall {
                 name: p.name.clone(),
                 args: args_pretty.clone(),
-                justification: p.justification.clone(),
                 tokens: turn_tokens.take(),
             })
             .await;
-        if is_approval_gated(&p.name) && !ctx.auto_approve {
-            if p.justification.is_none() {
-                let msg = format!(
-                    "tool `{name}` is approval-gated and was called without `justification`. \
-                     Repeat the call passing `justification` as an argument.",
-                    name = p.name,
-                );
-                let _ = tx
-                    .send(AgentEvent::ToolResult {
-                        name: p.name.clone(),
-                        output: msg.clone(),
-                        ok: false,
-                    })
-                    .await;
-                ctxm.push(ChatMessage::tool_result(p.id, msg));
-                continue;
-            }
-            ctx.set_approval(comrade_tool::ApprovalNotes {
-                justification: p.justification.clone().unwrap_or_default(),
-            });
-        }
 
         if let Some(count) = tracker.check(&sig) {
             if count >= MAX_LOOP_REFUSALS {
@@ -1505,7 +1375,6 @@ mod tests {
             user: Arc::new(FakeUser),
             undo: undo.clone(),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: Some(steer),
             stop: None,
@@ -1628,7 +1497,6 @@ mod tests {
             user: Arc::new(FakeUser),
             undo: undo.clone(),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: Some(compact),
@@ -1759,7 +1627,6 @@ mod tests {
             user: Arc::new(FakeUser),
             undo: undo.clone(),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -1829,7 +1696,6 @@ mod tests {
             user: Arc::new(FakeUser),
             undo: undo.clone(),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -1912,7 +1778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_gated_tool_refused_without_justification() {
+    async fn approval_gated_tool_runs_with_confirmation() {
         let port = spawn_model_with(&[
             "Thought: write it\nTool: fs_write_file\nArgs: {\"path\": \"x.rs\", \"content\": \"a\"}",
             "All done.",
@@ -1921,7 +1787,7 @@ mod tests {
         cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
         cfg.llm.model = "fake".into();
 
-        let (tx, mut events) = mpsc::channel(64);
+        let (tx, _events) = mpsc::channel(64);
         let session = Arc::new(AgentSession::new(tx.clone()));
         comrade_tool::SessionControl::set_plan(
             &*session,
@@ -1942,7 +1808,6 @@ mod tests {
             user: Arc::new(FakeUser),
             undo: undo.clone(),
             auto_approve: false,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -1964,24 +1829,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome.final_answer, "All done.");
-        // tool was never executed (no side effects, no confirm shown)
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-        let mut saw_refusal = false;
-        while let Ok(Some(ev)) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
-        {
-            match ev {
-                AgentEvent::ToolResult { output, ok, .. } => {
-                    if !ok && output.contains("approval-gated") {
-                        saw_refusal = true;
-                    }
-                }
-                AgentEvent::RunEnd => break,
-                _ => {}
-            }
-        }
-        assert!(saw_refusal, "expected an approval-gated refusal");
+        // the tool now runs with no justification, after the human confirms
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2079,7 +1928,6 @@ mod tests {
             user: Arc::new(FakeUser),
             undo: Arc::new(MemoryUndo::new(root.clone())),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -2144,7 +1992,6 @@ mod tests {
             user: Arc::new(FakeUser),
             undo: Arc::new(MemoryUndo::new(root.clone())),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -2181,66 +2028,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[tokio::test]
-    async fn approval_gated_tool_runs_when_notes_present() {
-        let port = spawn_model_with(&[
-            "Thought: write it\nJustification: needed to add the requested file\nTool: fs_write_file\nArgs: {\"path\": \"y.rs\", \"content\": \"b\"}",
-            "All done.",
-        ]);
-        let mut cfg = Config::default();
-        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
-        cfg.llm.model = "fake".into();
-
-        let (tx, _events) = mpsc::channel(64);
-        let session = Arc::new(AgentSession::new(tx.clone()));
-        comrade_tool::SessionControl::set_plan(
-            &*session,
-            vec![comrade_tool::PlanStepDraft {
-                goal: "do it".into(),
-                verification: "verifies".into(),
-                model: "".into(),
-                context: "".into(),
-            }],
-        );
-        let root = std::env::temp_dir().join(format!("comrade-notes-test-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let undo = Arc::new(MemoryUndo::new(root.clone()));
-        let ctx = ToolContext {
-            project_root: root.clone(),
-            cwd: root.clone(),
-            session: session.clone().as_control(),
-            user: Arc::new(FakeUser),
-            undo: undo.clone(),
-            auto_approve: false,
-            approval: Default::default(),
-            events: Arc::new(comrade_tool::NoopEvents),
-            steer: None,
-            compact: None,
-            stop: None,
-        };
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let tools = gated_registry(calls.clone());
-        let client = LlmClient::new(&cfg.llm).unwrap();
-
-        let outcome = run_agent(
-            &cfg,
-            &client,
-            ctx,
-            &tools,
-            "do it".to_string(),
-            tx,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome.final_answer, "All done.");
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Serve one native tool-call request (streamed `tool_calls`), then a final
-    /// text answer. When `gated` the tool call targets fs_write_file without a
-    /// justification.
+    /// Serve one native tool-call request (streamed `tool_calls`) for
+    /// fs_write_file, then a final text answer.
     fn spawn_native_model() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2313,7 +2102,6 @@ mod tests {
             user: Arc::new(FakeUser),
             undo: undo.clone(),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -2498,7 +2286,6 @@ mod tests {
             user: Arc::new(FakeUser),
             undo: undo.clone(),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -2560,13 +2347,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_gated_tool_refused_without_justification_args() {
+    async fn native_gated_tool_runs_with_confirmation() {
         let port = spawn_native_model();
         let mut cfg = Config::default();
         cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
         cfg.llm.model = "fake".into();
 
-        let (tx, mut events) = mpsc::channel(64);
+        let (tx, _events) = mpsc::channel(64);
         let session = Arc::new(AgentSession::new(tx.clone()));
         comrade_tool::SessionControl::set_plan(
             &*session,
@@ -2588,7 +2375,6 @@ mod tests {
             user: Arc::new(FakeUser),
             undo: undo.clone(),
             auto_approve: false,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,
@@ -2610,24 +2396,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome.final_answer, "All done.");
-        // gated native call without justification never reached the tool
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-        let mut saw_refusal = false;
-        while let Ok(Some(ev)) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
-        {
-            if let AgentEvent::ToolResult { output, ok, .. } = &ev
-                && !ok
-                && output.contains("approval-gated")
-            {
-                saw_refusal = true;
-            }
-            if let AgentEvent::RunEnd = ev {
-                break;
-            }
-        }
-        assert!(saw_refusal, "expected native approval-gated refusal");
+        // the gated tool now runs with no justification, after the human confirms
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -2734,7 +2504,6 @@ mod loop_tests {
             user: Arc::new(IoNoop),
             undo: undo.clone(),
             auto_approve: true,
-            approval: Default::default(),
             events: Arc::new(comrade_tool::NoopEvents),
             steer: None,
             compact: None,

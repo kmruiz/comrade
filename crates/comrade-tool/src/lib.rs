@@ -17,6 +17,6 @@ pub use policy::{SecurityPolicy, check_command, confine, policy, set_policy, wit
 pub use repo::changed_files_abs;
 pub use task_runner::{TaskRun, TaskRunner};
 pub use tool::{
-    ActivityEvents, ApprovalNotes, CompactRequest, NoopEvents, Steer, Tool, ToolContext,
-    ToolRegistry, ToolSpec, UndoLog, UserIo, UserPrompt, UserReply,
+    ActivityEvents, CompactRequest, NoopEvents, Steer, Tool, ToolContext, ToolRegistry, ToolSpec,
+    UndoLog, UserIo, UserPrompt, UserReply,
 };

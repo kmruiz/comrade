@@ -231,10 +231,6 @@ pub struct ToolContext {
     pub undo: std::sync::Arc<dyn UndoLog>,
     /// When true, mutating tools run without asking the user for confirmation.
     pub auto_approve: bool,
-    /// One-shot notes the model supplied for the next confirmation (why the
-    /// action should run, and what could go wrong). Written by the agent loop
-    /// before invoking a tool, read and cleared by [`ToolContext::confirm`].
-    pub approval: std::sync::Arc<std::sync::Mutex<Option<ApprovalNotes>>>,
     /// Live activity a long-running tool wants to surface in the UI while it
     /// runs. The agent core wires this to the session's event channel so the
     /// `delegate` tool can stream what its sub-agent is doing, as it happens.
@@ -279,51 +275,20 @@ impl ActivityEvents for NoopEvents {
 }
 
 impl ToolContext {
-    /// Model-supplied reasoning attached to the next approval prompt.
-    pub fn set_approval(&self, notes: ApprovalNotes) {
-        *self.approval.lock().unwrap() = Some(notes);
-    }
-
-    /// Drop any pending approval notes (called at the top of each agent turn).
-    pub fn clear_approval(&self) {
-        *self.approval.lock().unwrap() = None;
-    }
-
-    /// Take (and clear) any pending approval notes.
-    fn take_approval(&self) -> Option<ApprovalNotes> {
-        self.approval.lock().unwrap().take()
-    }
-
     /// Ask the human to approve a mutating operation.
     ///
     /// When `auto_approve` is set this returns `Ok` immediately. Otherwise it
     /// routes a [`UserPrompt::Confirm`] and fails with [`UserReply::Denied`]
-    /// unless the user consents. Any [`ApprovalNotes`] left by the agent are
-    /// rendered above the diff so the human sees the model's reasoning before
-    /// deciding.
+    /// unless the user consents.
     pub async fn confirm(&self, summary: impl Into<String>, diff: Option<String>) -> Result<()> {
         if self.auto_approve {
             return Ok(());
         }
-        let notes = self.take_approval();
-        let body = match notes {
-            Some(notes) => {
-                let mut text = notes.render();
-                if let Some(d) = diff
-                    && !d.is_empty()
-                {
-                    text.push_str("\n\n");
-                    text.push_str(&d);
-                }
-                Some(text)
-            }
-            None => diff,
-        };
         match self
             .user
             .ask(UserPrompt::Confirm {
                 title: summary.into(),
-                diff: body,
+                diff,
             })
             .await?
         {
@@ -333,19 +298,6 @@ impl ToolContext {
             // A form answer to a yes/no confirmation is nonsense: treat as not consenting.
             UserReply::Form(_) => anyhow::bail!("user denied request"),
         }
-    }
-}
-
-/// Reasoning the model attaches to an action that needs human approval.
-#[derive(Debug, Clone, Default)]
-pub struct ApprovalNotes {
-    /// Why this action should run.
-    pub justification: String,
-}
-
-impl ApprovalNotes {
-    pub fn render(&self) -> String {
-        format!("Justification: {}", self.justification.trim())
     }
 }
 
@@ -465,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirm_includes_model_justification() {
+    async fn confirm_passes_diff_through() {
         let last = Arc::new(Mutex::new(None));
         let ctx = ToolContext {
             project_root: PathBuf::from("/tmp/x"),
@@ -474,31 +426,6 @@ mod tests {
             user: Arc::new(CaptureIo { last: last.clone() }),
             undo: Arc::new(NoopUndo),
             auto_approve: false,
-            approval: Default::default(),
-            events: Arc::new(crate::NoopEvents),
-            steer: None,
-            compact: None,
-            stop: None,
-        };
-        ctx.set_approval(ApprovalNotes {
-            justification: "completes the requested rename".into(),
-        });
-        ctx.confirm("rename foo -> bar", None).await.unwrap();
-        let shown = last.lock().unwrap().clone().unwrap();
-        assert!(shown.contains("Justification: completes the requested rename"));
-    }
-
-    #[tokio::test]
-    async fn confirm_passes_diff_through_when_no_notes() {
-        let last = Arc::new(Mutex::new(None));
-        let ctx = ToolContext {
-            project_root: PathBuf::from("/tmp/x"),
-            cwd: PathBuf::from("/tmp/x"),
-            session: Arc::new(NoopSession),
-            user: Arc::new(CaptureIo { last: last.clone() }),
-            undo: Arc::new(NoopUndo),
-            auto_approve: false,
-            approval: Default::default(),
             events: Arc::new(crate::NoopEvents),
             steer: None,
             compact: None,
