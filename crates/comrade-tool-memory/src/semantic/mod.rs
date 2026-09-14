@@ -35,10 +35,10 @@
 //! (committed diff + working tree). Unchanged files are neither re-parsed nor
 //! re-embedded; projects without a repo fall back to mtime/size stamps.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
@@ -660,6 +660,13 @@ fn code_store() -> &'static Mutex<HashMap<PathBuf, Store>> {
     CODE_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Project roots with a background warm-up in flight, so [`warm`] is idempotent.
+static WARMING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn warming() -> &'static Mutex<HashSet<PathBuf>> {
+    WARMING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 fn save_store(path: &Path, store: &Store) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -813,6 +820,91 @@ pub fn reindex(root: &Path) -> Result<String> {
     ))
 }
 
+/// Warm the semantic index in the BACKGROUND so the first `semantic_search` is
+/// instant: build the memory and code indexes (incrementally, reusing whatever
+/// is already cached), save each and install it into the resident store, then
+/// return. The work runs on a detached thread, so this never blocks the caller
+/// (the TUI at startup, or the `warm_semantic_index` tool). Idempotent: while a
+/// warm-up for the same root is still running, a second call is a no-op.
+pub fn warm(root: &Path) -> String {
+    warm_with(root, Arc::new(FastEmbedder))
+}
+
+/// [`warm`] with an explicit embedder (the seam tests use).
+fn warm_with(root: &Path, embedder: Arc<dyn Embedder>) -> String {
+    {
+        let mut set = warming().lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(root.to_path_buf()) {
+            return "Semantic index warm-up is already running in the background.".to_string();
+        }
+    }
+    let root = root.to_path_buf();
+    std::thread::spawn(move || {
+        build_indexes(&root, embedder.as_ref());
+        warming()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&root);
+    });
+    "Warming the semantic index in the background (memory + code chunks). The next semantic_search will be fast once it finishes.".to_string()
+}
+
+/// Build the index synchronously and return a one-line report. Used by the
+/// `--warm-index` CLI, where the process is short-lived and wants to block until
+/// the index exists (and to be a no-op release-fast when it is already warm).
+pub fn warm_blocking(root: &Path) -> String {
+    let (memory, code) = build_indexes(root, &FastEmbedder);
+    format!("Semantic index ready: {memory} memory doc(s), {code} code chunk(s).")
+}
+
+/// Build the memory and code indexes for `root` incrementally (reusing whatever
+/// is cached), save each and install it into the resident maps. Each index is
+/// best-effort and independent: a failure in one is logged and does not stop the
+/// other (the code index is the slow, valuable one). Returns `(memory docs, code
+/// docs)`; a failed index reports `0`.
+fn build_indexes(root: &Path, embedder: &dyn Embedder) -> (usize, usize) {
+    let memory = match documents(root)
+        .and_then(|docs| refresh(&docs, &load_store(&index_path(root)), embedder))
+    {
+        Ok((mem, changed)) => {
+            if changed && let Err(e) = save_store(&index_path(root), &mem) {
+                eprintln!("[comrade] cannot save the memory index: {e:#}");
+            }
+            let n = mem.docs.len();
+            // Install under a brief lock (never hold one across the build).
+            mem_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(root.to_path_buf(), mem);
+            n
+        }
+        Err(e) => {
+            eprintln!("[comrade] memory index warm-up failed: {e:#}");
+            0
+        }
+    };
+
+    let code = match code_refresh(root, &load_store(&code_index_path(root)), embedder) {
+        Ok((code, changed)) => {
+            if changed && let Err(e) = save_store(&code_index_path(root), &code) {
+                eprintln!("[comrade] cannot save the code index: {e:#}");
+            }
+            let n = code.docs.len();
+            code_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(root.to_path_buf(), code);
+            n
+        }
+        Err(e) => {
+            eprintln!("[comrade] code index warm-up failed: {e:#}");
+            0
+        }
+    };
+
+    (memory, code)
+}
+
 /// The in-process model, built from the embedded assets on first use.
 static MODEL: OnceLock<Result<Mutex<TextEmbedding>, String>> = OnceLock::new();
 
@@ -899,7 +991,7 @@ impl Embedder for FastEmbedder {
 }
 
 pub fn all() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(SemanticSearch)]
+    vec![Box::new(SemanticSearch), Box::new(WarmSemanticIndex)]
 }
 
 struct SemanticSearch;
@@ -1076,6 +1168,32 @@ impl Tool for SemanticSearch {
         .await
         .context("semantic search task panicked")??;
         Ok(out)
+    }
+}
+
+/// The tool the agent calls to kick off a background index warm-up.
+struct WarmSemanticIndex;
+
+static WARM_SEMANTIC_INDEX_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
+    ToolSpec {
+    name: "warm_semantic_index".into(),
+    description: "Start building the semantic-search index (project memory + code chunks) in the BACKGROUND and return immediately. Building the index in a fresh checkout is CPU-heavy and takes a minute or two, so the app also does this automatically at startup; call this after a large change or when semantic_search feels slow, then carry on - it never blocks. Idempotent: a call while a warm-up is already running is a no-op.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for WarmSemanticIndex {
+    fn spec(&self) -> &ToolSpec {
+        &WARM_SEMANTIC_INDEX_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, _args: Value) -> Result<String> {
+        Ok(warm(&ctx.project_root))
     }
 }
 

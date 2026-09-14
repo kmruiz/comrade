@@ -476,6 +476,58 @@ fn real_model_preserves_order_across_batches() {
     }
 }
 
+/// The background warm-up builds + installs the index so a later search is a
+/// no-op (the resident store already matches the tree).
+#[test]
+fn warm_installs_the_code_index_in_the_background() {
+    let dir = scratch("warm");
+    std::fs::write(dir.join("a.rs"), "fn alpha() {}\n").unwrap();
+    std::fs::write(dir.join("b.rs"), "fn beta() {}\n").unwrap();
+
+    warm_with(&dir, std::sync::Arc::new(StubEmbedder::default()));
+
+    // The build runs on a detached thread; wait for it to install and finish.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let installed = code_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&dir)
+            .cloned();
+        let done = !warming()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&dir);
+        if let Some(store) = installed {
+            assert_eq!(store.docs.len(), 2, "both chunks indexed");
+            if done {
+                // The installed store is the real, current index: rebuilding from
+                // it reports no change and re-embeds nothing.
+                let emb = StubEmbedder::default();
+                let (_, changed) = code_refresh(&dir, &store, &emb).unwrap();
+                assert!(!changed, "a warmed index must match the tree");
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "warm-up did not finish in time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Clean the process-global statics so other tests are unaffected.
+    code_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&dir);
+    mem_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Timing benchmark (NOT a correctness test). Run explicitly with:
 /// `cargo test -p comrade-tool-memory --release -- --ignored --nocapture bench_semantic`
 ///

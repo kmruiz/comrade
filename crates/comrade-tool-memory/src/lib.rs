@@ -33,7 +33,7 @@ use comrade_tool::{Tool, ToolContext, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-pub use semantic::reindex;
+pub use semantic::{reindex, warm, warm_blocking};
 pub use store::{list, read as read_entry, search};
 
 pub fn all() -> Vec<Box<dyn Tool>> {

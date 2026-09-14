@@ -279,6 +279,16 @@ Why a larger batch size makes the cold build slower, not faster. Measured on thi
 - `crates/comrade-core/src/agent.rs`
 - `.comrade/memory/0037-tool-dispatch-prepost-hooks-per-tool-timeout-per-run-budget.md`
 
+## index warm-up
+> The background build of the semantic index (memory + code) so the first `semantic_search` is instant. Triggered automatically by comrade-tui's main() at startup (comrade_tool_memory::warm, a detached, idempotent thread), by the `warm_semantic_index` tool for the agent, or by `comrade --warm-index` (blocking) for run_bg/bg jobs. It is incremental: an already-warm index is a no-op (~0.04s).
+
+**References:**
+- `crates/comrade-tool-memory/src/semantic/mod.rs`
+- `crates/comrade-tui/src/main.rs`
+
+**Notes:**
+Not a background-job-registry job: no jobs-panel entry, not killable via bg_kill. See the ADR 'Warm the semantic index in the background at startup'. Measured cold 67.6s / incremental 2.0s / no-op 0.04s on this repo.
+
 ## LangId
 > A source language the tree-sitter tools understand: Rust, JavaScript, TypeScript, Tsx, Css, Html. engine.rs maps a file extension to a LangId (`lang_of`), a LangId to its tree-sitter grammar (`grammar`), to the node kinds counted as identifier occurrences (`ident_kinds`), and to a declaration-kind -> short-label table (`decl_label`), plus `container_body` (which declarations nest others) and `decl_name` (display name). Non-Rust files are walked via `walk_sources` over `SUPPORTED_EXTS`.
 

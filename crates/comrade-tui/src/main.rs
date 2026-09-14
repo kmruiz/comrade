@@ -40,6 +40,20 @@ struct Cli {
     /// Convenience: set autonomy = "auto" (apply changes without asking).
     #[arg(long)]
     auto: bool,
+
+    /// Build the semantic index for --dir (or the current directory) and exit,
+    /// without starting the TUI or contacting a model. The one-shot command the
+    /// background-job tooling (`run_bg`) can launch to warm the index.
+    #[arg(long)]
+    warm_index: bool,
+}
+
+/// The project root to operate in: `--dir` (canonicalised) or the current dir.
+fn project_root(cli: &Cli) -> Result<PathBuf> {
+    match &cli.dir {
+        Some(d) => d.canonicalize().context("bad --dir"),
+        None => std::env::current_dir().context("no current dir"),
+    }
 }
 
 /// Spawn the task that relays agent events from the run-facing bounded
@@ -88,10 +102,7 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
         cfg.security.autonomy = comrade_core::Autonomy::Auto;
     }
 
-    let root = match &cli.dir {
-        Some(d) => d.canonicalize().context("bad --dir")?,
-        None => std::env::current_dir().context("no current dir")?,
-    };
+    let root = project_root(cli)?;
 
     let client = Arc::new(LlmClient::new(&cfg.llm)?);
 
@@ -336,7 +347,27 @@ fn new_session(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // `--warm-index` builds the semantic index and exits, without loading config,
+    // contacting a model or starting the TUI. This is the one-shot process the
+    // background-job tooling (`run_bg`) can launch to warm the index; it builds
+    // incrementally, so a repeat run when the index is already warm is quick.
+    if cli.warm_index {
+        let root = project_root(&cli)?;
+        let report =
+            tokio::task::spawn_blocking(move || comrade_tool_memory::warm_blocking(&root)).await?;
+        println!("{report}");
+        return Ok(());
+    }
+
     let deps = build_deps(&cli).await?;
+
+    // Warm the semantic index in the background so the first `semantic_search` is
+    // instant: the build is CPU-heavy (a fresh checkout takes a minute or two) and
+    // there is no reason for the user's first search to pay it. Non-blocking and
+    // idempotent; the `warm_semantic_index` tool can kick it off again after big
+    // changes.
+    let _ = comrade_tool_memory::warm(&deps.root);
 
     let interactive = !cli.headless && cli.prompt.is_empty();
     if interactive && !std::io::stdout().is_terminal() {
