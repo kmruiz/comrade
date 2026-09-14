@@ -1,0 +1,14 @@
+# .comrade.toml — project-level overrides, layered on top of the user config.
+# Tables here supersede the user config key by key; `[[sensors]]` entries merge
+# by `name`. Because it ships with the repository, treat it as trusted input.
+
+# Proactive sensor: watch the repository's open GitHub issues through the `gh`
+# CLI. The first poll only sets a baseline; whenever the open-issue list changes
+# the request is pushed onto the sensors queue for triage (see `mode`). Open the
+# queue in the TUI and use the `sensors-*` M-x commands to start an entry.
+[[sensors]]
+name = "gh-issues"
+command = "gh issue list --state open --limit 50"
+interval_secs = 120
+mode = "ask"
+prompt = "Triage the new GitHub issues above: fix the small ones directly (delegate where it helps) and reply with a short plan for the rest."
