@@ -21,17 +21,18 @@ can follow while it runs.
 
 | | |
 |---|---|
-| 🧠 **Agent loop** | ReAct-style tool use with a live, scrollable plan, streaming output, reasoning blocks and a distraction-free focus mode. |
+| 🧠 **Agent loop** | ReAct-style tool use with a live, scrollable plan, streaming output, reasoning blocks and a focus mode that hides tool/meta noise by default. |
 | 🔌 **Models** | Anthropic-compatible clients with retry/backoff and optional prompt caching. Configure **delegates** for parallel jobs and isolated git worktrees. |
 | 🌳 **Code tools** | tree-sitter powered `ts_*` tools: find/read symbol, references, rename, structural map — plus `fs_*` read / write / edit / rgrep. |
 | 📦 **Project tools** | Detect and run the project's own tasks (Cargo & npm), background jobs, git operations and web search/fetch. |
-| 🗂️ **Memory** | ADR decisions and a glossary under `.comrade/memory/`, with semantic search across both memory and code. |
+| 🗂️ **Memory** | ADR decisions and a glossary under `.comrade/memory/`, with semantic search across both memory and code (the index warms in the background at startup). |
 | 🧩 **Extensible** | MCP servers, Claude-format skills (`SKILL.md`), and per-tool approval policies. |
 
 ## 📖 Table of contents
 
 - [Install](#-install)
 - [Usage](#-usage)
+- [Configuration](#-configuration)
 - [Build from source](#-build-from-source)
 - [Contributing](#-contributing)
 - [Releasing](#-releasing)
@@ -94,9 +95,127 @@ comrade --version          # print the installed version
 comrade                    # start the TUI in the current directory
 ```
 
-Comrade reads its configuration and project memory from `.comrade/` in the
-working directory (see the `AGENTS.md` at the repo root for project rules that
-are injected into the agent's system prompt).
+Comrade keeps project memory (decisions and a glossary) in `.comrade/memory/`
+inside the project, and reads its configuration from a TOML file — see
+[Configuration](#-configuration). If the project root contains an `AGENTS.md`,
+its text is injected into the agent's system prompt (this repo does not ship one;
+it is user-supplied).
+
+## ⚙️ Configuration
+
+Configuration is a single TOML file, resolved in this order:
+
+1. `--config <PATH>`
+2. `$COMRADE_CONFIG`
+3. `$XDG_CONFIG_HOME/comrade/config.toml` — default `~/.config/comrade/config.toml`
+
+When no file is found, built-in defaults apply. Every table below is optional.
+
+### Command line
+
+| Flag | Meaning |
+|---|---|
+| `comrade [PROMPT]` | Open the TUI, or run `PROMPT` as a one-shot task. |
+| `--headless` | Run without the TUI, streaming the run to stdout. |
+| `--config <PATH>` | Use a specific config file. |
+| `--dir <PATH>` | Project root to operate in (defaults to the current directory). |
+| `--auto` | Shorthand for `autonomy = "auto"` — apply changes without asking. |
+| `--warm-index` | Build the semantic index for the project and exit. |
+| `--version` | Print the installed version. |
+
+### `[llm]`
+
+The model the agent talks to.
+
+| Key | Default | Notes |
+|---|---|---|
+| `base_url` | `http://localhost:11434/v1` | OpenAI-compatible endpoint. |
+| `api_key` | – | Sent as `Authorization: Bearer …` when set. |
+| `model` | `devstral-small-2` | Model identifier. |
+| `provider` | – | One of `ollama`, `openai`, `deepseek`, `mistral`, `openrouter`, `groq`, `together`; sets `base_url` unless given explicitly. |
+| `temperature` | `0.2` | |
+| `timeout_secs` | `600` | Response timeout. |
+| `max_retries` | `2` | Retries for transient failures. |
+| `retry_backoff_ms` | `500` | Base backoff delay (doubles per attempt, capped at 8s). |
+| `protocol` | `auto` | `auto` \| `native` \| `react` tool-calling. |
+| `context_window` | auto-detected | Model context window in tokens. |
+| `prompt_caching` | `false` | Anthropic-style `cache_control` on the stable prefix. |
+
+### `[[delegates]]`
+
+One table per developer model the tech lead may hand sub-tasks to (the
+`delegate` / `ask_advise` tools). Keys: `name`, `description`, `enabled`
+(`true`), `approval` (`auto` \| `ask` \| `deny`, default `auto`), plus the inline
+`[llm]` keys (`provider`, `model`, `api_key`, `temperature`, …).
+
+### `[agent]`
+
+| Key | Default | Notes |
+|---|---|---|
+| `max_iterations` | `30` | Tool-use turns per run. |
+| `tool_timeout_secs` | `0` | Kill a single tool after N seconds (`0` = no limit). |
+| `run_timeout_secs` | `0` | Stop a whole run after N seconds (`0` = no limit). |
+
+### `[context]`
+
+| Key | Default | Notes |
+|---|---|---|
+| `budget_tokens` | `6000` | Rolling chat-history budget. |
+| `max_tool_output_chars` | `5000` | Cap on tool output fed back to the model. |
+| `auto_compact` | `true` | Summarise the history automatically when it fills the budget. |
+
+### `[security]`
+
+| Key | Default | Notes |
+|---|---|---|
+| `autonomy` | `ask` | `ask` \| `auto` \| `deny` for mutating tools. |
+| `redact_secrets` | `true` | Scrub secret-looking values from tool output. |
+| `extra_roots` | `[]` | Extra directories the filesystem tools may touch. |
+| `shell_allow` | `[]` | If set, `shell`/`run_bg` commands must start with one of these. |
+| `shell_deny` | `[]` | `shell`/`run_bg` commands containing any of these are refused. |
+
+### `[[mcp.servers]]`
+
+External MCP servers whose tools are bridged into the agent as
+`mcp_<name>_<tool>`. Each has a `name` and a `transport`:
+
+```toml
+[[mcp.servers]]
+name = "files"
+transport = { type = "stdio", command = "npx", args = ["-y", "@modelcontextprotocol/server-filesystem", "."] }
+
+[[mcp.servers]]
+name = "remote"
+transport = { type = "http", url = "https://mcp.example.com/mcp" }
+auth = { type = "api_key", key = "$MY_MCP_KEY" }
+```
+
+`stdio` takes `command`, `args` and `env`; `http` takes `url`. `auth` is either
+`{ type = "api_key", key, header? }` or an OIDC block. `$NAME`-prefixed values are
+expanded from the environment.
+
+### `[[hooks.pre_tool]]` / `[[hooks.post_tool]]`
+
+Shell hooks run around every tool call. `on` matches `*`, an exact tool name
+(`fs_edit`) or a prefix (`fs_*`); `run` is the command executed via `bash -c`. A
+non-zero `pre_tool` exit aborts the call; a non-zero `post_tool` exit only warns.
+
+### Example
+
+```toml
+[llm]
+provider = "ollama"
+model = "devstral-small-2"
+
+[security]
+autonomy = "ask"
+
+[[delegates]]
+name = "groq"
+description = "Cheap, fast model for small edits and translations."
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+```
 
 ## 🔧 Build from source
 
