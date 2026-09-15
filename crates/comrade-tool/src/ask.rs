@@ -49,6 +49,14 @@ pub trait UpwardAsk: Send + Sync {
     async fn approve(&self, _title: &str, _detail: &str) -> Result<Verdict> {
         Ok(Verdict::Unavailable)
     }
+
+    /// Summarise a long transcript so a sub-agent whose context overflowed can
+    /// continue from a compact briefing instead of dying. `Ok(None)` means the
+    /// parent cannot summarise (the default), which callers read as "no recovery
+    /// available" so the sub-agent keeps its previous behaviour.
+    async fn summarise(&self, _transcript: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// Shared handle to the parent model, carried by the session ("this session's

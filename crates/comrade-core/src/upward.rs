@@ -67,11 +67,39 @@ impl UpwardAsk for ParentAsk {
             _ => Ok(Verdict::Unavailable),
         }
     }
+
+    async fn summarise(&self, transcript: &str) -> Result<Option<String>> {
+        let prompt = format!(
+            "One of your sub-agents (a developer model) has run out of context mid-task. Its \
+             transcript so far follows.\n\n--- transcript ---\n{transcript}\n--- end transcript \
+             ---\n\nWrite a compact briefing that lets it CONTINUE the same task: (1) the task it \
+             was given, restated in one or two lines so it knows what it is still doing; (2) what \
+             it has already done, and the exact files it changed; (3) what it learned - the \
+             commands it ran and their results, and any error it hit; (4) exactly what remains. \
+             Keep exact file paths, identifiers and commands. Do not invent new requirements, do \
+             not add advice, and do not address the user. Output only the briefing."
+        );
+        let messages = vec![
+            ChatMessage::new(Role::System, self.system.clone()),
+            ChatMessage::new(Role::User, prompt),
+        ];
+        // Bounded like `approve`: no summary (or a failed request) means the caller
+        // keeps its previous behaviour rather than the run dying.
+        match tokio::time::timeout(SUMMARY_TIMEOUT, self.client.chat(&messages)).await {
+            Ok(Ok(text)) => Ok(usable_summary(&text)),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// How long a parent model gets to answer a permission request before the
 /// destructive action is refused.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long the parent model gets to write a context-overflow summary. Summarising
+/// is a real generation, so it needs longer than a one-line verdict - but still
+/// bounded, so a sub-agent can never be held open by a parent that stalls.
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Read a permission verdict out of the parent's reply. Fail closed: only a reply
 /// whose first substantive line OPENS with `APPROVE` approves; `DENY: <why>`
@@ -107,6 +135,18 @@ pub fn parse_verdict(reply: &str) -> Verdict {
     Verdict::Unavailable
 }
 
+/// The parent's reply as a usable summary: trimmed, or `None` when it returned
+/// nothing usable. Fail open - no summary only means the caller falls back to its
+/// own degraded path, so an empty reply must never replace a real transcript.
+fn usable_summary(reply: &str) -> Option<String> {
+    let text = reply.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +179,16 @@ mod tests {
         assert!(matches!(parse_verdict("DENY"), Verdict::Denied(_)));
         assert!(!parse_verdict("DENY").is_approved());
         assert!(Verdict::Approved.is_approved());
+    }
+
+    #[test]
+    fn usable_summary_keeps_text_and_rejects_blank() {
+        assert_eq!(
+            usable_summary("  a summary  "),
+            Some("a summary".to_string())
+        );
+        // A blank reply is not a summary: the caller must keep its transcript.
+        assert_eq!(usable_summary("   \n"), None);
+        assert_eq!(usable_summary(""), None);
     }
 }

@@ -934,15 +934,44 @@ static STUB_READ_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(
     }),
 });
 
-/// A fake chat server that answers N sequential requests with N distinct
-/// raw JSON bodies. The delegate sub-agent loop makes one request per turn,
-/// so this models a tool round (turn 1: model asks for a tool) followed by
-/// a final answer (turn 2).
-fn scripted_server(responses: Vec<String>) -> String {
+#[test]
+fn context_overflow_errors_are_recognised() {
+    // The provider wording that killed a real delegate run, quoted verbatim.
+    let provider_error = format!(
+        "llm error 400 Bad Request: {}",
+        r#"{"error":"Context size has been exceeded."}"#
+    );
+    assert!(is_context_overflow(&anyhow::anyhow!(provider_error)));
+    assert!(is_context_overflow(&anyhow::anyhow!(
+        "context_length_exceeded"
+    )));
+    assert!(is_context_overflow(&anyhow::anyhow!(
+        "This model's maximum context length is 8192 tokens"
+    )));
+    // The ReAct parser's "line too long" is a parse error, not an overflow.
+    assert!(!is_context_overflow(&anyhow::anyhow!("line too long: 42")));
+    assert!(!is_context_overflow(&anyhow::anyhow!("connection refused")));
+}
+
+#[test]
+fn history_is_material_needs_an_assistant_turn() {
+    let mut ctxm = ContextManager::with_system("sys".to_string(), 6000, 2000);
+    ctxm.push(ChatMessage::new(Role::User, "task"));
+    // Only the fixed prompt is present, so a summary would have nothing to say
+    // and the overflow must be treated as the fixed-footprint case.
+    assert!(!history_is_material(&ctxm));
+    ctxm.push(ChatMessage::new(Role::Assistant, "working"));
+    assert!(history_is_material(&ctxm));
+}
+
+/// A fake chat server that answers N sequential requests with N distinct raw
+/// JSON bodies, each with its own HTTP status, so a test can script a provider
+/// error (e.g. a 400 context-overflow) followed by successful turns.
+fn scripted_http(responses: Vec<(u16, String)>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
-        for body in responses {
+        for (status, body) in responses {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 8192];
             let mut used = 0usize;
@@ -956,8 +985,9 @@ fn scripted_server(responses: Vec<String>) -> String {
                     break;
                 }
             }
+            let reason = if status == 200 { "OK" } else { "Bad Request" };
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -965,6 +995,199 @@ fn scripted_server(responses: Vec<String>) -> String {
         }
     });
     format!("http://127.0.0.1:{port}/v1")
+}
+
+/// A fake chat server that answers N sequential requests with N distinct
+/// raw JSON bodies. The delegate sub-agent loop makes one request per turn,
+/// so this models a tool round (turn 1: model asks for a tool) followed by
+/// a final answer (turn 2).
+fn scripted_server(responses: Vec<String>) -> String {
+    scripted_http(responses.into_iter().map(|body| (200, body)).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Context-overflow recovery
+// ---------------------------------------------------------------------------
+
+/// The provider wording a real delegate run died on, surfaced by the client's
+/// `LlmHttpError` as `llm error 400 Bad Request: <body>`.
+fn overflow_response() -> (u16, String) {
+    (
+        400,
+        r#"{"error":"Context size has been exceeded."}"#.to_string(),
+    )
+}
+
+/// A native turn asking the stub to make change number `n`.
+fn edit_turn(n: u32) -> String {
+    json!({"choices":[{"message":{"content":"","tool_calls":[{
+        "id": format!("call_{n}"),
+        "function": {"name": "fs_edit", "arguments": json!({
+            "path": format!("src/f{n}.rs"), "old": "a", "new": "b"
+        }).to_string()}
+    }]}}]})
+    .to_string()
+}
+
+/// A native turn that ends the run with `text`.
+fn answer_turn(text: &str) -> String {
+    json!({"choices":[{"message":{"content": text}}]}).to_string()
+}
+
+/// A parent model that answers every `summarise` call with a fixed briefing and
+/// counts how often it was asked, so a test can prove a recovery ran (or did
+/// not). Its `approve` never authorises anything.
+struct SummarisingParent {
+    summary: String,
+    called: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl UpwardAsk for SummarisingParent {
+    async fn ask(&self, _question: &str) -> Result<String> {
+        Ok(String::new())
+    }
+
+    async fn approve(&self, _title: &str, _detail: &str) -> Result<Verdict> {
+        Ok(Verdict::Unavailable)
+    }
+
+    async fn summarise(&self, _transcript: &str) -> Result<Option<String>> {
+        self.called
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(self.summary.clone()))
+    }
+}
+
+/// A recording stub `fs_edit`. The name matters: `fs_edit` is a MUTATING tool, so
+/// the no-progress guard clears its refusal counter on every run and the stub may
+/// legitimately be called more than once in a test.
+struct EditStubTool {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+static STUB_EDIT_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| ToolSpec {
+    name: "fs_edit".into(),
+    description: "stub fs_edit".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string" },
+            "old": { "type": "string" },
+            "new": { "type": "string" }
+        },
+        "required": ["path", "old", "new"]
+    }),
+});
+
+#[async_trait::async_trait]
+impl Tool for EditStubTool {
+    fn spec(&self) -> &ToolSpec {
+        &STUB_EDIT_SPEC
+    }
+
+    async fn invoke(&self, _ctx: &ToolContext, _args: Value) -> Result<String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("stub fs_edit executed".to_string())
+    }
+}
+
+/// Drive one delegate run against `script` and report the tool's reply plus how
+/// often the parent was asked to summarise the delegate's context.
+async fn overflow_run(script: Vec<(u16, String)>) -> (String, usize) {
+    let base = scripted_http(script);
+    let cfg = Config {
+        delegates: vec![delegate("cheap", &base)],
+        ..Config::default()
+    };
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EditStubTool {
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    let tool = DelegateTool::new(&cfg.delegates, registry, DelegateLimits::default())
+        .unwrap()
+        .unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let session = Arc::new(AgentSession::new(tx));
+    let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    session.set_upward(Arc::new(SummarisingParent {
+        summary: "BRIEFING: the delegate was changing a to b in src/f1.rs; that work is unfinished"
+            .to_string(),
+        called: called.clone(),
+    }));
+
+    let mut ctx = test_ctx();
+    ctx.session = session.as_control();
+    let out = tool
+        .invoke(&ctx, json!({"model": "cheap", "task": "change a to b"}))
+        .await
+        .unwrap();
+    (out, called.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// A delegate that has done work and then overflows must be summarised by the
+/// parent and CONTINUE, not die with the provider's error.
+#[tokio::test]
+async fn delegate_recovers_from_a_context_overflow() {
+    let (out, summaries) = overflow_run(vec![
+        (200, edit_turn(1)),
+        overflow_response(),
+        (200, answer_turn("finished")),
+    ])
+    .await;
+
+    assert_eq!(summaries, 1, "the parent must be asked for one summary");
+    assert!(
+        out.contains("finished"),
+        "the run must continue past the overflow: {out}"
+    );
+}
+
+/// Recovery is capped at three per run: past that the run hands back what it had
+/// instead of summarising again, so a model that cannot fit its task cannot keep
+/// the parent answering forever.
+#[tokio::test]
+async fn delegate_stops_compacting_after_three_recoveries() {
+    // Each overflow is preceded by a successful turn, so the history is material
+    // again and a recovery is genuinely available - the cap is what stops it.
+    let (out, summaries) = overflow_run(vec![
+        (200, edit_turn(1)),
+        overflow_response(),
+        (200, edit_turn(2)),
+        overflow_response(),
+        (200, edit_turn(3)),
+        overflow_response(),
+        (200, edit_turn(4)),
+        overflow_response(),
+        overflow_response(),
+        overflow_response(),
+    ])
+    .await;
+
+    assert_eq!(summaries, 3, "at most three recoveries per run");
+    assert!(
+        out.contains("compacted 3 time(s)"),
+        "an exhausted run must return its partial answer, not fail: {out}"
+    );
+}
+
+/// When nothing but the fixed prompt and the tool schemas fit the window, a
+/// summary has nothing to say: the fixed-footprint retry must handle it WITHOUT
+/// spending one of the three recovery rounds.
+#[tokio::test]
+async fn delegate_does_not_spend_a_compaction_on_a_fixed_footprint_overflow() {
+    let (out, summaries) =
+        overflow_run(vec![overflow_response(), (200, answer_turn("finished"))]).await;
+
+    assert_eq!(
+        summaries, 0,
+        "a fixed-footprint overflow must not consume a recovery"
+    );
+    assert!(
+        out.contains("finished"),
+        "the slim retry must let the run continue: {out}"
+    );
 }
 
 /// Build a delegate whose registry contains one recording stub `fs_write_file`

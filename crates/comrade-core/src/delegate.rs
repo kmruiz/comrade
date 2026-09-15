@@ -754,6 +754,60 @@ fn join_or(items: &[String], fallback: &str) -> String {
     }
 }
 
+/// Tools dropped from the advertised schema set in the fixed-footprint retry: the
+/// ones a delegate can still finish its task without. Advertising fewer schemas
+/// makes the request itself smaller, which is the only lever left when the fixed
+/// prompt plus the tool schemas are what does not fit the model's window.
+const SLIM_SPEC_DROP: &[&str] = &[
+    "web_search",
+    "web_fetch",
+    "find_adr",
+    "read_adr",
+    "find_glossary",
+    "read_glossary",
+    "stale_memory",
+    "ask_upwards",
+];
+
+/// Whether `name` is still advertised after the fixed-footprint retry: everything
+/// except [`SLIM_SPEC_DROP`], plus every generated `skill_*` tool.
+fn keep_in_slim_specs(name: &str) -> bool {
+    !name.starts_with("skill_") && !SLIM_SPEC_DROP.contains(&name)
+}
+
+/// Recover a delegate whose context overflowed: ask the parent model to summarise
+/// the transcript and replace the history with that summary, so the delegate can
+/// continue the same task with far less context.
+///
+/// Returns `false` - the caller then keeps its previous behaviour - when the cap
+/// is already spent, the delegate has done no work to summarise (see
+/// [`history_is_material`]), there is no parent to ask, or the parent produced no
+/// usable summary.
+async fn recover_context(
+    dctx: &ToolContext,
+    ctxm: &mut ContextManager,
+    compactions: &mut usize,
+) -> bool {
+    if *compactions >= MAX_DELEGATE_COMPACTIONS || !history_is_material(ctxm) {
+        return false;
+    }
+    let Some(parent) = dctx.session.upward() else {
+        return false;
+    };
+    // The parent sees the transcript as data in a standalone request: its own
+    // conversation is never touched, so recovering a delegate's context cannot
+    // cost the tech lead's context.
+    let transcript = crate::compact::render_transcript(ctxm.messages());
+    match parent.summarise(&transcript).await {
+        Ok(Some(summary)) if !summary.trim().is_empty() => {
+            ctxm.compact(summary.trim());
+            *compactions += 1;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Escalation cap for one delegate run: `ask_upwards` is a recovery move, not a
 /// way to keep the parent model answering forever.
 const MAX_UPWARD_ASKS: usize = 3;
@@ -773,6 +827,44 @@ fn refuse_upward(name: &str, used: &mut usize) -> Option<String> {
         ));
     }
     None
+}
+
+/// Cap on context-overflow recoveries per delegate run: each one replaces the
+/// delegate's transcript with a parent-written summary so it can continue. Past
+/// the cap the run returns what it had gathered instead of summarising again.
+const MAX_DELEGATE_COMPACTIONS: usize = 3;
+
+/// True when a model request failed because it did not fit the model's context
+/// window. Matched on the provider's own wording, because the harness does not
+/// know a delegate's real window - only the server does.
+///
+/// Note the absence of a bare `": too long"` marker: the ReAct parser raises a
+/// legitimate "line too long" error, which is not an overflow.
+fn is_context_overflow(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "context size",
+        "context length",
+        "context_length_exceeded",
+        "context window",
+        "maximum context",
+        "too many tokens",
+        "tokens in the messages",
+        "exceeds the maximum",
+        "reduce the length of the messages",
+    ];
+    MARKERS.iter().any(|m| msg.contains(m))
+}
+
+/// True when the delegate has actually done work (it has taken an assistant
+/// turn), so a summary would have something to say.
+///
+/// A request that overflows with nothing but the system prompt and the first
+/// user turn cannot be fixed by summarising: what is too big is the delegate's
+/// fixed footprint - its prompt plus the tool schemas - so the caller must not
+/// spend a recovery on it.
+fn history_is_material(ctxm: &ContextManager) -> bool {
+    ctxm.messages().iter().any(|m| m.role == Role::Assistant)
 }
 
 /// Read guard for the delegate sub-agent loop, mirroring the main loop's
@@ -853,6 +945,17 @@ pub(crate) async fn run_delegate_subagent(
     let mut consecutive_reads = 0usize;
     // Escalation budget: how many `ask_upwards` questions this run has spent.
     let mut upward_asks = 0usize;
+    // Context-overflow recoveries spent by this run (see MAX_DELEGATE_COMPACTIONS).
+    let mut compactions = 0usize;
+    // Whether a proactive compaction is armed for the current over-budget episode.
+    // Mirrors the main loop's `auto_compact_armed` guard, so a history that stays
+    // over budget for a structural reason (its fixed prompt is too big) cannot
+    // summarise on every iteration.
+    let mut compact_armed = true;
+    // Whether the fixed-footprint retry - a smaller advertised schema set - has
+    // been tried. It is the only lever when the prompt plus tool schemas alone
+    // are what does not fit.
+    let mut slim_specs = false;
     // Inactivity budget (see [`DelegateLimits::timeout`]): a delegate may complete
     // nothing - no model reply, no tool result - for `idle_nudge_at` before the
     // harness nudges it to act, and for `idle_stop_at` before it is stopped with
@@ -896,6 +999,18 @@ pub(crate) async fn run_delegate_subagent(
         // own conversation at its next rest point (drained from the shared bus
         // cloned into `dctx`).
         crate::agent::drain_steer(dctx.steer.as_ref(), &mut ctxm).await;
+        // Prefer a parent-written summary over the lossy trim once the context is
+        // about to be degraded, mirroring the main loop's auto-compaction. Armed
+        // once per over-budget episode, so a structurally over-budget history (its
+        // fixed prompt is too big) cannot summarise on every iteration.
+        if compact_armed && ctxm.needs_auto_compaction() {
+            compact_armed = false;
+            // A failed recovery deliberately falls through to `enforce_budget`,
+            // which is the existing behaviour.
+            let _ = recover_context(&dctx, &mut ctxm, &mut compactions).await;
+        } else if !ctxm.needs_auto_compaction() {
+            compact_armed = true;
+        }
         ctxm.enforce_budget();
         // Idle gate: nudge once when nothing has completed for `idle_nudge_at`,
         // and stop the run at `idle_stop_at` so a hung request or a frozen run
@@ -919,7 +1034,13 @@ pub(crate) async fn run_delegate_subagent(
             ctxm.push_user_merged(crate::agent::STALL_NUDGE);
         }
         let specs: Option<Vec<comrade_tool::ToolSpec>> = if native {
-            let specs: Vec<_> = tools.iter().map(|t| t.spec().clone()).collect();
+            // After a fixed-footprint overflow (`slim_specs`) advertise fewer
+            // tools, so the request itself gets smaller.
+            let specs: Vec<_> = tools
+                .iter()
+                .filter(|t| !slim_specs || keep_in_slim_specs(&t.spec().name))
+                .map(|t| t.spec().clone())
+                .collect();
             if specs.is_empty() { None } else { Some(specs) }
         } else {
             None
@@ -949,7 +1070,25 @@ pub(crate) async fn run_delegate_subagent(
             // above nudges (at `idle_nudge_at`) or stops (at `idle_stop_at`).
             continue;
         };
-        let turn = res?;
+        let turn = match res {
+            Ok(turn) => turn,
+            Err(e) if is_context_overflow(&e) => {
+                // The request did not fit the model's window. If the delegate has
+                // done work, a parent-written summary lets it continue; if it has
+                // not, then the fixed prompt plus the tool schemas are what is too
+                // big, and no summary can help - retry once with fewer schemas.
+                if recover_context(&dctx, &mut ctxm, &mut compactions).await {
+                    continue;
+                }
+                if native && !slim_specs {
+                    slim_specs = true;
+                    continue;
+                }
+                // Out of recoveries: hand back what it had rather than losing it.
+                return Ok(overflow_answer(author, compactions, &last_text));
+            }
+            Err(e) => return Err(e),
+        };
         // A request that came back is progress: reset the idle clock.
         last_progress = Instant::now();
         idle_nudged = false;
@@ -1208,6 +1347,25 @@ fn timeout_answer(author: &str, idle: Duration, last: &str) -> String {
         format!(
             "{head} It had not produced an answer yet, so treat its result as unavailable and \
              continue without it (re-delegate a smaller, tightly-scoped task if you still need it)."
+        )
+    } else {
+        format!("{head}\n\nBest effort with what it had gathered so far:\n\n{last}")
+    }
+}
+
+/// The reply a delegate returns when its context kept overflowing: whatever it
+/// had produced, plus a note that the transcript was summarised, so the parent can
+/// re-delegate a narrower task instead of losing the work entirely.
+fn overflow_answer(author: &str, compactions: usize, last: &str) -> String {
+    let head = format!(
+        "[delegate {author}: its context overflowed and was compacted {compactions} time(s) \
+         without leaving room to finish]"
+    );
+    let last = last.trim();
+    if last.is_empty() {
+        format!(
+            "{head} It produced no answer, so treat its result as unavailable and re-delegate a \
+             smaller, tightly-scoped task (or use a model with a larger context window)."
         )
     } else {
         format!("{head}\n\nBest effort with what it had gathered so far:\n\n{last}")

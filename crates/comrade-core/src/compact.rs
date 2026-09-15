@@ -30,7 +30,10 @@ fn role_label(role: Role) -> &'static str {
 
 /// Flatten the message history into a plain-text transcript. The system prompt
 /// is skipped: it is the agent's own instructions, not work done.
-fn render_transcript(messages: &[ChatMessage]) -> String {
+///
+/// `pub(crate)` because the delegate loop reuses it to hand a sub-agent's
+/// transcript to the parent model when its context overflows.
+pub(crate) fn render_transcript(messages: &[ChatMessage]) -> String {
     let mut out = String::new();
     for m in messages {
         if m.role == Role::System {

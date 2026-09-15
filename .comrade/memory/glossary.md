@@ -334,6 +334,18 @@ Why a larger batch size makes the cold build slower, not faster. Measured on thi
 - `crates/comrade-core/src/delegate.rs`
 - `crates/comrade-tui/src/tui.rs`
 
+## fixed-footprint overflow
+> A context-window overflow in which the FIXED part of a request - the sub-agent's system prompt plus the schemas of the tools advertised to it - already exceeds the model's window before any work has accumulated. Distinguished from a variable-history overflow, where what the agent accumulated (tool output, turns) is what grew past the window. Only the latter can be fixed by summarising; summarising an empty history still overflows.
+
+**References:**
+- `crates/comrade-core/src/delegate.rs`
+- `crates/comrade-tool/src/ask.rs`
+- `crates/comrade-core/src/upward.rs`
+- `.comrade/memory/0006-restyle-all-model-facing-prompts-as-terse-runbooks-for-small-model-tech-leads.md`
+
+**Notes:**
+Detected in the delegate loop by `history_is_material` (crates/comrade-core/src/delegate.rs) returning false - i.e. no assistant turn exists yet - at the moment `is_context_overflow` matches. Such an overflow must NOT spend one of the MAX_DELEGATE_COMPACTIONS recoveries; it is answered instead by one retry with a slimmer advertised schema set (SLIM_SPEC_DROP) in native mode. This is the case that killed every delegate job in the 2026-09-16 session and the ministral-3-3b delegate in ADR 6. Diagnostic clue: the run fails on its FIRST request, before any tool call.
+
 ## flat tool schema
 > Flat tool schema - the required shape of a model-facing ToolSpec.json_schema: ONE object shape with every mandatory field listed in the top-level `required` (plus `additionalProperties: false`), and no `anyOf`/`oneOf`/`allOf` over required-subset branches. A local OpenAI-compatible server (LM Studio) compiles the schema into a generation grammar: an `anyOf` made ministral-3-3b emit ~60 empty-argument calls per request and a `oneOf` silently dropped the alternative-required `index`. Alternatives are expressed instead as optional properties plus runtime validation (fs_edit advertises literal mode only and keeps `diff` as an internal runtime argument; self_update_plan/self_set_step_model/self_set_step_context require `index` with `text` as a runtime fallback).
 
