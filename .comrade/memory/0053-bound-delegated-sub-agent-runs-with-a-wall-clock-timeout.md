@@ -1,5 +1,5 @@
 # 0053 - Bound delegated sub-agent runs with a wall-clock timeout
-status: accepted
+status: superseded
 date: 2026-09-14
 tags: delegate, timeout, config, reliability
 summary: Delegated sub-agents run under a wall-clock budget ([agent].delegate_timeout_secs, default 60s); on expiry they stop and return their partial answer or a notice, so a slow/stuck delegate can no longer hang the parent run.
@@ -31,3 +31,6 @@ Confirmed again in practice: with the default 60s budget the delegate cannot eve
 
 ## Note
 Default raised from 60s to 300s (2026-09-14). The 60s default proved too aggressive in practice for the configured delegate (qwen/qwen3.6-35b-a3b): it consistently ran out of budget on multi-file steps and even on read-only `ask_advise step=N` readiness checks over large files (see the two notes below). The limit still exists (a delegate cannot hang the parent forever); only its default changed. `[agent].delegate_timeout_secs = 0` still disables it entirely. The Decision/Rationale above still reference the original "60s / in a minute" figure — the mechanism is unchanged, only the default value.
+
+## Note
+Mechanism superseded by #68 (2026-09-16): the budget is no longer wall-clock. `DelegateLimits::timeout` / `[agent].delegate_timeout_secs` now measure INACTIVITY - a delegate that completes nothing (no model reply, no tool result) is nudged at that many seconds and stopped at twice it, and any completed request or tool call resets the clock. The field name, the config key and the 0-disables rule are unchanged; a hung request/tool is still bounded, and the partial-answer `timeout_answer` path is kept (reworded to "stopped after Ns of inactivity"). The notes below (60s -> 300s default, delegates missing the budget on multi-file steps and on `ask_advise step=N` readiness checks) remain useful history: the inactivity change is what makes those cases survivable, since a delegate that keeps working is no longer cut off.

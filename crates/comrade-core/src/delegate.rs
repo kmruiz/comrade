@@ -98,10 +98,12 @@ pub struct DelegateLimits {
     pub max_iterations: usize,
     pub budget_tokens: usize,
     pub max_tool_output_chars: usize,
-    /// Wall-clock budget for the whole delegated run. Every model request and
-    /// tool call is bounded by what is left of it; when it runs out the delegate
-    /// is stopped and returns whatever it had gathered, so a slow or stuck
-    /// delegate cannot hang the parent. [`Duration::ZERO`] disables the limit.
+    /// Inactivity budget for one delegated run: how long it may complete NOTHING
+    /// - no model reply, no tool result - before the harness nudges it to act,
+    /// and twice that before it is stopped and returns whatever it had gathered,
+    /// so a slow or hung delegate cannot hang the parent. Progress resets the
+    /// clock, so a delegate that keeps working is never cut off for taking its
+    /// time. [`Duration::ZERO`] disables the limit.
     pub timeout: Duration,
 }
 
@@ -799,6 +801,16 @@ const DELEGATE_READ_NUDGE: &str = "You have performed {count} reads in a row wit
      You have enough context - implement now (write or edit a file) and verify your work, then \
      reply with your final answer. Do not keep reading.";
 
+/// Injected into a delegate that has completed nothing for its whole inactivity
+/// budget (`[agent].delegate_timeout_secs`, see [`DelegateLimits::timeout`]): a
+/// hung model request or a frozen turn is cut off at that point and the delegate
+/// is told to act rather than wait. If it stays silent for twice as long the run
+/// is stopped. Injected as a user turn so the next request sees it.
+pub(crate) const IDLE_NUDGE: &str = "You have made no progress for a while: no tool call has \
+     completed and no model reply has come back. Take an action now - call a tool (fs_read_file, \
+     fs_edit, pom_run_tests, ...) or, if the task is done, reply with your final answer. Do not \
+     sit idle.";
+
 /// Run one delegate as a tool-using sub-agent until it produces a final answer.
 /// Mirrors the main agent loop but for the delegate's own client, scoped tool
 /// registry and limits: native tool calling when the delegate protocol allows
@@ -841,16 +853,31 @@ pub(crate) async fn run_delegate_subagent(
     let mut consecutive_reads = 0usize;
     // Escalation budget: how many `ask_upwards` questions this run has spent.
     let mut upward_asks = 0usize;
-    // Wall-clock budget for the whole run (see [`DelegateLimits::timeout`]): every
-    // model request and tool call is bounded by what is left, so a single slow or
-    // hung request (or a long chain of turns) cannot hold the parent run open
-    // forever. On expiry the delegate answers with whatever it has.
-    let deadline = if limits.timeout.is_zero() {
-        None
-    } else {
-        Some(Instant::now() + limits.timeout)
+    // Inactivity budget (see [`DelegateLimits::timeout`]): a delegate may complete
+    // nothing - no model reply, no tool result - for `idle_nudge_at` before the
+    // harness nudges it to act, and for `idle_stop_at` before it is stopped with
+    // whatever it had gathered. Progress (a request or a tool that came back)
+    // resets the clock, so a delegate that keeps working is never cut off for
+    // simply taking its time; only genuine idleness - a hung or frozen run - is.
+    let idle_nudge_at = limits.timeout;
+    let idle_stop_at = limits.timeout * 2;
+    // When the last bit of progress happened; reset by every completed request or
+    // tool call.
+    let mut last_progress = Instant::now();
+    // Whether the idle nudge already fired for the current stretch of inactivity,
+    // so it is injected at most once per stretch.
+    let mut idle_nudged = false;
+    // How long the next request or tool call may take before the next gate: the
+    // nudge while it has not fired, the stop once it has. `None` disables the
+    // limit (a zero `timeout`).
+    let idle_left = |last: Instant, nudged: bool| {
+        if limits.timeout.is_zero() {
+            None
+        } else {
+            let gate = if nudged { idle_stop_at } else { idle_nudge_at };
+            Some(gate.saturating_sub(last.elapsed()))
+        }
     };
-    let budget_left = || deadline.map(|d| d.saturating_duration_since(Instant::now()));
     // The most recent non-empty assistant text, returned as a best-effort answer
     // if the budget runs out before the delegate produces a final answer.
     let mut last_text = String::new();
@@ -870,6 +897,19 @@ pub(crate) async fn run_delegate_subagent(
         // cloned into `dctx`).
         crate::agent::drain_steer(dctx.steer.as_ref(), &mut ctxm).await;
         ctxm.enforce_budget();
+        // Idle gate: nudge once when nothing has completed for `idle_nudge_at`,
+        // and stop the run at `idle_stop_at` so a hung request or a frozen run
+        // cannot hold the parent open. Progress resets both (see `last_progress`).
+        if !limits.timeout.is_zero() {
+            let idle = last_progress.elapsed();
+            if idle >= idle_stop_at {
+                return Ok(timeout_answer(author, idle_stop_at, &last_text));
+            }
+            if !idle_nudged && idle >= idle_nudge_at {
+                idle_nudged = true;
+                ctxm.push_user_merged(IDLE_NUDGE);
+            }
+        }
         // One-shot nudges mirrored from the main loop, so a small delegate does
         // not edit forever without testing, or keep re-verifying after it has
         // finished. Injected as a user turn so the next request sees it.
@@ -903,10 +943,15 @@ pub(crate) async fn run_delegate_subagent(
                 }
             }
         };
-        let Some(res) = invoke_within(budget_left(), model_call).await else {
-            return Ok(timeout_answer(author, limits.timeout, &last_text));
+        let Some(res) = invoke_within(idle_left(last_progress, idle_nudged), model_call).await else {
+            // Nothing came back before the next gate: loop back so the idle gate
+            // above nudges (at `idle_nudge_at`) or stops (at `idle_stop_at`).
+            continue;
         };
         let turn = res?;
+        // A request that came back is progress: reset the idle clock.
+        last_progress = Instant::now();
+        idle_nudged = false;
         if !turn.content.trim().is_empty() {
             last_text = turn.content.clone();
         }
@@ -965,13 +1010,27 @@ pub(crate) async fn run_delegate_subagent(
                 let output = match tools.get(&tc.name) {
                     Some(tool) => {
                         dctx.events.tool_call(author, &tc.name, &args_pretty).await;
-                        // Bound the tool call by the remaining budget too, so a
-                        // hanging tool cannot outlive the delegate's deadline.
-                        let Some(ran) =
-                            invoke_within(budget_left(), tool.invoke(&dctx, args)).await
-                        else {
-                            return Ok(timeout_answer(author, limits.timeout, &last_text));
+                        // Bound the tool call by the idle gate too, so a hanging
+                        // tool cannot outlive the delegate: on timeout answer the
+                        // call so the history stays API-valid and let the idle
+                        // gate nudge or stop the run.
+                        let ran = invoke_within(
+                            idle_left(last_progress, idle_nudged),
+                            tool.invoke(&dctx, args),
+                        )
+                        .await;
+                        let Some(ran) = ran else {
+                            let cut = "the tool did not return in time and was cut off";
+                            dctx.events.tool_result(author, &tc.name, cut, false).await;
+                            let clamped = ctxm.truncate_observation(&format!(
+                                "ERROR: {cut}. Take a different action."
+                            ));
+                            ctxm.push(ChatMessage::tool_result(tc.id.clone(), clamped));
+                            continue;
                         };
+                        // A tool that came back is progress: reset the idle clock.
+                        last_progress = Instant::now();
+                        idle_nudged = false;
                         let r = match ran {
                             Ok(out) => (out, true),
                             Err(e) => (format!("ERROR: {e:#}"), false),
@@ -1076,10 +1135,28 @@ pub(crate) async fn run_delegate_subagent(
         dctx.events
             .tool_call(author, &tool_call.name, &args_pretty)
             .await;
-        let Some(ran) = invoke_within(budget_left(), tool.invoke(&dctx, tool_call.args)).await
-        else {
-            return Ok(timeout_answer(author, limits.timeout, &last_text));
+        let ran = invoke_within(
+            idle_left(last_progress, idle_nudged),
+            tool.invoke(&dctx, tool_call.args),
+        )
+        .await;
+        let Some(ran) = ran else {
+            // The tool outlived the gate (it hung): feed the model an observation
+            // and let the idle gate nudge or stop the run.
+            let cut = "the tool did not return in time and was cut off";
+            dctx.events
+                .tool_result(author, &tool_call.name, cut, false)
+                .await;
+            let obs = ctxm.truncate_observation(&format!("ERROR: {cut}. Take a different action."));
+            ctxm.push(ChatMessage::new(
+                Role::User,
+                render_observation(&tool_call.name, &obs),
+            ));
+            continue;
         };
+        // A tool that came back is progress: reset the idle clock.
+        last_progress = Instant::now();
+        idle_nudged = false;
         let (output, ok) = match ran {
             Ok(out) => (out, true),
             Err(e) => (format!("ERROR: {e:#}"), false),
@@ -1104,8 +1181,8 @@ pub(crate) async fn run_delegate_subagent(
 
 /// Run a future under an optional remaining budget: `Some(left)` bounds it and
 /// yields `None` if it does not finish in time, `None` runs it unbounded. Gives
-/// every model request and tool call inside a delegate its slice of the
-/// delegate's wall-clock budget (see [`DelegateLimits::timeout`]).
+/// every model request and tool call inside a delegate the time left until the
+/// delegate's next idle gate (see [`DelegateLimits::timeout`]).
 async fn invoke_within<F: std::future::Future>(
     left: Option<Duration>,
     fut: F,
@@ -1116,14 +1193,14 @@ async fn invoke_within<F: std::future::Future>(
     }
 }
 
-/// The best-effort reply a delegate returns when it runs out of its wall-clock
-/// budget: whatever partial answer it had, or a clear notice that it did not
-/// finish, so the parent can carry on instead of waiting forever.
-fn timeout_answer(author: &str, timeout: Duration, last: &str) -> String {
-    let secs = timeout.as_secs();
+/// The best-effort reply a delegate returns when it has stayed idle for its whole
+/// inactivity budget: whatever partial answer it had, or a clear notice that it
+/// did not finish, so the parent can carry on instead of waiting forever.
+fn timeout_answer(author: &str, idle: Duration, last: &str) -> String {
+    let secs = idle.as_secs();
     let head = format!(
-        "[delegate {author}: stopped after {secs}s without a final answer — it reached its time \
-         budget]"
+        "[delegate {author}: stopped after {secs}s of inactivity without a final answer — it \
+         made no progress for too long]"
     );
     let last = last.trim();
     if last.is_empty() {

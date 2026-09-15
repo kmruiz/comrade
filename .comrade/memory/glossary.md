@@ -208,6 +208,17 @@ The project declares `license = "MIT OR Apache-2.0"` in Cargo.toml but only an A
 - `crates/comrade-tool-memory/src/semantic/mod.rs`
 - `.comrade/memory/0022-semantic-memory-search-fastembed-model-persisted-flat-cosine-index.md`
 
+## delegate inactivity gate (IDLE_NUDGE)
+> The delegate inactivity gate: a delegated sub-agent's budget (`[agent].delegate_timeout_secs` -> `DelegateLimits::timeout`, default 300s) measures time in which the delegate completed NOTHING - no model reply, no tool result. At that many idle seconds `run_delegate_subagent` (crates/comrade-core/src/delegate.rs) injects the crate constant `IDLE_NUDGE` (once per idle stretch, via `ContextManager::push_user_merged`); at TWICE it (600s at the default) the run stops and returns `timeout_answer(...)` ("stopped after Ns of inactivity"). Every completed model request and every tool call that returns resets the clock (`last_progress`), and `invoke_within` bounds each request/tool by the time left until the NEXT gate, so an in-flight hung call is interruptible exactly at the nudge point. `0` disables the gate.
+
+**References:**
+- `crates/comrade-core/src/delegate.rs`
+- `crates/comrade-core/src/config.rs`
+- `crates/comrade-core/src/delegate/tests.rs`
+
+**Notes:**
+Distinct from the call-count guards STALL_NUDGE / VERIFY_NUDGE / DELEGATE_READ_NUDGE, which fire on non-progress CALLS (loop-guard nudge entry); this one fires on idle TIME. A hung tool is cut off at the gate and ANSWERED with an error tool result (so the history stays API-valid and the delegate gets another turn) rather than aborting the run. Replaced the wall-clock budget of ADR #53 (see ADR #68). Tests: crates/comrade-core/src/delegate/tests.rs `a_frozen_delegate_is_nudged_to_act`, `a_progressing_delegate_is_never_cut_off`, `a_hanging_tool_is_cut_off_and_the_delegate_recovers`.
+
 ## delegate sub-chat
 > The chat rows authored by a delegate model (its tool cards and its reply), rendered indented 2 columns under a "| " rule in the delegate's agent color with a dim per-agent background band, visually nested under the parent's delegate tool call.
 

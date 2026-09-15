@@ -1505,9 +1505,10 @@ fn timeout_answer_reports_a_partial_or_missing_result() {
     assert!(none.contains("unavailable"), "{none}");
 }
 
-/// A delegate whose model never answers must still return within its wall-clock
-/// budget (a slow or hung model request used to hold the parent run open
-/// indefinitely), replying with a notice instead of blocking forever.
+/// A delegate whose model never answers must still return (a slow or hung model
+/// request used to hold the parent run open indefinitely): it is nudged once at
+/// its inactivity budget, then stopped at twice that, replying with a notice
+/// instead of blocking forever.
 #[tokio::test]
 async fn a_delegate_that_never_answers_times_out_within_its_budget() {
     // The server reads the request and then holds the connection open without
@@ -1558,13 +1559,14 @@ async fn a_delegate_that_never_answers_times_out_within_its_budget() {
         elapsed < std::time::Duration::from_secs(5),
         "the delegate must be cut off, took {elapsed:?}"
     );
-    assert!(out.contains("time budget"), "{out}");
+    assert!(out.contains("inactivity"), "{out}");
 }
 
-/// The same budget applies to a tool call that hangs: a delegate that reads from
-/// a tool which never returns is stopped at its deadline, not left hanging.
+/// A tool that never returns does not hang the delegate: the call is cut off at
+/// the idle gate and answered with an error so the history stays API-valid, and
+/// the delegate gets its next turn (here it recovers and answers).
 #[tokio::test]
-async fn a_delegate_stuck_in_a_hanging_tool_times_out() {
+async fn a_hanging_tool_is_cut_off_and_the_delegate_recovers() {
     /// A tool whose `invoke` never resolves.
     struct HangingTool;
     #[async_trait]
@@ -1582,8 +1584,9 @@ async fn a_delegate_stuck_in_a_hanging_tool_times_out() {
         json_schema: json!({"type": "object"}),
     });
 
-    // The model asks for the hanging read, then (after it is cut off) is never
-    // reached again because the delegate's budget expires during the call.
+    // Turn 1 asks for the hanging read; after it is cut off the delegate is
+    // reached again and answers differently, proving the cut-off left the run
+    // usable instead of aborting it.
     let turn = json!({
         "choices": [{
             "message": {
@@ -1596,7 +1599,8 @@ async fn a_delegate_stuck_in_a_hanging_tool_times_out() {
         }]
     })
     .to_string();
-    let base = scripted_server(vec![turn]);
+    let recovered = json!({"choices": [{"message": {"content": "read another way"}}]}).to_string();
+    let base = scripted_server(vec![turn, recovered]);
     let mut d = delegate("reader", &base);
     d.llm.protocol = Protocol::Native;
     d.llm.timeout_secs = 30;
@@ -1619,13 +1623,17 @@ async fn a_delegate_stuck_in_a_hanging_tool_times_out() {
     let out = tool
         .invoke(&ctx, json!({"model": "reader", "task": "read the file"}))
         .await
-        .expect("a timed-out delegate returns a notice");
+        .expect("a hanging tool is cut off, it does not block the run");
     let elapsed = started.elapsed();
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "a hanging tool must be cut off, took {elapsed:?}"
     );
-    assert!(out.contains("time budget"), "{out}");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(100),
+        "the hang must actually reach the idle gate, took {elapsed:?}"
+    );
+    assert!(out.contains("read another way"), "{out}");
 }
 
 /// A native-mode delegate that does nothing but read different files for 21
@@ -2088,5 +2096,161 @@ fn native_subagent_protocol_asks_for_reasoning_before_tool_calls() {
     assert!(
         react.contains("Thought:"),
         "react protocol keeps its Thought line: {react}"
+    );
+}
+
+/// A delegate that completes nothing for its inactivity budget is nudged to act:
+/// the nudge must reach its NEXT model request.
+#[tokio::test]
+async fn a_frozen_delegate_is_nudged_to_act() {
+    /// A tool whose `invoke` never resolves, so the delegate completes nothing.
+    struct HangingTool;
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn spec(&self) -> &ToolSpec {
+            &IDLE_HANGING_SPEC
+        }
+        async fn invoke(&self, _ctx: &ToolContext, _args: Value) -> Result<String> {
+            std::future::pending::<Result<String>>().await
+        }
+    }
+    static IDLE_HANGING_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| ToolSpec {
+        name: "fs_read_file".into(),
+        description: "hangs forever".into(),
+        json_schema: json!({"type": "object"}),
+    });
+
+    let turn = json!({
+        "choices": [{
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_0",
+                    "function": { "name": "fs_read_file", "arguments": "{}" }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let recovered = json!({"choices": [{"message": {"content": "acted at last"}}]}).to_string();
+    let (base, rx) = scripted_spy(vec![turn, recovered]);
+    let mut d = delegate("frozen", &base);
+    d.llm.protocol = Protocol::Native;
+    d.llm.timeout_secs = 30;
+    let cfg = Config {
+        delegates: vec![d],
+        ..Config::default()
+    };
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(HangingTool));
+    let limits = DelegateLimits {
+        timeout: std::time::Duration::from_millis(150),
+        ..DelegateLimits::default()
+    };
+    let tool = DelegateTool::new(&cfg.delegates, registry, limits)
+        .unwrap()
+        .unwrap();
+    let ctx = test_ctx();
+
+    let out = tool
+        .invoke(&ctx, json!({"model": "frozen", "task": "read the file"}))
+        .await
+        .unwrap();
+    assert!(out.contains("acted at last"), "{out}");
+    // Request 1 is the plain task; request 2 (after the hang was cut off at the
+    // idle gate) must carry the nudge telling the delegate to act.
+    let first = recv_body(&rx).await;
+    assert!(
+        !first.contains("Take an action now"),
+        "no nudge before the idle gate: {first}"
+    );
+    let second = recv_body(&rx).await;
+    assert!(
+        second.contains("Take an action now"),
+        "the frozen delegate must be nudged: {second}"
+    );
+}
+
+/// A delegate that keeps making progress is never cut off, even when the TOTAL
+/// run time exceeds the old wall-clock budget: only a gap with no completed
+/// request or tool call counts against the inactivity budget.
+#[tokio::test]
+async fn a_progressing_delegate_is_never_cut_off() {
+    /// A read that takes a fixed slice of time, so the total run time can exceed
+    /// the budget while every individual gap stays below it.
+    struct SlowRead;
+    #[async_trait]
+    impl Tool for SlowRead {
+        fn spec(&self) -> &ToolSpec {
+            &SLOW_READ_SPEC
+        }
+        async fn invoke(&self, _ctx: &ToolContext, _args: Value) -> Result<String> {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            Ok("read ok".to_string())
+        }
+    }
+    static SLOW_READ_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| ToolSpec {
+        name: "fs_read_file".into(),
+        description: "a slow read".into(),
+        json_schema: json!({"type": "object"}),
+    });
+
+    // Four slow reads (distinct paths, so the no-progress guard never fires) take
+    // ~240ms in total - more than the 100ms budget and its 200ms stop - but every
+    // gap is 60ms, below both gates.
+    let mut turns = Vec::new();
+    for i in 0..4 {
+        turns.push(
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "id": format!("call_{i}"),
+                            "function": {
+                                "name": "fs_read_file",
+                                "arguments": json!({"path": format!("src/f{i}.rs")}).to_string()
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        );
+    }
+    turns.push(json!({"choices": [{"message": {"content": "all read"}}]}).to_string());
+    let base = scripted_server(turns);
+    let mut d = delegate("steady", &base);
+    d.llm.protocol = Protocol::Native;
+    d.llm.timeout_secs = 30;
+    let cfg = Config {
+        delegates: vec![d],
+        ..Config::default()
+    };
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(SlowRead));
+    let limits = DelegateLimits {
+        timeout: std::time::Duration::from_millis(100),
+        ..DelegateLimits::default()
+    };
+    let tool = DelegateTool::new(&cfg.delegates, registry, limits)
+        .unwrap()
+        .unwrap();
+    let ctx = test_ctx();
+
+    let started = std::time::Instant::now();
+    let out = tool
+        .invoke(&ctx, json!({"model": "steady", "task": "read four files"}))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(out.contains("all read"), "{out}");
+    assert!(
+        !out.contains("inactivity"),
+        "progress must not be cut off: {out}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(200),
+        "the run must outlast the whole budget to prove the point, took {elapsed:?}"
     );
 }
