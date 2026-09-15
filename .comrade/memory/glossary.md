@@ -729,6 +729,18 @@ Model-facing tool names appear in: ToolSpec name in each comrade-tool-* lib.rs, 
 **Notes:**
 Stated in crates/comrade-core/prompts/tools-intro.md, echoed in working-style.md step 3 and delegate-system.md step 2; reinforced by the first lines of the fs_rgrep and semantic_search ToolSpec descriptions. See ADR for the decision and why fs_rgrep is not a last resort.
 
+## trust rule (delegate trusts the lead)
+> The rule that a delegated sub-agent takes the tech lead's task `Context` (and a plan step's goal/verification/context) as authoritative and judges only whether the information is SUFFICIENT for its step - never whether it is correct. It must not re-run the lead's searches/reads or re-load files the context already holds. Stated in crates/comrade-core/prompts/delegate-system.md ('## Trust the tech lead'), in the readiness prompt (crates/comrade-core/src/advise/tool.rs, 'Do NOT re-run the lead's reconnaissance') and in crates/comrade-core/prompts/advise-system.md. The lead owns orientation, the delegate executes, the harness owns verification (the lead re-runs the step's verification after every delegate reply).
+
+**References:**
+- `crates/comrade-core/prompts/delegate-system.md`
+- `crates/comrade-core/prompts/advise-system.md`
+- `crates/comrade-core/src/advise/tool.rs`
+- `crates/comrade-core/prompts/delegate-by-default.md`
+
+**Notes:**
+Scoped to reconnaissance: a delegate MUST still read the exact lines it anchors fs_edit's byte-exact `old` on, and must not retype long content from memory (see the 3B measurement ADR #65, which is about writing, not about trusting facts). Motivation: a defensive delegate burned its budget re-verifying what the lead had already verified and stalled on a readiness check.
+
 ## ts_test_impact
 > Read-only tree-sitter tool in comrade-tool-syntax that maps the files changed since a revision (git diff) to the tests likely to cover them: a test counts as affected if it references a symbol declared in a changed file, or lives in the same crate.
 

@@ -178,10 +178,14 @@ impl Tool for AskAdviseTool {
                      Goal: {goal}\n\
                      Verification: {verify}\n\
                      Context: {}\n\n\
-                     You are the delegate that will execute this step. Working directory: {} — \
-                     browse the repository read-only if you need more to judge. Tell the tech lead \
-                     whether the context above is ENOUGH for you to accomplish the goal, or \
-                     exactly what is missing.\n\n\
+                     You are the delegate that will execute this step. Working directory: {}. \
+                     Judge only whether the context above is SUFFICIENT to do the step - not \
+                     whether it is correct. The goal, verification and context are the tech \
+                     lead's; take them as true. Do NOT re-run the lead's reconnaissance: do not \
+                     re-search or re-read files to confirm what they already told you. Read \
+                     something only if a specific piece your step needs is genuinely absent, and \
+                     then read no more than that piece. Answer from the context you were given \
+                     and keep it short.\n\n\
                      Reply with your verdict as the FINAL line, exactly one of:\n\
                      VERDICT: READY\n\
                      VERDICT: NEEDS_MORE: <exactly what extra context you need>",

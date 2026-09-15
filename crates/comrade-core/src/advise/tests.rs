@@ -592,4 +592,23 @@ mod cases {
         let err = tool.invoke(&ctx, json!({"step": 1})).await.unwrap_err();
         assert!(err.to_string().contains("in_progress"), "{err}");
     }
+
+    /// The readiness check asks the delegate for SUFFICIENCY, not correctness: it
+    /// must tell it to trust the context it was given instead of re-running the
+    /// lead's reconnaissance to confirm it.
+    #[tokio::test]
+    async fn step_mode_readiness_prompt_asks_for_sufficiency_not_correctness() {
+        let (base, spy) = request_spy();
+        let tool = mk_advise(&[delegate("cheap", &base)]).unwrap().unwrap();
+        let ctx = step_ctx();
+        tool.invoke(&ctx, json!({"step": 1})).await.unwrap();
+        let body = spy.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(body.contains("SUFFICIENT"), "{body}");
+        assert!(body.contains("not whether it is correct"), "{body}");
+        assert!(
+            body.contains("Do NOT re-run the lead's reconnaissance"),
+            "{body}"
+        );
+        assert!(!body.contains("browse the repository"), "{body}");
+    }
 }

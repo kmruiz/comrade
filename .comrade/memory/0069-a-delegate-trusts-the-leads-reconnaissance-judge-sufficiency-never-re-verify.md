@@ -1,0 +1,24 @@
+# 0069 - A delegate trusts the lead's reconnaissance: judge sufficiency, never re-verify
+status: accepted
+date: 2026-09-15
+tags: prompts, delegation, readiness, trust
+summary: A delegate now trusts the lead's reconnaissance: the task Context (and a plan step's goal/verification/context) is authoritative, the delegate judges whether the information is SUFFICIENT rather than correct, and it must not re-run the lead's reads/searches or re-load files the context already holds.
+
+## Context
+Observed in practice: a delegate re-runs the tech lead's own reconnaissance before working - the same searches and reads the lead had already done - to confirm the information is CORRECT, and it re-loads files whose content the lead had already put in the step context. A concrete case: a readiness check (`ask_advise step=N`) spent its whole 300s budget re-verifying anchors the lead had just verified, stalled, and returned no verdict. The delegate's job is to confirm the information is SUFFICIENT for its step, not to audit it; the lead already owns orientation and the harness owns verification (the lead re-runs the step's verification after every delegate reply).
+
+## Decision
+Make the task Context authoritative for the delegate, and say so in the prompts it reads. (1) crates/comrade-core/prompts/delegate-system.md gains a '## Trust the tech lead' section: the Context is the lead's reconnaissance, take it as TRUE; judge only whether it is SUFFICIENT for YOUR step, never whether it is correct; when the Context already holds the content you need, do NOT read it again; do not be defensive (never re-run a passing check or the lead's facts; fix a failure when it actually happens). Recipe step 1 is narrowed to 'read ONLY the exact lines you will edit, and only if the task's Context does not already contain them'; step 3 is 'verify your OWN change ... the lead's information is already trusted'. (2) The readiness prompt in crates/comrade-core/src/advise/tool.rs now asks for SUFFICIENCY, not correctness, and says 'Do NOT re-run the lead's reconnaissance: do not re-search or re-read files to confirm what they already told you', read only a piece genuinely absent - replacing the old 'browse the repository read-only if you need more to judge'. (3) prompts/advise-system.md runbook step 1: answer from what you were given, never re-run the lead's reconnaissance. (4) prompts/delegate-by-default.md tells the lead to paste the exact existing lines it must change, so the delegate opens the file at most once.
+
+## Rationale
+Trust is what makes a small, cheap delegate viable: its budget cannot absorb a second reconnaissance, and re-deriving the lead's facts adds no information the lead's verification would not catch. Splitting responsibility this way (lead orients, delegate executes, harness verifies) removes the overlap that made the delegate both slow and redundant. Wording, not tooling, is the right lever because the failure is a judgement the model makes, and both prompts already exist as the shared model-facing path (ADR #62).
+
+## Alternatives considered
+(a) Remove the read tools from the readiness advisor so it cannot re-explore — rejected: it sometimes genuinely needs one piece the context lacks; scoping the prompt is better than blinding it. (b) Keep 'read the file the task names' and rely on the lead's prompt only — rejected: that instruction IS the cause of the re-loading. (c) Enforce mechanically (refuse a read of a file the context already mentions) — rejected: brittle, and it would break the byte-exact `old` anchor fs_edit needs. (d) Drop the readiness check entirely — rejected: it catches genuinely thin context before a delegate burns its budget.
+
+## Scope
+Model-facing prompt prose (crates/comrade-core/prompts/*.md) and the readiness prompt string built in crates/comrade-core/src/advise/tool.rs. It does not change any tool implementation, the delegate loop's guards/budgets, or which tools a delegate may call. It does not touch the lead's own working-style prompts beyond the one sentence about what to paste into `context`.
+
+## Impact
+Fewer wasted reads/searches and fewer stalls: the delegate spends its budget on the step, and the readiness handshake returns a verdict instead of re-verifying the lead. The delegate still MUST read the exact lines it anchors fs_edit's byte-exact `old` on - 'do not read' is scoped to reconnaissance, not to the edit target. Known risk, accepted: a delegate could now trust a wrong lead detail instead of catching it; the mitigation is that the lead re-runs the step's verification and the append-first / anti-retyping rules (ADR #65) still protect the source. Tests: delegate::tests::delegate_prompt_trusts_the_leads_reconnaissance and advise::tests::cases::step_mode_readiness_prompt_asks_for_sufficiency_not_correctness (both wording pins).
+

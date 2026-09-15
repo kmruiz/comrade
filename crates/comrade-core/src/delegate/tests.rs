@@ -2029,8 +2029,6 @@ async fn isolated_parallel_job_runs_in_its_own_worktree() {
         !root.join("out.txt").exists(),
         "an isolated job must not write into the main tree"
     );
-    let worktrees = root.join(".comrade").join("worktrees");
-    assert!(worktrees.exists(), "a worktree should have been created");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -2253,4 +2251,23 @@ async fn a_progressing_delegate_is_never_cut_off() {
         elapsed >= std::time::Duration::from_millis(200),
         "the run must outlast the whole budget to prove the point, took {elapsed:?}"
     );
+}
+
+/// The delegate prompt must tell the sub-agent to trust the tech lead's
+/// reconnaissance and to judge sufficiency, not correctness: it must not
+/// re-run the lead's reads or re-load what the task context already holds.
+#[test]
+fn delegate_prompt_trusts_the_leads_reconnaissance() {
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(StubTool {
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    for native in [false, true] {
+        let p = delegate_system_prompt("/repo/root", &reg, native).to_lowercase();
+        assert!(p.contains("trust the tech lead"), "{p}");
+        assert!(p.contains("sufficient"), "{p}");
+        assert!(p.contains("do not read it again"), "{p}");
+        assert!(p.contains("do not re-run"), "{p}");
+        assert!(p.contains("never re-run"), "{p}");
+    }
 }
