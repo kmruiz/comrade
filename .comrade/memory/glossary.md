@@ -304,6 +304,13 @@ The refusal is returned as the tool result and emitted as a tool_call/tool_resul
 - `crates/comrade-tool-project/src/ecosystem/mod.rs`
 - `crates/comrade-tool-project/src/node.rs`
 
+## diagram block sentinel
+> The two lines `--- diagram (ascii) ---` and `--- end diagram ---` that `show_diagram` wraps around its output. `result_rows` in crates/comrade-tui/src/tui.rs keys off them (constants `DIAGRAM_OPEN`/`DIAGRAM_CLOSE`) to render every line of the block as one chat row, verbatim, never re-wrapped. Shared contract: the same strings exist in crates/comrade-tool-session/src/diagram.rs — change both together.
+
+**References:**
+- `crates/comrade-tool-session/src/diagram.rs`
+- `crates/comrade-tui/src/tui.rs`
+
 ## diff_choice
 > A `FieldKind` variant ("diff_choice") for ask_form: a pick-list whose options carry a code diff each (`DiffOption { label, diff }`). Rendered as the diffs; the answer is the chosen option's `label`. Used to let the human pick between competing patches.
 
@@ -717,6 +724,14 @@ Backed by fastembed (quantized BGE-small-en-v1.5, in-process ONNX) + a flat cosi
 
 **Notes:**
 SessionFile is the on-disk JSON form (version/title/status/plan/delegated/finished/chat/section_collapsed/ctx_*/history/rollup/evicted). Save/load prompt for a file path each time (find-file semantics). Ctrl-x is a prefix key handled in handle_event; PathPrompt and SessionPick are the two modals it drives. AgentSession::restore and ContextManager::from_parts rebuild the live session on load/switch/fork. new-session is non-destructive: it stashes the current session and opens a fresh empty slot (emacs scratch-buffer semantics); kill-session discards the active slot and activates a neighbour and refuses to close the only session.
+
+## show_diagram
+> The session tool models call to show an ASCII-art diagram in the chat. `kind="flow"` renders a sequence of `steps` as aligned boxes joined by `-->` arrows (horizontal by default, auto-falling back to vertical when the row is wider than `width`, default 100); `kind="raw"` frames ASCII the model supplies in `ascii`. Lives in crates/comrade-tool-session/src/diagram.rs and is registered by `comrade_tool_session::all()`. It takes no `self_` prefix (like `ask_form`) because it does not change the agent's own session state.
+
+**References:**
+- `crates/comrade-tool-session/src/diagram.rs`
+- `crates/comrade-tool-session/src/lib.rs`
+- `crates/comrade-core/prompts/tools-intro.md`
 
 ## side-by-side diff renderer
 > The aligned removed(left)/added(right) diff renderer in the TUI chat (crates/comrade-tui/src/tui.rs): extract_diff_sides pulls (removed, added) line lists, edit_diff_label builds the header, lcs_pairs aligns them (dropping unchanged lines, merging a removed+added pair into one row), and build_diff_row/cell_spans draw each row with diff_remove_bg/diff_add_bg. Handles fs_edit (args: literal old/new or embedded diff) and, since ADR #12, git_diff (parsed from the tool result).
