@@ -763,10 +763,11 @@ mod dev_prompt_tests {
         assert!(prompt.contains("`feedback`"), "{prompt}");
         assert!(prompt.contains("5 fix rounds"), "{prompt}");
         assert!(prompt.contains("do the step yourself"), "{prompt}");
-        // Parallel jobs that would touch the same files must run in their own
-        // git worktree so they cannot clobber each other.
+        // Parallel jobs isolate into their own git worktree by default, and the
+        // lead must merge each back before finishing.
         assert!(prompt.contains("git worktree"), "{prompt}");
         assert!(prompt.contains("isolate"), "{prompt}");
+        assert!(prompt.contains("apply --3way"), "{prompt}");
     }
 
     #[test]

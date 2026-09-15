@@ -58,6 +58,12 @@ impl Worktree {
         })
     }
 
+    /// Whether `repo` is a git repository, i.e. whether worktree isolation is
+    /// possible. A non-git project must fall back to a shared workspace.
+    pub async fn isolation_available(repo: &Path) -> bool {
+        is_git_repo(repo).await
+    }
+
     /// `true` when the worktree has uncommitted changes (so it is worth keeping).
     pub async fn has_changes(&self) -> bool {
         match git(&self.path, &["status", "--porcelain"]).await {

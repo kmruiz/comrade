@@ -784,3 +784,11 @@ Practical consequence: a full-suite `pom_run_tests` output is often truncated by
 - `crates/comrade-core/src/delegate.rs`
 - `.comrade/memory/0023-parallel-delegates-via-a-one-call-delegate-parallel-tool.md`
 
+## Worktree isolation
+> Running a delegate_parallel job inside its own detached git worktree (<repo>/.comrade/worktrees/<id>) so parallel jobs cannot clobber each other's files. It is the DEFAULT for parallel jobs; pass isolate=false to share the workspace, and non-git projects fall back to sharing. Changed worktrees are kept for the tech lead to merge back with `git apply --3way`; unchanged ones are removed.
+
+**References:**
+- `crates/comrade-core/src/worktree.rs`
+- `crates/comrade-core/src/delegate/parallel.rs`
+- `crates/comrade-core/prompts/delegate-by-default.md`
+

@@ -2035,6 +2035,109 @@ async fn isolated_parallel_job_runs_in_its_own_worktree() {
 }
 
 #[tokio::test]
+async fn parallel_jobs_isolate_by_default() {
+    let root = scratch_git_repo();
+    let tool_call_turn = json!({
+        "choices": [{
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {
+                        "name": "fs_write_file",
+                        "arguments": "{\"path\":\"out.txt\",\"content\":\"hi\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let final_turn = json!({"choices": [{"message": {"content": "wrote out.txt"}}]}).to_string();
+    let base = scripted_server(vec![tool_call_turn, final_turn]);
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(WriteIntoRoot));
+    let cfg = vec![delegate("alpha", &base)];
+    let tool = DelegateParallelTool::new(&cfg, registry, DelegateLimits::default())
+        .unwrap()
+        .unwrap();
+    let mut ctx = test_ctx();
+    ctx.project_root = root.clone();
+    ctx.cwd = root.clone();
+
+    // No `isolate` key: the default must isolate the job in a worktree.
+    let out = tool
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "alpha", "task": "write out.txt"}]}),
+        )
+        .await
+        .unwrap();
+
+    assert!(out.contains("worktree"), "{out}");
+    assert!(
+        !root.join("out.txt").exists(),
+        "a default job must isolate and not write into the main tree"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn parallel_jobs_share_when_not_a_git_repo() {
+    let root = std::env::temp_dir().join(format!(
+        "comrade-delegate-nogit-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let tool_call_turn = json!({
+        "choices": [{
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {
+                        "name": "fs_write_file",
+                        "arguments": "{\"path\":\"out.txt\",\"content\":\"hi\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let final_turn = json!({"choices": [{"message": {"content": "wrote out.txt"}}]}).to_string();
+    let base = scripted_server(vec![tool_call_turn, final_turn]);
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(WriteIntoRoot));
+    let cfg = vec![delegate("alpha", &base)];
+    let tool = DelegateParallelTool::new(&cfg, registry, DelegateLimits::default())
+        .unwrap()
+        .unwrap();
+    let mut ctx = test_ctx();
+    ctx.project_root = root.clone();
+    ctx.cwd = root.clone();
+
+    let out = tool
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "alpha", "task": "write out.txt"}]}),
+        )
+        .await
+        .unwrap();
+
+    assert!(out.contains("not a git repository"), "{out}");
+    assert!(
+        root.join("out.txt").exists(),
+        "without a git repo the job must fall back to the shared workspace"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn parallel_delegates_reject_unknown_model_and_empty_jobs() {
     let url = fake_chat_server("unused");
     let cfg = vec![delegate("alpha", &url)];

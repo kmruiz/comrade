@@ -49,3 +49,6 @@ Parallel delegates can safely edit overlapping files when isolated. New schema f
 
 ## Note
 Rollup of parallel delegation: this ADR adds delegate_parallel (up to 8 concurrent jobs); #0038 adds isolate=true so jobs run in detached git worktrees. Body preserved under "Merged from".
+
+## Note
+Amended by the new ADR on isolating by default: the `isolate` default is now true (opt out with isolate=false), non-git projects fall back to the shared workspace instead of erroring, and the deferred "explicit merge/apply step" is now mandatory in the tech-lead prompt (`git apply --3way`).

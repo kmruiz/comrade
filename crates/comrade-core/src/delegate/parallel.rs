@@ -11,6 +11,11 @@ pub const TOOL_NAME_PARALLEL: &str = "delegate_parallel";
 /// spawn an unbounded number of concurrent sub-agent runs.
 const MAX_PARALLEL_JOBS: usize = 8;
 
+/// Parallel jobs isolate into a git worktree unless a job explicitly opts out.
+fn default_isolate() -> bool {
+    true
+}
+
 /// A tool that runs several INDEPENDENT delegate tasks at the same time and
 /// returns every reply together.
 ///
@@ -58,10 +63,11 @@ impl DelegateParallelTool {
             "(this tool never touches the plan). A delegate configured `approval = \"ask\"` pauses for",
             "each of its jobs before the batch starts; `approval = \"deny\"` refuses it.",
             "",
-            "Set a job's `isolate = true` to run it in its own git worktree (a detached checkout under",
-            ".comrade/worktrees/) when two jobs would edit the same files: the job's tools then operate",
-            "in that worktree, and its changes are left there for you to review (or removed if it made",
-            "none). Requires the project to be a git repository.",
+            "Jobs are isolated into their own git worktree by default (a detached checkout under",
+            ".comrade/worktrees/), so parallel jobs cannot clobber each other's files; set a job's",
+            "`isolate = false` to make it share the workspace instead. A changed worktree is left in",
+            "place for you to merge back before you finish; a job that changed nothing has its",
+            "worktree removed. In a non-git project jobs fall back to sharing the workspace.",
         ]
         .join("\n");
         let description = format!("{body}\n\nConfigured delegates:\n{listing}");
@@ -79,7 +85,7 @@ impl DelegateParallelTool {
                             "model": { "type": "string", "enum": names, "description": "Configured delegate model for this job." },
                             "task": { "type": "string", "description": "Self-contained job for the delegate: paths, code, expected output." },
                             "context": { "type": "string", "description": "Optional background for the delegate." },
-                            "isolate": { "type": "boolean", "default": false, "description": "Run this job in its own git worktree so parallel jobs cannot clobber each other's files (needs a git repo)." }
+                            "isolate": { "type": "boolean", "default": true, "description": "Run this job in its own git worktree (the default) so parallel jobs cannot clobber each other's files; set false to share the workspace. Without a git repo jobs fall back to sharing." }
                         },
                         "required": ["model", "task"],
                         "additionalProperties": false
@@ -115,7 +121,7 @@ impl Tool for DelegateParallelTool {
             task: String,
             #[serde(default)]
             context: String,
-            #[serde(default)]
+            #[serde(default = "default_isolate")]
             isolate: bool,
         }
         #[derive(Deserialize)]
@@ -176,6 +182,14 @@ impl Tool for DelegateParallelTool {
             });
         }
 
+        // Isolation needs a git repo; when the project is not one, fall back to
+        // the shared workspace so parallel delegation still works.
+        let can_isolate = if prepared.iter().any(|p| p.isolate) {
+            crate::worktree::Worktree::isolation_available(&ctx.project_root).await
+        } else {
+            true
+        };
+
         // Gate every job up front so a single denial aborts before anything runs.
         for (i, p) in prepared.iter().enumerate() {
             let cfg = &self.targets[p.idx].cfg;
@@ -192,7 +206,7 @@ impl Tool for DelegateParallelTool {
             let target = &self.targets[p.idx];
             let tools = &self.tools;
             let limits = &self.limits;
-            let isolated = p.isolate;
+            let isolated = p.isolate && can_isolate;
             async move {
                 // An isolating job runs in its own worktree; its tools, cwd and
                 // system prompt are rooted there so parallel edits cannot clash.
@@ -234,17 +248,22 @@ impl Tool for DelegateParallelTool {
         .await;
 
         let mut out = format!("{} parallel delegate job(s):\n", prepared.len());
+        if !can_isolate && prepared.iter().any(|p| p.isolate) {
+            out.push_str(
+                "[project is not a git repository; isolated jobs ran in the shared workspace]\n",
+            );
+        }
         for (i, (p, res)) in prepared.iter().zip(results).enumerate() {
             match res {
                 Ok((reply, worktree)) => {
                     out.push_str(&format!("\n=== job {} ({}) ===\n{reply}\n", i + 1, p.model));
                     if let Some(w) = worktree {
                         if w.has_changes().await {
+                            let wt = w.path().display();
+                            let repo = ctx.project_root.display();
                             out.push_str(&format!(
-                                "[job {} isolated in worktree {} — review with `git -C {} diff`]\n",
+                                "[job {} left changes in worktree {wt} — merge them back before you verify:\n    git -C {wt} add -A && git -C {wt} diff --cached --binary | git -C {repo} apply --3way\n  then remove it: git -C {repo} worktree remove --force {wt}]\n",
                                 i + 1,
-                                w.path().display(),
-                                w.path().display()
                             ));
                         } else {
                             let _ = w.remove().await;
