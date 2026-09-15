@@ -751,6 +751,18 @@ Scoped to reconnaissance: a delegate MUST still read the exact lines it anchors 
 **Notes:**
 Heuristic, not a proof of coverage. Engine helpers: `test_functions`, `decl_names_in_text`, `identifier_tokens`. It also suggests `cargo test -p <crate>` lines.
 
+## two-shape tool
+> A model-facing tool whose arguments come in TWO mutually exclusive call shapes rather than one flat shape, so its json_schema carries a top-level `oneOf` over required-subset branches and NO top-level `required`. Members: `delegate` (delegate.rs:332), `delegate_parallel` (uses `required: ["jobs"]` at top level, but each job object is flat), `ask_advise` (advise/tool.rs:86), `summarise` (summarise.rs:136). Contrast with a FLAT tool (fs_edit, self_set_plan, self_update_plan), which advertises every field in a single top-level `required`.
+
+**References:**
+- `crates/comrade-core/src/delegate.rs`
+- `crates/comrade-core/src/advise/tool.rs`
+- `crates/comrade-core/src/summarise.rs`
+- `.comrade/memory/0057-tool-schemas-stay-flat-no-anyofoneof-a-model-must-choose-from.md`
+
+**Notes:**
+A prompt audit (2026-09-16) flagged the two-shape tools as violating ADR 0057, which requires flat schemas. They are NOT a defect: the two shapes cannot be expressed by any flat `required` list, the shape is pinned by tests (comrade-core/src/delegate/tests.rs:368, advise/tests.rs:233), and both `delegate step=N` and `ask_advise step=N` formed correct calls through the oneOf on the local OpenAI-compatible provider. ADR 0057 was amended to scope the flat-schema rule to tools whose fields are UNCONDITIONALLY required. Do not "fix" these by flattening them.
+
 ## verify-then-commit guard
 > The agent loop's monitor (agent.rs `update_verify_state` + the `git_commit` pre-check) that refuses a `git_commit` while unverified code changes exist. A change tool in CODE_CHANGES (fs_edit, fs_write_file, ts_rename, pom_format_code, shell, delegate) sets verified=false; only a successful `pom_run_tests`/`pom_run_task` whose observation contains the literal "test result: ok." sets it back to true.
 
