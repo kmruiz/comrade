@@ -102,10 +102,10 @@ const READ_GUARD_THRESHOLD: usize = 20;
 /// After ≥ this many consecutive non-progress calls following the first
 /// workspace change, nudge the model once to finish (small models otherwise
 /// keep re-verifying until `max_iterations`).
-const STALL_NUDGE_AT: usize = 8;
+const STALL_NUDGE_AT: usize = READ_GUARD_THRESHOLD;
 
 /// At ≥ this many, end the run gracefully instead of burning the budget.
-const STALL_END_AT: usize = 18;
+const STALL_END_AT: usize = READ_GUARD_THRESHOLD * 2;
 
 /// Tools that push a task forward: they change the repo or the plan. Anything
 /// else (reads, tests, checks, shell, jobs) only inspects state, so a long run
@@ -165,7 +165,6 @@ const VERIFY_NUDGE_AFTER_EDITS: usize = 3;
 pub(crate) const VERIFY_NUDGE: &str = "You have edited the code several times without running the \
      tests. STOP editing. Run `pom_run_tests` NOW, read its result, and only then edit again to fix \
      what it reports. If it passes, you are done.";
-
 
 /// Process monitor: if the model keeps reading without doing anything, stop it.
 /// Returns `true` when the tool may run (and updates the counter); `false` when
@@ -1362,6 +1361,9 @@ pub async fn run_headless(
                 } => {
                     let mark = if *ok { "↳" } else { "⚠" };
                     format!("   {mark} {model}: {output}")
+                }
+                AgentEvent::DelegateThought { model, text } => {
+                    format!("   🧠 {model}: {text}")
                 }
                 _ => continue,
             };
@@ -2911,7 +2913,7 @@ mod usage_tests {
 
 #[cfg(test)]
 mod stall_tests {
-    use super::LoopTracker;
+    use super::{LoopTracker, STALL_END_AT, STALL_NUDGE_AT};
 
     fn read(t: &mut LoopTracker, i: usize) {
         t.record("fs_read_file", format!("r{i}"));
@@ -2932,11 +2934,15 @@ mod stall_tests {
     fn a_progress_call_resets_the_idle_run_and_the_nudge_is_one_shot() {
         let mut t = LoopTracker::default();
         t.record("fs_edit", "e1".into());
-        for i in 0..7 {
+        for i in 0..STALL_NUDGE_AT - 1 {
             read(&mut t, i);
         }
-        assert!(!t.needs_stall_nudge(), "7 idle calls is below the nudge");
-        read(&mut t, 7);
+        assert!(
+            !t.needs_stall_nudge(),
+            "{} idle calls is below the nudge",
+            STALL_NUDGE_AT - 1
+        );
+        read(&mut t, STALL_NUDGE_AT - 1);
         assert!(t.needs_stall_nudge());
         assert!(!t.needs_stall_nudge(), "the nudge fires at most once");
         // A further edit is progress and resets the idle run.
@@ -2949,11 +2955,11 @@ mod stall_tests {
     fn stall_reason_only_after_the_end_threshold() {
         let mut t = LoopTracker::default();
         t.record("fs_write_file", "w1".into());
-        for i in 0..17 {
+        for i in 0..STALL_END_AT - 1 {
             read(&mut t, i);
         }
         assert!(t.stall_reason().is_none());
-        read(&mut t, 17);
+        read(&mut t, STALL_END_AT - 1);
         assert!(t.stall_reason().is_some());
     }
 
@@ -2963,7 +2969,7 @@ mod stall_tests {
         // change to the repo, so re-running it must still arm the stall guard.
         let mut t = LoopTracker::default();
         t.record("fs_edit", "e1".into());
-        for i in 0..8 {
+        for i in 0..STALL_NUDGE_AT {
             t.record("pom_run_tests", format!("t{i}"));
         }
         assert!(t.needs_stall_nudge());

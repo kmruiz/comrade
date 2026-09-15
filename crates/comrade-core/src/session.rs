@@ -93,6 +93,10 @@ pub enum AgentEvent {
         output: String,
         ok: bool,
     },
+    /// The reasoning ("Thought:") text a delegated sub-agent produced for one
+    /// turn. `model` is the delegate's configured name, so the UI can show the
+    /// delegate's thinking under the delegate instead of the main model.
+    DelegateThought { model: String, text: String },
 }
 
 /// Bridges a session's UI event channel to the [`ActivityEvents`] sink carried
@@ -123,6 +127,16 @@ impl ActivityEvents for SessionEvents {
                 name: name.to_string(),
                 output: output.to_string(),
                 ok,
+            })
+            .await;
+    }
+
+    async fn reasoning(&self, author: &str, text: &str) {
+        let _ = self
+            .0
+            .send(AgentEvent::DelegateThought {
+                model: author.to_string(),
+                text: text.to_string(),
             })
             .await;
     }

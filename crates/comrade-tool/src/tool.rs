@@ -262,6 +262,10 @@ pub trait ActivityEvents: Send + Sync {
     async fn tool_call(&self, author: &str, name: &str, args: &str);
     /// A tool call finished.
     async fn tool_result(&self, author: &str, name: &str, output: &str, ok: bool);
+    /// The sub-agent's own reasoning ("Thought:") text for one turn. Defaults to
+    /// a no-op so an implementor that only cares about tool activity need not
+    /// handle it.
+    async fn reasoning(&self, _author: &str, _text: &str) {}
 }
 
 /// An [`ActivityEvents`] sink that discards everything: the default when no UI

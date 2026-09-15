@@ -3377,6 +3377,16 @@ impl App {
                     tokens: None,
                 }));
             }
+            AgentEvent::DelegateThought { model, text } => {
+                // The delegate's own reasoning between actions: show it as a
+                // brain-headed block under the delegate's name (indented as its
+                // sub-chat, tinted with its colour), so the chat follows what
+                // the delegate is thinking and not only which tools it ran.
+                let text = text.trim();
+                if !text.is_empty() {
+                    self.push_msg(Msg::reasoning(model, text.to_string()));
+                }
+            }
             AgentEvent::DelegateToolResult {
                 model,
                 name,
@@ -10023,6 +10033,30 @@ mod tests {
             owners.contains(&Some(1)),
             "the folded reasoning should be owned by the digest index"
         );
+    }
+
+    #[tokio::test]
+    async fn delegate_thought_event_pushes_a_reasoning_block_under_the_delegate() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::DelegateThought {
+            model: "cheap".to_string(),
+            text: "checking the tests before I write".to_string(),
+        });
+        let msg = app.chat.last().expect("a message was pushed");
+        assert_eq!(msg.kind, MsgKind::Reasoning);
+        assert_eq!(
+            msg.author.as_deref(),
+            Some("cheap"),
+            "the block is attributed to the delegate, so it renders in the delegate's sub-chat"
+        );
+        assert!(msg.text.contains("checking the tests"), "{:?}", msg.text);
+        // Blank reasoning (a turn that thought nothing) must not add a row.
+        let n = app.chat.len();
+        app.on_agent_event(AgentEvent::DelegateThought {
+            model: "cheap".to_string(),
+            text: "   ".to_string(),
+        });
+        assert_eq!(app.chat.len(), n, "blank reasoning must not add a row");
     }
 
     #[test]

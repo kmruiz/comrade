@@ -237,6 +237,18 @@ Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by rende
 **Notes:**
 Each job's approval policy is enforced before any run starts; it never touches the plan; it is DENIED_FOR_DELEGATES so a delegate cannot fan out recursively. See ADR #23.
 
+## DelegateThought
+> `AgentEvent::DelegateThought { model, text }` (crates/comrade-core/src/session.rs) — the per-turn reasoning text a delegated sub-agent produced, emitted by `SessionEvents::reasoning` (the defaulted `ActivityEvents::reasoning(author, text)` method) from run_delegate_subagent for a native tool-calling turn (`turn.content`) or a ReAct turn (`turn_p.thought`). The TUI turns it into `Msg::reasoning(model, text)`, a 🧠 block under the delegate's name.
+
+**References:**
+- `crates/comrade-core/src/session.rs`
+- `crates/comrade-core/src/delegate.rs`
+- `crates/comrade-tool/src/tool.rs`
+- `crates/comrade-tui/src/tui.rs`
+
+**Notes:**
+Only fires when the model actually writes text alongside its tool call; a native tool-calling turn with empty content emits nothing, so the native {protocol} in render_subagent_system asks the delegate for one short sentence before each tool call. The resulting row is a run member: it folds into the completed stretch's digest and is rendered in focus mode (default ON).
+
 ## destructive-write approval
 > The permission gate a delegated sub-agent must pass before a destructive write: `delegate::refuse_destructive` (crates/comrade-core/src/delegate.rs) inspects an `fs_write_file` call, computes `comrade_tool::removed_declarations(before, after)`, and when the rewrite would delete declarations the file already had, it asks the parent model through `UpwardAsk::approve(title, detail)` and acts on the returned `Verdict` (Approved -> write runs; Denied(reason) -> refused with the reason; Unavailable -> refused). Fail closed: no parent wired, no answer within APPROVAL_TIMEOUT (60s), or a reply whose first substantive line does not open with APPROVE all mean "refused". Non-destructive writes and file creation never ask, so the gate costs nothing until a deletion appears.
 
@@ -371,6 +383,17 @@ Not a background-job-registry job: no jobs-panel entry, not killable via bg_kill
 
 **References:**
 - `crates/comrade-tui/src/tui.rs`
+
+## loop-guard nudge (STALL_NUDGE / VERIFY_NUDGE)
+> Harness-injected steering strings (not user input, not an injection attack). `STALL_NUDGE` (agent.rs:148) and `VERIFY_NUDGE` (agent.rs:165) are sent as `AgentEvent::ToolResult { name: \"loop_guard\", ok: false }` and merged into the conversation by `ContextManager::push_user_merged` (context.rs:84). A third inline nudge ("Every task starts with a plan. Call self_set_plan first…") is injected at agent.rs:795 and agent.rs:900. Triggers: `LoopTracker::needs_stall_nudge` (agent.rs:353, once after STALL_NUDGE_AT=8 idle calls post-change) and `needs_verify_nudge` (agent.rs:342, after VERIFY_NUDGE_AFTER_EDITS=3 edits without a test run). The delegate sub-loop reuses the same two constants (delegate.rs:874-878).
+
+**References:**
+- `crates/comrade-core/src/agent.rs`
+- `crates/comrade-core/src/context.rs`
+- `crates/comrade-core/src/delegate.rs`
+
+**Notes:**
+IMPORTANT presentation trap: `push_user_merged` appends the nudge with `\n\n` onto the LAST message when it is Role::Tool or a ReAct user observation, so the "STOP investigating…" text appears WELDED TO THE TAIL OF THE PRECEDING TOOL OUTPUT (e.g. a semantic_search or fs_rgrep result) instead of as its own message. This makes a benign loop guard look exactly like a prompt-injection planted in tool data. Merging is intentional: LM Studio's Mistral template rejects two user turns in a row / a user turn straight after tool results (comment at context.rs:78-83). If you see this text in a tool result, the source is our own agent loop, not the tool.
 
 ## Message timestamp (stamp)
 > The per-message chat timestamp in comrade-tui: `Msg::ts` holds Unix seconds (set once in `App::push_msg`), and the header row of a User/Assistant/Delegate/Reasoning block renders its label right-aligned in dim. The label comes from `fmt_stamp(ts, now)`: "now" under a minute, "{m}m" under an hour, and the local wall-clock "HH:MM" (via `hhmm_local`, chrono `Local`) once the message is at least an hour old. A message with no ts (restored from an older session file) shows no stamp.

@@ -609,7 +609,9 @@ pub(crate) fn render_subagent_system(
         tool_lines.push_str(&line);
     }
     let protocol = if native {
-        "You call tools natively (function calling). When the task is done and \
+        "You call tools natively (function calling). Before each tool call, write \
+         one short sentence in the message content saying what you are about to do \
+         and why - your tech lead reads it as your reasoning. When the task is done and \
          verified, stop calling tools and reply with your final answer."
     } else {
         "Think and act step by step, one tool per turn:\n\
@@ -911,6 +913,12 @@ pub(crate) async fn run_delegate_subagent(
 
         // Native tool calls: dispatch all of them like the main loop does.
         if !turn.tool_calls.is_empty() {
+            // The delegate's own reasoning text for this turn (the prose it emits
+            // alongside its tool calls): surface it so the chat shows what the
+            // delegate is thinking, not only which tools it ran.
+            if !turn.content.trim().is_empty() {
+                dctx.events.reasoning(author, turn.content.trim()).await;
+            }
             let calls: Vec<ToolCallMsg> = turn
                 .tool_calls
                 .iter()
@@ -1002,6 +1010,12 @@ pub(crate) async fn run_delegate_subagent(
                 continue;
             }
         };
+        if let Some(t) = turn_p.thought.as_deref() {
+            let t = t.trim();
+            if !t.is_empty() {
+                dctx.events.reasoning(author, t).await;
+            }
+        }
         let Some(tool_call) = turn_p.tool_call else {
             return Ok(turn_p.final_text);
         };
@@ -1023,8 +1037,14 @@ pub(crate) async fn run_delegate_subagent(
             ));
             continue;
         }
-        if let Some(msg) =
-            refuse_destructive(&dctx, author, &tool_call.name, &tool_call.args, &args_pretty).await
+        if let Some(msg) = refuse_destructive(
+            &dctx,
+            author,
+            &tool_call.name,
+            &tool_call.args,
+            &args_pretty,
+        )
+        .await
         {
             let obs = ctxm.truncate_observation(&msg);
             ctxm.push(ChatMessage::new(

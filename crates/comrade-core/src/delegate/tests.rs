@@ -1194,6 +1194,66 @@ async fn delegate_tool_activity_streams_as_chat_events() {
     assert!(seen_result, "expected a DelegateToolResult event");
 }
 
+/// The delegate sub-agent's own reasoning text must be forwarded to the
+/// session event channel as `AgentEvent::DelegateThought { model, text }`.
+#[tokio::test]
+async fn delegate_thought_streams_as_a_chat_event() {
+    let write_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(StubTool {
+        calls: write_calls.clone(),
+    }));
+
+    let first_turn = json!({
+        "choices": [{
+            "message": {
+                "content": "Let me write the file now.",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {
+                        "name": "fs_write_file",
+                        "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let final_turn = json!({"choices": [{"message": {"content": "done"}}]}).to_string();
+    let base = scripted_server(vec![first_turn, final_turn]);
+
+    let cfg = Config {
+        delegates: vec![delegate("cheap", &base)],
+        ..Config::default()
+    };
+    let tool = DelegateTool::new(&cfg.delegates, registry, DelegateLimits::default())
+        .unwrap()
+        .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut ctx = test_ctx();
+    ctx.events = Arc::new(crate::session::SessionEvents(tx));
+
+    let out = tool
+        .invoke(&ctx, json!({"model": "cheap", "task": "write src/a.rs"}))
+        .await
+        .unwrap();
+    assert!(out.contains("done"), "{out}");
+
+    let mut seen = false;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            crate::session::AgentEvent::DelegateThought { model, text } => {
+                seen = true;
+                assert_eq!(model, "cheap");
+                assert!(text.contains("Let me write the file now"), "{text:?}");
+            }
+            _ => {}
+        }
+    }
+    assert!(seen, "expected a DelegateThought event");
+}
+
 /// A registry that contains exactly one recording stub `fs_write_file` tool.
 fn write_stub_registry(calls: Arc<std::sync::atomic::AtomicUsize>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -2008,4 +2068,25 @@ fn the_upward_escalation_is_capped_per_run() {
     // Past the cap the delegate is told to decide for itself.
     let msg = refuse_upward("ask_upwards", &mut used).expect("refused past the cap");
     assert!(msg.contains("Stop asking"), "{msg}");
+}
+
+#[test]
+fn native_subagent_protocol_asks_for_reasoning_before_tool_calls() {
+    let tools = ToolRegistry::new();
+    let body = "BODY {protocol} {tool_lines} {project_root}";
+    let native = render_subagent_system(body, "/tmp/p", &tools, true);
+    let lower = native.to_lowercase();
+    assert!(
+        lower.contains("reasoning"),
+        "native protocol must mention reasoning: {native}"
+    );
+    assert!(
+        lower.contains("before each tool call"),
+        "native protocol must ask for a sentence before each tool call: {native}"
+    );
+    let react = render_subagent_system(body, "/tmp/p", &tools, false);
+    assert!(
+        react.contains("Thought:"),
+        "react protocol keeps its Thought line: {react}"
+    );
 }
