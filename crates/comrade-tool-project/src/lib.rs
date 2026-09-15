@@ -136,7 +136,7 @@ struct PomRunTask;
 static POM_RUN_TASK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "pom_run_task".into(),
-    description: "Run a named project task and return its output: standard project tasks (build, run, check, clippy, fmt, doc, bench, release) and configured aliases; optionally scope to a subproject. Runs directly without approval. Works for Cargo and npm projects; in a repo with several build ecosystems pass `ecosystem` to choose one. Run tests with pom_run_tests, not here - it returns only the failure summary and costs far less context.".into(),
+    description: "Run a named project task and return its output: standard project tasks (e.g. build, run, check, fmt, doc, test, bench, release) and configured aliases; optionally scope to a subproject. Runs directly without approval. Works for Cargo and npm projects; in a repo with several build ecosystems pass `ecosystem` to choose one. Run tests with pom_run_tests, not here - it returns only the failure summary and costs far less context.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -265,13 +265,12 @@ struct PomRunTests;
 static POM_RUN_TESTS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "pom_run_tests".into(),
-    description: "Run the project's tests and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names, key error lines. Use to verify work instead of reasoning about code. Works for Cargo and npm projects; pass `ecosystem` in a polyglot repo. In a Cargo workspace, a root-level run tests the whole workspace (every member).".into(),
+    description: "Run the project's tests and return a SIMPLIFIED summary the model can read: pass/fail totals, failing test names, key error lines. Use to verify work instead of reasoning about code. Runs the WHOLE suite - there is no test-filter argument. When it reports all tests passing, the change is verified: stop re-running it. Works for Cargo and npm projects; pass `ecosystem` in a polyglot repo. In a Cargo workspace, a root-level run tests the whole workspace (every member).".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "subproject": { "type": "string", "description": "Optional subproject directory relative to the root, e.g. \"crates/app\"." },
             "ecosystem": { "type": "string", "description": "Which build ecosystem to use in a polyglot repo, \"cargo\" or \"npm\". Defaults to the only one present, or the one that supports the test task." },
-            "args": { "type": "string", "description": "Extra test-runner arguments, e.g. \"--lib\" or a test filter." },
             "timeout_secs": { "type": "integer", "minimum": 1, "default": 600, "description": "Kill after this many seconds." }
         },
         "additionalProperties": false
@@ -307,9 +306,32 @@ impl Tool for PomRunTests {
             .map(|s| s.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default();
         let eco = ecosystem::pick(&ctx.project_root, args.ecosystem.as_deref(), "test")?;
-        let resolved = eco.resolve(&ctx.project_root, "test", &args.subproject, &extra)?;
+        // A small model happily invents a `subproject` (e.g. "src", "tests").
+        // Any supported backend counts, so a polyglot repo is judged by the union
+        // of manifests. Rather than spend an iteration on an error, ignore the
+        // bogus value, test the whole project, and say so.
+        let mut ignored_subproject: Option<String> = None;
+        let subproject = match args.subproject.as_deref() {
+            Some(sub)
+                if !sub.trim().is_empty()
+                    && !ecosystem::detect_all(&ctx.project_root)
+                        .iter()
+                        .any(|e| e.is_project_dir(&ctx.project_root.join(sub))) =>
+            {
+                ignored_subproject = Some(sub.to_string());
+                None
+            }
+            other => other.map(str::to_string),
+        };
+        let resolved = eco.resolve(&ctx.project_root, "test", &subproject, &extra)?;
         let raw = tasks::run(&resolved, args.timeout_secs).await?;
-        Ok(eco.simplify_tests(&raw))
+        let summary = eco.simplify_tests(&raw);
+        Ok(match ignored_subproject {
+            Some(sub) => format!(
+                "(no build project at {sub:?}; tested the whole project instead)\n{summary}"
+            ),
+            None => summary,
+        })
     }
 }
 
@@ -329,7 +351,6 @@ static POM_CHECK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
             "subproject": { "type": "string", "description": "Optional subproject directory relative to the root, e.g. \"crates/comrade-core\"." },
             "ecosystem": { "type": "string", "description": "Which build ecosystem to use in a polyglot repo, \"cargo\" or \"npm\". Defaults to the only one present, or the one that has a check step." },
             "all_targets": { "type": "boolean", "default": false, "description": "Also check tests, examples and benches (cargo check --all-targets)." },
-            "args": { "type": "string", "description": "Extra cargo-check arguments (e.g. \"--features foo\")." },
             "max_errors": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20, "description": "Show at most this many errors." },
             "timeout_secs": { "type": "integer", "minimum": 1, "default": 600, "description": "Kill after this many seconds." }
         },

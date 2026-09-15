@@ -5,6 +5,14 @@ use async_trait::async_trait;
 use comrade_tool::{ActivityEvents, PlanStatus, PlanStep, PlanTarget, SessionControl};
 use tokio::sync::mpsc;
 
+/// Loose goal match for `PlanTarget::Text`: case-insensitive substring either
+/// way, so a small model can refer to a step by a few remembered words.
+fn goal_matches(goal: &str, needle: &str) -> bool {
+    let goal = goal.to_lowercase();
+    let needle = needle.trim().to_lowercase();
+    !needle.is_empty() && goal.contains(&needle)
+}
+
 /// Events emitted by the session and the agent loop, consumed by the UI.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -133,6 +141,9 @@ pub struct AgentSession {
     /// Plan step ids the `delegate` tool has run at least once (so steps
     /// assigned a delegate model cannot be completed by the root itself).
     delegated: RwLock<HashSet<u64>>,
+    /// Handle sub-agents use to ask this session's model a question
+    /// (`ask_upwards`). Installed once when the session is wired up.
+    upward: RwLock<Option<comrade_tool::Upward>>,
 }
 
 impl AgentSession {
@@ -145,7 +156,14 @@ impl AgentSession {
             finished: RwLock::new(None),
             next_id: RwLock::new(1),
             delegated: RwLock::new(HashSet::new()),
+            upward: RwLock::new(None),
         }
+    }
+
+    /// Install the handle delegated sub-agents use to ask this session's model a
+    /// question when they are stuck (the `ask_upwards` tool).
+    pub fn set_upward(&self, upward: comrade_tool::Upward) {
+        *self.upward.write().unwrap() = Some(upward);
     }
 
     fn emit(&self, event: AgentEvent) {
@@ -241,7 +259,7 @@ impl SessionControl for AgentSession {
         let mut plan = self.plan.write().unwrap();
         let hit = plan.iter_mut().find(|s| match &target {
             PlanTarget::Id(id) => s.id == *id,
-            PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+            PlanTarget::Text(text) => goal_matches(&s.goal, text),
         });
         match hit {
             Some(step) => {
@@ -282,7 +300,7 @@ impl SessionControl for AgentSession {
             let mut plan = self.plan.write().unwrap();
             let hit = plan.iter_mut().find(|s| match target {
                 PlanTarget::Id(id) => s.id == *id,
-                PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+                PlanTarget::Text(text) => goal_matches(&s.goal, text),
             });
             let Some(step) = hit else {
                 return Ok(false);
@@ -319,7 +337,7 @@ impl SessionControl for AgentSession {
             let mut plan = self.plan.write().unwrap();
             let hit = plan.iter_mut().find(|s| match target {
                 PlanTarget::Id(id) => s.id == *id,
-                PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+                PlanTarget::Text(text) => goal_matches(&s.goal, text),
             });
             let Some(step) = hit else {
                 return Ok(false);
@@ -359,12 +377,36 @@ impl SessionControl for AgentSession {
     fn status(&self) -> String {
         self.status.read().unwrap().clone()
     }
+
+    fn upward(&self) -> Option<comrade_tool::Upward> {
+        self.upward.read().unwrap().clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use comrade_tool::{AGENT_MODEL, PlanStatus, PlanStepDraft, PlanTarget, SessionControl};
+
+    /// Stub parent model for the `ask_upwards` handle test.
+    struct StubLead;
+
+    #[async_trait::async_trait]
+    impl comrade_tool::UpwardAsk for StubLead {
+        async fn ask(&self, _question: &str) -> anyhow::Result<String> {
+            Ok("do X".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn upward_handle_is_none_until_installed() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let s = AgentSession::new(tx);
+        assert!(s.upward().is_none());
+        s.set_upward(std::sync::Arc::new(StubLead));
+        let up = s.upward().expect("handle installed");
+        assert_eq!(up.ask("q").await.unwrap(), "do X");
+    }
 
     fn draft(goal: &str, verification: &str) -> PlanStepDraft {
         PlanStepDraft {

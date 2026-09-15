@@ -31,7 +31,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
-use comrade_tool::{PlanStatus, PlanTarget, Tool, ToolContext, ToolRegistry, ToolSpec};
+use comrade_tool::{
+    PlanStatus, PlanTarget, Tool, ToolContext, ToolRegistry, ToolSpec, Verdict, declarations,
+    removed_declarations,
+};
 use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -382,17 +385,10 @@ impl Tool for DelegateTool {
         // (whose goal/verification/context/model all come from the plan).
         let (task, context, model) = match step_id {
             Some(id) => {
-                for (key, label) in [("task", "task"), ("context", "context")] {
-                    let present = args
-                        .get(key)
-                        .map(|v| v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(true))
-                        .unwrap_or(false);
-                    if present {
-                        bail!(
-                            "cannot pass `{label}` together with `step`: the {label} comes from the plan step"
-                        );
-                    }
-                }
+                // A small model often passes `step` together with a `task` (or a
+                // `context`) that just restates the step. Be lenient: the step's
+                // own task/context win and the duplicate is ignored, rather than
+                // failing the call and making the model burn a turn retrying.
                 let found = ctx
                     .session
                     .plan()
@@ -661,6 +657,120 @@ fn refuse_repeat(tracker: &mut LoopTracker, sig: &str) -> Result<Option<String>>
     }
 }
 
+/// Refuse a destructive tool call unless the delegate's tech lead approves it.
+///
+/// A small delegate makes a one-line change by rewriting the whole file with
+/// `fs_write_file` — and silently deletes the code it was not asked to touch. In
+/// the smoke trial that removed the crate's own pre-existing test and the
+/// delegate then reported success. So a write that would REMOVE declarations the
+/// file already had is stopped right here: the parent model (the tech lead, over
+/// the `ask_upwards` channel) is asked for permission first, and when there is
+/// nobody to ask the write is refused outright. Destruction fails closed.
+///
+/// Returns the message to hand back as the tool result, or `None` when the call
+/// may proceed. Any other tool, and a write with nothing to lose, is never asked
+/// about: the gate costs nothing until a deletion actually appears.
+async fn refuse_destructive(
+    dctx: &ToolContext,
+    author: &str,
+    name: &str,
+    args: &Value,
+    args_pretty: &str,
+) -> Option<String> {
+    if name != "fs_write_file" {
+        return None;
+    }
+    let rel = args.get("path").and_then(Value::as_str)?.trim();
+    let after = args.get("content").and_then(Value::as_str)?;
+    if rel.is_empty() {
+        return None;
+    }
+    // The model passes either a project-relative or an absolute path.
+    let given = std::path::Path::new(rel);
+    let path = if given.is_absolute() {
+        given.to_path_buf()
+    } else {
+        dctx.project_root.join(given)
+    };
+    // A new file has nothing to lose; a read that fails is not our business here
+    // (the tool itself reports a missing file far better than this gate could).
+    let before = tokio::fs::read_to_string(&path).await.ok()?;
+    let lost = removed_declarations(&before, after);
+    if lost.is_empty() {
+        return None;
+    }
+
+    let names = lost.join(", ");
+    let kept = declarations(after);
+    let title = format!("overwrite {rel} (deletes {names})");
+    let detail = format!(
+        "{rel} defines: {}. After the write only {} would be left, so writing it DELETES: {names}. \
+         ({} lines -> {} lines.)",
+        join_or(&declarations(&before), "(no functions)"),
+        join_or(&kept, "no functions"),
+        before.lines().count(),
+        after.lines().count(),
+    );
+    let verdict = match dctx.session.upward() {
+        Some(parent) => parent
+            .approve(&title, &detail)
+            .await
+            .unwrap_or(Verdict::Unavailable),
+        None => Verdict::Unavailable,
+    };
+    let refusal = match verdict {
+        // The tech lead approved the deletion: let the write proceed.
+        Verdict::Approved => return None,
+        Verdict::Denied(why) => format!(
+            "REFUSED by your tech lead: {why}\nNothing was written. Do NOT retry this whole-file \
+             rewrite: make the change with `fs_edit`, keeping every existing line the task does \
+             not change."
+        ),
+        Verdict::Unavailable => format!(
+            "REFUSED: this `fs_write_file` would DELETE code that is already in {rel}: {names}. \
+             Nothing was written.\nMake the change with `fs_edit` instead: copy the lines you need \
+             to change into `old` and set `new` to those same lines plus your addition, so every \
+             other line in the file stays exactly as it is. Never retype a file to make a small \
+             change."
+        ),
+    };
+    // Nothing else is emitted for a call that never reaches its tool, so without
+    // this the refusal would be invisible in the delegate's sub-chat.
+    dctx.events.tool_call(author, name, args_pretty).await;
+    dctx.events.tool_result(author, name, &refusal, false).await;
+    Some(refusal)
+}
+
+/// `items` as a comma-separated list, or `fallback` when it is empty.
+fn join_or(items: &[String], fallback: &str) -> String {
+    if items.is_empty() {
+        fallback.to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+/// Escalation cap for one delegate run: `ask_upwards` is a recovery move, not a
+/// way to keep the parent model answering forever.
+const MAX_UPWARD_ASKS: usize = 3;
+
+/// Cap the `ask_upwards` tool per delegate run. Returns the refusal message for
+/// the call that exceeds the cap, `None` for every other call (including the
+/// first [`MAX_UPWARD_ASKS`] upward questions).
+fn refuse_upward(name: &str, used: &mut usize) -> Option<String> {
+    if name != "ask_upwards" {
+        return None;
+    }
+    *used += 1;
+    if *used > MAX_UPWARD_ASKS {
+        return Some(format!(
+            "You have already asked your tech lead {MAX_UPWARD_ASKS} questions. Stop asking: decide \
+             now, make the smallest reasonable change, verify it, and reply with your final answer."
+        ));
+    }
+    None
+}
+
 /// Read guard for the delegate sub-agent loop, mirroring the main loop's
 /// `allow_read_step` (agent.rs): once the delegate has done twenty consecutive
 /// read-only calls with no state change in between, the next read is refused
@@ -727,6 +837,8 @@ pub(crate) async fn run_delegate_subagent(
     // Read guard: consecutive read-only calls since the last state change; the
     // delegate is nudged to implement once it has read too long without acting.
     let mut consecutive_reads = 0usize;
+    // Escalation budget: how many `ask_upwards` questions this run has spent.
+    let mut upward_asks = 0usize;
     // Wall-clock budget for the whole run (see [`DelegateLimits::timeout`]): every
     // model request and tool call is bounded by what is left, so a single slow or
     // hung request (or a long chain of turns) cannot hold the parent run open
@@ -756,6 +868,14 @@ pub(crate) async fn run_delegate_subagent(
         // cloned into `dctx`).
         crate::agent::drain_steer(dctx.steer.as_ref(), &mut ctxm).await;
         ctxm.enforce_budget();
+        // One-shot nudges mirrored from the main loop, so a small delegate does
+        // not edit forever without testing, or keep re-verifying after it has
+        // finished. Injected as a user turn so the next request sees it.
+        if tracker.needs_verify_nudge() {
+            ctxm.push_user_merged(crate::agent::VERIFY_NUDGE);
+        } else if tracker.needs_stall_nudge() {
+            ctxm.push_user_merged(crate::agent::STALL_NUDGE);
+        }
         let specs: Option<Vec<comrade_tool::ToolSpec>> = if native {
             let specs: Vec<_> = tools.iter().map(|t| t.spec().clone()).collect();
             if specs.is_empty() { None } else { Some(specs) }
@@ -808,6 +928,21 @@ pub(crate) async fn run_delegate_subagent(
                 if let Some(msg) = refuse_reading(&tc.name, &mut consecutive_reads, read_nudge) {
                     // Too many reads in a row: nudge to implement. Still answer
                     // the call with a tool result so history stays API-valid.
+                    let clamped = ctxm.truncate_observation(&msg);
+                    ctxm.push(ChatMessage::tool_result(tc.id, clamped));
+                    continue;
+                }
+                if let Some(msg) = refuse_upward(&tc.name, &mut upward_asks) {
+                    let clamped = ctxm.truncate_observation(&msg);
+                    ctxm.push(ChatMessage::tool_result(tc.id, clamped));
+                    continue;
+                }
+                if let Some(msg) =
+                    refuse_destructive(&dctx, author, &tc.name, &args, &args_pretty).await
+                {
+                    // Destructive write without the tech lead's permission:
+                    // answer the call so the history stays API-valid and let the
+                    // delegate try a smaller, non-destructive edit.
                     let clamped = ctxm.truncate_observation(&msg);
                     ctxm.push(ChatMessage::tool_result(tc.id, clamped));
                     continue;
@@ -873,6 +1008,24 @@ pub(crate) async fn run_delegate_subagent(
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
         let sig = format!("{} {}", tool_call.name, args_pretty);
         if let Some(msg) = refuse_reading(&tool_call.name, &mut consecutive_reads, read_nudge) {
+            let obs = ctxm.truncate_observation(&msg);
+            ctxm.push(ChatMessage::new(
+                Role::User,
+                render_observation(&tool_call.name, &obs),
+            ));
+            continue;
+        }
+        if let Some(msg) = refuse_upward(&tool_call.name, &mut upward_asks) {
+            let obs = ctxm.truncate_observation(&msg);
+            ctxm.push(ChatMessage::new(
+                Role::User,
+                render_observation(&tool_call.name, &obs),
+            ));
+            continue;
+        }
+        if let Some(msg) =
+            refuse_destructive(&dctx, author, &tool_call.name, &tool_call.args, &args_pretty).await
+        {
             let obs = ctxm.truncate_observation(&msg);
             ctxm.push(ChatMessage::new(
                 Role::User,

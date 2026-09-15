@@ -30,6 +30,7 @@ const MEMORY: &str = include_str!("../prompts/memory.md");
 const TRUST_BOUNDARIES: &str = include_str!("../prompts/trust-boundaries.md");
 const TOOLS_INTRO: &str = include_str!("../prompts/tools-intro.md");
 const PROTOCOL: &str = include_str!("../prompts/protocol.md");
+const FINISHING: &str = include_str!("../prompts/finishing.md");
 
 pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usize) -> String {
     let mut prompt = String::new();
@@ -51,6 +52,7 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
         prompt.push_str(DELEGATE_BY_DEFAULT);
     }
     prompt.push_str(WORKING_STYLE);
+    prompt.push_str(FINISHING);
     prompt.push_str(MEMORY);
     prompt.push_str(TRUST_BOUNDARIES);
     prompt.push_str(TOOLS_INTRO);
@@ -199,7 +201,7 @@ fn balanced_object(s: &str, open: usize) -> Result<&str> {
 /// Parse tool arguments, tolerating the JSON-ish output small models produce
 /// (unquoted keys and bare string values such as `{ path: crates }`). Strict
 /// JSON is tried first; on failure the text is repaired and parsing retried.
-fn parse_args_json(text: &str) -> Result<Value> {
+pub(crate) fn parse_args_json(text: &str) -> Result<Value> {
     match serde_json::from_str::<Value>(text) {
         Ok(v) => Ok(v),
         Err(_) => {
@@ -458,6 +460,16 @@ mod tests {
         let tools = ToolRegistry::new();
         let prompt = build_system_prompt("/nonexistent-comrade-dir-xyz", &tools, 1000);
         assert!(!prompt.contains("Project instructions (AGENTS.md)"));
+    }
+
+    #[test]
+    fn system_prompt_teaches_the_completion_rule() {
+        let tools = ToolRegistry::new();
+        let prompt = build_system_prompt("/nonexistent-comrade-dir-xyz", &tools, 1000);
+        assert!(prompt.contains("## Finishing"));
+        assert!(prompt.contains("You are DONE when the requested change is implemented"));
+        assert!(prompt.contains("Never re-run a verification that already passed"));
+        assert!(prompt.contains("self_finish_plan"));
     }
 
     #[test]

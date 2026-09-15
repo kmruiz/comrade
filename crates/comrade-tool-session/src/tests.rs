@@ -11,7 +11,8 @@ use comrade_tool::{
 use serde_json::json;
 
 use super::{
-    AskForm, SelfFinishPlan, SelfSetPlan, SelfSetStepContext, SelfSetStepModel, SelfUpdatePlan,
+    AskForm, AskUpwards, SelfFinishPlan, SelfSetPlan, SelfSetStepContext, SelfSetStepModel,
+    SelfUpdatePlan,
 };
 
 /// A real-enough session: stores the plan and which steps the `delegate`
@@ -19,6 +20,8 @@ use super::{
 struct StubSession {
     plan: Mutex<Vec<PlanStep>>,
     delegated: Mutex<HashSet<u64>>,
+    /// Handle a delegated sub-agent uses to ask the parent model (`ask_upwards`).
+    upward: Option<comrade_tool::Upward>,
 }
 
 impl StubSession {
@@ -41,6 +44,7 @@ impl StubSession {
         StubSession {
             plan: Mutex::new(plan),
             delegated: Mutex::new(HashSet::new()),
+            upward: None,
         }
     }
 }
@@ -145,6 +149,9 @@ impl SessionControl for StubSession {
     fn status(&self) -> String {
         String::new()
     }
+    fn upward(&self) -> Option<comrade_tool::Upward> {
+        self.upward.clone()
+    }
 }
 
 struct NoopIo;
@@ -206,6 +213,19 @@ fn plain_step() -> PlanStepDraft {
         model: AGENT_MODEL.into(),
         context: String::new(),
     }
+}
+
+#[tokio::test]
+async fn update_plan_with_a_non_matching_text_lists_the_steps() {
+    let c = ctx(StubSession::with_plan(vec![plain_step()]));
+    let err = SelfUpdatePlan
+        .invoke(&c, json!({"text": "something unrelated", "status": "done"}))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("Existing steps"), "{msg}");
+    assert!(msg.contains("1: plain step"), "{msg}");
+    assert_eq!(c.session.plan()[0].status, PlanStatus::Pending);
 }
 
 #[tokio::test]
@@ -605,4 +625,85 @@ async fn ask_form_accepts_a_diff_choice_field() {
         .await
         .unwrap();
     assert_eq!(out, "pick = B");
+}
+
+/// A fake tech lead: records the question it was asked and answers with a
+/// fixed sentence, so the tool can be tested without a model.
+struct FakeLead {
+    seen: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl comrade_tool::UpwardAsk for FakeLead {
+    async fn ask(&self, question: &str) -> Result<String> {
+        self.seen.lock().unwrap().push(question.to_string());
+        Ok("Put the function below the existing one.".to_string())
+    }
+}
+
+#[tokio::test]
+async fn ask_upwards_returns_the_parents_answer_with_the_plan_context() {
+    let mut session = StubSession::with_plan(vec![plain_step()]);
+    let lead = Arc::new(FakeLead {
+        seen: Mutex::new(Vec::new()),
+    });
+    session.upward = Some(lead.clone());
+    let c = ctx(session);
+    let out = AskUpwards
+        .invoke(&c, json!({ "question": "where do I put the new function?" }))
+        .await
+        .unwrap();
+    assert!(out.contains("Answer from your tech lead"), "{out}");
+    assert!(out.contains("Put the function below"), "{out}");
+    // The parent received the plan so it could answer in context.
+    let seen = lead.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].contains("plain step"), "{}", seen[0]);
+    assert!(seen[0].contains("where do I put"), "{}", seen[0]);
+}
+
+#[tokio::test]
+async fn ask_upwards_without_a_parent_tells_the_agent_to_decide() {
+    let c = ctx(StubSession::with_plan(vec![plain_step()]));
+    let out = AskUpwards
+        .invoke(&c, json!({ "question": "what now?" }))
+        .await
+        .unwrap();
+    assert!(out.contains("Decide for yourself"), "{out}");
+}
+
+#[test]
+fn plan_step_tools_advertise_a_flat_step_selector() {
+    // A local OpenAI-compatible server compiles the tool schema into a grammar;
+    // `oneOf` (index | text) made ministral-3-3b omit the selector entirely, so
+    // the call failed with "no step identified". The model-facing schema therefore
+    // requires `index`; `text` stays a runtime fallback for the caller.
+    for spec in [
+        SelfUpdatePlan.spec(),
+        SelfSetStepModel.spec(),
+        SelfSetStepContext.spec(),
+    ] {
+        let s = &spec.json_schema;
+        assert!(s.get("oneOf").is_none(), "{}: {s}", spec.name);
+        assert!(s.get("anyOf").is_none(), "{}: {s}", spec.name);
+        assert!(
+            s["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str() == Some("index")),
+            "{}: {s}",
+            spec.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn ask_upwards_refuses_an_empty_question() {
+    let c = ctx(StubSession::with_plan(vec![]));
+    let err = AskUpwards
+        .invoke(&c, json!({ "question": "   " }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("must not be empty"), "{err}");
 }

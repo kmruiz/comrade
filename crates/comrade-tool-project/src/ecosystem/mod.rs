@@ -68,9 +68,40 @@ pub trait Ecosystem: Send + Sync {
     fn parse_diagnostics(&self, raw: &str, max: usize) -> (Vec<String>, usize) {
         generic_error_lines(raw, max)
     }
-    /// Reduce raw test-runner output to a model-readable summary.
+    /// Reduce raw test-runner output to a model-readable summary. The default
+    /// keeps the generic test-result lines; when there are none it falls back to
+    /// this backend's diagnostics — a suite that reports no results almost always
+    /// failed to BUILD, and a model reads "no summary lines" as "the tests are
+    /// fine". Backends with a richer test format override this to parse their
+    /// runner's output and hand the result to [`Ecosystem::compose_test_summary`].
     fn simplify_tests(&self, raw: &str) -> String {
-        raw.to_string()
+        self.compose_test_summary(raw, simplify_test_output(raw))
+    }
+
+    /// Finish a test summary, adding the shared "the tests did not build" fallback:
+    /// a runner that prints no results at all (empty `summary`) plus parseable
+    /// diagnostics means the build failed, so hand the model the errors instead of
+    /// a message it reads as success.
+    fn compose_test_summary(&self, raw: &str, summary: String) -> String {
+        if !summary.trim().is_empty() {
+            return summary;
+        }
+        let (errors, _) = self.parse_diagnostics(raw, 20);
+        if !errors.is_empty() {
+            return format!(
+                "the tests could not build - fix these errors first, then rerun. Each error names \
+                 the file:line it comes from; edit exactly there:\n{}",
+                errors.join("\n")
+            );
+        }
+        "test run produced no summary lines (check timeout or exit code)".to_string()
+    }
+    /// Whether `dir` is a root this backend owns, i.e. it holds the backend's
+    /// manifest. Used to reject an invented `subproject` before a command is
+    /// attempted in it. Works for every backend because it is derived from
+    /// [`Ecosystem::manifest`].
+    fn is_project_dir(&self, dir: &Path) -> bool {
+        dir.join(self.manifest()).is_file()
     }
     /// Whether a resolved command runs tests. `pom_run_task` uses this to keep
     /// tests out of its raw-output path (they belong to `pom_run_tests`).
@@ -257,10 +288,6 @@ impl Ecosystem for Cargo {
         (errors, total)
     }
 
-    fn simplify_tests(&self, raw: &str) -> String {
-        simplify_test_output(raw)
-    }
-
     fn is_test_command(&self, line: &CommandLine) -> bool {
         matches!(
             line,
@@ -424,7 +451,7 @@ impl Ecosystem for Node {
     }
 
     fn simplify_tests(&self, raw: &str) -> String {
-        simplify_js_tests(raw)
+        self.compose_test_summary(raw, simplify_js_tests(raw))
     }
 
     fn is_test_command(&self, line: &CommandLine) -> bool {
@@ -553,12 +580,21 @@ fn simplify_js_tests(raw: &str) -> String {
 }
 
 /// Fallback diagnostic extraction for toolchains without a structured format:
-/// keep the non-empty lines that look like errors, capped at `max`.
+/// keep the lines that look like errors, capped at `max` — each one FOLLOWED by
+/// its location and code-snippet lines when the toolchain prints them on their
+/// own lines (Rust: `error: ...` then ` --> src/lib.rs:9:20` then the `|`-prefixed
+/// snippet). Dropping those left a small model with "unclosed delimiter" and no
+/// idea WHERE, so it rewrote the file blind until it hit max_iterations.
 pub fn generic_error_lines(raw: &str, max: usize) -> (Vec<String>, usize) {
+    /// Continuation lines kept after one error header (location + snippet).
+    const CONTEXT_LINES: usize = 6;
+    let lines: Vec<&str> = raw.lines().map(str::trim_end).collect();
     let mut out = Vec::new();
     let mut total = 0usize;
-    for line in raw.lines() {
-        let t = line.trim_end();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i];
+        i += 1;
         if t.trim().is_empty() {
             continue;
         }
@@ -567,11 +603,34 @@ pub fn generic_error_lines(raw: &str, max: usize) -> (Vec<String>, usize) {
             || l.contains("cannot find")
             || l.contains("mismatched types")
             || l.contains("failed to compile");
-        if looks_like_error {
-            total += 1;
-            if out.len() < max {
-                out.push(t.to_string());
+        if !looks_like_error {
+            continue;
+        }
+        total += 1;
+        if out.len() >= max {
+            continue;
+        }
+        out.push(t.to_string());
+        // Pull in the location/snippet lines that belong to this error.
+        let mut taken = 0usize;
+        while i < lines.len() && taken < CONTEXT_LINES && out.len() < max {
+            let next = lines[i];
+            let nt = next.trim();
+            if nt.is_empty() {
+                break;
             }
+            let is_location = nt.starts_with("-->") || nt.starts_with("|-->");
+            let is_snippet = next
+                .chars()
+                .next()
+                .is_some_and(|c| c == ' ' || c == '\t')
+                && nt.contains('|');
+            if !is_location && !is_snippet {
+                break;
+            }
+            out.push(next.to_string());
+            taken += 1;
+            i += 1;
         }
     }
     (out, total)
@@ -717,11 +776,9 @@ fn simplify_test_output(raw: &str) -> String {
         out.push('\n');
     }
     let out = trim_chars(out, MAX_CHARS);
-    if out.trim().is_empty() {
-        "test run produced no summary lines (check timeout or exit code)".to_string()
-    } else {
-        out
-    }
+    // Empty means "nothing recognizable in this output"; the caller decides what
+    // that means for its ecosystem (usually: the build failed).
+    out
 }
 
 /// Truncate `s` to at most `max` chars, appending a marker when cut.

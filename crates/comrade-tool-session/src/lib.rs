@@ -187,20 +187,16 @@ struct SelfUpdatePlan;
 static SELF_UPDATE_PLAN_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "self_update_plan".into(),
-    description: "Update one plan step's status (pending/ready/in_progress/done/blocked). Identify the step by its 1-based `index` (preferred) or by `text` in its goal.".into(),
+    description: "Update one plan step's status (pending/ready/in_progress/done/blocked). Identify the step by its 1-based `index`. Pass `text` (a substring of the step's goal) only when you do not know the index.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "index": { "type": "integer", "minimum": 1, "description": "1-based step id." },
-            "text": { "type": "string", "description": "Text contained in the step goal." },
+            "text": { "type": "string", "description": "Text contained in the step goal; used only when `index` is unknown." },
             "status": { "type": "string", "enum": ["pending", "ready", "in_progress", "done", "blocked"], "description": "New status. ready = delegate confirmed the context; done only after a green verification." },
             "note": { "type": "string", "description": "Optional note appended to the step." }
         },
-        "required": ["status"],
-        "oneOf": [
-            { "required": ["index"] },
-            { "required": ["text"] }
-        ],
+        "required": ["status", "index"],
         "additionalProperties": false
     }),
 }
@@ -271,7 +267,17 @@ impl Tool for SelfUpdatePlan {
                 .count();
             Ok(format!("Step marked {status}. {open} step(s) still open."))
         } else {
-            anyhow::bail!("no step matched the given index/text");
+            let listing = ctx
+                .session
+                .plan()
+                .iter()
+                .map(|s| format!("  {}: {}", s.id, s.goal))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!(
+                "no step matched the given index/text. Existing steps (retry with the numeric \
+                 `index`):\n{listing}"
+            );
         }
     }
 }
@@ -285,19 +291,15 @@ struct SelfSetStepModel;
 static SELF_SET_STEP_MODEL_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "self_set_step_model".into(),
-    description: "Change which model runs a plan step: 'self' for you, or a delegate name. Refused while the step is in_progress or done; only pending, ready or blocked steps can be reassigned.".into(),
+    description: "Change which model runs a plan step: 'self' for you, or a delegate name. Identify the step by its 1-based `index` (or `text` when the index is unknown). Refused while the step is in_progress or done; only pending, ready or blocked steps can be reassigned.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "index": { "type": "integer", "minimum": 1, "description": "1-based step id." },
-            "text": { "type": "string", "description": "Text contained in the step goal." },
+            "text": { "type": "string", "description": "Text contained in the step goal; used only when `index` is unknown." },
             "model": { "type": "string", "description": "The model that will now run this step: \"self\" for the main agent, or a configured delegate name (see the delegate tool's model listing)." }
         },
-        "required": ["model"],
-        "oneOf": [
-            { "required": ["index"] },
-            { "required": ["text"] }
-        ],
+        "required": ["model", "index"],
         "additionalProperties": false
     }),
 }
@@ -389,19 +391,15 @@ struct SelfSetStepContext;
 static SELF_SET_STEP_CONTEXT_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "self_set_step_context".into(),
-    description: "Replace one plan step's context - the instructions its executing delegate receives (never shown in the UI). Refused while in_progress or done; resets a `ready` step to pending.".into(),
+    description: "Replace one plan step's context - the instructions its executing delegate receives (never shown in the UI). Identify the step by its 1-based `index` (or `text` when the index is unknown). Refused while in_progress or done; resets a `ready` step to pending.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "index": { "type": "integer", "minimum": 1, "description": "1-based step id." },
-            "text": { "type": "string", "description": "Text contained in the step goal." },
+            "text": { "type": "string", "description": "Text contained in the step goal; used only when `index` is unknown." },
             "context": { "type": "string", "description": "The new summarised context for the executing model (replaces the step's current context entirely)." }
         },
-        "required": ["context"],
-        "oneOf": [
-            { "required": ["index"] },
-            { "required": ["text"] }
-        ],
+        "required": ["context", "index"],
         "additionalProperties": false
     }),
 }
@@ -631,6 +629,79 @@ impl Tool for AskForm {
             UserReply::Denied => Ok("(user dismissed the form)".to_string()),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ask_upwards
+// ---------------------------------------------------------------------------
+
+/// Ask the model that owns the session (the tech lead) a question. Registered
+/// ONLY for delegated sub-agents: the main agent has no parent to ask. The
+/// delegate sub-loop additionally caps how often it may be used per run.
+pub struct AskUpwards;
+
+static ASK_UPWARDS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "ask_upwards".into(),
+    description: "Ask the tech lead - the model that gave you this task - a question when you are stuck, e.g. the same error twice, or a decision you cannot make. Send ONE specific question: what you tried, the exact error, and what you need decided. Use it at most twice; after that decide yourself and continue. Read-only: it changes nothing in the repository.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "question": { "type": "string", "description": "The specific question, plus the evidence needed to answer it (what you tried and the exact error)." }
+        },
+        "required": ["question"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for AskUpwards {
+    fn spec(&self) -> &ToolSpec {
+        &ASK_UPWARDS_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            question: String,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let question = args.question.trim();
+        if question.is_empty() {
+            anyhow::bail!("`question` must not be empty");
+        }
+        let Some(upward) = ctx.session.upward() else {
+            return Ok("No tech lead is available to answer right now. Decide for yourself, make the \
+                       smallest reasonable change, and continue."
+                .to_string());
+        };
+        // Give the parent the little bit of shared state it needs to answer
+        // well: which session this is and what the plan says.
+        let mut msg = String::new();
+        let title = ctx.session.title();
+        if !title.is_empty() {
+            msg.push_str(&format!("Session: {title}\n"));
+        }
+        let plan = ctx.session.plan();
+        if !plan.is_empty() {
+            msg.push_str("Plan:\n");
+            for step in &plan {
+                msg.push_str(&format!("  {}: {} [{}]\n", step.id, step.goal, step.status));
+            }
+        }
+        msg.push_str(&format!(
+            "\nA sub-agent you delegated a step to is stuck and asks:\n{question}"
+        ));
+        let answer = upward.ask(&msg).await?;
+        Ok(format!("Answer from your tech lead:\n{}", answer.trim()))
+    }
+}
+
+/// The tools only delegated sub-agents get: escalation to their parent. The
+/// main agent has no parent, so this is NOT part of [`all`].
+pub fn upward_tools() -> Vec<Box<dyn Tool>> {
+    vec![Box::new(AskUpwards)]
 }
 
 #[cfg(test)]

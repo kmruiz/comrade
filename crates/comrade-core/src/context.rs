@@ -74,6 +74,31 @@ impl ContextManager {
         self.history.push(msg);
     }
 
+    /// Push a user note (`text`) while keeping the conversation role-valid for
+    /// strict providers. LM Studio's Mistral template rejects two user turns in
+    /// a row, AND rejects a user turn straight after tool results ("conversation
+    /// roles must alternate user and assistant except for tool calls and
+    /// results"). So the note is folded into whatever role is pending — a ReAct
+    /// observation (user) or a native tool result (tool) — and only pushed as a
+    /// new user turn when the last message is an assistant one.
+    pub fn push_user_merged(&mut self, text: &str) {
+        if let Some(last) = self.history.last_mut() {
+            let mergeable = match last.role {
+                crate::llm::Role::User => last.tool_calls.is_none(),
+                crate::llm::Role::Tool => true,
+                _ => false,
+            };
+            if mergeable {
+                if !last.content.is_empty() {
+                    last.content.push_str("\n\n");
+                }
+                last.content.push_str(text);
+                return;
+            }
+        }
+        self.push(ChatMessage::new(crate::llm::Role::User, text));
+    }
+
     pub fn messages(&self) -> &[ChatMessage] {
         &self.history
     }
@@ -352,6 +377,47 @@ fn rollup_snippet(msg: &ChatMessage) -> Option<String> {
 mod tests {
     use super::*;
     use crate::llm::{ChatMessage, Role};
+
+    #[test]
+    fn user_notes_never_double_up_the_user_role() {
+        // Strict providers (LM Studio's Mistral template) reject two user turns
+        // in a row, so a nudge/steer merges into a trailing user message.
+        let mut cm = ContextManager::new(10_000, 100);
+        cm.push(ChatMessage::new(Role::System, "sys"));
+        cm.push(ChatMessage::new(Role::User, "the task"));
+        cm.push_user_merged("nudge");
+        assert_eq!(cm.messages().len(), 2);
+        let last = cm.messages().last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert!(last.content.contains("the task") && last.content.contains("nudge"));
+        // After an assistant turn it becomes its own user turn.
+        cm.push(ChatMessage::new(Role::Assistant, "ok"));
+        cm.push_user_merged("more");
+        assert_eq!(cm.messages().len(), 4);
+        assert_eq!(cm.messages().last().unwrap().content, "more");
+        // A native tool result (Role::Tool) folds the note into itself: a user
+        // turn straight after tool results is rejected too.
+        cm.push(ChatMessage::tool_result("c1", "tool output"));
+        cm.push_user_merged("after tool");
+        assert_eq!(cm.messages().len(), 5);
+        assert_eq!(cm.messages()[4].role, Role::Tool);
+        assert!(cm.messages()[4].content.contains("tool output"));
+        assert!(cm.messages()[4].content.contains("after tool"));
+        // …but an assistant message with tool calls is never merged into: its
+        // results must follow directly.
+        cm.push(ChatMessage::assistant_with_calls(
+            String::new(),
+            vec![crate::llm::ToolCallMsg {
+                id: "c2".into(),
+                name: "fs_read_file".into(),
+                arguments: serde_json::json!({ "path": "x" }),
+            }],
+        ));
+        cm.push_user_merged("note");
+        assert_eq!(cm.messages().len(), 7);
+        assert_eq!(cm.messages().last().unwrap().role, Role::User);
+        assert_eq!(cm.messages().last().unwrap().content, "note");
+    }
 
     #[test]
     fn budget_evicts_oldest_and_folds_into_rollup() {

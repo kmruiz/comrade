@@ -4,12 +4,17 @@
 //! and the agent core (`comrade-core`) depend only on the traits and value types
 //! defined here, never on each other.
 
+pub mod ask;
+pub mod decl;
 pub mod form;
 pub mod plan;
 pub mod policy;
 pub mod repo;
 pub mod task_runner;
 pub mod tool;
+
+pub use ask::{Upward, UpwardAsk, Verdict};
+pub use decl::{declarations, removed_declarations};
 
 pub use form::{DiffOption, FieldKind, FormField, FormSpec, truthy};
 pub use plan::{AGENT_MODEL, PlanStatus, PlanStep, PlanStepDraft, PlanTarget, SessionControl};

@@ -533,18 +533,19 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn step_mode_rejects_mixed_and_mismatched_args() {
+    async fn step_mode_ignores_extra_prose_but_rejects_a_mismatched_model() {
         let base = fake_chat_server("ignored");
         let tool = mk_advise(&[delegate("cheap", &base)]).unwrap().unwrap();
         let ctx = step_ctx();
 
-        // `step` together with `question` or `context` is ambiguous: they come
-        // from the plan step.
-        let err = tool
-            .invoke(&ctx, json!({"step": 1, "question": "is it enough?"}))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("cannot pass `question`"), "{err}");
+        // `step` together with `question`/`context` is NOT an error: a small
+        // model routinely echoes them, and both are derived from the plan step.
+        tool.invoke(
+            &ctx,
+            json!({"step": 1, "question": "is it enough?", "context": "extra"}),
+        )
+        .await
+        .expect("step mode ignores question/context");
 
         // The consulted delegate must be the step's own assigned delegate.
         let err = tool

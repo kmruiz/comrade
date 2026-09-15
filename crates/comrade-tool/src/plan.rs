@@ -271,6 +271,14 @@ pub trait SessionControl: Send + Sync {
 
     fn set_status(&self, status: &str);
     fn status(&self) -> String;
+
+    /// Handle a delegated sub-agent uses to ask the model that owns this session
+    /// (its parent, the tech lead) a question — see the `ask_upwards` tool.
+    /// `None` (the default) means there is nobody to ask; the tool then tells the
+    /// sub-agent to decide for itself.
+    fn upward(&self) -> Option<crate::ask::Upward> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -85,6 +85,21 @@ Replaces the former unconditional "no approval" wording.
 **Notes:**
 Enabled by the UserPrompt::Form(FormSpec) / UserReply::Form(BTreeMap<String,String>) variants on the UserIo contract. Added FieldKind::DiffChoice (diff_choice) for picking between code diffs. The TUI records a MsgKind::Question transcript entry when a form is asked (and when it is answered) so the question stays visible in focus mode.
 
+## ask_upwards
+> ask_upwards - the session tool (only in the delegate registry) that lets a stalled sub-agent ask its parent model one specific question and get the answer back as the tool result. Backed by the UpwardAsk/Upward contract (crates/comrade-tool/src/ask.rs) exposed as SessionControl::upward(); the delegate sub-agent loop caps it at MAX_UPWARD_ASKS and then calls refuse_upward. The main agent has no parent, so it never gets the tool. Since ADR #63 the SAME channel also carries permission requests: `UpwardAsk::approve(title, detail)` returns a `Verdict` (Approved/Denied(reason)/Unavailable) and gates a delegate's destructive fs_write_file, with Unavailable meaning refuse.
+
+**References:**
+- `crates/comrade-tool-session/src/lib.rs (ask_upwards, upward_tools)`
+- `crates/comrade-tool/src/ask.rs (UpwardAsk, Upward, Verdict)`
+- `crates/comrade-core/src/upward.rs (ParentAsk, parse_verdict)`
+- `crates/comrade-core/src/delegate.rs (MAX_UPWARD_ASKS, refuse_upward, refuse_destructive)`
+- `crates/comrade-tui/src/main.rs (delegate_registry, session_bundle)`
+- `.comrade/memory/0061-a«redacted».md`
+- `.comrade/memory/0063-destructive-delegate-writes-need-the-tech-leads-permission-fail-closed.md`
+
+**Notes:**
+Delegate prompt: use it at most twice (one specific question: what you tried + the exact error), then decide yourself and continue. `ParentAsk` answers both `ask` and `approve` with a single tool-less chat call to the session's own model, so the escalation cannot recurse into another agent run; approve is bounded by APPROVAL_TIMEOUT (60s) and its reply is read by parse_verdict, which approves only a line opening with APPROVE.
+
 ## ask_user dialog
 > The TUI modal rendered by `draw_dialog`. It shows a `UserPrompt::Confirm` (permission/approval of mutating tools) in yellow, or a `UserPrompt::Form` (ask_form) in cyan with an editable `FormEdit`. The old `UserPrompt::Question`/`ask_user` dialog was removed (ask_form supersedes it).
 
@@ -222,6 +237,20 @@ Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by rende
 **Notes:**
 Each job's approval policy is enforced before any run starts; it never touches the plan; it is DENIED_FOR_DELEGATES so a delegate cannot fan out recursively. See ADR #23.
 
+## destructive-write approval
+> The permission gate a delegated sub-agent must pass before a destructive write: `delegate::refuse_destructive` (crates/comrade-core/src/delegate.rs) inspects an `fs_write_file` call, computes `comrade_tool::removed_declarations(before, after)`, and when the rewrite would delete declarations the file already had, it asks the parent model through `UpwardAsk::approve(title, detail)` and acts on the returned `Verdict` (Approved -> write runs; Denied(reason) -> refused with the reason; Unavailable -> refused). Fail closed: no parent wired, no answer within APPROVAL_TIMEOUT (60s), or a reply whose first substantive line does not open with APPROVE all mean "refused". Non-destructive writes and file creation never ask, so the gate costs nothing until a deletion appears.
+
+**References:**
+- `crates/comrade-core/src/delegate.rs (refuse_destructive, join_or)`
+- `crates/comrade-tool/src/ask.rs (Verdict, UpwardAsk::approve)`
+- `crates/comrade-tool/src/decl.rs (declarations, removed_declarations)`
+- `crates/comrade-core/src/upward.rs (ParentAsk::approve, parse_verdict, APPROVAL_TIMEOUT)`
+- `crates/comrade-core/src/delegate/tests.rs (delegate_may_not_delete_code_without_the_tech_leads_permission)`
+- `.comrade/memory/0063-destructive-delegate-writes-need-the-tech-leads-permission-fail-closed.md`
+
+**Notes:**
+The refusal is returned as the tool result and emitted as a tool_call/tool_result event pair so it is visible in the delegate's sub-chat. The lead agent is NOT gated here: its fs_write_file asks the human via ctx.confirm and, under autonomy=auto, still gets the tool's "this rewrite REMOVED X" warning. `Verdict` lives in comrade-tool (ask.rs) next to UpwardAsk, so the default impl fails closed for any parent that does not implement approve.
+
 ## detect_all / pick (ecosystem selection)
 > A repository may host several build systems (a Cargo.toml AND a package.json). ecosystem::detect_all(root) returns every present backend in priority order (Cargo, then npm); ecosystem::pick(root, ecosystem, verb) selects one: an explicit `ecosystem` name, else the sole backend, else the single backend whose `supports(root, verb)` is true, else an error asking for an explicit choice. `detect` (single) prefers Cargo. pom_model renders ALL detected ecosystems; pom_run_task/pom_run_tests/pom_check/pom_format_code take an `ecosystem` arg.
 
@@ -281,6 +310,18 @@ Why a larger batch size makes the cold build slower, not faster. Measured on thi
 - `crates/comrade-core/src/config.rs`
 - `crates/comrade-core/src/delegate.rs`
 - `crates/comrade-tui/src/tui.rs`
+
+## flat tool schema
+> Flat tool schema - the required shape of a model-facing ToolSpec.json_schema: ONE object shape with every mandatory field listed in the top-level `required` (plus `additionalProperties: false`), and no `anyOf`/`oneOf`/`allOf` over required-subset branches. A local OpenAI-compatible server (LM Studio) compiles the schema into a generation grammar: an `anyOf` made ministral-3-3b emit ~60 empty-argument calls per request and a `oneOf` silently dropped the alternative-required `index`. Alternatives are expressed instead as optional properties plus runtime validation (fs_edit advertises literal mode only and keeps `diff` as an internal runtime argument; self_update_plan/self_set_step_model/self_set_step_context require `index` with `text` as a runtime fallback).
+
+**References:**
+- `crates/comrade-tool-fs/src/lib.rs (FS_EDIT_SPEC, fs_edit_schema_is_flat_literal_only)`
+- `crates/comrade-tool-session/src/lib.rs (SELF_UPDATE_PLAN_SPEC etc.)`
+- `crates/comrade-tool-session/src/tests.rs (plan_step_tools_advertise_a_flat_step_selector)`
+- `.comrade/memory/0057-tool-schemas-stay-flat-no-anyofoneof-a-model-must-choose-from.md`
+
+**Notes:**
+Known remaining exceptions (measured harmless, flattened only if they misbehave): amend_adr's `anyOf` over status|note, and ask_form's nested `options` `anyOf` (string | {label,diff}) - interactive-only, off the small-model path.
 
 ## focus mode
 > A chat view filter in the TUI, toggled by M-f or M-x focus-mode (same chord turns it off). It is ON by default at startup (build_app sets focus_mode: true). When on it hides tool noise so the chat reads as pure conversation: it keeps MsgKind::User, MsgKind::Assistant, MsgKind::Delegate (advisories) and MsgKind::Reasoning, and drops MsgKind::Tool, MsgKind::Failure, MsgKind::Meta and the folded MsgKind::Run digest's summary row — but a folded Run still renders the Reasoning children inside it. While a run is in flight in focus mode, the bottom chat row shows a rotating activity spinner (activity_line) so a silent tool run never looks frozen. The mode line (bottom status bar) shows "focus mode enabled" (bold green) when on and "focus mode disabled" (dim gray) when off, right after the auto/ask token.
@@ -621,10 +662,11 @@ Auto-pick: pick_default_model scores each enabled delegate on name+llm.model+des
 - `crates/comrade-tui/src/tui.rs`
 
 ## tool name prefixes (fs_/ts_/pom_/self_)
-> The model-facing toolset naming convention (ADR #7): every tool's name carries a domain prefix - fs_* for filesystem tools (comrade-tool-fs), ts_* for tree-sitter/code tools (comrade-tool-syntax), pom_* for project/task tools (comrade-tool-project), self_* for session/planning tools the agent runs on itself (comrade-tool-session), memory tools use the adr/glossary families (record_adr/find_adr/read_adr/amend_adr, record_glossary), and ask_user asks the human. apply_edit+apply_patch merged into fs_edit (literal old/new OR diff); find_definition+read_symbol merged into ts_read_symbol (body flag); references_count was removed. Engine helper fns keep internal names.
+> The model-facing toolset naming convention (ADR #7): every tool's name carries a domain prefix - fs_* for filesystem tools (comrade-tool-fs), ts_* for tree-sitter/code tools (comrade-tool-syntax), pom_* for project/task tools (comrade-tool-project), self_* for session/planning tools the agent runs on itself (comrade-tool-session), memory tools use the adr/glossary families (record_adr/find_adr/read_adr/amend_adr, record_glossary), and ask_user asks the human. apply_edit+apply_patch merged into fs_edit (literal old/new OR diff); find_definition+read_symbol merged into ts_read_symbol (body flag); references_count was removed. Engine helper fns keep internal names. Since ADR #57 fs_edit ADVERTISES the literal mode only - flat schema, required path+old+new, no `diff` property, because an `anyOf` made a local small model emit empty/garbage calls - while the unified-diff patch mode stays an accepted RUNTIME argument for internal callers.
 
 **References:**
 - `.comrade/memory/0007-namespaced-consistent-tool-names-fs-ts-pom-self-prefixes-merges.md`
+- `.comrade/memory/0057-tool-schemas-stay-flat-no-anyofoneof-a-model-must-choose-from.md`
 - `crates/comrade-tool-syntax/src/lib.rs`
 - `crates/comrade-tool-fs/src/lib.rs`
 - `crates/comrade-core/src/agent.rs`

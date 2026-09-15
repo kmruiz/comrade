@@ -67,7 +67,7 @@ impl AskAdviseTool {
                 "step": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Plan step id for a readiness check: the step's own delegate is consulted about whether its context suffices. VERDICT: READY marks it `ready`; NEEDS_MORE keeps it `pending`. Do not pass `model`, `question` or `context` with `step`."
+                    "description": "Plan step id for a readiness check: the step's own delegate is consulted about whether its context suffices. VERDICT: READY marks it `ready`; NEEDS_MORE keeps it `pending`. The step supplies the question, context and delegate model, so pass `step` alone."
                 },
                 "model": {
                     "type": "string",
@@ -134,18 +134,11 @@ impl Tool for AskAdviseTool {
         // free-form advice consult.
         let (model, user_prompt, approval_title) = match step_id {
             Some(id) => {
-                for (key, label) in [("question", "question"), ("context", "context")] {
-                    let present = args
-                        .get(key)
-                        .map(|v| v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(true))
-                        .unwrap_or(false);
-                    if present {
-                        bail!(
-                            "cannot pass `{label}` together with `step`: the {label} comes from \
-                             the plan step"
-                        );
-                    }
-                }
+                // A small model routinely echoes `question`/`context` next to
+                // `step`; both are DERIVED from the plan step, so ignore them
+                // rather than spending an iteration on an avoidable error (the
+                // delegate tool already tolerates the same redundancy). A
+                // `model` that CONTRADICTS the step is still an error, below.
                 let found = ctx
                     .session
                     .plan()

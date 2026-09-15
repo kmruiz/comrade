@@ -21,6 +21,58 @@ fn detects_cargo_and_rejects_unknown() {
 }
 
 #[test]
+fn is_project_dir_matches_the_backend_manifest() {
+    let dir = std::env::temp_dir().join(format!("comrade-eco-isdir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // An empty directory is no backend's project root.
+    assert!(!Cargo.is_project_dir(&dir));
+    assert!(!Node.is_project_dir(&dir));
+    // Each backend owns the directory that holds ITS manifest, and only that one.
+    std::fs::write(dir.join("Cargo.toml"), "package\n").unwrap();
+    assert!(Cargo.is_project_dir(&dir));
+    assert!(!Node.is_project_dir(&dir));
+    std::fs::write(dir.join("package.json"), "{}\n").unwrap();
+    assert!(Node.is_project_dir(&dir));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn generic_error_lines_keeps_the_location_and_snippet() {
+    // A compile error names the file:line on the line AFTER the header; dropping
+    // it left a small model unable to see where the error was (it then rewrote
+    // the file blindly until max_iterations).
+    let raw = [
+        "   Compiling smoke v0.1.0",
+        "error: this file contains an unclosed delimiter",
+        "  --> src/lib.rs:9:20",
+        "   |",
+        " 9 |     mod tests {",
+        "   |          ----- unclosed delimiter",
+        "   |",
+        "error: could not compile `smoke` (lib) due to 1 previous error",
+        "",
+    ]
+    .join("\n");
+    let (errors, total) = generic_error_lines(&raw, 20);
+    assert_eq!(total, 2, "{errors:?}");
+    let joined = errors.join("\n");
+    assert!(joined.contains("unclosed delimiter"), "{joined}");
+    assert!(joined.contains("--> src/lib.rs:9:20"), "{joined}");
+    assert!(joined.contains("9 |     mod tests {"), "{joined}");
+    // Build noise is still dropped.
+    assert!(!joined.contains("Compiling smoke"), "{joined}");
+}
+
+#[test]
+fn generic_error_lines_respects_the_cap() {
+    let raw = "error: a\n --> f.rs:1:1\nerror: b\n --> f.rs:2:2\nerror: c\n --> f.rs:3:3\n";
+    let (errors, total) = generic_error_lines(raw, 2);
+    assert_eq!(total, 3);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors[0].contains("error: a"), "{errors:?}");
+}
+
+#[test]
 fn cargo_check_command_is_json() {
     let eco = Cargo;
     let sub = Some("crates/a".to_string());

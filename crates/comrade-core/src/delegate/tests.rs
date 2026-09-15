@@ -579,12 +579,10 @@ async fn plan_step_delegation_validates_args() {
         "{err}"
     );
 
-    // `step` is exclusive with an explicit `task`.
-    let err = tool
-        .invoke(&ctx, json!({"step": 1, "task": "nope"}))
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("cannot pass `task`"), "{err}");
+    // `step` is lenient about a duplicate `task`: the step's own task wins and
+    // the extra argument is ignored (a small model passes both routinely).
+    let ok = tool.invoke(&ctx, json!({"step": 1, "task": "nope"})).await;
+    assert!(ok.is_ok(), "{:?}", ok.err());
 
     // Unknown step id.
     let err = tool.invoke(&ctx, json!({"step": 99})).await.unwrap_err();
@@ -1016,6 +1014,109 @@ async fn delegate_executes_its_tools_in_a_subagent_loop() {
         1,
         "delegate must have run its fs_write_file tool once"
     );
+}
+
+use comrade_tool::{UpwardAsk, Verdict};
+
+/// A parent model that answers permission requests with a fixed verdict and
+/// counts how often it was asked.
+struct StubParent {
+    verdict: Verdict,
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl UpwardAsk for StubParent {
+    async fn ask(&self, _question: &str) -> Result<String> {
+        Ok(String::new())
+    }
+    async fn approve(&self, _title: &str, _detail: &str) -> Result<Verdict> {
+        self.asked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.verdict.clone())
+    }
+}
+
+/// Run a delegate that tries to REPLACE src/lib.rs wholesale (which would delete
+/// the crate's own `greet_works`), with an optional parent model answering the
+/// permission request. Returns (times the write tool ran, the file afterwards).
+async fn destructive_trial(verdict: Option<Verdict>, tag: &str) -> (usize, String) {
+    let dir = std::env::temp_dir().join(format!("comrade-destructive-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let before = "pub fn greet() {}\n\nfn greet_works() {}\n";
+    std::fs::write(dir.join("src/lib.rs"), before).unwrap();
+
+    let write_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(StubTool {
+        calls: write_calls.clone(),
+    }));
+
+    let tool_call_turn = json!({"choices":[{"message":{"content":"","tool_calls":[{
+        "id":"call_1","function":{"name":"fs_write_file",
+        "arguments": json!({"path":"src/lib.rs","content":"pub fn shout() {}\n"}).to_string()
+    }}]}}]})
+    .to_string();
+    let final_turn = json!({"choices":[{"message":{"content":"finished"}}]}).to_string();
+    let base = scripted_server(vec![tool_call_turn, final_turn]);
+
+    let cfg = Config {
+        delegates: vec![delegate("cheap", &base)],
+        ..Config::default()
+    };
+    let tool = DelegateTool::new(&cfg.delegates, registry, DelegateLimits::default())
+        .unwrap()
+        .unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let session = Arc::new(AgentSession::new(tx));
+    if let Some(verdict) = verdict {
+        session.set_upward(Arc::new(StubParent {
+            verdict,
+            asked: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+    }
+    let mut ctx = test_ctx();
+    ctx.project_root = dir.clone();
+    ctx.cwd = dir.clone();
+    ctx.session = session.as_control();
+
+    let out = tool
+        .invoke(&ctx, json!({"model": "cheap", "task": "replace greet with shout"}))
+        .await
+        .unwrap();
+    assert!(out.contains("finished"), "{out}");
+    (
+        write_calls.load(std::sync::atomic::Ordering::SeqCst),
+        std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+    )
+}
+
+/// A whole-file rewrite that DELETES code must not run unless the tech lead
+/// approves it: in the smoke trial the delegate dropped the crate's own test
+/// this way and then reported success.
+#[tokio::test]
+async fn delegate_may_not_delete_code_without_the_tech_leads_permission() {
+    let before = "pub fn greet() {}\n\nfn greet_works() {}\n";
+
+    // (1) Nobody to ask: the write is refused outright (fail closed).
+    let (calls, after) = destructive_trial(None, "guard-noparent").await;
+    assert_eq!(calls, 0, "an unapproved destructive write must not run");
+    assert_eq!(after, before, "the file must be untouched");
+
+    // (2) The tech lead refuses: still nothing is written.
+    let (calls, after) = destructive_trial(
+        Some(Verdict::Denied("use fs_edit, keep greet_works".into())),
+        "guard-denied",
+    )
+    .await;
+    assert_eq!(calls, 0, "a refused destructive write must not run");
+    assert_eq!(after, before, "the file must be untouched");
+
+    // (3) The tech lead approves: the write runs, so approval is not a dead end.
+    let (calls, _) = destructive_trial(Some(Verdict::Approved), "guard-approved").await;
+    assert_eq!(calls, 1, "an approved destructive write must run");
 }
 
 /// The delegate's sub-agent tool calls must reach the session's event
@@ -1892,4 +1993,19 @@ fn no_delegates_yields_no_parallel_tool() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn the_upward_escalation_is_capped_per_run() {
+    use super::{MAX_UPWARD_ASKS, refuse_upward};
+    let mut used = 0usize;
+    // Other tools never touch the escalation budget.
+    assert!(refuse_upward("fs_read_file", &mut used).is_none());
+    assert_eq!(used, 0);
+    for _ in 0..MAX_UPWARD_ASKS {
+        assert!(refuse_upward("ask_upwards", &mut used).is_none());
+    }
+    // Past the cap the delegate is told to decide for itself.
+    let msg = refuse_upward("ask_upwards", &mut used).expect("refused past the cap");
+    assert!(msg.contains("Stop asking"), "{msg}");
 }

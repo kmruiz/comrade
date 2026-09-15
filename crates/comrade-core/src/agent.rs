@@ -99,6 +99,74 @@ const READ_ONLY_TOOLS: &[&str] = &[
 /// After this many consecutive reads with no state change, we refuse another.
 const READ_GUARD_THRESHOLD: usize = 20;
 
+/// After ≥ this many consecutive non-progress calls following the first
+/// workspace change, nudge the model once to finish (small models otherwise
+/// keep re-verifying until `max_iterations`).
+const STALL_NUDGE_AT: usize = 8;
+
+/// At ≥ this many, end the run gracefully instead of burning the budget.
+const STALL_END_AT: usize = 18;
+
+/// Tools that push a task forward: they change the repo or the plan. Anything
+/// else (reads, tests, checks, shell, jobs) only inspects state, so a long run
+/// of them after the first change means the model is spinning.
+const PROGRESS_TOOLS: &[&str] = &[
+    "fs_edit",
+    "fs_write_file",
+    "ts_rename",
+    "self_set_plan",
+    "self_update_plan",
+    "self_set_step_model",
+    "self_set_step_context",
+    "self_finish_plan",
+    "self_rename_session",
+    "ask_form",
+    "delegate",
+    "delegate_parallel",
+    "record_adr",
+    "amend_adr",
+    "merge_adr",
+    "record_glossary",
+    "rename_glossary",
+    "delete_glossary",
+    "git_commit",
+    "git_stash",
+    "git_branch",
+    "git_checkout",
+    // A stuck sub-agent escalating to its parent is a recovery move: it counts
+    // as progress, so the stall guard gives it a fresh window.
+    "ask_upwards",
+];
+
+/// Whether a tool call moves the task forward (see [`PROGRESS_TOOLS`]).
+pub(crate) fn is_progress(name: &str) -> bool {
+    PROGRESS_TOOLS.contains(&name)
+}
+
+/// Injected (once) when the model keeps verifying after it has already changed
+/// the repo — the classic small-model failure to recognise completion.
+pub(crate) const STALL_NUDGE: &str = "You have already made your change and are now only re-checking. \
+     STOP investigating. If the requested change is implemented and your last verification passed, \
+     finish NOW: call `self_finish_plan` (if you made a plan), then reply with your final summary and \
+     NO tool call. Only continue if the last verification actually FAILED - then fix the code with \
+     `fs_edit`/`fs_write_file` first.";
+
+/// Tools that verify the work (a test or type check run).
+const VERIFY_TOOLS: &[&str] = &["pom_run_tests", "pom_check", "pom_run_task"];
+
+/// Files that an edit tool rewrites.
+const EDIT_TOOLS: &[&str] = &["fs_edit", "fs_write_file", "ts_rename"];
+
+/// After this many edits with no verification in between, tell the model to run
+/// the tests (a small model otherwise rewrites a broken file over and over).
+const VERIFY_NUDGE_AFTER_EDITS: usize = 3;
+
+/// Injected (once) when the model keeps editing without ever verifying.
+pub(crate) const VERIFY_NUDGE: &str = "You have edited the code several times without running the \
+     tests. STOP editing. Run `pom_run_tests` NOW, read its result, and only then edit again to fix \
+     what it reports. If it passes, you are done.";
+
+
 /// Process monitor: if the model keeps reading without doing anything, stop it.
 /// Returns `true` when the tool may run (and updates the counter); `false` when
 /// the read should be refused as "enough context".
@@ -197,6 +265,16 @@ pub(crate) struct LoopTracker {
     /// When the model refuses to stop repeating, the run ends gracefully
     /// (instead of erroring out) with this message.
     stuck: Option<String>,
+    /// Workspace/plan changes observed so far (see [`is_progress`]).
+    progress: u64,
+    /// Consecutive non-progress calls since the last progress call.
+    idle: usize,
+    /// Whether the one-shot stall nudge has already been emitted.
+    stall_nudged: bool,
+    /// Edits since the last verification (test/check) run.
+    edits_since_verify: usize,
+    /// Whether the one-shot "verify now" nudge has already been emitted.
+    verify_nudged: bool,
 }
 
 impl LoopTracker {
@@ -240,6 +318,57 @@ impl LoopTracker {
                 self.refusals.remove(&dropped);
             }
         }
+        // Stall tracking: a progress call resets the idle run; anything else
+        // extends it, but only once the model has changed something at all (a
+        // long read-only exploration before the first edit is legitimate).
+        if is_progress(name) {
+            self.progress += 1;
+            self.idle = 0;
+        } else if self.progress > 0 {
+            self.idle += 1;
+        }
+        // Anti-thrash: a verification resets the edit run; an edit extends it.
+        if VERIFY_TOOLS.contains(&name) {
+            self.edits_since_verify = 0;
+            self.verify_nudged = false;
+        } else if EDIT_TOOLS.contains(&name) {
+            self.edits_since_verify += 1;
+        }
+    }
+
+    /// True exactly once, when the model has edited several times in a row
+    /// without ever running the tests. A small model otherwise rewrites a
+    /// broken file over and over instead of seeing the compiler error.
+    pub(crate) fn needs_verify_nudge(&mut self) -> bool {
+        if !self.verify_nudged && self.edits_since_verify >= VERIFY_NUDGE_AFTER_EDITS {
+            self.verify_nudged = true;
+            return true;
+        }
+        false
+    }
+
+    /// True exactly once, when the model has changed the repo and then spent
+    /// [`STALL_NUDGE_AT`] calls in a row without making another change. The
+    /// caller then injects [`STALL_NUDGE`] so the model learns to stop.
+    pub(crate) fn needs_stall_nudge(&mut self) -> bool {
+        if !self.stall_nudged && self.progress > 0 && self.idle >= STALL_NUDGE_AT {
+            self.stall_nudged = true;
+            return true;
+        }
+        false
+    }
+
+    /// Some(reason) once the model has kept spinning well past the nudge, so
+    /// the loop can end gracefully with an explanation instead of hitting
+    /// `max_iterations`.
+    pub(crate) fn stall_reason(&self) -> Option<String> {
+        (self.progress > 0 && self.idle >= STALL_END_AT).then(|| {
+            format!(
+                "Stopped: {} calls in a row without a further change after making progress - the \
+                 work looks complete. (Last step: re-run your verification only if it truly failed.)",
+                self.idle
+            )
+        })
     }
 
     /// Stop the run gracefully (not an error) because the model kept repeating.
@@ -285,7 +414,9 @@ pub(crate) async fn drain_steer(steer: Option<&Steer>, history: &mut ContextMana
         return;
     };
     for text in steer.drain().await {
-        history.push(ChatMessage::new(Role::User, text));
+        // Merged so a steer cannot produce two user turns in a row (which some
+        // strict providers reject).
+        history.push_user_merged(&text);
     }
 }
 
@@ -451,6 +582,16 @@ async fn run_agent_loop(
             });
         }
 
+        // End gracefully when the model keeps re-verifying long after it has
+        // already changed the repo (the nudge above was ignored).
+        if let Some(reason) = tracker.stall_reason() {
+            let _ = tx.send(AgentEvent::FinalAnswer(reason.clone())).await;
+            return Ok(AgentOutcome {
+                final_answer: reason,
+                iterations,
+            });
+        }
+
         // A steer typed while this run was in flight reaches the model at its
         // next rest point, injected BEFORE the budget is enforced so compaction
         // can still make room for it.
@@ -517,6 +658,31 @@ async fn run_agent_loop(
         }
 
         ctxm.enforce_budget();
+
+        // One-shot stall nudge: the model has changed the repo and is now only
+        // re-checking without editing again, so tell it to finish. Injected as
+        // a user turn so it is seen by the model request below.
+        if tracker.needs_stall_nudge() {
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: "loop_guard".into(),
+                    output: STALL_NUDGE.to_string(),
+                    ok: false,
+                })
+                .await;
+            ctxm.push_user_merged(STALL_NUDGE);
+        } else if tracker.needs_verify_nudge() {
+            // Mirror nudge for the opposite pathology: editing forever without
+            // ever running the tests.
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: "loop_guard".into(),
+                    output: VERIFY_NUDGE.to_string(),
+                    ok: false,
+                })
+                .await;
+            ctxm.push_user_merged(VERIFY_NUDGE);
+        }
 
         // Advertise native tools unless the protocol is strictly ReAct.
         let native = cfg.llm.protocol.native_enabled();
@@ -921,22 +1087,33 @@ async fn run_native_calls(
         id: String,
         name: String,
         args: serde_json::Value,
+        /// False when the model's argument string was not parseable JSON.
+        parse_ok: bool,
+        raw_args: String,
     }
 
     let mut prepared = Vec::new();
     let mut calls = Vec::new();
     for mc in turn.tool_calls {
-        let parsed: serde_json::Value = serde_json::from_str(&mc.arguments)
-            .unwrap_or(serde_json::Value::Object(Default::default()));
+        // Small models often emit JSON-ish arguments (unescaped quotes, bare
+        // keys, trailing commas). Repair with the same tolerant parser the
+        // ReAct path uses before giving up on the call.
+        let parsed = serde_json::from_str::<serde_json::Value>(&mc.arguments)
+            .ok()
+            .or_else(|| crate::react::parse_args_json(&mc.arguments).ok());
+        let parse_ok = parsed.is_some();
+        let args = parsed.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
         calls.push(crate::llm::ToolCallMsg {
             id: mc.id.clone(),
             name: mc.name.clone(),
-            arguments: parsed.clone(),
+            arguments: args.clone(),
         });
         prepared.push(Prepared {
             id: mc.id,
             name: mc.name,
-            args: parsed,
+            args,
+            parse_ok,
+            raw_args: mc.arguments,
         });
     }
 
@@ -959,6 +1136,25 @@ async fn run_native_calls(
     let mut turn_tokens = turn.usage.as_ref().and_then(usage_total);
 
     'calls: for p in prepared {
+        if !p.parse_ok {
+            // Do not run a tool with a half-parsed argument set (that is how a
+            // small model silently corrupts a file): tell it to resend.
+            let msg = format!(
+                "ERROR: could not parse the arguments of `{}` as JSON. Resend this call with VALID \
+                 strict JSON: escape newlines as \\n, escape every double quote inside a string as \
+                 \\\", quote every key, and use no trailing comma. Received: {}",
+                p.name, p.raw_args
+            );
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: p.name.clone(),
+                    output: msg.clone(),
+                    ok: false,
+                })
+                .await;
+            ctxm.push(ChatMessage::tool_result(p.id, msg));
+            continue;
+        }
         let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
         let sig = format!("{} {args_pretty}", p.name);
         // Read guard: refuse further exploration once nothing has changed.
@@ -1153,6 +1349,20 @@ pub async fn run_headless(
                 AgentEvent::FinalAnswer(a) => format!("\n✅ {a}"),
                 AgentEvent::Error(e) => format!("❌ {e}"),
                 AgentEvent::User(u) => format!("🧑 {u}"),
+                // Sub-agent activity (delegate/ask_advise): indented so a
+                // delegate's own tool calls are visible in the run log.
+                AgentEvent::DelegateToolCall { model, name, args } => {
+                    format!("   ↳ {model} → {name} {args}")
+                }
+                AgentEvent::DelegateToolResult {
+                    model,
+                    name: _,
+                    output,
+                    ok,
+                } => {
+                    let mark = if *ok { "↳" } else { "⚠" };
+                    format!("   {mark} {model}: {output}")
+                }
                 _ => continue,
             };
             println!("{line}");
@@ -2696,5 +2906,66 @@ mod usage_tests {
         );
         // No usage at all: the UI falls back to "no tokens reported".
         assert_eq!(usage_total(&Usage::default()), None);
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::LoopTracker;
+
+    fn read(t: &mut LoopTracker, i: usize) {
+        t.record("fs_read_file", format!("r{i}"));
+    }
+
+    #[test]
+    fn reads_before_any_change_never_arm_the_guard() {
+        // A long read-only exploration before the first edit is legitimate.
+        let mut t = LoopTracker::default();
+        for i in 0..40 {
+            read(&mut t, i);
+        }
+        assert!(!t.needs_stall_nudge());
+        assert!(t.stall_reason().is_none());
+    }
+
+    #[test]
+    fn a_progress_call_resets_the_idle_run_and_the_nudge_is_one_shot() {
+        let mut t = LoopTracker::default();
+        t.record("fs_edit", "e1".into());
+        for i in 0..7 {
+            read(&mut t, i);
+        }
+        assert!(!t.needs_stall_nudge(), "7 idle calls is below the nudge");
+        read(&mut t, 7);
+        assert!(t.needs_stall_nudge());
+        assert!(!t.needs_stall_nudge(), "the nudge fires at most once");
+        // A further edit is progress and resets the idle run.
+        t.record("fs_edit", "e2".into());
+        read(&mut t, 0);
+        assert!(t.stall_reason().is_none());
+    }
+
+    #[test]
+    fn stall_reason_only_after_the_end_threshold() {
+        let mut t = LoopTracker::default();
+        t.record("fs_write_file", "w1".into());
+        for i in 0..17 {
+            read(&mut t, i);
+        }
+        assert!(t.stall_reason().is_none());
+        read(&mut t, 17);
+        assert!(t.stall_reason().is_some());
+    }
+
+    #[test]
+    fn test_runs_count_as_non_progress() {
+        // `pom_run_tests` is "mutating" for the repeat tracker but it is not a
+        // change to the repo, so re-running it must still arm the stall guard.
+        let mut t = LoopTracker::default();
+        t.record("fs_edit", "e1".into());
+        for i in 0..8 {
+            t.record("pom_run_tests", format!("t{i}"));
+        }
+        assert!(t.needs_stall_nudge());
     }
 }

@@ -20,6 +20,7 @@ pub mod redact;
 pub mod session;
 pub mod summarise;
 pub mod undo;
+pub mod upward;
 pub mod worktree;
 
 pub use advise::AskAdviseTool;
@@ -38,4 +39,5 @@ pub use redact::Redactor;
 pub use session::{AgentEvent, AgentSession};
 pub use summarise::SummariseTool;
 pub use undo::MemoryUndo;
+pub use upward::ParentAsk;
 pub use worktree::Worktree;

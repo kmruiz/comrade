@@ -221,12 +221,43 @@ fn build_tools(
     Ok((reg, jobs))
 }
 
-/// The tools a delegated sub-agent may call: every repository/memory/project
-/// tool from the same crates as the main registry, minus the ones a delegate
-/// must never see (git_commit, the session/UI tools, and `delegate` itself so
-/// it cannot recurse). `deny` is shared with comrade-core's delegate module so
-/// the tool description and this registry can never drift apart.
+/// The tools a delegated sub-agent may call. A delegate is usually a small,
+/// cheap model, so it gets a SHORT core toolbox instead of the main agent's
+/// full set: a small model picks the right tool far more reliably from ~20
+/// options than from ~60, and the sub-agent prompt stays inside a 3B-class
+/// context window. `deny` is still applied (git_commit, session/UI tools), and
+/// `delegate`/`ask_advise` are absent so a delegate cannot recurse.
 fn delegate_registry(root: &std::path::Path) -> ToolRegistry {
+    const CORE: &[&str] = &[
+        // Find the code.
+        "fs_list_files",
+        "fs_list_dir",
+        "fs_rgrep",
+        "fs_read_file",
+        "semantic_search",
+        "ts_find_symbol",
+        "ts_read_symbol",
+        // Change the code.
+        "fs_write_file",
+        "fs_edit",
+        // Verify.
+        "pom_model",
+        "pom_check",
+        "pom_run_tests",
+        "pom_run_task",
+        "pom_format_code",
+        "shell",
+        // Inspect the diff (never commit).
+        "git_status",
+        "git_diff",
+        "git_log",
+        // Memory (read-only for a delegate: recording belongs to the lead).
+        "find_adr",
+        "read_adr",
+        "find_glossary",
+        "read_glossary",
+        "stale_memory",
+    ];
     let mut reg = ToolRegistry::new();
     for tool in comrade_tool_fs::all()
         .into_iter()
@@ -237,12 +268,15 @@ fn delegate_registry(root: &std::path::Path) -> ToolRegistry {
         .chain(comrade_tool_web::all())
     {
         let name = tool.spec().name.clone();
-        if !DelegateTool::denied_for_delegates(&name) {
+        if CORE.contains(&name.as_str()) && !DelegateTool::denied_for_delegates(&name) {
             reg.register(tool);
         }
     }
     // Skills are read-only text: delegates may load them too.
     reg.extend(comrade_tool_skill::all(root));
+    // Escalation: a stuck delegate can ask the tech lead a question
+    // (`ask_upwards`). Only delegates get it - the main agent has no parent.
+    reg.extend(comrade_tool_session::upward_tools());
     reg
 }
 
@@ -315,6 +349,19 @@ pub(crate) fn session_bundle(
     tx: tokio::sync::mpsc::Sender<comrade_core::AgentEvent>,
 ) -> SessionBundle {
     let session = Arc::new(comrade_core::AgentSession::new(tx));
+    // The session's own model answers a stuck sub-agent's `ask_upwards`
+    // questions: the tech lead that delegated the step.
+    session.set_upward(Arc::new(comrade_core::ParentAsk::new(
+        deps.client.clone(),
+        format!(
+            "You are {}, the tech lead of a small team of coding agents (working directory {}). \
+             One of your sub-agents is stuck on a step you delegated and asks you a question. \
+             Answer with a decision: the exact next action it should take, concrete and at most a \
+             few sentences. Do not ask it questions back and do not tell it to find out itself.",
+            deps.cfg.llm.display(),
+            deps.root.display()
+        ),
+    )));
     let undo = Arc::new(MemoryUndo::new(deps.root.clone()));
     // Install the configured filesystem/shell guardrails process-wide so the fs
     // and shell tools honour `[security] extra_roots`/`shell_allow`/`shell_deny`.

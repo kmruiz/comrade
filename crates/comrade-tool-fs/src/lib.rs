@@ -99,6 +99,97 @@ fn edit_location(before: &str, old: &str, new: &str) -> String {
     format!("@@ -{start},{old_span} +{start},{new_span} @@")
 }
 
+/// Longest common leading whitespace of the non-empty lines.
+fn common_indent(lines: &[&str]) -> String {
+    let mut common: Option<String> = None;
+    for line in lines.iter().filter(|l| !l.trim().is_empty()) {
+        let indent: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        common = Some(match common {
+            None => indent,
+            Some(prev) => {
+                let n = prev
+                    .chars()
+                    .zip(indent.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                prev.chars().take(n).collect()
+            }
+        });
+    }
+    common.unwrap_or_default()
+}
+
+/// Whitespace-tolerant whole-line match, used when the exact `old` block is not
+/// found: a small model that re-types a block it just read routinely gets the
+/// indentation or trailing spaces wrong. Lines are compared trimmed, so the
+/// match succeeds anyway — but only when it is UNIQUE, and the returned
+/// replacement is re-indented to the block it replaces (the `new` lines'
+/// common indentation is swapped for the matched block's own).
+///
+/// Returns `(exact file slice, replacement)`; `None` when nothing matches or
+/// more than one place does.
+fn fuzzy_line_match(file: &str, old: &str, new: &str) -> Option<(String, String)> {
+    // Keep the trailing newline with each line so a match spans whole lines and
+    // a deletion removes the line rather than leaving a blank.
+    let mut lines: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    for (i, c) in file.char_indices() {
+        if c == '\n' {
+            lines.push(&file[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < file.len() {
+        lines.push(&file[start..]);
+    }
+
+    let old_lines: Vec<&str> = old.lines().map(str::trim_end).collect();
+    let lead = old_lines.iter().take_while(|l| l.trim().is_empty()).count();
+    let trail = old_lines.iter().rev().take_while(|l| l.trim().is_empty()).count();
+    let end = old_lines.len().saturating_sub(trail);
+    if lead >= end {
+        return None; // only blank lines
+    }
+    let core = &old_lines[lead..end];
+    if core.len() > lines.len() {
+        return None;
+    }
+
+    let mut hits: Vec<usize> = Vec::new();
+    for i in 0..=lines.len() - core.len() {
+        if lines[i..i + core.len()]
+            .iter()
+            .zip(core)
+            .all(|(f, o)| f.trim() == o.trim())
+        {
+            hits.push(i);
+        }
+    }
+    if hits.len() != 1 {
+        return None;
+    }
+
+    let i = hits[0];
+    let matched: String = lines[i..i + core.len()].concat();
+    let indent = common_indent(&lines[i..i + core.len()]);
+    let new_lines: Vec<&str> = new.lines().collect();
+    let new_common = common_indent(&new_lines);
+    let mut replacement = String::new();
+    for line in &new_lines {
+        if line.trim().is_empty() {
+            replacement.push('\n');
+            continue;
+        }
+        let body = line
+            .strip_prefix(new_common.as_str())
+            .unwrap_or_else(|| line.trim_start_matches([' ', '\t']));
+        replacement.push_str(&indent);
+        replacement.push_str(body);
+        replacement.push('\n');
+    }
+    Some((matched, replacement))
+}
+
 // ---------------------------------------------------------------------------
 // fs_list_dir
 // ---------------------------------------------------------------------------
@@ -278,19 +369,15 @@ struct FsEdit;
 static FS_EDIT_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "fs_edit".into(),
-    description: "Edit a file (project-root relative) in one of two modes: (1) literal - replace the first exact occurrence of `old` with `new` in `path` (byte-for-byte; include surrounding lines to be unique); (2) patch - apply a unified `diff` string to one or more files (send +/- hunks with a little context; each old block must appear exactly once). Prefer several small precise edits over whole-file rewrites.".into(),
+    description: "Edit a file (project-root relative) by replacing the first exact occurrence of `old` with `new` (byte-for-byte; include a line or two of surrounding context so the match is unique). Prefer several small precise edits over rewriting a file; to create a file or rewrite one wholesale, use fs_write_file instead.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "description": "File to edit (literal mode)." },
-            "old": { "type": "string", "description": "Exact text to find and replace (literal mode)." },
-            "new": { "type": "string", "description": "Replacement text (literal mode)." },
-            "diff": { "type": "string", "description": "Unified diff text (patch mode)." }
+            "path": { "type": "string", "description": "File to edit (project-root relative)." },
+            "old": { "type": "string", "description": "Exact text to find and replace." },
+            "new": { "type": "string", "description": "Replacement text." }
         },
-        "anyOf": [
-            { "required": ["path", "old", "new"] },
-            { "required": ["diff"] }
-        ],
+        "required": ["path", "old", "new"],
         "additionalProperties": false
     }),
 }
@@ -315,8 +402,12 @@ impl Tool for FsEdit {
             diff: Option<String>,
         }
         let args: Args = serde_json::from_value(args)?;
-        // Patch mode wins when a `diff` is given; otherwise literal mode needs
-        // path + old + new.
+        // `diff` remains a supported runtime argument (internal callers use it)
+        // but is deliberately NOT advertised in the schema: an `anyOf` over two
+        // call shapes makes a local OpenAI-compatible server's tool-call grammar
+        // degenerate (ministral emits empty/garbage calls), so the model-facing
+        // schema is the flat literal one. Patch mode still wins when `diff` is
+        // given; otherwise literal mode needs path + old + new.
         if let Some(diff) = args.diff {
             return self.patch_mode(ctx, diff).await;
         }
@@ -340,7 +431,11 @@ impl FsEdit {
         new: &str,
     ) -> Result<String> {
         if old.is_empty() {
-            anyhow::bail!("`old` must not be empty");
+            anyhow::bail!(
+                "`old` must not be empty. To INSERT, copy the last lines of the file into `old` \
+                 and set `new` to those same lines plus your addition; to create a file or rewrite \
+                 it wholesale, use fs_write_file instead"
+            );
         }
         let file = resolve(ctx, path)?;
         let rel = display_path(ctx, &file);
@@ -349,6 +444,29 @@ impl FsEdit {
             .with_context(|| format!("cannot read {rel}"))?;
         let count = before.matches(old).count();
         if count == 0 {
+            // Fallback for small models: re-read/typed `old` blocks often differ
+            // from the file only in indentation or trailing spaces. Retry with an
+            // indentation-insensitive match on whole lines, which is safe because
+            // the match must be unique.
+            if let Some((matched, replacement)) = fuzzy_line_match(&before, old, new) {
+                let after = before.replacen(&matched, &replacement, 1);
+                let loc = edit_location(&before, &matched, &replacement);
+                ctx.undo.capture(&rel, before.clone()).await?;
+                ctx.confirm(
+                    format!("fs_edit {rel} (literal, whitespace-tolerant)"),
+                    Some(format!(
+                        "{rel}\n{loc}\n--- remove ---\n{matched}\n+++ insert +++\n{replacement}"
+                    )),
+                )
+                .await?;
+                tokio::fs::write(&file, after)
+                    .await
+                    .with_context(|| format!("cannot write {rel}"))?;
+                return Ok(format!(
+                    "Edited {rel}: replaced 1 block ({loc}; matched ignoring indentation/trailing \
+                     spaces)."
+                ));
+            }
             anyhow::bail!(
                 "`old` block was not found in {rel}. Re-read the file and retry with an exact match."
             );
@@ -478,10 +596,28 @@ impl Tool for FsWriteFile {
             tokio::fs::write(&file, &args.content)
                 .await
                 .with_context(|| format!("cannot write {rel}"))?;
-            Ok(format!(
+            let mut msg = format!(
                 "Wrote {rel} ({} chars).",
                 args.content.chars().count()
-            ))
+            );
+            // A small model overwrites a whole file to make a one-line change and
+            // silently deletes the rest of it (including the tests that were
+            // there). Name what it dropped so the next turn can undo the damage
+            // instead of confidently reporting success. The delegate loop refuses
+            // the same call outright unless the tech lead approves it
+            // (comrade-core::delegate::refuse_destructive) - the lead agent, with
+            // a human to ask, only gets this warning.
+            let lost = comrade_tool::removed_declarations(&before, &args.content);
+            if !lost.is_empty() {
+                msg.push_str(&format!(
+                    "\nWARNING: this rewrite REMOVED code that was in {rel} before: {}. If you \
+                     only meant to add or change something, undo this by calling fs_edit with the \
+                     removed code back in `new`, or call fs_read_file first and retype the whole \
+                     file including it.",
+                    lost.join(", ")
+                ));
+            }
+            Ok(msg)
         } else {
             Ok(format!("{rel} is unchanged; nothing written."))
         }
@@ -1130,6 +1266,26 @@ mod tests {
     }
 
     #[test]
+    fn fs_edit_schema_is_flat_literal_only() {
+        // A local OpenAI-compatible server compiles each tool schema into a
+        // grammar and degenerates on `anyOf`: ministral-3-3b then emits
+        // empty/garbage calls instead of a usable edit (observed in the smoke
+        // trial). The model-facing schema must stay a FLAT literal edit
+        // (path + old + new); the `diff` patch mode is an internal-only extra.
+        let schema = &FS_EDIT_SPEC.json_schema;
+        assert!(schema.get("anyOf").is_none(), "{schema}");
+        assert!(schema.get("oneOf").is_none(), "{schema}");
+        assert!(schema["properties"].get("diff").is_none(), "{schema}");
+        let req: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required list")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(req, ["path", "old", "new"], "{schema}");
+    }
+
+    #[test]
     fn line_of_handles_multibyte_offsets() {
         // A byte offset landing inside a multi-byte UTF-8 char must not panic:
         // 'é' is 2 bytes, so offset 2 is its second byte.
@@ -1140,6 +1296,35 @@ mod tests {
         assert_eq!(line_of("a\né b", 3), 2);
         // Offset past the end clamps to the whole string.
         assert_eq!(line_of("a\né", 99), 2);
+    }
+
+    #[test]
+    fn fuzzy_line_match_ignores_indentation_and_trailing_space() {
+        // The file uses 4-space indentation; the model re-typed the block with
+        // 2 spaces (and a trailing space) - it still applies, re-indented to the
+        // block it replaces.
+        let file = "fn a() {\n    let x = 1;\n    x\n}\n";
+        let old = "  let x = 1;  \n  x";
+        let new = "  let x = 2;\n  x";
+        let (matched, replacement) = fuzzy_line_match(file, old, new).expect("unique match");
+        assert_eq!(matched, "    let x = 1;\n    x\n");
+        assert_eq!(replacement, "    let x = 2;\n    x\n");
+    }
+
+    #[test]
+    fn fuzzy_line_match_refuses_ambiguous_or_missing_blocks() {
+        let file = "a();\na();\n";
+        assert!(fuzzy_line_match(file, "  a();", "b();").is_none());
+        assert!(fuzzy_line_match(file, "nope();", "b();").is_none());
+        assert!(fuzzy_line_match(file, "   ", "b();").is_none());
+    }
+
+    #[test]
+    fn fuzzy_line_match_deletes_whole_lines() {
+        let file = "keep\nremove me\nkeep too\n";
+        let (matched, replacement) = fuzzy_line_match(file, "   remove me  ", "").expect("match");
+        assert_eq!(matched, "remove me\n");
+        assert_eq!(replacement, "");
     }
 
     #[test]

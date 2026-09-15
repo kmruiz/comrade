@@ -175,6 +175,7 @@ pub fn resolve(
 }
 
 /// Result of running a task to completion.
+#[derive(Debug)]
 pub struct TaskOutput {
     /// Whether the process exited successfully.
     pub success: bool,
@@ -206,6 +207,11 @@ pub async fn exec(resolved: &Resolved, timeout_secs: u64) -> Result<TaskOutput> 
         };
         command
             .current_dir(&resolved.cwd)
+            // Never inherit stdin: a command that reads it (`cat` with no
+            // operand is the classic small-model output) would block on the
+            // terminal forever and freeze the run. With an empty stdin such a
+            // command sees EOF and exits immediately.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -454,5 +460,51 @@ mod tests {
         );
         assert!(out.contains("exit 0"), "cargo check failed: {out}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod hang_tests {
+    use super::*;
+
+    fn shell(script: &str) -> Resolved {
+        Resolved {
+            describe: script.into(),
+            cwd: std::env::temp_dir(),
+            line: CommandLine::Shell {
+                script: script.into(),
+            },
+        }
+    }
+
+    /// A command that reads stdin (`cat` with no operand - a garbage shell
+    /// command a small model loves to emit) used to block the runner forever,
+    /// freezing the whole agent run. It must get an empty stdin and exit.
+    #[tokio::test]
+    async fn a_command_reading_stdin_does_not_freeze_the_runner() {
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            exec(&shell("cat"), 5),
+        )
+        .await
+        .expect("exec must not block on stdin")
+        .expect("cat sees EOF and exits ok");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert!(out.success, "cat should exit 0 on an empty stdin");
+    }
+
+    /// A command that ignores its stdin and truly hangs is still killed by the
+    /// timeout, and the call returns.
+    #[tokio::test]
+    async fn a_hanging_command_is_killed_by_the_timeout() {
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            exec(&shell("sleep 60"), 1),
+        )
+        .await
+        .expect("exec must return once its own timeout fires");
+        let err = out.expect_err("sleep 60 must time out").to_string();
+        assert!(err.contains("timed out"), "{err}");
     }
 }
