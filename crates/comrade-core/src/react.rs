@@ -648,6 +648,18 @@ mod dev_prompt_tests {
     }
 
     #[test]
+    fn prompt_orientates_the_model_to_the_project() {
+        let reg = ToolRegistry::new();
+        let prompt = build_system_prompt("/x", &reg, 6000);
+        // The intro section must tell the model it is inside a real software
+        // project and that requests from the user or another agent are about
+        // that project by default.
+        assert!(prompt.contains("is a software project"), "{prompt}");
+        assert!(prompt.contains("another agent"), "{prompt}");
+        assert!(prompt.contains("about this project"), "{prompt}");
+    }
+
+    #[test]
     fn prompt_encodes_adr_decisions_and_glossary() {
         let reg = ToolRegistry::new();
         let prompt = build_system_prompt("/x", &reg, 6000);
