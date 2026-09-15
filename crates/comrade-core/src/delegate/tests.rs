@@ -362,9 +362,9 @@ fn schema_advertises_models_and_required_args() {
         !model_desc.contains("mistral test delegate"),
         "model arg must not duplicate the listing:\n{model_desc}"
     );
-    assert!(schema["properties"]["task"].is_object());
+    assert!(schema["properties"]["jobs"].is_object());
     assert!(schema["properties"]["step"].is_object());
-    // `step` alone, or `model` + `task` (oneOf), are the two call shapes.
+    // `step` alone, or `jobs` (oneOf), are the two call shapes.
     let one_of = schema["oneOf"].as_array().unwrap();
     let requires = |needle: &str| {
         one_of.iter().any(|o| {
@@ -374,7 +374,7 @@ fn schema_advertises_models_and_required_args() {
         })
     };
     assert!(requires("step"));
-    assert!(requires("model") && requires("task"));
+    assert!(requires("jobs"));
 }
 
 #[test]
@@ -451,15 +451,13 @@ async fn invoke_queries_the_chosen_delegate() {
     let out = tool
         .invoke(
             &ctx,
-            json!({
-                "model": "cheap",
+            json!({"jobs": [{"model": "cheap",
                 "task": "Write a double() function.",
-                "context": "Rust, must be pure."
-            }),
+                "context": "Rust, must be pure."}]}),
         )
         .await
         .unwrap();
-    assert!(out.contains("delegate cheap"));
+    assert!(out.contains("job 1 (cheap)"));
     assert!(out.contains("here is the finished function"));
 }
 
@@ -473,7 +471,7 @@ async fn invoke_rejects_unknown_model_and_empty_task() {
     let tool = mk_delegate(&cfg.delegates).unwrap().unwrap();
     let ctx = test_ctx();
     let err = tool
-        .invoke(&ctx, json!({"model": "nope", "task": "x"}))
+        .invoke(&ctx, json!({"jobs": [{"model": "nope", "task": "x"}]}))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("unknown delegate model"));
@@ -485,7 +483,7 @@ async fn invoke_rejects_unknown_model_and_empty_task() {
     );
 
     let err = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "   "}))
+        .invoke(&ctx, json!({"jobs": [{"model": "cheap", "task": "   "}]}))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("task"));
@@ -626,7 +624,10 @@ async fn ask_gated_delegate_pauses_for_approval_then_runs() {
     }));
 
     let out = tool
-        .invoke(&ctx, json!({"model": "expensive", "task": "add a test"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "expensive", "task": "add a test"}]}),
+        )
         .await
         .unwrap();
     let held = titles.lock().unwrap();
@@ -637,7 +638,7 @@ async fn ask_gated_delegate_pauses_for_approval_then_runs() {
         held[0]
     );
     drop(held);
-    assert!(out.contains("delegate expensive"), "{out}");
+    assert!(out.contains("job 1 (expensive)"), "{out}");
 }
 
 #[tokio::test]
@@ -707,7 +708,10 @@ async fn deny_gated_delegate_is_refused_without_running() {
     let ctx = test_ctx();
 
     let err = tool
-        .invoke(&ctx, json!({"model": "guarded", "task": "any task"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "guarded", "task": "any task"}]}),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -722,10 +726,13 @@ async fn auto_gated_default_delegate_runs_without_any_prompt() {
     let tool = mk_delegate(&[delegate("cheap", &base)]).unwrap().unwrap();
     let ctx = ask_ctx(Arc::new(MustNotAsk));
     let out = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "add a test"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "add a test"}]}),
+        )
         .await
         .unwrap();
-    assert!(out.contains("delegate cheap"), "{out}");
+    assert!(out.contains("job 1 (cheap)"), "{out}");
 }
 
 fn cheap_tool(base_url: &str) -> DelegateTool {
@@ -829,7 +836,7 @@ async fn feedback_without_a_step_is_rejected() {
     let err = tool
         .invoke(
             &ctx,
-            json!({"model": "cheap", "task": "write double()", "feedback": "nope"}),
+            json!({"jobs": [{"model": "cheap", "task": "write double()"}], "feedback": "nope"}),
         )
         .await
         .unwrap_err();
@@ -1120,7 +1127,10 @@ async fn overflow_run(script: Vec<(u16, String)>) -> (String, usize) {
     let mut ctx = test_ctx();
     ctx.session = session.as_control();
     let out = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "change a to b"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "change a to b"}]}),
+        )
         .await
         .unwrap();
     (out, called.load(std::sync::atomic::Ordering::SeqCst))
@@ -1228,7 +1238,10 @@ async fn delegate_executes_its_tools_in_a_subagent_loop() {
         .unwrap();
     let ctx = test_ctx();
     let out = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "write src/a.rs"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "write src/a.rs"}]}),
+        )
         .await
         .unwrap();
     assert!(out.contains("done, file written"), "{out}");
@@ -1307,7 +1320,7 @@ async fn destructive_trial(verdict: Option<Verdict>, tag: &str) -> (usize, Strin
     let out = tool
         .invoke(
             &ctx,
-            json!({"model": "cheap", "task": "replace greet with shout"}),
+            json!({"jobs": [{"model": "cheap", "task": "replace greet with shout"}]}),
         )
         .await
         .unwrap();
@@ -1388,7 +1401,10 @@ async fn delegate_tool_activity_streams_as_chat_events() {
     ctx.events = Arc::new(crate::session::SessionEvents(tx));
 
     let out = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "write src/a.rs"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "write src/a.rs"}]}),
+        )
         .await
         .unwrap();
     assert!(out.contains("done, file written"), "{out}");
@@ -1460,7 +1476,10 @@ async fn delegate_thought_streams_as_a_chat_event() {
     ctx.events = Arc::new(crate::session::SessionEvents(tx));
 
     let out = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "write src/a.rs"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "write src/a.rs"}]}),
+        )
         .await
         .unwrap();
     assert!(out.contains("done"), "{out}");
@@ -1521,7 +1540,10 @@ async fn repeated_native_tool_call_is_refused_then_aborts() {
         .unwrap();
     let ctx = test_ctx();
     let err = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "write src/a.rs"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "write src/a.rs"}]}),
+        )
         .await
         .unwrap_err();
     let text = format!("{err:#}");
@@ -1558,7 +1580,10 @@ async fn repeated_react_tool_call_is_refused_then_aborts() {
         .unwrap();
     let ctx = test_ctx();
     let err = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "write src/a.rs"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "write src/a.rs"}]}),
+        )
         .await
         .unwrap_err();
     let text = format!("{err:#}");
@@ -1623,7 +1648,10 @@ async fn identical_call_after_a_mutation_is_not_a_loop() {
         .unwrap();
     let ctx = test_ctx();
     let out = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "write two files"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "write two files"}]}),
+        )
         .await
         .unwrap();
     assert!(out.contains("done, both files written"), "{out}");
@@ -1673,7 +1701,10 @@ async fn delegate_cannot_commit_even_if_the_model_asks() {
         .unwrap();
     let ctx = test_ctx();
     let out = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "commit everything"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "commit everything"}]}),
+        )
         .await
         .unwrap();
     // The sub-agent loop must not have crashed: unknown tool became an
@@ -1776,7 +1807,10 @@ async fn a_delegate_that_never_answers_times_out_within_its_budget() {
 
     let started = std::time::Instant::now();
     let out = tool
-        .invoke(&ctx, json!({"model": "slow", "task": "do the thing"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "slow", "task": "do the thing"}]}),
+        )
         .await
         .expect("a timed-out delegate returns a notice, not an error");
     let elapsed = started.elapsed();
@@ -1846,7 +1880,10 @@ async fn a_hanging_tool_is_cut_off_and_the_delegate_recovers() {
 
     let started = std::time::Instant::now();
     let out = tool
-        .invoke(&ctx, json!({"model": "reader", "task": "read the file"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "reader", "task": "read the file"}]}),
+        )
         .await
         .expect("a hanging tool is cut off, it does not block the run");
     let elapsed = started.elapsed();
@@ -1905,7 +1942,10 @@ async fn native_delegate_read_guard_stops_a_read_only_run() {
         .unwrap();
     let ctx = test_ctx();
     let out = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "read src/f0.rs"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "read src/f0.rs"}]}),
+        )
         .await
         .unwrap();
     assert!(out.contains("done reading"), "{out}");
@@ -1950,7 +1990,10 @@ async fn react_delegate_read_guard_stops_a_read_only_run() {
         .unwrap();
     let ctx = test_ctx();
     let out = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "read src/f0.rs"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "read src/f0.rs"}]}),
+        )
         .await
         .unwrap();
     assert!(out.contains("done reading"), "{out}");
@@ -2102,9 +2145,12 @@ async fn delegate_receives_a_steer_mid_run() {
     let run = tokio::spawn({
         let ctx = ctx.clone();
         async move {
-            tool.invoke(&ctx, json!({"model": "cheap", "task": "write src/a.rs"}))
-                .await
-                .unwrap()
+            tool.invoke(
+                &ctx,
+                json!({"jobs": [{"model": "cheap", "task": "write src/a.rs"}]}),
+            )
+            .await
+            .unwrap()
         }
     });
 
@@ -2137,7 +2183,7 @@ async fn parallel_delegates_run_every_job_and_merge_replies() {
     let a_url = fake_chat_server("reply-from-alpha");
     let b_url = fake_chat_server("reply-from-beta");
     let cfg = vec![delegate("alpha", &a_url), delegate("beta", &b_url)];
-    let tool = DelegateParallelTool::new(&cfg, ToolRegistry::new(), DelegateLimits::default())
+    let tool = DelegateTool::new(&cfg, ToolRegistry::new(), DelegateLimits::default())
         .unwrap()
         .unwrap();
     let ctx = test_ctx();
@@ -2232,7 +2278,7 @@ async fn isolated_parallel_job_runs_in_its_own_worktree() {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(WriteIntoRoot));
     let cfg = vec![delegate("alpha", &base)];
-    let tool = DelegateParallelTool::new(&cfg, registry, DelegateLimits::default())
+    let tool = DelegateTool::new(&cfg, registry, DelegateLimits::default())
         .unwrap()
         .unwrap();
     let mut ctx = test_ctx();
@@ -2242,7 +2288,7 @@ async fn isolated_parallel_job_runs_in_its_own_worktree() {
     let out = tool
         .invoke(
             &ctx,
-            json!({"jobs": [{"model": "alpha", "task": "write out.txt", "isolate": true}]}),
+            json!({"jobs": [{"model": "alpha", "task": "write out.txt"}]}),
         )
         .await
         .unwrap();
@@ -2281,7 +2327,7 @@ async fn parallel_jobs_isolate_by_default() {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(WriteIntoRoot));
     let cfg = vec![delegate("alpha", &base)];
-    let tool = DelegateParallelTool::new(&cfg, registry, DelegateLimits::default())
+    let tool = DelegateTool::new(&cfg, registry, DelegateLimits::default())
         .unwrap()
         .unwrap();
     let mut ctx = test_ctx();
@@ -2337,7 +2383,7 @@ async fn parallel_jobs_share_when_not_a_git_repo() {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(WriteIntoRoot));
     let cfg = vec![delegate("alpha", &base)];
-    let tool = DelegateParallelTool::new(&cfg, registry, DelegateLimits::default())
+    let tool = DelegateTool::new(&cfg, registry, DelegateLimits::default())
         .unwrap()
         .unwrap();
     let mut ctx = test_ctx();
@@ -2364,7 +2410,7 @@ async fn parallel_jobs_share_when_not_a_git_repo() {
 async fn parallel_delegates_reject_unknown_model_and_empty_jobs() {
     let url = fake_chat_server("unused");
     let cfg = vec![delegate("alpha", &url)];
-    let tool = DelegateParallelTool::new(&cfg, ToolRegistry::new(), DelegateLimits::default())
+    let tool = DelegateTool::new(&cfg, ToolRegistry::new(), DelegateLimits::default())
         .unwrap()
         .unwrap();
     let ctx = test_ctx();
@@ -2381,9 +2427,9 @@ async fn parallel_delegates_reject_unknown_model_and_empty_jobs() {
 }
 
 #[test]
-fn no_delegates_yields_no_parallel_tool() {
+fn no_delegates_yields_no_delegate_tool() {
     assert!(
-        DelegateParallelTool::new(&[], ToolRegistry::new(), DelegateLimits::default())
+        DelegateTool::new(&[], ToolRegistry::new(), DelegateLimits::default())
             .unwrap()
             .is_none()
     );
@@ -2480,7 +2526,10 @@ async fn a_frozen_delegate_is_nudged_to_act() {
     let ctx = test_ctx();
 
     let out = tool
-        .invoke(&ctx, json!({"model": "frozen", "task": "read the file"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "frozen", "task": "read the file"}]}),
+        )
         .await
         .unwrap();
     assert!(out.contains("acted at last"), "{out}");
@@ -2567,7 +2616,10 @@ async fn a_progressing_delegate_is_never_cut_off() {
 
     let started = std::time::Instant::now();
     let out = tool
-        .invoke(&ctx, json!({"model": "steady", "task": "read four files"}))
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "steady", "task": "read four files"}]}),
+        )
         .await
         .unwrap();
     let elapsed = started.elapsed();

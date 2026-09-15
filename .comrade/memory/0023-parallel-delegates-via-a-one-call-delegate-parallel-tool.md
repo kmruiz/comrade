@@ -1,5 +1,5 @@
 # 0023 - Parallel delegates via a one-call `delegate_parallel` tool
-status: accepted
+status: superseded
 date: 2026-09-13
 tags: delegates, concurrency, tools
 summary: Add a `delegate_parallel` tool that runs up to 8 independent delegate jobs concurrently in one call (works under native and ReAct), gating each job's approval up front; delegates may not call it.
@@ -52,3 +52,6 @@ Rollup of parallel delegation: this ADR adds delegate_parallel (up to 8 concurre
 
 ## Note
 Amended by the new ADR on isolating by default: the `isolate` default is now true (opt out with isolate=false), non-git projects fall back to the shared workspace instead of erroring, and the deferred "explicit merge/apply step" is now mandatory in the tech-lead prompt (`git apply --3way`).
+
+## Note
+Superseded on the tool surface by #0072: the separate `delegate_parallel` tool was merged into `delegate` as its `jobs` argument, and the `model`+`task` ad-hoc shorthand of `delegate` was removed. Plan-step delegation, the deny list and the approval gating it describes are unchanged.

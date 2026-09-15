@@ -1,9 +1,13 @@
-//! The `delegate` tool: hand a single, self-contained sub-task to another
-//! model — typically a cheaper or faster one on a different provider.
+//! The `delegate` tool: hand work to another model — typically a cheaper or
+//! faster one on a different provider.
 //!
-//! The companion `delegate_parallel` tool fans out SEVERAL such tasks at once
-//! (a single call, so it works in both the native and ReAct protocols) and
-//! returns every reply together.
+//! The same tool covers both shapes, and they are mutually exclusive:
+//! - `step`: run ONE plan step on the delegate model assigned to it (the task,
+//!   context and model all come from the plan).
+//! - `jobs`: fan out one or MORE independent ad-hoc tasks at once (a single
+//!   call, so it works in both the native and ReAct protocols) and return every
+//!   reply together. Every job is always isolated in its own git worktree, so
+//!   parallel jobs cannot clobber each other's files.
 //!
 //! The main ("tech lead") model keeps orchestrating and committing, but can
 //! offload a well-defined piece of work to a developer model configured in
@@ -63,7 +67,6 @@ pub const DENIED_FOR_DELEGATES: &[&str] = &[
     "git_branch",
     "git_checkout",
     "delegate",
-    "delegate_parallel",
     "ask_advise",
     "summarise",
     "ask_form",
@@ -74,7 +77,6 @@ pub const DENIED_FOR_DELEGATES: &[&str] = &[
     "self_set_step_model",
     "self_set_step_context",
     "self_finish_plan",
-    "delegate_parallel",
     "run_bg",
     "bg_status",
     "bg_tail",
@@ -278,25 +280,34 @@ impl DelegateTool {
             .collect::<Vec<_>>()
             .join("\n");
         let body = [
-            "Hand ONE self-contained task to another model - a delegate sub-agent WITH tools",
-            "(read/search, fs_write_file, pom_run_tests, memory, web) minus git_commit; only you commit.",
+            "Hand work to other models - delegate sub-agents WITH tools (read/search, fs_write_file,",
+            "pom_run_tests, memory, web) minus git_commit; only you commit.",
             "",
-            "Delegating runs without human approval. A delegate configured `approval = \"ask\"`",
-            "pauses for approval first; `approval = \"deny\"` refuses it.",
+            "Two modes, mutually exclusive:",
+            "- `step`: run ONE of your plan steps on its model (the task, context and model come from",
+            "  the step; `model` must match). A plan step you run yourself carries the reserved model",
+            "  \"self\" and cannot be delegated.",
+            "- `jobs`: fan out ONE or MORE independent ad-hoc tasks at the same time, each with its own",
+            "  model/task/context, and get every reply together. Use it for work that is not a plan",
+            "  step: split a job into independent sub-tasks, or run several reviews of the same diff.",
             "",
-            "To run one of your plan steps, pass `step`: the task, context and model then come from",
-            "the step, and `model` must match the step's model. Otherwise pass `model` + `task`",
-            "(+ optional `context`) for ad-hoc work. Plan steps you run yourself carry the reserved",
-            "model \"self\" and cannot be delegated via `step`.",
+            "EVERY job is ALWAYS isolated in its own git worktree (a detached checkout under",
+            ".comrade/worktrees/), so parallel jobs cannot clobber each other's work. When ALL the",
+            "delegates are done you MUST merge each kept worktree back into the repo before you",
+            "verify or commit: for each reported worktree `<wt>`, from the project root run",
+            "`git -C <wt> add -A && git -C <wt> diff --cached --binary | git -C <repo> apply --3way`",
+            "(with `<repo>` the project root), fix any conflict, then drop the worktree with",
+            "`git -C <repo> worktree remove --force <wt>`. A job that changed nothing has its worktree",
+            "removed for you. In a non-git project jobs fall back to sharing the workspace.",
             "",
-            "Delegating a step marks it in_progress with a `working: <model>` note. After the",
-            "delegate replies, run the step's verification yourself with your tools; on failure",
-            "re-delegate the SAME step with `feedback` so it fixes its work (up to 5 fix rounds,",
-            "then do the step yourself). The delegate closes with a VERIFICATION: line, but that is",
-            "never proof - you verify.",
+            "Delegating runs without human approval. A delegate configured `approval = \"ask\"` pauses",
+            "for approval first (once per job); `approval = \"deny\"` refuses it.",
             "",
-            "Several independent delegate calls issued in one message run in PARALLEL - split",
-            "independent sub-tasks into separate calls and batch them together.",
+            "Running a step marks it in_progress with a `working: <model>` note. After the delegate",
+            "replies, run the step's verification yourself with your tools; on failure re-delegate the",
+            "SAME step with `feedback` so it fixes its work (up to 5 fix rounds, then do the step",
+            "yourself). The delegate closes with a VERIFICATION: line, but that is never proof - you",
+            "verify.",
         ]
         .join("\n");
         let description = format!(
@@ -309,29 +320,37 @@ impl DelegateTool {
                 "step": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Plan step id to execute. The task, context and model come from the step."
+                    "description": "Plan step id to execute. The task, context and model come from the step. Mutually exclusive with `jobs`."
                 },
                 "model": {
                     "type": "string",
-                    "enum": names,
-                    "description": "Which configured delegate model does the work. Must match the step's model when `step` is given."
-                },
-                "task": {
-                    "type": "string",
-                    "description": "The exact, self-contained job for the delegate: paths, code, identifiers, expected output. Mutually exclusive with `step`."
-                },
-                "context": {
-                    "type": "string",
-                    "description": "Optional background for the delegate: existing code, error logs, constraints. Mutually exclusive with `step`."
+                    "enum": names.clone(),
+                    "description": "Which configured delegate model does the work. Only with `step`: must match the step's model."
                 },
                 "feedback": {
                     "type": "string",
-                    "description": "Your verification failure output for a step this delegate already attempted; it must fix its work until it passes. One fix round (max 5 per step). Must contain an actionable plan."
+                    "description": "Your verification failure output for a step this delegate already attempted; it must fix its work until it passes. One fix round (max 5 per step). Only with `step`."
+                },
+                "jobs": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": parallel::MAX_PARALLEL_JOBS,
+                    "description": "The independent ad-hoc tasks to run concurrently, each isolated in its own git worktree. Mutually exclusive with `step`.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "model": { "type": "string", "enum": names, "description": "Configured delegate model for this job." },
+                            "task": { "type": "string", "description": "Self-contained job for the delegate: paths, code, expected output." },
+                            "context": { "type": "string", "description": "Optional background for the delegate." }
+                        },
+                        "required": ["model", "task"],
+                        "additionalProperties": false
+                    }
                 }
             },
             "oneOf": [
                 { "required": ["step"] },
-                { "required": ["model", "task"] }
+                { "required": ["jobs"] }
             ],
             "additionalProperties": false
         });
@@ -357,6 +376,29 @@ impl Tool for DelegateTool {
 
     async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
         let step_id = args.get("step").and_then(Value::as_u64);
+        if step_id.is_some() && args.get("jobs").is_some() {
+            bail!(
+                "pass either `step` (run one plan step on its model) or `jobs` (fan out one or \
+                 more ad-hoc tasks), not both"
+            );
+        }
+        if step_id.is_none() {
+            if !args
+                .get("feedback")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                bail!(
+                    "`feedback` is only valid with `step`: it reports a failed verification to a \
+                     delegate that previously attempted that plan step"
+                );
+            }
+            // No plan step: the `jobs` fan-out mode. Every job is isolated in its
+            // own git worktree so parallel jobs cannot clobber each other.
+            return parallel::run_jobs(ctx, &self.targets, &self.tools, &self.limits, &args).await;
+        }
         let model_arg = args
             .get("model")
             .and_then(Value::as_str)
@@ -369,109 +411,73 @@ impl Tool for DelegateTool {
             .unwrap_or_default()
             .trim()
             .to_string();
-        if !feedback.is_empty() && step_id.is_none() {
-            bail!(
-                "`feedback` is only valid with `step`: it reports a failed verification to a \
-                 delegate that previously attempted that plan step"
-            );
-        }
-
-        // When a plan step is delegated, remember its previous status so the
-        // plan can be restored if the delegate call itself fails.
-        let mut delegated_step: Option<(u64, PlanStatus)> = None;
-        // The `working: <model>` note to apply once the run is approved. Kept
-        // separate so the plan is only touched after the approval gate passes.
-        let mut delegated_note: Option<String> = None;
-
-        // Resolve what to run: either an explicit ad-hoc task, or one plan step
-        // (whose goal/verification/context/model all come from the plan).
-        let (task, context, model) = match step_id {
-            Some(id) => {
-                // A small model often passes `step` together with a `task` (or a
-                // `context`) that just restates the step. Be lenient: the step's
-                // own task/context win and the duplicate is ignored, rather than
-                // failing the call and making the model burn a turn retrying.
-                let found = ctx
-                    .session
-                    .plan()
-                    .into_iter()
-                    .find(|s| s.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("no plan step with id {id}"))?;
-                if !model_arg.is_empty() && model_arg != found.model {
-                    bail!(
-                        "`model` {model_arg:?} does not match the model assigned to plan step {id} \
+        // The step's goal/verification/context/model all come from the plan. A
+        // small model often passes `step` together with a `task` (or a
+        // `context`) that just restates the step: be lenient and let the step's
+        // own task/context win, rather than failing the call and making the
+        // model burn a turn retrying.
+        let id = step_id.expect("checked above: `step` mode");
+        let (task, context, model, previous, note) = {
+            let found = ctx
+                .session
+                .plan()
+                .into_iter()
+                .find(|s| s.id == id)
+                .ok_or_else(|| anyhow::anyhow!("no plan step with id {id}"))?;
+            if !model_arg.is_empty() && model_arg != found.model {
+                bail!(
+                    "`model` {model_arg:?} does not match the model assigned to plan step {id} \
                          ({:?})",
-                        found.model
-                    );
-                }
-                if found.model.trim().is_empty() {
-                    bail!(
-                        "plan step {id} has no delegate model assigned; it runs on the main model"
-                    );
-                }
-                if found.model.trim() == AGENT_MODEL {
-                    bail!(
-                        "plan step {id} is assigned to the main agent model ({AGENT_MODEL:?}), not \
+                    found.model
+                );
+            }
+            if found.model.trim().is_empty() {
+                bail!("plan step {id} has no delegate model assigned; it runs on the main model");
+            }
+            if found.model.trim() == AGENT_MODEL {
+                bail!(
+                    "plan step {id} is assigned to the main agent model ({AGENT_MODEL:?}), not \
                          a delegate — do the step yourself instead of delegating it"
-                    );
-                }
-                let goal = found.goal.trim();
-                let verify = found.verification.trim();
-                let task = if verify.is_empty() {
-                    goal.to_string()
-                } else {
-                    format!("{goal}\n\nVerify your work: {verify}")
-                };
+                );
+            }
+            let goal = found.goal.trim();
+            let verify = found.verification.trim();
+            let task = if verify.is_empty() {
+                goal.to_string()
+            } else {
+                format!("{goal}\n\nVerify your work: {verify}")
+            };
 
-                // Compute the `working: <model>` note the plan will show once
-                // the run is approved, and count the fix rounds. A step gets one
-                // attempt from the delegate, then up to MAX_FIX_ROUNDS repairs
-                // requested via `feedback`; past that the parent must take over.
-                let fixes = fix_rounds_in_note(found.note.as_deref(), &found.model);
-                if fixes >= MAX_FIX_ROUNDS {
-                    bail!(
-                        "plan step {id} already had {MAX_FIX_ROUNDS} failed fix round(s) with \
+            // Compute the `working: <model>` note the plan will show once
+            // the run is approved, and count the fix rounds. A step gets one
+            // attempt from the delegate, then up to MAX_FIX_ROUNDS repairs
+            // requested via `feedback`; past that the parent must take over.
+            let fixes = fix_rounds_in_note(found.note.as_deref(), &found.model);
+            if fixes >= MAX_FIX_ROUNDS {
+                bail!(
+                    "plan step {id} already had {MAX_FIX_ROUNDS} failed fix round(s) with \
                          delegate {:?}; stop delegating and do the step yourself",
-                        found.model
-                    );
-                }
-                let note = if feedback.is_empty() {
-                    if fixes == 0 {
-                        format!("working: {}", found.model)
-                    } else {
-                        // a bare re-run keeps the fix count intact
-                        format!("working: {} (fix {fixes}/{MAX_FIX_ROUNDS})", found.model)
-                    }
+                    found.model
+                );
+            }
+            let note = if feedback.is_empty() {
+                if fixes == 0 {
+                    format!("working: {}", found.model)
                 } else {
-                    format!(
-                        "working: {} (fix {}/{MAX_FIX_ROUNDS})",
-                        found.model,
-                        fixes + 1
-                    )
-                };
-                delegated_step = Some((id, found.status));
-                // The plan is marked working after the approval gate (below):
-                // a denied run must leave the step in its previous status.
-                delegated_note = Some(note);
-
-                (task, found.context, found.model)
-            }
-            None => {
-                let task = args
-                    .get("task")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if task.trim().is_empty() {
-                    bail!("`task` must not be empty (or pass `step` to delegate a plan step)");
+                    // a bare re-run keeps the fix count intact
+                    format!("working: {} (fix {fixes}/{MAX_FIX_ROUNDS})", found.model)
                 }
-                let context = args
-                    .get("context")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                (task, context, model_arg)
-            }
+            } else {
+                format!(
+                    "working: {} (fix {}/{MAX_FIX_ROUNDS})",
+                    found.model,
+                    fixes + 1
+                )
+            }; // The `working: <model>` note, applied only after the approval gate.
+
+            // The step's previous status, so the plan can be restored if the
+            // delegate call itself fails.
+            (task, found.context, found.model, found.status, note)
         };
 
         let Some(target) = self.targets.iter().find(|t| t.cfg.name == model) else {
@@ -499,13 +505,8 @@ impl Tool for DelegateTool {
 
         // Reflect the delegation in the plan only after approval passed, so a
         // denial or a deny-gated model never leaves the step half-claimed.
-        if let (Some(id), Some(note)) = (step_id, delegated_note.as_deref()) {
-            ctx.session.update_plan(
-                PlanTarget::Id(id),
-                PlanStatus::InProgress,
-                Some(note.to_string()),
-            );
-        }
+        ctx.session
+            .update_plan(PlanTarget::Id(id), PlanStatus::InProgress, Some(note));
 
         let user_prompt = if feedback.is_empty() {
             if context.trim().is_empty() {
@@ -550,13 +551,11 @@ impl Tool for DelegateTool {
             Err(err) => {
                 // The delegate never finished: pull the step back from
                 // "working" so the plan does not claim a delegate is on the job.
-                if let Some((id, previous)) = delegated_step {
-                    ctx.session.update_plan(
-                        PlanTarget::Id(id),
-                        previous,
-                        Some(format!("delegate {model} failed to run")),
-                    );
-                }
+                ctx.session.update_plan(
+                    PlanTarget::Id(id),
+                    previous,
+                    Some(format!("delegate {model} failed to run")),
+                );
                 return Err(err);
             }
         };
@@ -564,9 +563,7 @@ impl Tool for DelegateTool {
         // The delegate produced a reply: record that this plan step really ran
         // on a delegate, so the root cannot later complete it "itself" without
         // delegating (enforced by update_plan/finish_plan).
-        if let Some((id, _)) = delegated_step {
-            ctx.session.mark_step_delegated(id);
-        }
+        ctx.session.mark_step_delegated(id);
 
         Ok(format!("delegate {model} ({display}) replied:\n{reply}"))
     }
@@ -1393,6 +1390,5 @@ fn fix_rounds_in_note(note: Option<&str>, model: &str) -> u64 {
 }
 
 mod parallel;
-pub use parallel::*;
 #[cfg(test)]
 mod tests;

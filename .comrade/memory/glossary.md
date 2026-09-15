@@ -237,6 +237,17 @@ Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by rende
 - `crates/comrade-core/src/config.rs`
 - `README.md`
 
+## delegate tool
+> The single tool the tech lead uses to hand work to a developer model. It has two mutually exclusive modes: `step` (run ONE plan step on the delegate model assigned to it, with `working:` notes and up to 5 `feedback` fix rounds) and `jobs` (fan out 1..=8 ad-hoc `{model, task, context}` tasks in one call and return every reply together). There is no separate `delegate_parallel` tool any more.
+
+**References:**
+- `crates/comrade-core/src/delegate.rs`
+- `crates/comrade-core/src/delegate/parallel.rs`
+- `crates/comrade-core/prompts/delegate-by-default.md`
+
+**Notes:**
+Every `jobs` entry is ALWAYS isolated in its own git worktree under `.comrade/worktrees/` - the old `isolate` flag is gone. A non-git project falls back to the shared workspace with a notice. If every job in a batch fails, the tool returns `Err`; a partial batch returns `Ok` with per-job `FAILED` lines. Delegates themselves never get this tool (it is in DENIED_FOR_DELEGATES, so no recursion).
+
 ## delegate_parallel
 > `delegate_parallel` (comrade-core delegate.rs, `DelegateParallelTool`): runs up to 8 independent delegate jobs concurrently in ONE call (jobs: [{model, task, context}]) and returns each reply. Works under both native and ReAct protocols, unlike the loop's own parallel dispatch of a pure-delegate native batch.
 

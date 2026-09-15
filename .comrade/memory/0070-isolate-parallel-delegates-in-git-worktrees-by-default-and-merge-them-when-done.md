@@ -1,5 +1,5 @@
 # 0070 - Isolate parallel delegates in git worktrees by default and merge them when done
-status: accepted
+status: superseded
 date: 2026-09-15
 tags: delegate, worktree, git, prompt
 summary: delegate_parallel jobs now isolate into a git worktree by default (isolate=false to share, non-git projects fall back to sharing), and the tech-lead prompt MUST merge each kept worktree back with `git apply --3way` before verify/commit.
@@ -22,3 +22,6 @@ The delegate_parallel isolation default, the non-git fallback, the tool's output
 ## Impact
 Parallel delegate jobs are isolated and therefore safe by default; the lead now carries a mandatory merge step before verify/commit, and non-git projects silently share the workspace (with a notice). Worktrees live under .comrade/worktrees/ (already git-ignored). Tests: parallel_jobs_isolate_by_default, parallel_jobs_share_when_not_a_git_repo, and the extended react.rs delegation-prompt test.
 
+
+## Note
+Superseded on the tool surface by #0072: `delegate_parallel` no longer exists (merged into `delegate` as the `jobs` argument) and the `isolate` opt-out is gone - jobs are now unconditionally isolated. The isolation-by-default behaviour and the mandatory merge-back recipe this ADR introduced are retained verbatim.

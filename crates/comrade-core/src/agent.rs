@@ -37,7 +37,6 @@ const MUTATING_TOOLS: &[&str] = &[
     "git_branch",
     "git_checkout",
     "delegate",
-    "delegate_parallel",
     "pom_run_task",
     "record_adr",
     "amend_adr",
@@ -122,7 +121,6 @@ const PROGRESS_TOOLS: &[&str] = &[
     "self_rename_session",
     "ask_form",
     "delegate",
-    "delegate_parallel",
     "record_adr",
     "amend_adr",
     "merge_adr",
@@ -2379,8 +2377,8 @@ mod tests {
                 }
                 let body = if n == 0 {
                     concat!(
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"Delegating two tasks.\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"delegate\",\"arguments\":\"{\\\"model\\\": \\\"a\\\", \\\"task\\\": \\\"alpha work\\\"}\"}}]}}]}\n\n",
-                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"delegate\",\"arguments\":\"{\\\"model\\\": \\\"b\\\", \\\"task\\\": \\\"beta work\\\"}\"}}]}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Delegating two tasks.\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"delegate\",\"arguments\":\"{\\\"jobs\\\": [{\\\"model\\\": \\\"a\\\", \\\"task\\\": \\\"alpha work\\\"}]}\"}}]}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"delegate\",\"arguments\":\"{\\\"jobs\\\": [{\\\"model\\\": \\\"b\\\", \\\"task\\\": \\\"beta work\\\"}]}\"}}]}}]}\n\n",
                         "data: [DONE]\n\n"
                     )
                 } else {
