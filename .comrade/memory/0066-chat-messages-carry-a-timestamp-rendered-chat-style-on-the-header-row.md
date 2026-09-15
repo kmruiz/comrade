@@ -1,0 +1,24 @@
+# 0066 - Chat messages carry a timestamp, rendered chat-style on the header row
+status: accepted
+date: 2026-09-15
+tags: tui, chat, design, time
+summary: Every chat message stores a Unix-seconds `Msg::ts` (serde-defaulted for old sessions), stamped once in `push_msg`; the User/Assistant/Delegate/Reasoning header rows render it right-aligned in dim, as a relative age ("now", "5m") under an hour and local "HH:MM" beyond that.
+
+## Context
+The transcript had no sense of when a message happened: a session restored days later, or a long idle gap mid-session, looked like one continuous conversation. The user asked for chat-style timestamps per message, with the rule "if it's at least 1h ago, show the time in HH:MM".
+
+## Decision
+`Msg` (crates/comrade-tui/src/tui.rs) gains `#[serde(default)] ts: Option<u64>` (Unix seconds). It is set in exactly one place, `App::push_msg`, via `ts.get_or_insert_with(now_secs)`, so every message that enters the chat is stamped once at append time and folds/clones (run digests, delegate sub-chats) carry it along. Rows restored from an older session.json have no ts and render no stamp at all, exactly as before. Three pure helpers next to `now_ms()`: `now_secs()`, `hhmm_local(ts)` (chrono `Local`, format "%H:%M") and `fmt_stamp(ts, now)` -> "now" (<1 min), "{m}m" (<1 h) or the local "HH:MM" (>=1 h, and for a future ts due to clock skew the saturating_sub yields "now"). `layout_chat_rows` takes the wall clock as a new `now: u64` parameter; `stamp_of(&Msg, now)` turns a ts into its label and `right_stamp(stamp, used, width)` produces the dim, right-aligned span (None if it would not fit). The stamp is attached to the header row of the spoken blocks: the user turn's first echo row (its body is wrapped narrower to leave room), `author_header` (Assistant and Delegate) and `layout_reasoning` (including reasoning folded inside a run digest in focus mode). Tool cards, meta notes and run-digest headers get none.
+
+## Rationale
+Stamping in `push_msg` rather than in the `Msg` constructors keeps every pure-constructor caller (notably the ~40 layout tests that build messages directly and assert on exact spans) unchanged: a test-built message has no ts and renders byte-identically to before, and only the three new tests opt in. Right-aligning the stamp is what makes the header read like a chat client, and reserving its width before wrapping means a long user prompt never swallows it. Relative-under-an-hour keeps the common case short while an absolute HH:MM is what you actually want for anything older; one minute is the natural granularity of the label, so the cached row layout keys on `now/60` and rebuilds when the minute rolls over.
+
+## Alternatives considered
+1) Format the label once at push time and store the string: rejected, it would freeze "now"/"5m" forever. 2) Compute the label in the draw path only: rejected, the layout is cached and would never refresh. 3) Add a `now` parameter to `chat_cache`/`draw_chat` instead of keying the cache on a minute bucket: rejected as extra signature churn for the same effect; `chat_cache` reads the clock itself. 4) Show a stamp on every row, including tool cards and meta notes: rejected as noise (and it would churn many span assertions). 5) Add a general date/time crate (`time`, or chrono with an explicit feature set): chrono 0.4.45 is already in the workspace lock via rmcp/oauth2/schemars, so `chrono = "0.4"` in comrade-tui adds no new download; default features are required for `Local` (the `clock` feature). 6) Render HH:MM in UTC: rejected, the timestamp is for the human's wall clock.
+
+## Scope
+Comrade-tui only: the `Msg` struct + constructors, `push_msg`, `ChatRowsCache`/`chat_cache`, `layout_chat_rows`, `author_header`, `layout_reasoning`, two new helpers, and three new tests. Does not change tool cards, meta/failure rows, run-digest headers, the model/plan panels, or the session file format (ts is optional, so old sessions load unchanged).
+
+## Impact
+A transcript now reads like a chat: fresh messages show "now"/"42m" on their header, anything older shows the local time it happened. The row cache gains one `now_min` field so the labels refresh each minute. `comrade-tui` gains a direct `chrono` dependency (already in the lock). Tests: `stamp_is_relative_then_wall_clock`, `assistant_header_shows_a_relative_timestamp`, `old_message_header_shows_the_wall_clock`, `message_without_a_timestamp_renders_no_stamp` (190 passing in comrade-tui, workspace green).
+

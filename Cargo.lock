@@ -582,6 +582,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-trait",
+ "chrono",
  "clap",
  "comrade-core",
  "comrade-tool",

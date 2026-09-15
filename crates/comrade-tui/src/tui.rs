@@ -195,6 +195,10 @@ pub(crate) struct Msg {
     /// The original messages behind a folded [`MsgKind::Run`] digest. Empty for
     /// every other kind.
     children: Vec<Msg>,
+    /// Unix seconds when the message was appended to the chat. None on rows
+    /// restored from an older session file, which then show no timestamp.
+    #[serde(default)]
+    ts: Option<u64>,
 }
 
 impl Msg {
@@ -207,6 +211,7 @@ impl Msg {
             author: None,
             open: false,
             children: Vec::new(),
+            ts: None,
         }
     }
     fn authored(kind: MsgKind, author: impl Into<String>, text: impl Into<String>) -> Self {
@@ -218,6 +223,7 @@ impl Msg {
             author: Some(author.into()),
             open: false,
             children: Vec::new(),
+            ts: None,
         }
     }
     fn tool(card: ToolCard) -> Self {
@@ -229,6 +235,7 @@ impl Msg {
             author: None,
             open: false,
             children: Vec::new(),
+            ts: None,
         }
     }
     fn failure(name: String, detail: String) -> Self {
@@ -244,6 +251,7 @@ impl Msg {
             author: None,
             open: false,
             children: Vec::new(),
+            ts: None,
         }
     }
     /// A folded digest holding the messages of one completed activity stretch.
@@ -256,6 +264,7 @@ impl Msg {
             author: None,
             open: false,
             children,
+            ts: None,
         }
     }
     /// A thinking block under `author`, rendered like a spoken answer with a
@@ -290,6 +299,10 @@ struct ChatRowsCache {
     epoch: u64,
     /// Value of App::focus_mode when this layout was built.
     focus: bool,
+    /// Minute bucket (`now_secs() / 60`) this layout was built in: the relative
+    /// timestamps on the headers ("now", "5m") age, so the rows must be rebuilt
+    /// when the minute rolls over.
+    now_min: u64,
     rows: Vec<RenderRow>,
     /// Owning chat-message index per row (parallel to `rows`).
     owner: Vec<Option<usize>>,
@@ -311,15 +324,18 @@ fn chat_cache<'a>(
     delegates: &[DelegateCfg],
     colors: &ModelColors,
 ) -> &'a ChatRowsCache {
-    let stale =
-        !matches!(cache, Some(c) if c.epoch == epoch && c.width == width && c.focus == focus);
+    let now = now_secs();
+    let now_min = now / 60;
+    let stale = !matches!(cache, Some(c)
+        if c.epoch == epoch && c.width == width && c.focus == focus && c.now_min == now_min);
     if stale {
         let (rows, owner, ranges) =
-            layout_chat_rows(chat, collapsed, "", width, delegates, colors, focus);
+            layout_chat_rows(chat, collapsed, "", width, delegates, colors, focus, now);
         *cache = Some(ChatRowsCache {
             width,
             epoch,
             focus,
+            now_min,
             rows,
             owner,
             ranges,
@@ -1459,7 +1475,10 @@ impl App {
         self.push_msg(Msg::reasoning(author, text));
     }
 
-    fn push_msg(&mut self, msg: Msg) {
+    fn push_msg(&mut self, mut msg: Msg) {
+        // Stamp once, at append time: the renderer turns it into a chat-style
+        // timestamp ("now", "5m", "14:32").
+        msg.ts.get_or_insert_with(now_secs);
         self.chat_epoch = self.chat_epoch.wrapping_add(1);
         if self.chat.len() >= 400 {
             self.chat.remove(0);
@@ -5911,6 +5930,7 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
 /// owning chat-message index and that message's `(start row, height)` span.
 type ChatRowLayout = (Vec<RenderRow>, Vec<Option<usize>>, Vec<(usize, usize)>);
 
+#[allow(clippy::too_many_arguments)]
 fn layout_chat_rows(
     chat: &[Msg],
     collapsed: &[bool],
@@ -5919,6 +5939,9 @@ fn layout_chat_rows(
     delegates: &[DelegateCfg],
     colors: &ModelColors,
     focus: bool,
+    // Wall clock (Unix seconds) used to label each message with a chat-style
+    // timestamp.
+    now: u64,
 ) -> ChatRowLayout {
     let mut out = Vec::new();
     let mut owner: Vec<Option<usize>> = Vec::new();
@@ -5969,13 +5992,26 @@ fn layout_chat_rows(
                         .add_modifier(Modifier::BOLD),
                 );
                 let cont = Span::styled("  ", dim);
-                for (k, spans) in md_to_lines(&msg.text, width.saturating_sub(2))
-                    .into_iter()
-                    .enumerate()
-                {
-                    let mut row = Vec::with_capacity(spans.len() + 1);
+                // The turn's timestamp goes right-aligned on the first row, so
+                // the echo body is wrapped narrower to leave room for it.
+                let stamp = stamp_of(msg, now);
+                let stamp_w = stamp
+                    .as_deref()
+                    .map_or(0, |s| s.chars().count().saturating_add(1));
+                let body_w = width.saturating_sub(2 + stamp_w).max(1);
+                for (k, spans) in md_to_lines(&msg.text, body_w).into_iter().enumerate() {
+                    let mut row = Vec::with_capacity(spans.len() + 2);
                     row.push(if k == 0 { echo.clone() } else { cont.clone() });
+                    let used = 2 + spans
+                        .iter()
+                        .map(|s| s.content.chars().count())
+                        .sum::<usize>();
                     row.extend(spans);
+                    if k == 0
+                        && let Some(s) = stamp.as_deref().and_then(|t| right_stamp(t, used, width))
+                    {
+                        row.push(s);
+                    }
                     out.push(RenderRow {
                         rule: Some(Color::Green),
                         spans: row,
@@ -6007,6 +6043,7 @@ fn layout_chat_rows(
                     // folded inside it, rendered as normal reasoning blocks.
                     for child in &msg.children {
                         if child.kind == MsgKind::Reasoning {
+                            let stamp = stamp_of(child, now);
                             layout_reasoning(
                                 &mut out,
                                 child.text.as_str(),
@@ -6014,6 +6051,7 @@ fn layout_chat_rows(
                                 colors,
                                 child.open,
                                 width,
+                                stamp.as_deref(),
                             );
                         }
                     }
@@ -6023,14 +6061,18 @@ fn layout_chat_rows(
             }
             MsgKind::Failure => layout_failure(&mut out, i, msg.fail.as_ref().unwrap(), width),
             MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), w),
-            MsgKind::Reasoning => layout_reasoning(
-                &mut out,
-                msg.text.as_str(),
-                msg.author.as_deref().unwrap_or("model"),
-                colors,
-                msg.open,
-                width,
-            ),
+            MsgKind::Reasoning => {
+                let stamp = stamp_of(msg, now);
+                layout_reasoning(
+                    &mut out,
+                    msg.text.as_str(),
+                    msg.author.as_deref().unwrap_or("model"),
+                    colors,
+                    msg.open,
+                    width,
+                    stamp.as_deref(),
+                );
+            }
             MsgKind::Meta => {
                 for s in plain_wrap(&msg.text, width) {
                     out.push(RenderRow {
@@ -6061,7 +6103,14 @@ fn layout_chat_rows(
                 // colour — the same shape as the reasoning block, so answers,
                 // thinking and delegate replies read as one integrated chat.
                 let author = msg.author.as_deref().unwrap_or("assistant");
-                author_header(&mut out, author, colors.name_color(author), width);
+                let stamp = stamp_of(msg, now);
+                author_header(
+                    &mut out,
+                    author,
+                    colors.name_color(author),
+                    width,
+                    stamp.as_deref(),
+                );
                 for spans in md_to_lines(&msg.text, width) {
                     out.push(RenderRow {
                         rule: None,
@@ -6073,7 +6122,8 @@ fn layout_chat_rows(
             MsgKind::Delegate => {
                 let author = msg.author.as_deref().unwrap_or("delegate");
                 let color = sub.map(|m| colors.name_color(m)).unwrap_or(Color::Magenta);
-                author_header(&mut out, author, color, w);
+                let stamp = stamp_of(msg, now);
+                author_header(&mut out, author, color, w, stamp.as_deref());
                 let rule = Some(color);
                 for spans in md_to_lines(&msg.text, w) {
                     out.push(RenderRow {
@@ -6485,6 +6535,26 @@ fn arg_lines(args: &str) -> Vec<String> {
     lines
 }
 
+/// The chat-style timestamp label of `msg`, or None for rows restored from an
+/// older session file (which carry no timestamp and so show none).
+fn stamp_of(msg: &Msg, now: u64) -> Option<String> {
+    msg.ts.map(|ts| fmt_stamp(ts, now))
+}
+
+/// A dim timestamp span right-aligned at column `width`, given that the row
+/// already occupies `used` columns, or None when it would not fit. Putting the
+/// stamp hard right is what makes the header rows read like a chat client.
+fn right_stamp(stamp: &str, used: usize, width: usize) -> Option<Span<'static>> {
+    let w = stamp.chars().count();
+    if used + w + 1 > width {
+        return None;
+    }
+    Some(Span::styled(
+        format!("{}{stamp}", " ".repeat(width - used - w)),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
 /// The delegate model behind `author`, when `author` is one of the configured
 /// delegates: rows authored by a delegate form its sub-chat (indented, tinted
 /// in the delegate's color) in the chat window.
@@ -6520,15 +6590,27 @@ fn row_band(
 }
 
 /// A one-row author tag ("you", the main model's label, or a delegate name)
-/// rendered above a content block so the transcript shows *who* produced it.
-fn author_header(out: &mut Vec<RenderRow>, author: &str, color: Color, width: usize) {
-    let label = cap(author, width.saturating_sub(2));
+/// rendered above a content block so the transcript shows *who* produced it,
+/// with that message's chat-style timestamp right-aligned when it has one.
+fn author_header(
+    out: &mut Vec<RenderRow>,
+    author: &str,
+    color: Color,
+    width: usize,
+    stamp: Option<&str>,
+) {
+    let stamp_w = stamp.map_or(0, |s| s.chars().count().saturating_add(1));
+    let label = cap(author, width.saturating_sub(2 + stamp_w));
+    let mut spans = vec![Span::styled(
+        label.clone(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(s) = stamp.and_then(|s| right_stamp(s, label.chars().count(), width)) {
+        spans.push(s);
+    }
     out.push(RenderRow {
         rule: None,
-        spans: vec![Span::styled(
-            label,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )],
+        spans,
         tool_header: None,
     });
 }
@@ -6546,19 +6628,26 @@ fn layout_reasoning(
     colors: &ModelColors,
     open: bool,
     width: usize,
+    stamp: Option<&str>,
 ) {
     // Header: the brain glyph plus the model's name, in the model's colour — the
     // spoken-block look shared with the assistant final answer (ADR 19), with the
-    // name made explicit so thinking is attributed to its model at a glance.
-    let label = cap(&format!("🧠 {author}"), width.saturating_sub(2));
+    // name made explicit so thinking is attributed to its model at a glance and
+    // the block's own timestamp right-aligned when it has one.
+    let stamp_w = stamp.map_or(0, |s| s.chars().count().saturating_add(1));
+    let label = cap(&format!("🧠 {author}"), width.saturating_sub(2 + stamp_w));
+    let mut spans = vec![Span::styled(
+        label.clone(),
+        Style::default()
+            .fg(colors.name_color(author))
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(s) = stamp.and_then(|s| right_stamp(s, label.chars().count(), width)) {
+        spans.push(s);
+    }
     out.push(RenderRow {
         rule: None,
-        spans: vec![Span::styled(
-            label,
-            Style::default()
-                .fg(colors.name_color(author))
-                .add_modifier(Modifier::BOLD),
-        )],
+        spans,
         tool_header: None,
     });
     if !open {
@@ -7492,6 +7581,40 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+/// Seconds since the Unix epoch (wall clock), for chat message timestamps.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Local wall-clock "HH:MM" for a Unix timestamp (e.g. "14:32"), used for
+/// messages that are at least an hour old.
+fn hhmm_local(ts: u64) -> String {
+    use chrono::{Local, TimeZone as _};
+    Local
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .map(|dt| dt.format("%H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// A chat message's timestamp label, like a chat client: relative while the
+/// message is fresh ("now" under a minute, "5m" under an hour) and the local
+/// wall-clock "HH:MM" once it is at least an hour old. `now` and `ts` are Unix
+/// seconds; a `ts` in the future (clock skew) counts as "now".
+fn fmt_stamp(ts: u64, now: u64) -> String {
+    let ago = now.saturating_sub(ts);
+    if ago < 60 {
+        "now".to_string()
+    } else if ago < 3600 {
+        format!("{}m", ago / 60)
+    } else {
+        hhmm_local(ts)
+    }
 }
 
 /// The rotating Braille spinner frame for the current time. Shared by the plan
@@ -9707,8 +9830,16 @@ mod tests {
             Msg::authored(MsgKind::Assistant, "model", "done"),
         ];
         let collapsed = &[false];
-        let (rows, owners, _) =
-            layout_chat_rows(&chat, collapsed, "", 80, &[], &ModelColors::default(), true);
+        let (rows, owners, _) = layout_chat_rows(
+            &chat,
+            collapsed,
+            "",
+            80,
+            &[],
+            &ModelColors::default(),
+            true,
+            0,
+        );
         // The question message (idx 1) shows in focus mode...
         assert!(owners.iter().flatten().any(|&i| i == 1));
         let text: String = rows
@@ -9743,8 +9874,16 @@ mod tests {
         let collapsed = &[false];
 
         // With focus=true, only User/Reasoning/Assistant should produce rows
-        let (_rows_focus, owners_focus, _) =
-            layout_chat_rows(&chat, collapsed, "", 80, &[], &ModelColors::default(), true);
+        let (_rows_focus, owners_focus, _) = layout_chat_rows(
+            &chat,
+            collapsed,
+            "",
+            80,
+            &[],
+            &ModelColors::default(),
+            true,
+            0,
+        );
         // Only indices 0 (User), 2 (Reasoning), 3 (Assistant) should have rows
         // Tool (idx 1), Meta (idx 4), Failure (idx 5) should be hidden
         for idx in owners_focus.iter().flatten() {
@@ -9852,8 +9991,16 @@ mod tests {
         let collapsed = &[false];
 
         // With focus=true, the Run digest's summary row is hidden but reasoning text appears
-        let (rows, owners, _) =
-            layout_chat_rows(&chat, collapsed, "", 80, &[], &ModelColors::default(), true);
+        let (rows, owners, _) = layout_chat_rows(
+            &chat,
+            collapsed,
+            "",
+            80,
+            &[],
+            &ModelColors::default(),
+            true,
+            0,
+        );
 
         // The digest has no summary row of its own, but its reasoning child
         // renders as a normal block (header + markdown body), so search the
@@ -10153,6 +10300,70 @@ mod tests {
     }
 
     #[test]
+    fn stamp_is_relative_then_wall_clock() {
+        let t = 1_700_000_000u64;
+        assert_eq!(fmt_stamp(t, t), "now");
+        assert_eq!(fmt_stamp(t, t + 59), "now");
+        assert_eq!(fmt_stamp(t, t + 60), "1m");
+        assert_eq!(fmt_stamp(t, t + 59 * 60), "59m");
+        // At >= 1h the label becomes the local wall clock HH:MM.
+        let hh = fmt_stamp(t, t + 3600);
+        assert_eq!(hh.len(), 5, "{hh}");
+        assert_eq!(hh.as_bytes()[2], b':', "{hh}");
+        // Clock skew (a ts in the future) must not underflow.
+        assert_eq!(fmt_stamp(t, t - 10), "now");
+    }
+
+    #[test]
+    fn assistant_header_shows_a_relative_timestamp() {
+        let mut m = Msg::authored(MsgKind::Assistant, "model", "hello");
+        m.ts = Some(1_700_000_000);
+        let chat = vec![m];
+        let now = 1_700_000_000 + 5 * 60;
+        let (rows, _, _) =
+            layout_chat_rows(&chat, &[], "", 40, &[], &ModelColors::default(), false, now);
+        let header: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(header.starts_with("model"), "{header:?}");
+        assert!(header.trim_end().ends_with("5m"), "{header:?}");
+        // The stamp is right-aligned: the header row fills the full width.
+        assert_eq!(header.chars().count(), 40, "{header:?}");
+    }
+
+    #[test]
+    fn old_message_header_shows_the_wall_clock() {
+        let mut m = Msg::authored(MsgKind::Assistant, "model", "hello");
+        m.ts = Some(1_700_000_000);
+        let chat = vec![m];
+        let now = 1_700_000_000 + 2 * 3600;
+        let (rows, _, _) =
+            layout_chat_rows(&chat, &[], "", 40, &[], &ModelColors::default(), false, now);
+        let header: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let trimmed = header.trim_end();
+        let hhmm = &trimmed[trimmed.len() - 5..];
+        assert_eq!(hhmm.as_bytes()[2], b':', "{header:?}");
+        assert!(hhmm[..2].bytes().all(|b| b.is_ascii_digit()), "{header:?}");
+    }
+
+    #[test]
+    fn message_without_a_timestamp_renders_no_stamp() {
+        // Rows restored from an older session file carry no ts and must look
+        // exactly as they did before timestamps existed.
+        let chat = vec![Msg::authored(MsgKind::Assistant, "model", "hello")];
+        let (rows, _, _) = layout_chat_rows(
+            &chat,
+            &[],
+            "",
+            40,
+            &[],
+            &ModelColors::default(),
+            false,
+            1_700_000_000,
+        );
+        let header: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(header, "model", "{header:?}");
+    }
+
+    #[test]
     fn durations_and_tokens_format_compactly() {
         assert_eq!(fmt_dur_ms(140), "140ms");
         assert_eq!(fmt_dur_ms(3_000), "3s");
@@ -10288,6 +10499,7 @@ mod tests {
             &ModelColors::default(),
             true,
             40,
+            None,
         );
         // The header is the brain glyph plus the model's name in its colour, not
         // a collapsible card arrow.
@@ -10314,6 +10526,7 @@ mod tests {
             &ModelColors::default(),
             false,
             40,
+            None,
         );
         assert_eq!(closed.len(), 1);
     }
@@ -10330,6 +10543,7 @@ mod tests {
             &ModelColors::default(),
             true,
             40,
+            None,
         );
         let body = &out[1];
         assert!(
@@ -10398,7 +10612,7 @@ mod tests {
         let mut colors = ModelColors::new();
         colors.assign(&["main".to_string()]);
         let chat = vec![Msg::authored(MsgKind::Assistant, "main", "the answer")];
-        let (rows, owners, _) = layout_chat_rows(&chat, &[false], "", 60, &[], &colors, false);
+        let (rows, owners, _) = layout_chat_rows(&chat, &[false], "", 60, &[], &colors, false, 0);
         assert!(owners.iter().all(|o| *o == Some(0)));
         let header = &rows[0];
         assert_eq!(header.spans[0].style.fg, Some(colors.name_color("main")));
@@ -11933,6 +12147,7 @@ mod section_tests {
             &[],
             &ModelColors::new(),
             false,
+            0,
         );
         // The user turn is a single "> first ask" row (heading, no "you" bar).
         assert_eq!(row_text(&rows[0]), "> first ask");
@@ -11958,6 +12173,7 @@ mod section_tests {
             &[],
             &ModelColors::new(),
             false,
+            0,
         );
         let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
         // Exchange 0 collapsed: only its echo + a "… N more" marker show.
@@ -11989,6 +12205,7 @@ mod section_tests {
             &[],
             &ModelColors::new(),
             false,
+            0,
         );
         let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
         assert!(!all.contains("secret reply 0"), "{all}");
@@ -12000,6 +12217,7 @@ mod section_tests {
             &[],
             &ModelColors::new(),
             false,
+            0,
         );
         let all: String = rows.iter().map(row_text).collect::<Vec<_>>().join("|");
         assert!(all.contains("secret reply 0"), "{all}");
@@ -12011,7 +12229,7 @@ mod section_tests {
         let text = "abcdefghijkl mnopqrstuvwxyz 1234567890";
         let chat = vec![Msg::authored(MsgKind::User, "you", text)];
         let (rows, _, ranges) =
-            layout_chat_rows(&chat, &[false], "", 12, &[], &ModelColors::new(), false);
+            layout_chat_rows(&chat, &[false], "", 12, &[], &ModelColors::new(), false, 0);
         assert!(
             rows.len() >= 2,
             "expected wrapping into rows, got {}",
@@ -12170,6 +12388,7 @@ mod section_tests {
             &[],
             &ModelColors::new(),
             false,
+            0,
         );
         assert_eq!(collapsed.rows.len(), rows.len());
         assert_eq!(collapsed.owner, owner);

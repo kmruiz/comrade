@@ -372,6 +372,16 @@ Not a background-job-registry job: no jobs-panel entry, not killable via bg_kill
 **References:**
 - `crates/comrade-tui/src/tui.rs`
 
+## Message timestamp (stamp)
+> The per-message chat timestamp in comrade-tui: `Msg::ts` holds Unix seconds (set once in `App::push_msg`), and the header row of a User/Assistant/Delegate/Reasoning block renders its label right-aligned in dim. The label comes from `fmt_stamp(ts, now)`: "now" under a minute, "{m}m" under an hour, and the local wall-clock "HH:MM" (via `hhmm_local`, chrono `Local`) once the message is at least an hour old. A message with no ts (restored from an older session file) shows no stamp.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs`
+- `.comrade/memory/0066-chat-messages-carry-a-timestamp-rendered-chat-style-on-the-header-row.md`
+
+**Notes:**
+The row layout cache (`ChatRowsCache`) stores a `now_min` minute bucket so the relative labels refresh as the minute rolls over. See ADR #66.
+
 ## model panel
 > The right-hand panel of the TUI titled " model ", drawn by `draw_stats` (crates/comrade-tui/src/tui.rs). Two fixed inner rows now: (1) `label_line` = model name + version left, balance right-aligned; (2) `gauge_line` = context bar merged with `NN%  used/budget` (compact via `short_tokens`, k/M) plus an `est` marker when estimated. Below them: the delegate list from `delegate_panel_rows`. Panel height = `MODEL_PANEL_FIXED_ROWS (2) + 2 borders + delegate rows`.
 
