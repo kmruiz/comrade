@@ -1180,13 +1180,16 @@ async fn delegate_recovers_from_a_context_overflow() {
     );
 }
 
-/// Recovery is capped at three per run: past that the run hands back what it had
-/// instead of summarising again, so a model that cannot fit its task cannot keep
-/// the parent answering forever.
+/// The parent-call budget is shared and spent at five per run: past that the run
+/// hands back what it had instead of asking the lead again, so a model that cannot
+/// fit its task cannot keep the parent answering forever.
 #[tokio::test]
-async fn delegate_stops_compacting_after_three_recoveries() {
+async fn delegate_stops_intervening_after_five_parent_calls() {
     // Each overflow is preceded by a successful turn, so the history is material
-    // again and a recovery is genuinely available - the cap is what stops it.
+    // again and a recovery is genuinely available - the shared budget is what
+    // stops it, at the fifth. The last two overflows are what the run sees after
+    // the budget is gone: the first triggers the fixed-footprint retry, the second
+    // returns the partial answer.
     let (out, summaries) = overflow_run(vec![
         (200, edit_turn(1)),
         overflow_response(),
@@ -1196,21 +1199,110 @@ async fn delegate_stops_compacting_after_three_recoveries() {
         overflow_response(),
         (200, edit_turn(4)),
         overflow_response(),
+        (200, edit_turn(5)),
+        overflow_response(),
         overflow_response(),
         overflow_response(),
     ])
     .await;
 
-    assert_eq!(summaries, 3, "at most three recoveries per run");
+    assert_eq!(
+        summaries, MAX_DELEGATE_INTERVENTIONS,
+        "the shared budget is five parent calls per run"
+    );
     assert!(
-        out.contains("compacted 3 time(s)"),
+        out.contains("spent its 5 parent interventions"),
         "an exhausted run must return its partial answer, not fail: {out}"
+    );
+}
+
+/// Supervision and context-overflow recovery spend the SAME budget: a lead that
+/// keeps steering a running delegate consumes the capacity an overflow recovery
+/// would have used, and once the pool is empty an overflow can no longer be
+/// recovered - the run returns its partial answer instead of calling the lead a
+/// sixth time.
+#[tokio::test]
+async fn supervision_and_recovery_share_one_budget() {
+    /// A parent that always steers and always summarises, counting every call -
+    /// whichever kind it was - against one shared total.
+    struct AlwaysIntervening {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl UpwardAsk for AlwaysIntervening {
+        async fn ask(&self, _question: &str) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn summarise(&self, _transcript: &str) -> Result<Option<String>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some("BRIEFING: keep going".to_string()))
+        }
+
+        async fn supervise(&self, _briefing: &str) -> Result<Option<String>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some("keep going".to_string()))
+        }
+    }
+
+    // The delegate edits; the provider then rejects the next request as too big.
+    let base = scripted_http(vec![
+        (200, edit_turn(1)),
+        overflow_response(),
+        (200, edit_turn(2)),
+        overflow_response(),
+        overflow_response(),
+    ]);
+    let cfg = Config {
+        delegates: vec![delegate("cheap", &base)],
+        ..Config::default()
+    };
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EditStubTool {
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    // A supervision round falls due on every rest point, so the pool drains.
+    let limits = DelegateLimits {
+        supervise: std::time::Duration::from_nanos(1),
+        ..DelegateLimits::default()
+    };
+    let tool = DelegateTool::new(&cfg.delegates, registry, limits)
+        .unwrap()
+        .unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let session = Arc::new(AgentSession::new(tx));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    session.set_upward(Arc::new(AlwaysIntervening {
+        calls: calls.clone(),
+    }));
+    let mut ctx = test_ctx();
+    ctx.session = session.as_control();
+
+    let out = tool
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "change a to b"}]}),
+        )
+        .await
+        .unwrap();
+
+    let spent = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        spent, MAX_DELEGATE_INTERVENTIONS,
+        "one shared pool: the lead must be called exactly the cap, however the \
+         calls are split between supervision and recovery"
+    );
+    assert!(
+        out.contains("spent its 5 parent interventions"),
+        "once the pool is empty an overflow must return the partial answer: {out}"
     );
 }
 
 /// When nothing but the fixed prompt and the tool schemas fit the window, a
 /// summary has nothing to say: the fixed-footprint retry must handle it WITHOUT
-/// spending one of the three recovery rounds.
+/// spending one of the shared intervention rounds.
 #[tokio::test]
 async fn delegate_does_not_spend_a_compaction_on_a_fixed_footprint_overflow() {
     let (out, summaries) =
@@ -2308,7 +2400,7 @@ async fn a_running_delegate_is_steered_by_its_parent() {
 }
 
 /// Supervision is a bounded conversation: one run spends at most
-/// [`MAX_DELEGATE_SUPERVISIONS`] rounds, however often the lead has something to
+/// [`MAX_DELEGATE_INTERVENTIONS`] rounds, however often the lead has something to
 /// add.
 #[tokio::test]
 async fn supervision_stops_after_five_steers() {
@@ -2373,7 +2465,7 @@ async fn supervision_stops_after_five_steers() {
     assert!(out.contains("read everything"), "{out}");
     assert_eq!(
         supervised.load(std::sync::atomic::Ordering::SeqCst),
-        MAX_DELEGATE_SUPERVISIONS,
+        MAX_DELEGATE_INTERVENTIONS,
         "one run must spend exactly the cap"
     );
 }

@@ -172,7 +172,8 @@ pub struct AgentCfg {
     pub delegate_timeout_secs: u64,
     /// How often the tech lead re-reads the transcript of a delegate that is
     /// still running and may steer it back on task. At this interval, and at
-    /// most `MAX_DELEGATE_SUPERVISIONS` times per run, the parent model is shown
+    /// most `MAX_DELEGATE_INTERVENTIONS` times per run (shared with
+    /// context-overflow recovery), the parent model is shown
     /// what the delegate has done and what it intends to do next, and answers
     /// either "OK" (leave it alone) or a short correction that is injected into
     /// the delegate's conversation. `0` disables supervision.

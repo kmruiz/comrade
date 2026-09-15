@@ -109,7 +109,8 @@ pub struct DelegateLimits {
     pub timeout: Duration,
     /// How often the tech lead re-reads the transcript of a delegate that is
     /// still RUNNING and may steer it back on task (see
-    /// [`MAX_DELEGATE_SUPERVISIONS`]). [`Duration::ZERO`] disables supervision.
+    /// [`MAX_DELEGATE_INTERVENTIONS`] for how many rounds one run gets, shared
+    /// with context-overflow recovery). [`Duration::ZERO`] disables supervision.
     pub supervise: Duration,
 }
 
@@ -781,16 +782,17 @@ fn keep_in_slim_specs(name: &str) -> bool {
 /// the transcript and replace the history with that summary, so the delegate can
 /// continue the same task with far less context.
 ///
-/// Returns `false` - the caller then keeps its previous behaviour - when the cap
-/// is already spent, the delegate has done no work to summarise (see
+/// Returns `false` - the caller then keeps its previous behaviour - when the
+/// shared intervention budget ([`MAX_DELEGATE_INTERVENTIONS`]) is already spent,
+/// the delegate has done no work to summarise (see
 /// [`history_is_material`]), there is no parent to ask, or the parent produced no
 /// usable summary.
 async fn recover_context(
     dctx: &ToolContext,
     ctxm: &mut ContextManager,
-    compactions: &mut usize,
+    interventions: &mut usize,
 ) -> bool {
-    if *compactions >= MAX_DELEGATE_COMPACTIONS || !history_is_material(ctxm) {
+    if *interventions >= MAX_DELEGATE_INTERVENTIONS || !history_is_material(ctxm) {
         return false;
     }
     let Some(parent) = dctx.session.upward() else {
@@ -803,7 +805,7 @@ async fn recover_context(
     match parent.summarise(&transcript).await {
         Ok(Some(summary)) if !summary.trim().is_empty() => {
             ctxm.compact(summary.trim());
-            *compactions += 1;
+            *interventions += 1;
             true
         }
         _ => false,
@@ -814,12 +816,17 @@ async fn recover_context(
 /// way to keep the parent model answering forever.
 const MAX_UPWARD_ASKS: usize = 3;
 
-/// Cap on parent SUPERVISIONS per delegate run. Every
-/// [`DelegateLimits::supervise`] the tech lead is shown what a still-running
-/// delegate has done and may send back ONE correction. Each round is a real
-/// parent model call, so the rounds are capped; past the cap the delegate is left
-/// alone to finish, and the parent can still re-delegate the step afterwards.
-const MAX_DELEGATE_SUPERVISIONS: usize = 5;
+/// The ONE budget for every time the tech lead steps into a delegate run: a
+/// supervision round (see [`DelegateLimits::supervise`]) and a context-overflow
+/// recovery ([`recover_context`]) both spend from it, and once it is exhausted
+/// neither happens again.
+///
+/// One pool rather than two, because the cost being bounded is how many times the
+/// lead is dragged into a single sub-agent's run, however it happens - every round
+/// is a real call to the parent model. A run that keeps needing the lead is not
+/// finishing: past the cap the delegate is left to produce whatever it can, and
+/// the lead re-delegates the step itself if that is not enough.
+const MAX_DELEGATE_INTERVENTIONS: usize = 5;
 
 /// Framing for a correction the tech lead injects into a RUNNING delegate's
 /// conversation. The delegate must read it as an instruction from its own lead -
@@ -892,11 +899,6 @@ fn refuse_upward(name: &str, used: &mut usize) -> Option<String> {
     }
     None
 }
-
-/// Cap on context-overflow recoveries per delegate run: each one replaces the
-/// delegate's transcript with a parent-written summary so it can continue. Past
-/// the cap the run returns what it had gathered instead of summarising again.
-const MAX_DELEGATE_COMPACTIONS: usize = 3;
 
 /// True when a model request failed because it did not fit the model's context
 /// window. Matched on the provider's own wording, because the harness does not
@@ -1009,11 +1011,10 @@ pub(crate) async fn run_delegate_subagent(
     let mut consecutive_reads = 0usize;
     // Escalation budget: how many `ask_upwards` questions this run has spent.
     let mut upward_asks = 0usize;
-    // Context-overflow recoveries spent by this run (see MAX_DELEGATE_COMPACTIONS).
-    let mut compactions = 0usize;
-    // Supervision rounds spent by this run (see MAX_DELEGATE_SUPERVISIONS) and
-    // when the next one falls due.
-    let mut supervisions = 0usize;
+    // How many times this run has already asked the tech lead for help - a
+    // supervision round or a context-overflow recovery, which share one budget
+    // (see MAX_DELEGATE_INTERVENTIONS) - and when the next supervision falls due.
+    let mut interventions = 0usize;
     let mut next_supervision = Instant::now() + limits.supervise;
     // Whether a proactive compaction is armed for the current over-budget episode.
     // Mirrors the main loop's `auto_compact_armed` guard, so a history that stays
@@ -1076,14 +1077,14 @@ pub(crate) async fn run_delegate_subagent(
         // so a slow parent cannot eat the delegate's inactivity budget, and the
         // rounds are capped so one run cannot turn into a conversation.
         if !limits.supervise.is_zero()
-            && supervisions < MAX_DELEGATE_SUPERVISIONS
+            && interventions < MAX_DELEGATE_INTERVENTIONS
             && dctx.session.upward().is_some()
             && Instant::now() >= next_supervision
         {
             // Re-arm before the call: reviewing takes time, and a correction must
             // not be requested again on the very next iteration.
             next_supervision = Instant::now() + limits.supervise;
-            supervisions += 1;
+            interventions += 1;
             let review = invoke_within(
                 idle_left(last_progress, idle_nudged),
                 supervise_delegate(&dctx, &ctxm),
@@ -1102,7 +1103,7 @@ pub(crate) async fn run_delegate_subagent(
             compact_armed = false;
             // A failed recovery deliberately falls through to `enforce_budget`,
             // which is the existing behaviour.
-            let _ = recover_context(&dctx, &mut ctxm, &mut compactions).await;
+            let _ = recover_context(&dctx, &mut ctxm, &mut interventions).await;
         } else if !ctxm.needs_auto_compaction() {
             compact_armed = true;
         }
@@ -1172,15 +1173,15 @@ pub(crate) async fn run_delegate_subagent(
                 // done work, a parent-written summary lets it continue; if it has
                 // not, then the fixed prompt plus the tool schemas are what is too
                 // big, and no summary can help - retry once with fewer schemas.
-                if recover_context(&dctx, &mut ctxm, &mut compactions).await {
+                if recover_context(&dctx, &mut ctxm, &mut interventions).await {
                     continue;
                 }
                 if native && !slim_specs {
                     slim_specs = true;
                     continue;
                 }
-                // Out of recoveries: hand back what it had rather than losing it.
-                return Ok(overflow_answer(author, compactions, &last_text));
+                // Out of interventions: hand back what it had rather than losing it.
+                return Ok(overflow_answer(author, interventions, &last_text));
             }
             Err(e) => return Err(e),
         };
@@ -1448,13 +1449,15 @@ fn timeout_answer(author: &str, idle: Duration, last: &str) -> String {
     }
 }
 
-/// The reply a delegate returns when its context kept overflowing: whatever it
-/// had produced, plus a note that the transcript was summarised, so the parent can
-/// re-delegate a narrower task instead of losing the work entirely.
-fn overflow_answer(author: &str, compactions: usize, last: &str) -> String {
+/// The reply a delegate returns when its context kept overflowing and the run had
+/// already spent its whole intervention budget on the parent (supervision rounds
+/// or earlier recoveries): whatever it had produced, plus a note that the lead
+/// cannot summarise it again, so the parent can re-delegate a narrower task
+/// instead of losing the work entirely.
+fn overflow_answer(author: &str, interventions: usize, last: &str) -> String {
     let head = format!(
-        "[delegate {author}: its context overflowed and was compacted {compactions} time(s) \
-         without leaving room to finish]"
+        "[delegate {author}: its context overflowed and this run has already spent its \
+         {interventions} parent interventions, so there was no budget left to summarise it again]"
     );
     let last = last.trim();
     if last.is_empty() {

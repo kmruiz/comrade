@@ -230,7 +230,7 @@ Distinct from the call-count guards STALL_NUDGE / VERIFY_NUDGE / DELEGATE_READ_N
 Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by render_row_line's `sub: Option<Color>` param. Folded MsgKind::Run digests keep no sub-chat styling.
 
 ## Delegate supervision
-> The tech lead re-reading the transcript of a delegate that is still RUNNING (every `[agent].delegate_supervise_secs`, default 60s) and injecting at most one correction back into the delegate's own conversation. Implemented as `UpwardAsk::supervise` (one tool-less, bounded parent model call parsed by `parse_supervision`: `OK` = leave it alone, `STEER: <text>` = a correction), capped at `MAX_DELEGATE_SUPERVISIONS` (5) per run and applied at the delegate loop's rest point via `push_user_merged`. Distinct from context-overflow recovery (`recover_context`, capped by `MAX_DELEGATE_COMPACTIONS = 3`) and from `ask_upwards` (the DELEGATE asking its lead).
+> The tech lead re-reading the transcript of a delegate that is still RUNNING (every `[agent].delegate_supervise_secs`, default 60s) and injecting at most one correction back into the delegate's own conversation. Implemented as `UpwardAsk::supervise` (one tool-less, bounded parent model call parsed by `parse_supervision`: `OK` = leave it alone, `STEER: <text>` = a correction), applied at the delegate loop's rest point via `push_user_merged`. Distinct from `ask_upwards` (the DELEGATE asking its lead).
 
 **References:**
 - `crates/comrade-core/src/delegate.rs`
@@ -239,7 +239,7 @@ Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by rende
 - `crates/comrade-core/src/config.rs`
 
 **Notes:**
-`Duration::ZERO` / `delegate_supervise_secs = 0` disables it; comrade-tui passes ZERO for the `ask_advise` tool (advice runs are short and read-only). The parent is a plain tool-less chat, so it cannot revert files itself - it can only tell the delegate to discard a dead end.
+`Duration::ZERO` / `delegate_supervise_secs = 0` disables it; comrade-tui passes ZERO for the `ask_advise` tool (advice runs are short and read-only). The parent is a plain tool-less chat, so it cannot revert files itself - it can only tell the delegate to discard a dead end. Budget: supervision and context-overflow recovery (`recover_context`) draw on ONE shared pool, `MAX_DELEGATE_INTERVENTIONS = 5` parent calls per run (`const` in crates/comrade-core/src/delegate.rs); there is no separate `MAX_DELEGATE_SUPERVISIONS` / `MAX_DELEGATE_COMPACTIONS` any more. When the pool is spent, neither happens again and an overflow returns `overflow_answer` ("spent its N parent interventions"), so the lead re-delegates the step itself.
 
 ## Delegate timeout
 > A wall-clock budget (`[agent].delegate_timeout_secs`, default **300s / 5 minutes**; `0` = no limit) applied to every delegated sub-agent run (`delegate`, `delegate_parallel`, `ask_advise`). Enforced in `crates/comrade-core/src/delegate.rs::run_delegate_subagent`: each model request and tool call is bounded by the time left, and when the budget runs out the delegate returns `timeout_answer(...)` — a partial answer if it had one, else a notice that it did not finish. Prevents a slow/hung model request or hanging tool from holding the parent run open. (Originally 60s; raised to 300s on 2026-09-14 — the 60s default was too aggressive.)
@@ -440,6 +440,16 @@ Not a background-job-registry job: no jobs-panel entry, not killable via bg_kill
 
 **Notes:**
 IMPORTANT presentation trap: `push_user_merged` appends the nudge with `\n\n` onto the LAST message when it is Role::Tool or a ReAct user observation, so the "STOP investigating…" text appears WELDED TO THE TAIL OF THE PRECEDING TOOL OUTPUT (e.g. a semantic_search or fs_rgrep result) instead of as its own message. This makes a benign loop guard look exactly like a prompt-injection planted in tool data. Merging is intentional: LM Studio's Mistral template rejects two user turns in a row / a user turn straight after tool results (comment at context.rs:78-83). If you see this text in a tool result, the source is our own agent loop, not the tool.
+
+## MAX_DELEGATE_INTERVENTIONS
+> One shared per-run budget for every time the tech lead is called into a delegate run: `const MAX_DELEGATE_INTERVENTIONS: usize = 5` in crates/comrade-core/src/delegate.rs. A supervision round (`UpwardAsk::supervise`) and a context-overflow recovery (`recover_context`) both spend from it, so a run makes at most 5 parent model calls of either kind; when it is exhausted an overflow returns `overflow_answer` instead of summarising again.
+
+**References:**
+- `crates/comrade-core/src/delegate.rs`
+- `crates/comrade-core/src/delegate/tests.rs`
+
+**Notes:**
+Replaced the earlier pair of separate caps (`MAX_DELEGATE_SUPERVISIONS = 5` and `MAX_DELEGATE_COMPACTIONS = 3`), which allowed up to 8 parent calls in one run - folded at the human's request. The reasoning: the cost being bounded is how many times the lead is dragged into ONE sub-agent's run, however it happens, since every round is a real parent model call. Driven in tests by `supervision_and_recovery_share_one_budget`.
 
 ## Message timestamp (stamp)
 > The per-message chat timestamp in comrade-tui: `Msg::ts` holds Unix seconds (set once in `App::push_msg`), and the header row of a User/Assistant/Delegate/Reasoning block renders its label right-aligned in dim. The label comes from `fmt_stamp(ts, now)`: "now" under a minute, "{m}m" under an hour, and the local wall-clock "HH:MM" (via `hhmm_local`, chrono `Local`) once the message is at least an hour old. A message with no ts (restored from an older session file) shows no stamp.
