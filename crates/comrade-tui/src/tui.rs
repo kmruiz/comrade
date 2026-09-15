@@ -6007,15 +6007,14 @@ fn layout_chat_rows(
                 let stamp = stamp_of(msg, now);
                 let stamp_w = stamp
                     .as_deref()
-                    .map_or(0, |s| s.chars().count().saturating_add(1));
+                    .map_or(0, |s| Span::raw(s).width().saturating_add(1));
                 let body_w = width.saturating_sub(2 + stamp_w).max(1);
                 for (k, spans) in md_to_lines(&msg.text, body_w).into_iter().enumerate() {
                     let mut row = Vec::with_capacity(spans.len() + 2);
                     row.push(if k == 0 { echo.clone() } else { cont.clone() });
-                    let used = 2 + spans
-                        .iter()
-                        .map(|s| s.content.chars().count())
-                        .sum::<usize>();
+                    // The row's width in cells, so the stamp lands flush right
+                    // even when the prompt holds a wide glyph.
+                    let used = 2 + spans.iter().map(|s| s.width()).sum::<usize>();
                     row.extend(spans);
                     if k == 0
                         && let Some(s) = stamp.as_deref().and_then(|t| right_stamp(t, used, width))
@@ -6563,7 +6562,11 @@ fn stamp_of(msg: &Msg, now: u64) -> Option<String> {
 /// already occupies `used` columns, or None when it would not fit. Putting the
 /// stamp hard right is what makes the header rows read like a chat client.
 fn right_stamp(stamp: &str, used: usize, width: usize) -> Option<Span<'static>> {
-    let w = stamp.chars().count();
+    // Measured in DISPLAY columns, not chars: `used` counts the row's cells and
+    // the terminal lays the row out by cells, so a char-counted pad would push
+    // the stamp past the panel's right edge whenever the row holds a wide glyph
+    // (the 🧠 reasoning tag, an emoji or CJK in a prompt).
+    let w = Span::raw(stamp).width();
     if used + w + 1 > width {
         return None;
     }
@@ -6617,13 +6620,16 @@ fn author_header(
     width: usize,
     stamp: Option<&str>,
 ) {
-    let stamp_w = stamp.map_or(0, |s| s.chars().count().saturating_add(1));
+    // Reserve the stamp's room and measure the label in display columns, so a
+    // wide glyph in the tag (the 🧠 of a reasoning header) cannot push the
+    // stamp past the panel's right edge.
+    let stamp_w = stamp.map_or(0, |s| Span::raw(s).width().saturating_add(1));
     let label = cap(author, width.saturating_sub(2 + stamp_w));
     let mut spans = vec![Span::styled(
         label.clone(),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )];
-    if let Some(s) = stamp.and_then(|s| right_stamp(s, label.chars().count(), width)) {
+    if let Some(s) = stamp.and_then(|s| right_stamp(s, Span::raw(label.as_str()).width(), width)) {
         spans.push(s);
     }
     out.push(RenderRow {
@@ -6656,7 +6662,7 @@ fn layout_reasoning(
     // spoken-block look shared with the assistant final answer (ADR 19), with the
     // name made explicit so thinking is attributed to its model at a glance and
     // the block's own timestamp right-aligned when it has one.
-    let stamp_w = stamp.map_or(0, |s| s.chars().count().saturating_add(1));
+    let stamp_w = stamp.map_or(0, |s| Span::raw(s).width().saturating_add(1));
     let label = cap(&format!("🧠 {author}"), width.saturating_sub(2 + stamp_w));
     let mut spans = vec![Span::styled(
         label.clone(),
@@ -6664,7 +6670,7 @@ fn layout_reasoning(
             .fg(colors.name_color(author))
             .add_modifier(Modifier::BOLD),
     )];
-    if let Some(s) = stamp.and_then(|s| right_stamp(s, label.chars().count(), width)) {
+    if let Some(s) = stamp.and_then(|s| right_stamp(s, Span::raw(label.as_str()).width(), width)) {
         spans.push(s);
     }
     out.push(RenderRow {
@@ -10373,6 +10379,40 @@ mod tests {
         assert!(header.trim_end().ends_with("5m"), "{header:?}");
         // The stamp is right-aligned: the header row fills the full width.
         assert_eq!(header.chars().count(), 40, "{header:?}");
+    }
+
+    #[test]
+    fn reasoning_header_stamp_fits_the_row_width() {
+        // The brain tag is a WIDE glyph: two cells but one char, so padding the
+        // stamp from a char count would push it one column past the right edge.
+        let mut m = Msg::reasoning("model", "thinking");
+        m.ts = Some(1_700_000_000);
+        let chat = vec![m];
+        let now = 1_700_000_000 + 3 * 60;
+        let (rows, _, _) =
+            layout_chat_rows(&chat, &[], "", 40, &[], &ModelColors::default(), false, now);
+        let header: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(header.trim_end().ends_with("3m"), "{header:?}");
+        // Summed DISPLAY width: the header must fill, and never exceed, the chat
+        // width the renderer hands it.
+        let cells: usize = rows[0].spans.iter().map(|s| s.width()).sum();
+        assert_eq!(cells, 40, "{header:?}");
+    }
+
+    #[test]
+    fn user_echo_stamp_fits_a_prompt_with_a_wide_glyph() {
+        // An emoji in the prompt is two cells but one char; the echoed first row
+        // must still carry its stamp inside the panel's width.
+        let mut m = Msg::authored(MsgKind::User, "you", "hi 😀");
+        m.ts = Some(1_700_000_000);
+        let chat = vec![m];
+        let now = 1_700_000_000 + 30;
+        let (rows, _, _) =
+            layout_chat_rows(&chat, &[], "", 40, &[], &ModelColors::default(), false, now);
+        let first: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first.trim_end().ends_with("now"), "{first:?}");
+        let cells: usize = rows[0].spans.iter().map(|s| s.width()).sum();
+        assert_eq!(cells, 40, "{first:?}");
     }
 
     #[test]
