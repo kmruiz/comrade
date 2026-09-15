@@ -17,6 +17,8 @@ use comrade_tool::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+pub mod diagram;
+
 /// Whether a plan step's `model` names a delegate rather than the main agent.
 /// The main model is [`AGENT_MODEL`] ("self"); any other non-empty model is a
 /// configured delegate, so its step can only be completed via the `delegate`
@@ -46,6 +48,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(SelfFinishPlan),
         Box::new(SelfSetStatusBar),
         Box::new(AskForm),
+        Box::new(diagram::ShowDiagram),
     ]
 }
 

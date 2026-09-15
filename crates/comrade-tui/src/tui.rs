@@ -6966,25 +6966,41 @@ fn wrap_styled(parts: &[StyledPart], width: usize) -> Vec<Vec<Span<'static>>> {
     rows
 }
 
+/// Sentinels the `show_diagram` tool wraps around its ASCII art so the chat can
+/// show it verbatim: re-wrapping it would destroy the alignment.
+const DIAGRAM_OPEN: &str = "--- diagram (ascii) ---";
+const DIAGRAM_CLOSE: &str = "--- end diagram ---";
+
 /// Render a tool result as styled chat rows: code-location lines get their file
 /// name and line number emphasised (bold cyan path, bold yellow number) while
-/// every other line keeps the legacy single-colour wrapped rendering.
+/// every other line keeps the legacy single-colour wrapped rendering. A block
+/// delimited by the diagram sentinels is emitted one row per source line and is
+/// never wrapped, so ASCII art stays aligned (ratatui clips an over-wide span).
 fn result_rows(result: &str, ok: bool, width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
     let fallback = if ok { Color::Green } else { Color::Red };
+    let header = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut in_diagram = false;
     for line in result.split('\n') {
-        if let Some(name) = line
-            .trim_end()
+        let trimmed = line.trim_end();
+        if trimmed == DIAGRAM_OPEN {
+            in_diagram = true;
+            rows.push(vec![Span::styled(line.to_string(), header)]);
+        } else if trimmed == DIAGRAM_CLOSE {
+            in_diagram = false;
+            rows.push(vec![Span::styled(line.to_string(), header)]);
+        } else if in_diagram {
+            // ASCII art: one row per source line, verbatim. ratatui clips a
+            // span wider than the area, so the art is never re-wrapped.
+            rows.push(vec![Span::styled(line.to_string(), Style::default())]);
+        } else if let Some(name) = trimmed
             .strip_prefix("== ")
             .and_then(|s| s.strip_suffix(" =="))
         {
-            rows.push(vec![Span::styled(
-                format!("== {name} =="),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )]);
+            rows.push(vec![Span::styled(format!("== {name} =="), header)]);
         } else if let Some(parts) = loc_parts(line) {
             rows.extend(wrap_styled(&parts, width));
         } else {
@@ -10832,6 +10848,19 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0].content.as_ref(), "== crates/a.rs ==");
         assert_eq!(rows[0][0].style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn result_rows_keeps_diagram_lines_verbatim() {
+        // A narrow width would normally re-wrap the long art line; inside the
+        // diagram block it must stay a single row so the box stays aligned.
+        let art = "--- diagram (ascii) ---\n+-------------+\n| a very long |\n+-------------+\n--- end diagram ---";
+        let rows = result_rows(art, true, 5);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0][0].content.as_ref(), "--- diagram (ascii) ---");
+        assert_eq!(rows[2].len(), 1);
+        assert_eq!(rows[2][0].content.as_ref(), "| a very long |");
+        assert_eq!(rows[4][0].content.as_ref(), "--- end diagram ---");
     }
 
     #[test]
