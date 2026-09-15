@@ -87,7 +87,10 @@ mod tests {
     fn removed_declarations_names_what_a_rewrite_drops() {
         let before = "pub fn greet() {}\n\n#[cfg(test)]\nmod tests {\n    fn greet_works() {}\n}\n";
         let after = "pub fn shout() {}\n";
-        assert_eq!(removed_declarations(before, after), ["greet", "greet_works"]);
+        assert_eq!(
+            removed_declarations(before, after),
+            ["greet", "greet_works"]
+        );
         // An addition, or an unchanged file, loses nothing.
         assert!(removed_declarations(before, before).is_empty());
         assert!(

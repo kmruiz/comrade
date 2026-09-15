@@ -483,13 +483,10 @@ mod hang_tests {
     #[tokio::test]
     async fn a_command_reading_stdin_does_not_freeze_the_runner() {
         let started = std::time::Instant::now();
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            exec(&shell("cat"), 5),
-        )
-        .await
-        .expect("exec must not block on stdin")
-        .expect("cat sees EOF and exits ok");
+        let out = tokio::time::timeout(std::time::Duration::from_secs(20), exec(&shell("cat"), 5))
+            .await
+            .expect("exec must not block on stdin")
+            .expect("cat sees EOF and exits ok");
         assert!(started.elapsed() < std::time::Duration::from_secs(20));
         assert!(out.success, "cat should exit 0 on an empty stdin");
     }

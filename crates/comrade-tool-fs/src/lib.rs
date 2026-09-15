@@ -103,7 +103,10 @@ fn edit_location(before: &str, old: &str, new: &str) -> String {
 fn common_indent(lines: &[&str]) -> String {
     let mut common: Option<String> = None;
     for line in lines.iter().filter(|l| !l.trim().is_empty()) {
-        let indent: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        let indent: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
         common = Some(match common {
             None => indent,
             Some(prev) => {
@@ -145,7 +148,11 @@ fn fuzzy_line_match(file: &str, old: &str, new: &str) -> Option<(String, String)
 
     let old_lines: Vec<&str> = old.lines().map(str::trim_end).collect();
     let lead = old_lines.iter().take_while(|l| l.trim().is_empty()).count();
-    let trail = old_lines.iter().rev().take_while(|l| l.trim().is_empty()).count();
+    let trail = old_lines
+        .iter()
+        .rev()
+        .take_while(|l| l.trim().is_empty())
+        .count();
     let end = old_lines.len().saturating_sub(trail);
     if lead >= end {
         return None; // only blank lines
@@ -596,10 +603,7 @@ impl Tool for FsWriteFile {
             tokio::fs::write(&file, &args.content)
                 .await
                 .with_context(|| format!("cannot write {rel}"))?;
-            let mut msg = format!(
-                "Wrote {rel} ({} chars).",
-                args.content.chars().count()
-            );
+            let mut msg = format!("Wrote {rel} ({} chars).", args.content.chars().count());
             // A small model overwrites a whole file to make a one-line change and
             // silently deletes the rest of it (including the tests that were
             // there). Name what it dropped so the next turn can undo the damage

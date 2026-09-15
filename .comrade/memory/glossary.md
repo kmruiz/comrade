@@ -414,7 +414,7 @@ IMPORTANT presentation trap: `push_user_merged` appends the nudge with `\n\n` on
 - `.comrade/memory/0066-chat-messages-carry-a-timestamp-rendered-chat-style-on-the-header-row.md`
 
 **Notes:**
-The row layout cache (`ChatRowsCache`) stores a `now_min` minute bucket so the relative labels refresh as the minute rolls over. See ADR #66.
+The row layout cache (`ChatRowsCache`) stores a `now_min` minute bucket so the relative labels refresh as the minute rolls over. See ADR #66. Width rule (learned the hard way): the stamp's column maths must use DISPLAY cells, not chars - `Span::width()` / unicode-width - because the row's width budget comes from the terminal's cells and any wide glyph (the 🧠 reasoning tag, an emoji or CJK in a prompt) makes a char count too small, pushing the stamp past the panel's right edge. The body wrappers (`md_to_lines` et al.) still count chars, so a very wide-glyph body makes its row too wide and `right_stamp` then omits the stamp rather than spilling.
 
 ## model panel
 > The right-hand panel of the TUI titled " model ", drawn by `draw_stats` (crates/comrade-tui/src/tui.rs). Two fixed inner rows now: (1) `label_line` = model name + version left, balance right-aligned; (2) `gauge_line` = context bar merged with `NN%  used/budget` (compact via `short_tokens`, k/M) plus an `est` marker when estimated. Below them: the delegate list from `delegate_panel_rows`. Panel height = `MODEL_PANEL_FIXED_ROWS (2) + 2 borders + delegate rows`.

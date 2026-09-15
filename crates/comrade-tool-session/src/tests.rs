@@ -650,7 +650,10 @@ async fn ask_upwards_returns_the_parents_answer_with_the_plan_context() {
     session.upward = Some(lead.clone());
     let c = ctx(session);
     let out = AskUpwards
-        .invoke(&c, json!({ "question": "where do I put the new function?" }))
+        .invoke(
+            &c,
+            json!({ "question": "where do I put the new function?" }),
+        )
         .await
         .unwrap();
     assert!(out.contains("Answer from your tech lead"), "{out}");

@@ -1031,8 +1031,7 @@ impl UpwardAsk for StubParent {
         Ok(String::new())
     }
     async fn approve(&self, _title: &str, _detail: &str) -> Result<Verdict> {
-        self.asked
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self.verdict.clone())
     }
 }
@@ -1083,7 +1082,10 @@ async fn destructive_trial(verdict: Option<Verdict>, tag: &str) -> (usize, Strin
     ctx.session = session.as_control();
 
     let out = tool
-        .invoke(&ctx, json!({"model": "cheap", "task": "replace greet with shout"}))
+        .invoke(
+            &ctx,
+            json!({"model": "cheap", "task": "replace greet with shout"}),
+        )
         .await
         .unwrap();
     assert!(out.contains("finished"), "{out}");
@@ -2112,11 +2114,12 @@ async fn a_frozen_delegate_is_nudged_to_act() {
             std::future::pending::<Result<String>>().await
         }
     }
-    static IDLE_HANGING_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| ToolSpec {
-        name: "fs_read_file".into(),
-        description: "hangs forever".into(),
-        json_schema: json!({"type": "object"}),
-    });
+    static IDLE_HANGING_SPEC: std::sync::LazyLock<ToolSpec> =
+        std::sync::LazyLock::new(|| ToolSpec {
+            name: "fs_read_file".into(),
+            description: "hangs forever".into(),
+            json_schema: json!({"type": "object"}),
+        });
 
     let turn = json!({
         "choices": [{

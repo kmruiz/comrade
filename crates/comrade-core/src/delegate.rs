@@ -943,7 +943,8 @@ pub(crate) async fn run_delegate_subagent(
                 }
             }
         };
-        let Some(res) = invoke_within(idle_left(last_progress, idle_nudged), model_call).await else {
+        let Some(res) = invoke_within(idle_left(last_progress, idle_nudged), model_call).await
+        else {
             // Nothing came back before the next gate: loop back so the idle gate
             // above nudges (at `idle_nudge_at`) or stops (at `idle_stop_at`).
             continue;

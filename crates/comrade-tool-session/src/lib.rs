@@ -672,9 +672,11 @@ impl Tool for AskUpwards {
             anyhow::bail!("`question` must not be empty");
         }
         let Some(upward) = ctx.session.upward() else {
-            return Ok("No tech lead is available to answer right now. Decide for yourself, make the \
+            return Ok(
+                "No tech lead is available to answer right now. Decide for yourself, make the \
                        smallest reasonable change, and continue."
-                .to_string());
+                    .to_string(),
+            );
         };
         // Give the parent the little bit of shared state it needs to answer
         // well: which session this is and what the plan says.

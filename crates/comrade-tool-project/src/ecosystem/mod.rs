@@ -620,11 +620,8 @@ pub fn generic_error_lines(raw: &str, max: usize) -> (Vec<String>, usize) {
                 break;
             }
             let is_location = nt.starts_with("-->") || nt.starts_with("|-->");
-            let is_snippet = next
-                .chars()
-                .next()
-                .is_some_and(|c| c == ' ' || c == '\t')
-                && nt.contains('|');
+            let is_snippet =
+                next.chars().next().is_some_and(|c| c == ' ' || c == '\t') && nt.contains('|');
             if !is_location && !is_snippet {
                 break;
             }

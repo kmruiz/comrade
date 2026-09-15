@@ -122,5 +122,5 @@ if [ "$skip_notes" -eq 0 ]; then
 fi
 
 git push origin "${next}"
-
+git push origin main
 echo "pushed ${next}; the release workflow is now building the binaries."
