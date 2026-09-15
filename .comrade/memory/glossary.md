@@ -491,6 +491,16 @@ Private items cannot be re-exported, so a moved item used by a sibling submodule
 - `crates/comrade-tool-project/src/node.rs`
 - `crates/comrade-tool-project/src/ecosystem/mod.rs`
 
+## ort prebuilt (dfbin)
+> The prebuilt ONNX Runtime static library that `ort-sys` downloads at build time (the `download-binaries` path, enabled here through fastembed's `ort-download-binaries-native-tls` feature). It is cached per target triple under `~/.cache/ort.pyke.io/dfbin/<triple>/<sha256>/libonnxruntime.a` and is ~105 MB before the linker prunes it; the target list lives in ort-sys `build/download/dist.tsv`.
+
+**References:**
+- `crates/comrade-tool-memory/Cargo.toml`
+- `.comrade/memory/0075-reject-muslstatic-linking-for-the-linux-release-binary-it-is-larger-not-smaller.md`
+
+**Notes:**
+Only `*-linux-gnu` Linux triples are published (aarch64- and x86_64-unknown-linux-gnu, plus android); there is NO musl build. When a target has no row, ort-sys `build/download/resolve.rs` aborts with `no prebuilt binaries available for target {target}` and tells you to compile ONNX Runtime from source — which is why the Linux binary cannot simply be rebuilt for x86_64-unknown-linux-musl (see ADR 75).
+
 ## path completion (session prompt)
 > Emacs find-file style Tab completion in the Ctrl-x C-s / Ctrl-x C-f session path minibuffer (crates/comrade-tui/src/tui.rs). KeyCode::Tab in handle_path_prompt_key runs complete_path(input, base = app root): it splits the typed path at the last `/` (split_dir_prefix) into a verbatim directory part and a partial name, reads the resulting directory (read_dir_entries; dirs carry a trailing `/`), and extends the name via complete_names — one match completes fully, several extend to their longest common prefix (longest_common_prefix, built on common_prefix from the M-x palette). `~` expands (expand_tilde); a path with no directory part is completed relative to the project root. Matches live in PathPrompt.matches and are drawn by draw_path_matches (a popup like draw_mx_list); cleared on the next edit.
 
