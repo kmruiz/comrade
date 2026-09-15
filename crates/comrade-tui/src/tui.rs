@@ -6054,13 +6054,20 @@ fn layout_chat_rows(
                     for child in &msg.children {
                         if child.kind == MsgKind::Reasoning {
                             let stamp = stamp_of(child, now);
+                            let child_sub = subchat_model(child.author.as_deref(), delegates);
+                            let cw = if child_sub.is_some() {
+                                width.saturating_sub(2)
+                            } else {
+                                width
+                            };
                             layout_reasoning(
                                 &mut out,
                                 child.text.as_str(),
                                 child.author.as_deref().unwrap_or("model"),
+                                child_sub.map(|m| colors.name_color(m)),
                                 colors,
                                 child.open,
-                                width,
+                                cw,
                                 stamp.as_deref(),
                             );
                         }
@@ -6077,9 +6084,10 @@ fn layout_chat_rows(
                     &mut out,
                     msg.text.as_str(),
                     msg.author.as_deref().unwrap_or("model"),
+                    sub.map(|m| colors.name_color(m)),
                     colors,
                     msg.open,
-                    width,
+                    w,
                     stamp.as_deref(),
                 );
             }
@@ -6630,11 +6638,15 @@ fn author_header(
 /// reasoning text as markdown. No card arrow or author tag - the block reads as
 /// the model speaking, and `draw_chat` tints its rows with the model's dimmed
 /// background band (the same band a delegate's reply uses), so who is thinking
-/// is carried by the colour.
+/// is carried by the colour. `rule` is the left border for the body rows (the
+/// header stays borderless, like a delegate reply's header), so a delegate's
+/// reasoning wears the same border as its reply; the lead model's reasoning
+/// passes `None`.
 fn layout_reasoning(
     out: &mut Vec<RenderRow>,
     text: &str,
     author: &str,
+    rule: Option<Color>,
     colors: &ModelColors,
     open: bool,
     width: usize,
@@ -6666,7 +6678,7 @@ fn layout_reasoning(
     if !text.trim().is_empty() {
         for spans in md_to_lines(text, width) {
             out.push(RenderRow {
-                rule: None,
+                rule,
                 spans,
                 tool_header: None,
             });
@@ -10530,6 +10542,7 @@ mod tests {
             &mut out,
             "let me check **this**",
             "model",
+            None,
             &ModelColors::default(),
             true,
             40,
@@ -10540,7 +10553,8 @@ mod tests {
         assert_eq!(out[0].spans.len(), 1);
         assert_eq!(out[0].spans[0].content, "\u{1f9e0} model");
         assert!(out[0].tool_header.is_none(), "header is not a tool card");
-        // The body follows as a normal markdown block, no rule, no card.
+        // The body follows as a normal markdown block; the lead model's
+        // reasoning carries no border, and no card.
         assert!(out.len() > 1);
         let joined: String = out[1..]
             .iter()
@@ -10557,6 +10571,7 @@ mod tests {
             &mut closed,
             "hidden",
             "model",
+            None,
             &ModelColors::default(),
             false,
             40,
@@ -10574,6 +10589,7 @@ mod tests {
             &mut out,
             "plain reasoning prose",
             "model",
+            None,
             &ModelColors::default(),
             true,
             40,
@@ -10651,6 +10667,48 @@ mod tests {
         let header = &rows[0];
         assert_eq!(header.spans[0].style.fg, Some(colors.name_color("main")));
         assert_ne!(header.spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn delegate_reasoning_wears_the_same_border_as_its_reply() {
+        // A delegate's reasoning must carry the colour-tinted left border its
+        // reply has, and the same indented width, so the 🧠 block reads as part
+        // of the delegate's sub-chat instead of a borderless lead-model block.
+        let mut colors = ModelColors::new();
+        colors.assign(&["main".to_string(), "dev".to_string()]);
+        let dev_color = colors.name_color("dev");
+        let delegates = vec![DelegateCfg {
+            name: "dev".into(),
+            ..Default::default()
+        }];
+        let chat = vec![
+            Msg::reasoning("dev", "I will read the file first"),
+            Msg::authored(MsgKind::Delegate, "dev", "the summary"),
+            Msg::reasoning("main", "the lead thinking"),
+        ];
+        let (rows, owners, _) =
+            layout_chat_rows(&chat, &[false], "", 60, &delegates, &colors, false, 0);
+        // Group the render rows by the chat message that owns them.
+        let mut per_msg: Vec<Vec<&RenderRow>> = vec![Vec::new(); chat.len()];
+        for (row, owner) in rows.iter().zip(&owners) {
+            if let Some(i) = *owner {
+                per_msg[i].push(row);
+            }
+        }
+        // The delegate reasoning: a borderless header, then body rows that each
+        // wear the delegate's border colour (exactly the reply's shape).
+        assert!(per_msg[0].len() > 1, "header + body expected");
+        for row in &per_msg[0][1..] {
+            assert_eq!(row.rule, Some(dev_color), "delegate border missing");
+        }
+        // The delegate reply keeps the same border.
+        for row in &per_msg[1][1..] {
+            assert_eq!(row.rule, Some(dev_color), "reply border changed");
+        }
+        // The lead model's reasoning stays borderless.
+        for row in &per_msg[2] {
+            assert!(row.rule.is_none(), "lead reasoning must stay borderless");
+        }
     }
 
     #[test]
