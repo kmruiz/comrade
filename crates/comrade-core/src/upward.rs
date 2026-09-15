@@ -75,9 +75,10 @@ impl UpwardAsk for ParentAsk {
              ---\n\nWrite a compact briefing that lets it CONTINUE the same task: (1) the task it \
              was given, restated in one or two lines so it knows what it is still doing; (2) what \
              it has already done, and the exact files it changed; (3) what it learned - the \
-             commands it ran and their results, and any error it hit; (4) exactly what remains. \
-             Keep exact file paths, identifiers and commands. Do not invent new requirements, do \
-             not add advice, and do not address the user. Output only the briefing."
+             commands it ran and their results, and any error it hit; (4) exactly what remains, and \
+             if it went down a wrong path, which part is a dead end that must be discarded or \
+             reverted. Keep exact file paths, identifiers and commands. Do not invent new \
+             requirements, do not add advice, and do not address the user. Output only the briefing."
         );
         let messages = vec![
             ChatMessage::new(Role::System, self.system.clone()),
@@ -87,6 +88,36 @@ impl UpwardAsk for ParentAsk {
         // keeps its previous behaviour rather than the run dying.
         match tokio::time::timeout(SUMMARY_TIMEOUT, self.client.chat(&messages)).await {
             Ok(Ok(text)) => Ok(usable_summary(&text)),
+            _ => Ok(None),
+        }
+    }
+
+    async fn supervise(&self, briefing: &str) -> Result<Option<String>> {
+        let prompt = format!(
+            "One of your sub-agents (a developer model) is STILL RUNNING the step you delegated. \
+             Its task and everything it has done so far follow.\n\n--- briefing ---\n{briefing}\n\
+             \n--- end briefing ---\n\n\
+             Judge two things only: (1) is it still working on the task it was given, or has it \
+             drifted into work you never asked for; (2) will its next action make progress, or is \
+             it about to repeat itself, re-read what it already knows, or go down a dead end. If \
+             it has already produced something the task does not need, say so - the smallest \
+             correction wins.\n\n\
+             Reply with exactly one of these and nothing else:\n\
+             OK\n\
+             or\n\
+             STEER: <at most 3 lines: what to stop doing, and the single next action it must take \
+             instead>\n\n\
+             Reply OK unless a correction is genuinely needed. Never restate the task, never ask a \
+             question, never address the user."
+        );
+        let messages = vec![
+            ChatMessage::new(Role::System, self.system.clone()),
+            ChatMessage::new(Role::User, prompt),
+        ];
+        // Bounded like `approve` and `summarise`: no correction (or a failed or
+        // slow request) simply means the caller leaves the sub-agent on its path.
+        match tokio::time::timeout(SUPERVISION_TIMEOUT, self.client.chat(&messages)).await {
+            Ok(Ok(text)) => Ok(parse_supervision(&text)),
             _ => Ok(None),
         }
     }
@@ -100,6 +131,12 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// is a real generation, so it needs longer than a one-line verdict - but still
 /// bounded, so a sub-agent can never be held open by a parent that stalls.
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the parent model gets to answer a supervision call (see
+/// [`UpwardAsk::supervise`]). Falling short of it costs nothing: the sub-agent is
+/// simply left on its current path, so a slow tech lead never becomes a way to
+/// hold a delegate open.
+const SUPERVISION_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Read a permission verdict out of the parent's reply. Fail closed: only a reply
 /// whose first substantive line OPENS with `APPROVE` approves; `DENY: <why>`
@@ -147,6 +184,64 @@ fn usable_summary(reply: &str) -> Option<String> {
     }
 }
 
+/// Read the parent's supervision verdict: `None` means "leave the delegate
+/// alone" - an `OK` reply, or any reply that is not a usable correction. A reply
+/// whose first substantive line opens with `STEER` (optionally `STEER:`, `STEER -`
+/// or `STEER(...)`) yields that line's remainder plus every following line,
+/// trimmed, as the correction.
+///
+/// Fail open: a rambling reply is never taken as a correction to the delegate's
+/// task, so an unusable verdict costs nothing but wasted tokens.
+pub fn parse_supervision(reply: &str) -> Option<String> {
+    let mut lines = reply.lines().map(clean_line).filter(|l| !l.is_empty());
+    let first = lines.next()?;
+    let upper = first.to_ascii_uppercase();
+    if upper.starts_with("OK") {
+        return None;
+    }
+    if !upper.starts_with("STEER") {
+        return None;
+    }
+    // `STEERING into the wrong file` is prose, not a correction: the keyword must
+    // end at a word boundary.
+    if upper["STEER".len()..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric())
+    {
+        return None;
+    }
+    let mut rest = first["STEER".len()..].trim_start();
+    if let Some(inner) = rest.strip_prefix('(') {
+        rest = inner.strip_suffix(')').unwrap_or(inner);
+    } else {
+        rest = rest.trim_start_matches([':', '-', '.', ' ', '\t']);
+    }
+    // Markdown emphasis around the keyword leaves `**` behind (`**STEER:** x`).
+    let mut text = clean_line(rest);
+    for line in lines {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&line);
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// One line of a parent's reply, stripped of surrounding whitespace and markdown
+/// noise - the same cleaning `parse_verdict` applies before it looks at a line.
+fn clean_line(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|c: char| matches!(c, '*' | '#' | '`' | '_' | ' '))
+        .trim()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +285,32 @@ mod tests {
         // A blank reply is not a summary: the caller must keep its transcript.
         assert_eq!(usable_summary("   \n"), None);
         assert_eq!(usable_summary(""), None);
+    }
+
+    #[test]
+    fn parse_supervision_is_a_correction_or_nothing() {
+        // OK (in any shape) means "leave it alone".
+        assert_eq!(parse_supervision("OK"), None);
+        assert_eq!(parse_supervision("ok.\n"), None);
+        assert_eq!(parse_supervision("OK: nothing to add"), None);
+        // A rambling non-answer is never taken as a correction.
+        assert_eq!(parse_supervision("I think you should keep going."), None);
+        assert_eq!(parse_supervision(""), None);
+        assert_eq!(parse_supervision("  \n"), None);
+        // A bare STEER has nothing to act on.
+        assert_eq!(parse_supervision("STEER"), None);
+        // The correction is everything after the keyword, on one or many lines.
+        assert_eq!(
+            parse_supervision("STEER: stop editing tui.rs and run the test"),
+            Some("stop editing tui.rs and run the test".to_string())
+        );
+        assert_eq!(
+            parse_supervision("**STEER:** revert the new module\nand run cargo test"),
+            Some("revert the new module\nand run cargo test".to_string())
+        );
+        assert_eq!(
+            parse_supervision("steer - do not read that file again"),
+            Some("do not read that file again".to_string())
+        );
     }
 }

@@ -57,6 +57,16 @@ pub trait UpwardAsk: Send + Sync {
     async fn summarise(&self, _transcript: &str) -> Result<Option<String>> {
         Ok(None)
     }
+
+    /// Steer a sub-agent that is still RUNNING but has lost focus. The parent
+    /// model is shown what the sub-agent has done so far and may return a short
+    /// correction, which the caller injects into the sub-agent's conversation.
+    ///
+    /// `Ok(None)` - the default - means "leave it alone": no parent is wired, or
+    /// the parent has no objection, so the caller keeps its current path.
+    async fn supervise(&self, _briefing: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// Shared handle to the parent model, carried by the session ("this session's

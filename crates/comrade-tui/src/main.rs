@@ -174,6 +174,7 @@ fn build_tools(
             budget_tokens: cfg.context.budget_tokens,
             max_tool_output_chars: cfg.context.max_tool_output_chars,
             timeout: std::time::Duration::from_secs(cfg.agent.delegate_timeout_secs),
+            supervise: std::time::Duration::from_secs(cfg.agent.delegate_supervise_secs),
         },
     )? {
         reg.register(Box::new(delegate));
@@ -189,6 +190,8 @@ fn build_tools(
             budget_tokens: cfg.context.budget_tokens,
             max_tool_output_chars: cfg.context.max_tool_output_chars,
             timeout: std::time::Duration::from_secs(cfg.agent.delegate_timeout_secs),
+            // An advice run is short and read-only: there is nothing to steer.
+            supervise: std::time::Duration::ZERO,
         },
     )? {
         reg.register(Box::new(advise));

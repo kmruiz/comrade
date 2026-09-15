@@ -107,6 +107,10 @@ pub struct DelegateLimits {
     /// clock, so a delegate that keeps working is never cut off for taking its
     /// time. [`Duration::ZERO`] disables the limit.
     pub timeout: Duration,
+    /// How often the tech lead re-reads the transcript of a delegate that is
+    /// still RUNNING and may steer it back on task (see
+    /// [`MAX_DELEGATE_SUPERVISIONS`]). [`Duration::ZERO`] disables supervision.
+    pub supervise: Duration,
 }
 
 impl Default for DelegateLimits {
@@ -116,6 +120,7 @@ impl Default for DelegateLimits {
             budget_tokens: 6000,
             max_tool_output_chars: 5000,
             timeout: Duration::from_secs(60),
+            supervise: Duration::from_secs(60),
         }
     }
 }
@@ -809,6 +814,68 @@ async fn recover_context(
 /// way to keep the parent model answering forever.
 const MAX_UPWARD_ASKS: usize = 3;
 
+/// Cap on parent SUPERVISIONS per delegate run. Every
+/// [`DelegateLimits::supervise`] the tech lead is shown what a still-running
+/// delegate has done and may send back ONE correction. Each round is a real
+/// parent model call, so the rounds are capped; past the cap the delegate is left
+/// alone to finish, and the parent can still re-delegate the step afterwards.
+const MAX_DELEGATE_SUPERVISIONS: usize = 5;
+
+/// Framing for a correction the tech lead injects into a RUNNING delegate's
+/// conversation. The delegate must read it as an instruction from its own lead -
+/// not as a note to itself, and not as a new task - and must drop whatever it was
+/// doing that contradicts it.
+const SUPERVISE_PREFIX: &str = "Your tech lead has reviewed your progress mid-run and is \
+     correcting the step. Follow this correction, drop whatever you were doing that contradicts \
+     it, then continue the same task and reply with your final answer:\n";
+
+/// How much of a delegate's transcript one supervision round shows the tech lead:
+/// the tail, so an old and long run cannot make the parent's own request
+/// arbitrarily expensive (the parent has its own context to protect).
+const SUPERVISION_TRANSCRIPT_CHARS: usize = 8000;
+
+/// The briefing a supervision round hands to the tech lead: the task the delegate
+/// was given plus the tail of its transcript, so the parent can judge what the
+/// delegate is doing and what it intends to do next. Pure, so it is testable.
+fn supervise_briefing(ctxm: &ContextManager) -> String {
+    let task = ctxm
+        .messages()
+        .iter()
+        .find(|m| m.role == Role::User && m.tool_calls.is_none())
+        .map(|m| m.content.trim().to_string())
+        .unwrap_or_else(|| "(the delegated task is no longer in the transcript)".to_string());
+    let mut transcript = crate::compact::render_transcript(ctxm.messages());
+    if transcript.len() > SUPERVISION_TRANSCRIPT_CHARS {
+        let cut = transcript.len() - SUPERVISION_TRANSCRIPT_CHARS;
+        // Never cut a UTF-8 character in half.
+        let cut = (cut..transcript.len())
+            .find(|i| transcript.is_char_boundary(*i))
+            .unwrap_or(cut);
+        transcript = format!("[... earlier turns elided ...]\n{}", &transcript[cut..]);
+    }
+    format!(
+        "TASK IT WAS GIVEN: {task}\n\nWHAT IT HAS DONE SO FAR (oldest first; the last assistant \
+         turn is what it intends to do next):\n--- transcript ---\n{transcript}\n--- end \
+         transcript ---"
+    )
+}
+
+/// Ask the tech lead to review a delegate that is still running and return its
+/// correction, if any. `None` when no parent is wired, when the parent has no
+/// objection, or when it did not answer in time - the delegate then simply
+/// carries on.
+async fn supervise_delegate(dctx: &ToolContext, ctxm: &ContextManager) -> Option<String> {
+    let parent = dctx.session.upward()?;
+    // The parent sees the transcript as data in a standalone request: its own
+    // conversation is never touched, so supervising a delegate cannot cost the
+    // tech lead's context.
+    parent
+        .supervise(&supervise_briefing(ctxm))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Cap the `ask_upwards` tool per delegate run. Returns the refusal message for
 /// the call that exceeds the cap, `None` for every other call (including the
 /// first [`MAX_UPWARD_ASKS`] upward questions).
@@ -944,6 +1011,10 @@ pub(crate) async fn run_delegate_subagent(
     let mut upward_asks = 0usize;
     // Context-overflow recoveries spent by this run (see MAX_DELEGATE_COMPACTIONS).
     let mut compactions = 0usize;
+    // Supervision rounds spent by this run (see MAX_DELEGATE_SUPERVISIONS) and
+    // when the next one falls due.
+    let mut supervisions = 0usize;
+    let mut next_supervision = Instant::now() + limits.supervise;
     // Whether a proactive compaction is armed for the current over-budget episode.
     // Mirrors the main loop's `auto_compact_armed` guard, so a history that stays
     // over budget for a structural reason (its fixed prompt is too big) cannot
@@ -996,6 +1067,33 @@ pub(crate) async fn run_delegate_subagent(
         // own conversation at its next rest point (drained from the shared bus
         // cloned into `dctx`).
         crate::agent::drain_steer(dctx.steer.as_ref(), &mut ctxm).await;
+        // Supervision: every `limits.supervise` the tech lead re-reads what this
+        // still-running delegate has done and may send back ONE correction, which
+        // is injected as a user turn at this rest point (the same place a human
+        // steer lands, so message ordering with tool calls stays API-valid). A
+        // parent that is not wired, has nothing to add or is slow costs nothing:
+        // the delegate simply carries on. The call is bounded by the idle clock,
+        // so a slow parent cannot eat the delegate's inactivity budget, and the
+        // rounds are capped so one run cannot turn into a conversation.
+        if !limits.supervise.is_zero()
+            && supervisions < MAX_DELEGATE_SUPERVISIONS
+            && dctx.session.upward().is_some()
+            && Instant::now() >= next_supervision
+        {
+            // Re-arm before the call: reviewing takes time, and a correction must
+            // not be requested again on the very next iteration.
+            next_supervision = Instant::now() + limits.supervise;
+            supervisions += 1;
+            let review = invoke_within(
+                idle_left(last_progress, idle_nudged),
+                supervise_delegate(&dctx, &ctxm),
+            )
+            .await
+            .flatten();
+            if let Some(correction) = review {
+                ctxm.push_user_merged(&format!("{SUPERVISE_PREFIX}{correction}"));
+            }
+        }
         // Prefer a parent-written summary over the lossy trim once the context is
         // about to be degraded, mirroring the main loop's auto-compaction. Armed
         // once per over-budget episode, so a structurally over-budget history (its

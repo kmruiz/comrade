@@ -485,6 +485,16 @@ fn delegate_timeout_defaults_to_five_minutes_and_parses() {
 }
 
 #[test]
+fn delegate_supervise_defaults_to_a_minute_and_parses() {
+    let d = Config::load(Some(&write_tmp(""))).unwrap().config;
+    assert_eq!(d.agent.delegate_supervise_secs, 60);
+    let p = write_tmp("[agent]\ndelegate_supervise_secs = 0\n");
+    let c = Config::load(Some(&p)).unwrap().config;
+    let _ = std::fs::remove_file(&p);
+    assert_eq!(c.agent.delegate_supervise_secs, 0);
+}
+
+#[test]
 fn sensors_default_to_none() {
     let c = Config::default();
     assert!(c.sensors.is_empty());

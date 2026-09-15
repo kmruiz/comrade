@@ -229,6 +229,18 @@ Distinct from the call-count guards STALL_NUDGE / VERIFY_NUDGE / DELEGATE_READ_N
 **Notes:**
 Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by render_row_line's `sub: Option<Color>` param. Folded MsgKind::Run digests keep no sub-chat styling.
 
+## Delegate supervision
+> The tech lead re-reading the transcript of a delegate that is still RUNNING (every `[agent].delegate_supervise_secs`, default 60s) and injecting at most one correction back into the delegate's own conversation. Implemented as `UpwardAsk::supervise` (one tool-less, bounded parent model call parsed by `parse_supervision`: `OK` = leave it alone, `STEER: <text>` = a correction), capped at `MAX_DELEGATE_SUPERVISIONS` (5) per run and applied at the delegate loop's rest point via `push_user_merged`. Distinct from context-overflow recovery (`recover_context`, capped by `MAX_DELEGATE_COMPACTIONS = 3`) and from `ask_upwards` (the DELEGATE asking its lead).
+
+**References:**
+- `crates/comrade-core/src/delegate.rs`
+- `crates/comrade-core/src/upward.rs`
+- `crates/comrade-tool/src/ask.rs`
+- `crates/comrade-core/src/config.rs`
+
+**Notes:**
+`Duration::ZERO` / `delegate_supervise_secs = 0` disables it; comrade-tui passes ZERO for the `ask_advise` tool (advice runs are short and read-only). The parent is a plain tool-less chat, so it cannot revert files itself - it can only tell the delegate to discard a dead end.
+
 ## Delegate timeout
 > A wall-clock budget (`[agent].delegate_timeout_secs`, default **300s / 5 minutes**; `0` = no limit) applied to every delegated sub-agent run (`delegate`, `delegate_parallel`, `ask_advise`). Enforced in `crates/comrade-core/src/delegate.rs::run_delegate_subagent`: each model request and tool call is bounded by the time left, and when the budget runs out the delegate returns `timeout_answer(...)` — a partial answer if it had one, else a notice that it did not finish. Prevents a slow/hung model request or hanging tool from holding the parent run open. (Originally 60s; raised to 300s on 2026-09-14 — the 60s default was too aggressive.)
 

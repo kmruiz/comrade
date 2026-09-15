@@ -162,9 +162,15 @@ One table per developer model the tech lead may hand sub-tasks to (the
 `delegate` / `ask_advise` tools). Keys: `name`, `description`, `enabled`
 (`true`), `approval` (`auto` \| `ask` \| `deny`, default `auto`), plus the inline
 `[llm]` keys (`provider`, `model`, `api_key`, `temperature`, …). Every run is
-bounded by `[agent].delegate_timeout_secs` (default `300`): a delegate that has
-not produced a final answer by then is stopped and replies with what it gathered,
-so a slow or stuck delegate can never hang the parent run.
+bounded by `[agent].delegate_timeout_secs` (default `300`) seconds of INACTIVITY:
+a delegate that completes nothing (no model reply, no tool result) is nudged to
+act after that long and stopped at twice it, while any completed request or tool
+call resets the clock, so a slow but working delegate is never cut off and a
+stuck one can never hang the parent run. While a delegate runs, the tech lead is
+shown its transcript every `[agent].delegate_supervise_secs` (default `60`) and
+replies either OK or a short correction, at most 5 per run — so a delegate that
+drifts off its step is steered back instead of being left to loop; the same
+recovery covers a context overflow.
 
 ### `[agent]`
 
@@ -173,7 +179,8 @@ so a slow or stuck delegate can never hang the parent run.
 | `max_iterations` | `30` | Tool-use turns per run. |
 | `tool_timeout_secs` | `0` | Kill a single tool after N seconds (`0` = no limit). |
 | `run_timeout_secs` | `0` | Stop a whole run after N seconds (`0` = no limit). |
-| `delegate_timeout_secs` | `300` | Wall-clock budget for one delegate run; a delegate that misses it replies with what it has (`0` = no limit). |
+| `delegate_timeout_secs` | `300` | INACTIVITY budget: a delegate that completes nothing for N seconds is nudged to act and stopped at 2N; any completed request or tool result resets the clock (`0` = no limit). |
+| `delegate_supervise_secs` | `60` | How often the tech lead re-reads a running delegate's transcript and may steer it back on task; at most 5 steers per run (`0` = off). |
 
 ### `[context]`
 

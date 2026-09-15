@@ -170,6 +170,13 @@ pub struct AgentCfg {
     /// that keeps working is never cut off for taking its time, while a slow or
     /// hung one cannot hold the parent run open forever. `0` disables the limit.
     pub delegate_timeout_secs: u64,
+    /// How often the tech lead re-reads the transcript of a delegate that is
+    /// still running and may steer it back on task. At this interval, and at
+    /// most `MAX_DELEGATE_SUPERVISIONS` times per run, the parent model is shown
+    /// what the delegate has done and what it intends to do next, and answers
+    /// either "OK" (leave it alone) or a short correction that is injected into
+    /// the delegate's conversation. `0` disables supervision.
+    pub delegate_supervise_secs: u64,
 }
 
 impl Default for AgentCfg {
@@ -179,6 +186,7 @@ impl Default for AgentCfg {
             tool_timeout_secs: 0,
             run_timeout_secs: 0,
             delegate_timeout_secs: 300,
+            delegate_supervise_secs: 60,
         }
     }
 }

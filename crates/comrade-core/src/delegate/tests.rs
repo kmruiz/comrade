@@ -1066,6 +1066,32 @@ impl UpwardAsk for SummarisingParent {
     }
 }
 
+/// A parent model that steers every supervision round with a fixed correction -
+/// or with none when `steer` is `None` - and counts how often it was asked. Only
+/// `ask` (required) and `supervise` are implemented: the remaining trait methods
+/// keep their fail-open defaults.
+struct SteeringParent {
+    steer: Option<String>,
+    supervised: Arc<std::sync::atomic::AtomicUsize>,
+    /// The last briefing it was shown, so a test can assert what the tech lead
+    /// actually received.
+    last_briefing: Arc<std::sync::Mutex<String>>,
+}
+
+#[async_trait::async_trait]
+impl UpwardAsk for SteeringParent {
+    async fn ask(&self, _question: &str) -> Result<String> {
+        Ok(String::new())
+    }
+
+    async fn supervise(&self, briefing: &str) -> Result<Option<String>> {
+        self.supervised
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.last_briefing.lock().unwrap() = briefing.to_string();
+        Ok(self.steer.clone())
+    }
+}
+
 /// A recording stub `fs_edit`. The name matters: `fs_edit` is a MUTATING tool, so
 /// the no-progress guard clears its refusal counter on every run and the stub may
 /// legitimately be called more than once in a test.
@@ -2176,6 +2202,180 @@ async fn delegate_receives_a_steer_mid_run() {
 
     let out = run.await.unwrap();
     assert!(out.contains("done after the steer"), "{out}");
+}
+
+/// The tech lead re-reads a delegate that is still RUNNING and the correction it
+/// sends back reaches the delegate's next model request, framed as a correction
+/// from the lead. The review happens at the loop's rest point, never mid-call.
+#[tokio::test]
+async fn a_running_delegate_is_steered_by_its_parent() {
+    const CORRECTION: &str = "stop rewriting src/a.rs and run the test instead";
+    let (called_tx, called_rx) = tokio::sync::oneshot::channel();
+    let gate = Arc::new(Gate {
+        called: std::sync::Mutex::new(Some(called_tx)),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(GatedWriteTool { gate: gate.clone() }));
+
+    let tool_call_turn = json!({
+        "choices": [{
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {
+                        "name": "fs_write_file",
+                        "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let final_turn =
+        json!({"choices": [{"message": {"content": "done after the review"}}]}).to_string();
+    let (base, bodies) = scripted_spy(vec![tool_call_turn, final_turn]);
+
+    let cfg = Config {
+        delegates: vec![delegate("cheap", &base)],
+        ..Config::default()
+    };
+    // A review falls due while the delegate is still inside its tool call: the
+    // gate below keeps it there until the interval has passed.
+    let limits = DelegateLimits {
+        supervise: std::time::Duration::from_millis(50),
+        ..DelegateLimits::default()
+    };
+    let tool = DelegateTool::new(&cfg.delegates, registry, limits)
+        .unwrap()
+        .unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let session = Arc::new(AgentSession::new(tx));
+    let supervised = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let briefing = Arc::new(std::sync::Mutex::new(String::new()));
+    session.set_upward(Arc::new(SteeringParent {
+        steer: Some(CORRECTION.to_string()),
+        supervised: supervised.clone(),
+        last_briefing: briefing.clone(),
+    }));
+    let mut ctx = test_ctx();
+    ctx.session = session.as_control();
+
+    let run = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            tool.invoke(
+                &ctx,
+                json!({"jobs": [{"model": "cheap", "task": "write src/a.rs"}]}),
+            )
+            .await
+            .unwrap()
+        }
+    });
+
+    // Request 1 must NOT carry the correction: no review has happened yet.
+    let first = recv_body(&bodies).await;
+    assert!(
+        !first.contains(CORRECTION),
+        "the correction leaked into the first request"
+    );
+
+    // Let the interval lapse while the delegate is still executing its tool, then
+    // let it finish so the loop reaches its next rest point.
+    called_rx.await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    gate.release.notify_one();
+
+    let second = recv_body(&bodies).await;
+    assert!(
+        second.contains(CORRECTION),
+        "the correction never reached the delegate: {second}"
+    );
+
+    let out = run.await.unwrap();
+    assert!(out.contains("done after the review"), "{out}");
+    assert_eq!(
+        supervised.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the lead must have been asked exactly once"
+    );
+    // What the lead was shown: the delegated task and the delegate's transcript.
+    let seen = briefing.lock().unwrap().clone();
+    assert!(seen.contains("write src/a.rs"), "task missing: {seen}");
+    assert!(seen.contains("transcript"), "transcript missing: {seen}");
+}
+
+/// Supervision is a bounded conversation: one run spends at most
+/// [`MAX_DELEGATE_SUPERVISIONS`] rounds, however often the lead has something to
+/// add.
+#[tokio::test]
+async fn supervision_stops_after_five_steers() {
+    // Twelve read turns give twelve rest points, then the delegate answers.
+    let mut turns = Vec::new();
+    for n in 0..12 {
+        turns.push(
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "id": format!("call_{n}"),
+                            "function": {
+                                "name": "fs_read_file",
+                                "arguments": json!({"path": format!("src/f{n}.rs")}).to_string()
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        );
+    }
+    turns.push(json!({"choices": [{"message": {"content": "read everything"}}]}).to_string());
+    let base = scripted_server(turns);
+
+    let cfg = Config {
+        delegates: vec![delegate("cheap", &base)],
+        ..Config::default()
+    };
+    let limits = DelegateLimits {
+        supervise: std::time::Duration::from_nanos(1),
+        ..DelegateLimits::default()
+    };
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ReadStubTool {
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    let tool = DelegateTool::new(&cfg.delegates, registry, limits)
+        .unwrap()
+        .unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let session = Arc::new(AgentSession::new(tx));
+    let supervised = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    session.set_upward(Arc::new(SteeringParent {
+        steer: Some("keep going, but stop reading".to_string()),
+        supervised: supervised.clone(),
+        last_briefing: Arc::new(std::sync::Mutex::new(String::new())),
+    }));
+    let mut ctx = test_ctx();
+    ctx.session = session.as_control();
+
+    let out = tool
+        .invoke(
+            &ctx,
+            json!({"jobs": [{"model": "cheap", "task": "read the files"}]}),
+        )
+        .await
+        .unwrap();
+    assert!(out.contains("read everything"), "{out}");
+    assert_eq!(
+        supervised.load(std::sync::atomic::Ordering::SeqCst),
+        MAX_DELEGATE_SUPERVISIONS,
+        "one run must spend exactly the cap"
+    );
 }
 
 #[tokio::test]
