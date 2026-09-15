@@ -435,6 +435,8 @@ impl Tool for GitStash {
                 git(ctx, &["stash", "pop", &idx]).await?
             }
             Action::Apply => {
+                ctx.confirm(format!("Apply stash@{{{}}}", args.index), None)
+                    .await?;
                 let idx = format!("stash@{{{}}}", args.index);
                 git(ctx, &["stash", "apply", &idx]).await?
             }

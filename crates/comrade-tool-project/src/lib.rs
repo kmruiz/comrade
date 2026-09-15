@@ -136,7 +136,7 @@ struct PomRunTask;
 static POM_RUN_TASK_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "pom_run_task".into(),
-    description: "Run a named project task and return its output: standard project tasks (e.g. build, run, check, fmt, doc, test, bench, release) and configured aliases; optionally scope to a subproject. Runs directly without approval. Works for Cargo and npm projects; in a repo with several build ecosystems pass `ecosystem` to choose one. Run tests with pom_run_tests, not here - it returns only the failure summary and costs far less context.".into(),
+    description: "Run a named project task and return its output: standard project tasks (e.g. build, run, check, clippy, fmt, doc, bench, release) and configured aliases; optionally scope to a subproject. Runs directly without approval. Works for Cargo and npm projects; in a repo with several build ecosystems pass `ecosystem` to choose one. Run tests with pom_run_tests, not here - it returns only the failure summary and costs far less context.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
