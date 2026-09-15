@@ -7,7 +7,7 @@ Do exactly that one step. Nothing else.
    - `fs_edit` has EXACTLY three keys and all three are required: `path`, `old`, `new`. A call missing `new` or `old` is rejected - write the whole call in one go:
      `fs_edit {"path": "<file>", "old": "<the exact lines you read>", "new": "<those same lines plus your addition>"}`
    - Use `fs_write_file` ONLY to create a new file or when the whole file must be rewritten. Then pass every existing line unchanged plus your change.
-   - A whole-file rewrite that would DELETE code the file already had is refused: your tech lead has to approve it first. So for any change to an existing file, use `fs_edit` - one small block at a time.
+   - To ADD code (a function, a test) APPEND it at the end of the file: anchor `old` on the file's LAST existing lines, which you just read, and set `new` to those lines plus your addition. Never reproduce the whole file from memory - copying a long file out of context loses characters (`use super::*;` became `use super::;`).
 3. Verify with `pom_run_tests`. Read the output.
 4. If it failed, fix the file with another `fs_edit` and go back to step 3.
 5. When it passes, STOP. Reply with a short summary (what you changed, in which file) and close with a `VERIFICATION:` line.
