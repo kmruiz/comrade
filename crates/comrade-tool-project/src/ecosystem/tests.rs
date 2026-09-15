@@ -147,6 +147,34 @@ Compiling foo
 }
 
 #[test]
+fn error_scan_ignores_passing_tests_that_mention_error() {
+    // Real output from this repo's own green suite: the only "error" in the
+    // retained head is the NAME of a passing test. Reading that as a build
+    // failure made `pom_run_tests` report a green suite as broken.
+    let raw = "\
+running 3 tests
+test delegate::tests::context_overflow_errors_are_recognised ... ok
+test is_context_overflow_handles_io ... ok
+test other ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored
+";
+    let (errors, total) = generic_error_lines(raw, 20);
+    assert_eq!(total, 0, "a passing suite has no errors: {errors:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+
+    // A real diagnostic header is still picked up, with its location line.
+    let raw = "Compiling x\nerror[E0425]: cannot find value `a`\n --> src/lib.rs:3:5\n";
+    let (errors, total) = generic_error_lines(raw, 20);
+    assert_eq!(total, 1);
+    assert!(errors[0].contains("error[E0425]"), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("src/lib.rs:3:5")),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn test_output_is_simplified() {
     let raw = "\
    Compiling comrade-core v0.1.0

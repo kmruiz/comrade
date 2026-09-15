@@ -287,15 +287,29 @@ pub async fn run(resolved: &Resolved, timeout_secs: u64) -> Result<String> {
     Ok(result)
 }
 
-/// Cap `body` at `max` characters, appending a truncation marker.
+/// Cap `body` at `max` characters, eliding the middle when it is longer.
+///
+/// BOTH ends are kept because they carry different information and the caller
+/// only ever wants one of them per verb: the HEAD holds the compile errors
+/// (`pom_run_tests`/`pom_check`) and the first built target, while the TAIL
+/// holds the `test result: ...` totals that [`Ecosystem::simplify_tests`]
+/// parses. Keeping only the head dropped every `test result:` line on a
+/// workspace-wide `cargo test` (whose head is thousands of `test NAME ... ok`
+/// lines), so the simplifier saw no results at all and the model was told a
+/// green suite had failed to build.
 fn cap(body: &str, max: usize) -> String {
-    if body.chars().count() > max {
-        let mut s: String = body.chars().take(max).collect();
-        s.push_str("\n... (output truncated)");
-        s
-    } else {
-        body.to_string()
+    const MARKER: &str = "\n... (output truncated) ...\n";
+    let total = body.chars().count();
+    if total <= max {
+        return body.to_string();
     }
+    // Give the tail a third of the budget, so the trailing totals survive, and
+    // charge the elision marker to the head.
+    let tail_len = max / 3;
+    let head_len = max.saturating_sub(tail_len + MARKER.chars().count());
+    let head: String = body.chars().take(head_len).collect();
+    let tail: String = body.chars().skip(total - tail_len).collect::<String>();
+    format!("{head}{MARKER}{tail}")
 }
 
 /// Try to locate `cargo` when it is missing from this process's PATH: first via
@@ -328,6 +342,73 @@ async fn find_cargo() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::pom;
+
+    #[test]
+    fn cap_keeps_the_tail_so_test_totals_survive() {
+        // A workspace-wide `cargo test`: the head is thousands of per-test
+        // "... ok" lines and the `test result:` totals sit at the very end.
+        // Keeping only the head dropped every total, so `simplify_tests` saw
+        // no results and the model was told a green suite had failed to build.
+        let mut body = String::from("running 2 tests\n");
+        for i in 0..2000 {
+            body.push_str(&format!(
+                "test crate::very::long::test_name_number_{i} ... ok\n"
+            ));
+        }
+        body.push_str("test result: ok. 2000 passed; 0 failed; 0 ignored\n");
+
+        let capped = cap(&body, 9000);
+        assert!(
+            capped.contains("test result: ok. 2000 passed"),
+            "the tail totals must survive the cap"
+        );
+        assert!(
+            capped.contains("output truncated"),
+            "the elision must be marked"
+        );
+        assert!(
+            capped.chars().count() <= 9000,
+            "the cap must still bound the output, got {}",
+            capped.chars().count()
+        );
+
+        // Short output is returned untouched, and the head is still kept so
+        // compile errors survive.
+        assert_eq!(cap("short\n", 9000), "short\n");
+        let mut errs = String::from("error[E0425]: cannot find value `a`\n");
+        errs.push_str(&"filler\n".repeat(4000));
+        let capped = cap(&errs, 9000);
+        assert!(capped.starts_with("error[E0425]"), "{capped}");
+    }
+
+    #[test]
+    fn a_capped_workspace_test_run_still_reports_its_totals() {
+        use crate::ecosystem::{Cargo, Ecosystem};
+
+        // The shape of a real `cargo test --workspace` in this repo: compile
+        // noise and thousands of per-test "... ok" lines first, the totals last
+        // - plus a PASSING test whose name contains "error". `pom_run_tests`
+        // caps the raw output before simplifying it, so both the cap (keep the
+        // tail) and the error scan (only real diagnostics) are exercised.
+        let mut raw = String::from(
+            "   Compiling comrade-core v0.1.0\n    Finished `dev` profile\nrunning 2000 tests\n",
+        );
+        raw.push_str("test delegate::tests::context_overflow_errors_are_recognised ... ok\n");
+        for i in 0..2000 {
+            raw.push_str(&format!("test crate::t{i} ... ok\n"));
+        }
+        raw.push_str("\ntest result: ok. 2000 passed; 0 failed; 0 ignored\n");
+
+        let summary = Cargo.simplify_tests(&cap(&raw, 9000));
+        assert!(
+            summary.contains("test result: ok. 2000 passed"),
+            "a green suite must report its totals, got: {summary}"
+        );
+        assert!(
+            !summary.contains("could not build"),
+            "a green suite must never be reported as a build failure: {summary}"
+        );
+    }
 
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

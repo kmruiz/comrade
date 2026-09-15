@@ -579,6 +579,34 @@ fn simplify_js_tests(raw: &str) -> String {
     trim_chars(out, MAX_CHARS)
 }
 
+/// Whether one raw line is a REAL compiler-diagnostic header, as opposed to
+/// noise that merely mentions the word "error". A bare substring test on
+/// "error" matched unrelated lines - notably a PASSING test whose name
+/// contains it (`test foo::errors_are_recognised ... ok`) - which made
+/// `compose_test_summary` tell the model its green suite had failed to build.
+/// A real diagnostic has a known shape: `error:` / `error[E0425]:` (rustc,
+/// clang), a diagnostic code, or one of the toolchain's stock failure phrases.
+fn is_error_header(line: &str) -> bool {
+    let t = line.trim();
+    // Test-runner output can contain "error" and is never a diagnostic.
+    if t.starts_with("test ") || t.starts_with("test result:") {
+        return false;
+    }
+    let l = t.to_lowercase();
+    // rustc/clang style header: `error: ...` or `error[E0425]: ...`.
+    if l.starts_with("error:") || l.starts_with("error[") {
+        return true;
+    }
+    // Prefixed diagnostics, e.g. `src/x.rs:1:1: error[E0308]: ...`.
+    if l.contains("error[e") {
+        return true;
+    }
+    l.starts_with("cannot find")
+        || l.starts_with("mismatched types")
+        || l.contains("could not compile")
+        || l.contains("failed to compile")
+}
+
 /// Fallback diagnostic extraction for toolchains without a structured format:
 /// keep the lines that look like errors, capped at `max` — each one FOLLOWED by
 /// its location and code-snippet lines when the toolchain prints them on their
@@ -598,12 +626,7 @@ pub fn generic_error_lines(raw: &str, max: usize) -> (Vec<String>, usize) {
         if t.trim().is_empty() {
             continue;
         }
-        let l = t.to_lowercase();
-        let looks_like_error = l.contains("error")
-            || l.contains("cannot find")
-            || l.contains("mismatched types")
-            || l.contains("failed to compile");
-        if !looks_like_error {
+        if !is_error_header(t) {
             continue;
         }
         total += 1;
