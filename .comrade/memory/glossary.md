@@ -311,6 +311,9 @@ The refusal is returned as the tool result and emitted as a tool_call/tool_resul
 - `crates/comrade-tool-session/src/diagram.rs`
 - `crates/comrade-tui/src/tui.rs`
 
+**Notes:**
+The sentinel is also how focus mode recognises a diagram to keep: `diagram_block(msg)` in crates/comrade-tui/src/tui.rs returns a tool card's result when it contains `DIAGRAM_OPEN`, so `focus_visible` keeps that row (and a folded Run holding one) and `layout_diagram` draws it with no card chrome. Keying on the block, not the tool name, means any tool embedding a diagram block is covered. See ADR #16.
+
 ## diff_choice
 > A `FieldKind` variant ("diff_choice") for ask_form: a pick-list whose options carry a code diff each (`DiffOption { label, diff }`). Rendered as the diffs; the answer is the chosen option's `label`. Used to let the human pick between competing patches.
 
