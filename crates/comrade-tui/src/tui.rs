@@ -4839,11 +4839,20 @@ fn toggle_section(collapsed: &mut Vec<bool>, chat: &[Msg], running: bool, msg_id
     }
 }
 
+/// The tool result behind an ASCII diagram block, when this message is a tool
+/// card whose result carries one. `show_diagram` wraps its picture in the
+/// `DIAGRAM_OPEN`/`DIAGRAM_CLOSE` sentinels that [`result_rows`] keys off, so a
+/// diagram is recognised by the block itself rather than by the tool's name.
+fn diagram_block(msg: &Msg) -> Option<&str> {
+    let result = msg.tool.as_ref()?.result.as_deref()?;
+    result.contains(DIAGRAM_OPEN).then_some(result)
+}
+
 /// Whether a message produces any row in focus mode: the spoken conversation
-/// (user turn, model reply, delegate advisory), the model reasoning and the
-/// questions the agent asked (ask_form). Tool cards, failure blocks and grey
-/// status notes are dropped; a folded run digest survives only as the
-/// reasoning inside it.
+/// (user turn, model reply, delegate advisory), the model reasoning, the
+/// questions the agent asked (ask_form) and a tool result that drew a diagram.
+/// Other tool cards, failure blocks and grey status notes are dropped; a folded
+/// run digest survives as the reasoning and diagrams inside it.
 fn focus_visible(msg: &Msg) -> bool {
     match msg.kind {
         MsgKind::User
@@ -4851,8 +4860,14 @@ fn focus_visible(msg: &Msg) -> bool {
         | MsgKind::Delegate
         | MsgKind::Reasoning
         | MsgKind::Question => true,
-        MsgKind::Run => msg.children.iter().any(|c| c.kind == MsgKind::Reasoning),
-        MsgKind::Tool | MsgKind::Failure | MsgKind::Meta => false,
+        MsgKind::Run => msg
+            .children
+            .iter()
+            .any(|c| c.kind == MsgKind::Reasoning || diagram_block(c).is_some()),
+        // A diagram is content the model drew for the human, not tool noise:
+        // focus mode keeps it while every other tool row stays hidden.
+        MsgKind::Tool => diagram_block(msg).is_some(),
+        MsgKind::Failure | MsgKind::Meta => false,
     }
 }
 
@@ -6069,6 +6084,10 @@ fn layout_chat_rows(
                                 cw,
                                 stamp.as_deref(),
                             );
+                        } else if let Some(result) = diagram_block(child) {
+                            // A picture the model drew for the human survives
+                            // focus mode; the tool card around it does not.
+                            layout_diagram(&mut out, result, width);
                         }
                     }
                 } else {
@@ -6076,7 +6095,11 @@ fn layout_chat_rows(
                 }
             }
             MsgKind::Failure => layout_failure(&mut out, i, msg.fail.as_ref().unwrap(), width),
-            MsgKind::Tool => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), w),
+            MsgKind::Tool => match (focus, diagram_block(msg)) {
+                // Focus mode drops the card but keeps the diagram inside it.
+                (true, Some(result)) => layout_diagram(&mut out, result, w),
+                _ => layout_tool(&mut out, i, msg.tool.as_ref().unwrap(), w),
+            },
             MsgKind::Reasoning => {
                 let stamp = stamp_of(msg, now);
                 layout_reasoning(
@@ -7010,6 +7033,21 @@ fn result_rows(result: &str, ok: bool, width: usize) -> Vec<Vec<Span<'static>>> 
         }
     }
     rows
+}
+
+/// Draw a tool result's ASCII diagram block on its own: no card header, no
+/// status mark, no args — just the picture, line for line, styled exactly as
+/// the open tool card shows it (see [`result_rows`], which never rewraps the
+/// block so the art stays aligned). Focus mode renders a `show_diagram` result
+/// this way (see [`diagram_block`]).
+fn layout_diagram(out: &mut Vec<RenderRow>, result: &str, width: usize) {
+    for spans in result_rows(result, true, width) {
+        out.push(RenderRow {
+            rule: None,
+            spans,
+            tool_header: None,
+        });
+    }
 }
 
 fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width: usize) {
@@ -9903,6 +9941,81 @@ mod tests {
         // Run with only Tool children: not visible
         let run_only_tools = Msg::run(vec![card(), card()]);
         assert!(!focus_visible(&run_only_tools));
+    }
+
+    /// A tool card whose result carries an ASCII diagram block, the way the
+    /// `show_diagram` tool returns one.
+    fn diagram_card() -> Msg {
+        let mut m = tool_card("show_diagram", "{}", true, false);
+        m.tool.as_mut().unwrap().result = Some(format!(
+            "{DIAGRAM_OPEN}\n+---+\n| a |\n+---+\n{DIAGRAM_CLOSE}"
+        ));
+        m
+    }
+
+    fn flat_rows(rows: &[RenderRow]) -> String {
+        rows.iter()
+            .map(|r| {
+                r.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn focus_visible_keeps_a_diagram_tool_result() {
+        // The picture the model drew is content, so focus mode keeps it...
+        assert!(focus_visible(&diagram_card()));
+        // ...including when it sits inside a folded run.
+        assert!(focus_visible(&Msg::run(vec![card(), diagram_card()])));
+        // A tool card without a diagram stays hidden.
+        assert!(!focus_visible(&card()));
+    }
+
+    #[test]
+    fn layout_chat_rows_focus_shows_the_diagram_of_a_folded_run() {
+        let chat = vec![
+            Msg::authored(MsgKind::User, "you", "draw it"),
+            Msg::run(vec![card(), diagram_card()]),
+            Msg::authored(MsgKind::Assistant, "model", "done"),
+        ];
+        let (rows, owners, _) = layout_chat_rows(
+            &chat,
+            &[false],
+            "",
+            80,
+            &[],
+            &ModelColors::default(),
+            true,
+            0,
+        );
+        let text = flat_rows(&rows);
+        assert!(
+            text.contains("| a |"),
+            "diagram missing from the focused transcript: {text}"
+        );
+        assert!(
+            owners.iter().flatten().any(|&i| i == 1),
+            "the run holding the diagram should own rows"
+        );
+    }
+
+    #[test]
+    fn layout_chat_rows_focus_shows_a_standalone_diagram_without_the_card() {
+        let chat = vec![diagram_card()];
+        let (rows, owners, _) =
+            layout_chat_rows(&chat, &[], "", 80, &[], &ModelColors::default(), true, 0);
+        let text = flat_rows(&rows);
+        assert!(text.contains("| a |"), "diagram missing: {text}");
+        // Bare diagram: the tool card's pass mark must not leak through.
+        assert!(
+            !text.contains('✓'),
+            "card chrome leaked into focus mode: {text}"
+        );
+        assert!(owners.iter().flatten().any(|&i| i == 0));
     }
 
     #[test]
