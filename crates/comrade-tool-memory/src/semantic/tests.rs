@@ -138,6 +138,7 @@ fn git(dir: &Path, args: &[&str]) {
     let ok = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .status()
         .unwrap()
@@ -563,6 +564,111 @@ fn warm_installs_the_code_index_in_the_background() {
         .unwrap_or_else(|e| e.into_inner())
         .remove(&dir);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn code_files_respects_gitignore_and_untracked() {
+    let dir = scratch("files-git");
+    git(&dir, &["init", "-q"]);
+    git(&dir, &["config", "user.email", "t@example.com"]);
+    git(&dir, &["config", "user.name", "Test"]);
+    std::fs::write(dir.join(".gitignore"), "infra/.venv/\n").unwrap();
+    std::fs::create_dir_all(dir.join("infra/.venv/lib")).unwrap();
+    std::fs::create_dir_all(dir.join("crates/app/src")).unwrap();
+    std::fs::write(dir.join("infra/.venv/lib/dep.py"), "x = 1\n").unwrap();
+    std::fs::write(dir.join("crates/app/src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(dir.join("crates/app/src/new.rs"), "fn fresh() {}\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+
+    let rels: Vec<String> = code_files(&dir).into_iter().map(|(rel, ..)| rel).collect();
+    assert!(
+        rels.contains(&"crates/app/src/main.rs".to_string()),
+        "{rels:?}"
+    );
+    assert!(
+        rels.contains(&"crates/app/src/new.rs".to_string()),
+        "untracked non-ignored file missing: {rels:?}"
+    );
+    assert!(
+        !rels.iter().any(|r| r.contains(".venv")),
+        "ignored dependency tree leaked into the index: {rels:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn code_files_skips_dependency_dirs_without_git() {
+    let dir = scratch("files-walk");
+    std::fs::create_dir_all(dir.join("infra/.venv/lib/site-packages")).unwrap();
+    std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("infra/.venv/lib/site-packages/dep.py"), "x = 1\n").unwrap();
+    std::fs::write(dir.join("node_modules/pkg/index.js"), "let x = 1\n").unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "fn alpha() {}\n").unwrap();
+
+    let rels: Vec<String> = code_files(&dir).into_iter().map(|(rel, ..)| rel).collect();
+    assert_eq!(rels, vec!["src/lib.rs".to_string()], "{rels:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The async contract: before a build completes a search reports "not ready"
+/// (None, so the tool answers immediately); once the background build finishes
+/// the same query is served from the resident index without rebuilding.
+#[test]
+fn search_is_answered_immediately_until_the_index_is_ready() {
+    let dir = scratch("async-ready");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "fn alpha() {}\n").unwrap();
+
+    // Cold: no marker, so nothing is ready and `search_ready` declines to search.
+    assert!(!load_if_ready(&dir, Kind::Code));
+    let q = StubEmbedder::default();
+    assert!(
+        search_ready(&dir, "alpha", "all", None, None, 5, false, false, &q)
+            .unwrap()
+            .is_none(),
+        "a cold index must not be searched synchronously"
+    );
+
+    warm_with(&dir, std::sync::Arc::new(StubEmbedder::default()));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !load_if_ready(&dir, Kind::Code) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background build did not become ready in time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Ready: the query is served from the resident index.
+    let out = search_ready(
+        &dir,
+        "alpha",
+        "code",
+        Some("code"),
+        None,
+        5,
+        false,
+        true,
+        &q,
+    )
+    .unwrap()
+    .expect("a ready index must be searched");
+    assert!(out.contains("src/lib.rs"), "{out}");
+
+    invalidate(&dir, Kind::Memory);
+    invalidate(&dir, Kind::Code);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn not_ready_message_tells_the_agent_not_to_wait() {
+    let msg = not_ready_message();
+    assert!(msg.contains("not ready"), "{msg}");
+    assert!(msg.contains("fs_rgrep"), "{msg}");
+    assert!(msg.to_lowercase().contains("do not wait"), "{msg}");
 }
 
 /// Timing benchmark (NOT a correctness test). Run explicitly with:

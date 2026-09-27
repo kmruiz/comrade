@@ -33,7 +33,20 @@
 //! The code index is incremental and git-driven: it records the HEAD it was
 //! built at plus a per-file stamp, and `git::dirty_files` says what changed
 //! (committed diff + working tree). Unchanged files are neither re-parsed nor
-//! re-embedded; projects without a repo fall back to mtime/size stamps.
+//! re-embedded; projects without a repo fall back to mtime/size stamps. The file
+//! SET itself is git's own listing when the project is a repo (tracked plus
+//! untracked-but-not-ignored), so an ignored dependency tree — a Python `.venv`
+//! with tens of thousands of files — is never walked, parsed or embedded; a
+//! non-git project falls back to a walk that skips the usual dependency/build
+//! directories.
+//!
+//! `semantic_search` NEVER blocks on indexing. Each build writes a small status
+//! marker beside the index; a search serves an index that is already ready
+//! (resident, or persisted from an earlier session and loaded lazily) and kicks
+//! off the incremental background build so the next search sees the changes. If
+//! nothing is built yet it answers at once, telling the agent to continue with
+//! the keyword/symbol tools and retry shortly, instead of freezing the session
+//! while a cold index is built.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
@@ -267,13 +280,98 @@ const CODE_EXT: &[&str] = &[
 /// Source files larger than this are not indexed.
 const MAX_CODE_BYTES: u64 = 1_000_000;
 
-/// Source files under `root` as `(rel, abs, mtime_nanos, size)`, skipping the
-/// usual build/vendor directories.
+/// Directory names that never contain project source, skipped when a project is
+/// not a git repository (a repo uses git's own listing, which is exact). This
+/// list is what keeps dependency and build trees — most importantly a Python
+/// virtualenv's `site-packages` — out of the index; without it a checkout can
+/// present tens of thousands of files that are not "the project".
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    "vendor",
+    "bower_components",
+    "Pods",
+    "dist",
+    "build",
+    "out",
+    "coverage",
+    ".venv",
+    "venv",
+    ".env",
+    "env",
+    "__pycache__",
+    "site-packages",
+    ".tox",
+    ".nox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".cache",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".angular",
+    ".gradle",
+    ".dart_tool",
+    ".terraform",
+    ".serverless",
+    ".idea",
+    ".vscode",
+];
+
+/// Source files under `root` as `(rel, abs, mtime_nanos, size)`.
+///
+/// In a git repository the file set comes from git itself
+/// ([`crate::git::listed_files`]): every tracked file plus untracked files that
+/// are not ignored, so `target/`, `node_modules/` and a `.venv/` full of
+/// dependencies are excluded by the project's own `.gitignore` rather than by a
+/// hard-coded guess. A non-git project falls back to walking the tree and
+/// skipping [`SKIP_DIRS`].
 fn code_files(root: &Path) -> Vec<(String, PathBuf, u64, u64)> {
+    let rels = match crate::git::listed_files(root) {
+        Some(rels) => rels,
+        None => {
+            let mut found = Vec::new();
+            walk_code(root, root, &mut found);
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            return found;
+        }
+    };
     let mut out = Vec::new();
-    walk_code(root, root, &mut out);
+    for rel in rels {
+        if !is_code_path(&rel) {
+            continue;
+        }
+        let path = root.join(&rel);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            // Tracked but deleted (or otherwise gone): it drops out of the index.
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        out.push((rel, path, mtime_nanos(&meta), meta.len()));
+    }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// Whether a project-root relative path has an indexable source extension.
+fn is_code_path(rel: &str) -> bool {
+    Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| CODE_EXT.contains(&e))
+}
+
+/// Modification time in nanoseconds since the UNIX epoch (0 if unavailable).
+fn mtime_nanos(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 fn walk_code(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf, u64, u64)>) {
@@ -285,10 +383,7 @@ fn walk_code(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf, u64, u64)>
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
-            if matches!(
-                name.as_ref(),
-                ".git" | "target" | "node_modules" | "vendor" | ".idea" | ".vscode"
-            ) {
+            if SKIP_DIRS.contains(&name.as_ref()) {
                 continue;
             }
             walk_code(root, &path, out);
@@ -299,12 +394,7 @@ fn walk_code(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf, u64, u64)>
         {
             let meta = entry.metadata().ok();
             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let mtime = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
+            let mtime = meta.as_ref().map(mtime_nanos).unwrap_or(0);
             let rel = path
                 .strip_prefix(root)
                 .map(|p| p.to_string_lossy().into_owned())
@@ -478,6 +568,137 @@ fn code_index_path(root: &Path) -> PathBuf {
     cache_dir()
         .join("semantic")
         .join(format!("{key:016x}-code.bin"))
+}
+
+/// Which of the two indexes a path, status or resident map refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Memory,
+    Code,
+}
+
+impl Kind {
+    /// Distinguishes the cache files of the memory and code indexes.
+    fn suffix(self) -> &'static str {
+        match self {
+            Kind::Memory => "",
+            Kind::Code => "-code",
+        }
+    }
+}
+
+/// The resident map backing `kind`.
+fn store_map(kind: Kind) -> &'static Mutex<HashMap<PathBuf, Store>> {
+    match kind {
+        Kind::Memory => mem_store(),
+        Kind::Code => code_store(),
+    }
+}
+
+/// Where `kind`'s persisted index lives.
+fn store_path(root: &Path, kind: Kind) -> PathBuf {
+    match kind {
+        Kind::Memory => index_path(root),
+        Kind::Code => code_index_path(root),
+    }
+}
+
+/// A tiny marker persisted next to an index once a build for the current model
+/// has FINISHED. Its presence is what lets a fresh process serve the persisted
+/// index immediately instead of answering "the index is still building": the
+/// binary store alone cannot distinguish "never built" from "built and empty".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexStatus {
+    model: String,
+    docs: usize,
+}
+
+/// Where `kind`'s build marker lives.
+fn status_path(root: &Path, kind: Kind) -> PathBuf {
+    let key = fnv(&root.to_string_lossy());
+    cache_dir()
+        .join("semantic")
+        .join(format!("{key:016x}{}.status", kind.suffix()))
+}
+
+/// Record that a build for `kind` completed with `docs` documents. Best-effort:
+/// a missing marker only costs an extra rebuild on the next start, never
+/// correctness.
+fn write_status(root: &Path, kind: Kind, docs: usize) {
+    let status = IndexStatus {
+        model: MODEL_ID.into(),
+        docs,
+    };
+    let Ok(bytes) = serde_json::to_vec(&status) else {
+        return;
+    };
+    let path = status_path(root, kind);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, bytes);
+}
+
+/// The build marker for `kind`, only when it was written for the current model.
+fn read_status(root: &Path, kind: Kind) -> Option<IndexStatus> {
+    let bytes = std::fs::read(status_path(root, kind)).ok()?;
+    let status: IndexStatus = serde_json::from_slice(&bytes).ok()?;
+    (status.model == MODEL_ID).then_some(status)
+}
+
+/// Drop everything that makes `kind` ready: the resident copy, the persisted
+/// index and the build marker. Used by `rebuild`/`reindex` so the next build
+/// starts from scratch.
+fn invalidate(root: &Path, kind: Kind) {
+    store_map(kind)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(root);
+    let _ = std::fs::remove_file(status_path(root, kind));
+    let _ = std::fs::remove_file(store_path(root, kind));
+}
+
+/// Ensure a usable index for `kind` is resident, without building: the in-memory
+/// copy if present, else the persisted one when a completed-build marker exists.
+/// Returns whether `kind` is ready to rank (a finished build, possibly empty).
+///
+/// This is the whole point of the persisted marker: after a restart on an
+/// already-indexed project the first `semantic_search` is served from disk
+/// immediately, and only a project that was never built is reported as "not
+/// ready" while a background build runs.
+fn load_if_ready(root: &Path, kind: Kind) -> bool {
+    {
+        let guard = store_map(kind).lock().unwrap_or_else(|e| e.into_inner());
+        if guard.get(root).is_some_and(|s| s.model == MODEL_ID) {
+            return true;
+        }
+    }
+    if read_status(root, kind).is_none() {
+        return false;
+    }
+    let store = load_store(&store_path(root, kind));
+    if store.model != MODEL_ID {
+        return false;
+    }
+    store_map(kind)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(root.to_path_buf(), store);
+    true
+}
+
+/// The current resident index for `kind` (taken out, so the caller owns it while
+/// building and never holds a lock across the work), else the persisted one, else
+/// an empty store to rebuild.
+fn take_or_load(root: &Path, kind: Kind) -> Store {
+    if let Some(store) = store_map(kind)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(root)
+    {
+        return store;
+    }
+    load_store(&store_path(root, kind))
 }
 
 /// Magic + version marking the compact binary index format (see [`encode_store`]).
@@ -745,10 +966,14 @@ fn code_refresh(root: &Path, existing: &Store, embedder: &dyn Embedder) -> Resul
             );
             continue;
         }
+        // Skip oversized files by their stat size instead of reading them whole.
+        if size > MAX_CODE_BYTES {
+            continue;
+        }
         let Ok(bytes) = std::fs::read(&abs) else {
             continue;
         };
-        if bytes.len() as u64 > MAX_CODE_BYTES || bytes.contains(&0) {
+        if bytes.contains(&0) {
             continue;
         }
         let Ok(text) = String::from_utf8(bytes) else {
@@ -829,17 +1054,19 @@ fn code_refresh(root: &Path, existing: &Store, embedder: &dyn Embedder) -> Resul
 pub fn reindex(root: &Path) -> Result<String> {
     let (mem, _) = refresh(&documents(root)?, &Store::default(), &FastEmbedder)?;
     save_store(&index_path(root), &mem)?;
+    write_status(root, Kind::Memory, mem.docs.len());
     let (code, _) = code_refresh(root, &Store::default(), &FastEmbedder)?;
     save_store(&code_index_path(root), &code)?;
-    // Drop any resident copies so the next search reloads the fresh indexes.
+    write_status(root, Kind::Code, code.docs.len());
+    // Install the fresh indexes so the next search does not reload from disk.
     mem_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clear();
+        .insert(root.to_path_buf(), mem.clone());
     code_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clear();
+        .insert(root.to_path_buf(), code.clone());
     Ok(format!(
         "Reindexed semantic search: {} memory doc(s), {} code chunk(s).",
         mem.docs.len(),
@@ -890,14 +1117,19 @@ pub fn warm_blocking(root: &Path) -> String {
 /// other (the code index is the slow, valuable one). Returns `(memory docs, code
 /// docs)`; a failed index reports `0`.
 fn build_indexes(root: &Path, embedder: &dyn Embedder) -> (usize, usize) {
+    // The existing resident index is reused (taken out, so no lock is held while
+    // embedding); a project with no resident copy falls back to its persisted one.
     let memory = match documents(root)
-        .and_then(|docs| refresh(&docs, &load_store(&index_path(root)), embedder))
+        .and_then(|docs| refresh(&docs, &take_or_load(root, Kind::Memory), embedder))
     {
         Ok((mem, changed)) => {
             if changed && let Err(e) = save_store(&index_path(root), &mem) {
                 eprintln!("[comrade] cannot save the memory index: {e:#}");
             }
             let n = mem.docs.len();
+            // Mark the build complete BEFORE installing, so a concurrent search
+            // that misses the map still finds the persisted index ready.
+            write_status(root, Kind::Memory, n);
             // Install under a brief lock (never hold one across the build).
             mem_store()
                 .lock()
@@ -911,12 +1143,13 @@ fn build_indexes(root: &Path, embedder: &dyn Embedder) -> (usize, usize) {
         }
     };
 
-    let code = match code_refresh(root, &load_store(&code_index_path(root)), embedder) {
+    let code = match code_refresh(root, &take_or_load(root, Kind::Code), embedder) {
         Ok((code, changed)) => {
             if changed && let Err(e) = save_store(&code_index_path(root), &code) {
                 eprintln!("[comrade] cannot save the code index: {e:#}");
             }
             let n = code.docs.len();
+            write_status(root, Kind::Code, n);
             code_store()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1026,7 +1259,7 @@ struct SemanticSearch;
 static SEMANTIC_SEARCH_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
         name: "semantic_search".into(),
-        description: "Search project memory (ADR decisions + glossary) AND source code by MEANING, not keywords: returns the closest hits with a similarity score. Code hits are tree-sitter symbols/line windows carrying file:line. Reach for it EARLY to locate things when you know the domain but not yet the exact symbol, file or string - it is the first choice whenever you know WHAT you want but not WHERE it lives, NOT a fallback; find_adr/ts_find_symbol/fs_rgrep only help once you already hold a name. Searches memory and code by default; pass `scope` to narrow to memory or code. Pass `path` to restrict code hits to one file or directory. Locally embedded model + vector index; no network for search; the index is rebuilt incrementally and only changed files are re-parsed.".into(),
+        description: "Search project memory (ADR decisions + glossary) AND source code by MEANING, not keywords: returns the closest hits with a similarity score. Code hits are tree-sitter symbols/line windows carrying file:line. Reach for it EARLY to locate things when you know the domain but not yet the exact symbol, file or string - it is the first choice whenever you know WHAT you want but NOT where it lives, NOT a fallback; find_adr/ts_find_symbol/fs_rgrep only help once you already hold a name. Searches memory and code by default; pass `scope` to narrow to memory or code. Pass `path` to restrict code hits to one file or directory. Locally embedded model + vector index; no network for search. The index is persistent and rebuilt incrementally in the background (only changed, non-ignored files are re-parsed); it NEVER blocks: if the index is not built yet it returns immediately telling you so - then use fs_rgrep/ts_find_symbol and retry later, do not wait.".into(),
         json_schema: json!({
             "type": "object",
             "properties": {
@@ -1082,139 +1315,153 @@ impl Tool for SemanticSearch {
         let limit = args.limit;
         let rebuild = args.rebuild;
 
-        let out = tokio::task::spawn_blocking(move || -> Result<String> {
+        // An explicit rebuild discards the caches and restarts a background
+        // build; it must not make the agent wait, so answer immediately.
+        if rebuild {
+            invalidate(&root, Kind::Memory);
+            invalidate(&root, Kind::Code);
+            let _ = warm(&root);
+            return Ok(not_ready_message());
+        }
+
+        // Never make the agent wait on indexing: start (or keep current) the
+        // background build, then answer from whatever is READY right now. A
+        // search only ever ranks an already-built index - it never triggers a
+        // synchronous cold build.
+        let _ = warm(&root);
+
+        let out = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
             let want_memory = scope != "code";
             let want_code = scope != "memory";
-            let mut any_source = false;
-
-            // Operate on the resident indexes: load once, reuse across calls,
-            // and only write the cache back when something actually changed.
-            let mut mem_guard = mem_store().lock().unwrap_or_else(|e| e.into_inner());
-            let mut code_guard = code_store().lock().unwrap_or_else(|e| e.into_inner());
-
-            if want_memory {
-                let memory_docs = documents(&root)?;
-                any_source |= !memory_docs.is_empty();
-                let path = index_path(&root);
-                let entry = mem_guard
-                    .entry(root.clone())
-                    .or_insert_with(|| load_store(&path));
-                if rebuild {
-                    *entry = Store::default();
-                }
-                let (store, changed) = refresh(&memory_docs, entry, &FastEmbedder)?;
-                if rebuild || changed {
-                    save_store(&path, &store)?;
-                }
-                *entry = store;
-            }
-            if want_code {
-                let path = code_index_path(&root);
-                let entry = code_guard
-                    .entry(root.clone())
-                    .or_insert_with(|| load_store(&path));
-                if rebuild {
-                    *entry = Store::default();
-                }
-                // Fast path: a clean repo whose HEAD still matches the index
-                // needs no file walk and no rewrite.
-                let clean = !rebuild
-                    && entry.model == MODEL_ID
-                    && !entry.docs.is_empty()
-                    && entry.head.is_some()
-                    && entry.head == crate::git::head_sha(&root)
-                    && matches!(
-                        crate::git::dirty_files(&root, entry.head.as_deref()),
-                        Some(files) if files.is_empty()
-                    );
-                if !clean {
-                    let (store, changed) = code_refresh(&root, entry, &FastEmbedder)?;
-                    if rebuild || changed {
-                        save_store(&path, &store)?;
-                    }
-                    *entry = store;
-                }
-                any_source |= !entry.docs.is_empty();
-            }
-
-            if !any_source {
-                return Ok(match scope.as_str() {
-                    "code" => "No source chunks to search yet.".to_string(),
-                    "all" => "Nothing to search yet (no ADRs, glossary terms or source chunks)."
-                        .to_string(),
-                    _ => "No memory to search yet (no ADRs or glossary terms).".to_string(),
-                });
-            }
-
-            let mut qvec = FastEmbedder
-                .embed(std::slice::from_ref(&query))?
-                .into_iter()
-                .next()
-                .context("no query embedding")?;
-            normalize(&mut qvec);
-
-            // Rank each resident index, then merge — no vectors are cloned.
-            let mut hits: Vec<Hit> = Vec::new();
-            if want_memory {
-                for (score, d) in rank(
-                    &mem_guard[&root].docs,
-                    &qvec,
-                    limit,
-                    kind.as_deref(),
-                    path.as_deref(),
-                ) {
-                    hits.push(Hit::of(score, d));
-                }
-            }
-            if want_code {
-                for (score, d) in rank(
-                    &code_guard[&root].docs,
-                    &qvec,
-                    limit,
-                    kind.as_deref(),
-                    path.as_deref(),
-                ) {
-                    hits.push(Hit::of(score, d));
-                }
-            }
-            hits.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
-            hits.truncate(limit.max(1));
-            if hits.is_empty() {
-                return Ok(match &path {
-                    Some(p) => format!("No results for {query:?} in scope {scope} under {p:?}."),
-                    None => format!("No results for {query:?} in scope {scope}."),
-                });
-            }
-            let has_code = hits.iter().any(|h| h.kind == "code");
-            let has_memory = hits.iter().any(|h| h.kind != "code");
-            let mut s = format!("{} result(s) for {query:?}:\n", hits.len());
-            for h in &hits {
-                s.push_str(&format!(
-                    "  {:.3}  {}  {}\n         {}\n",
-                    h.score, h.id, h.title, h.preview
-                ));
-            }
-            let mut hints = Vec::new();
-            if has_memory {
-                hints.push("read_adr/read_glossary to open a memory hit");
-            }
-            if has_code {
-                hints.push(
-                    "ts_read_symbol (by name) or fs_read_file at path:line to open a code hit",
-                );
-            }
-            s.push_str(&format!("\nUse {}.", hints.join("; ")));
-            Ok(s)
+            let ready_memory = want_memory && load_if_ready(&root, Kind::Memory);
+            let ready_code = want_code && load_if_ready(&root, Kind::Code);
+            search_ready(
+                &root,
+                &query,
+                &scope,
+                kind.as_deref(),
+                path.as_deref(),
+                limit,
+                ready_memory,
+                ready_code,
+                &FastEmbedder,
+            )
         })
         .await
         .context("semantic search task panicked")??;
-        Ok(out)
+
+        Ok(out.unwrap_or_else(not_ready_message))
     }
+}
+
+/// Answer that no index is ready yet, without waiting for the background build.
+fn not_ready_message() -> String {
+    "semantic_search: this project's index is not ready yet - it is being built in the background \
+     (a first build on a large project can take a while). Do NOT wait or retry in a loop: carry on \
+     with fs_rgrep, ts_find_symbol or fs_list_files, and call semantic_search again a little later."
+        .to_string()
+}
+
+/// Rank the READY indexes for `root`. Returns `Ok(None)` when neither requested
+/// kind has finished a build (the caller then reports the background build);
+/// otherwise it returns the formatted hits, noting any requested kind that is
+/// still building (so partial results are honest about what is missing).
+///
+/// This does no building: it only embeds the query and scans resident vectors.
+#[allow(clippy::too_many_arguments)]
+fn search_ready(
+    root: &Path,
+    query: &str,
+    scope: &str,
+    kind: Option<&str>,
+    path: Option<&str>,
+    limit: usize,
+    ready_memory: bool,
+    ready_code: bool,
+    embedder: &dyn Embedder,
+) -> Result<Option<String>> {
+    let want_memory = scope != "code";
+    let want_code = scope != "memory";
+    let has_memory = want_memory && ready_memory;
+    let has_code = want_code && ready_code;
+    if !has_memory && !has_code {
+        return Ok(None);
+    }
+
+    // Note any requested kind that is not ready, so partial results stay honest.
+    let mut building = String::new();
+    if want_memory && !ready_memory {
+        building.push_str("  (the memory index is still building; memory hits may be missing)\n");
+    }
+    if want_code && !ready_code {
+        building.push_str("  (the code index is still building; code hits may be missing)\n");
+    }
+
+    let qtext = query.to_string();
+    let mut qvec = embedder
+        .embed(std::slice::from_ref(&qtext))?
+        .into_iter()
+        .next()
+        .context("no query embedding")?;
+    normalize(&mut qvec);
+
+    // Rank each resident index, then merge - no vectors are cloned.
+    let mut hits: Vec<Hit> = Vec::new();
+    if has_memory {
+        let guard = mem_store().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = guard.get(root) {
+            for (score, d) in rank(&store.docs, &qvec, limit, kind, path) {
+                hits.push(Hit::of(score, d));
+            }
+        }
+    }
+    if has_code {
+        let guard = code_store().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = guard.get(root) {
+            for (score, d) in rank(&store.docs, &qvec, limit, kind, path) {
+                hits.push(Hit::of(score, d));
+            }
+        }
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    hits.truncate(limit.max(1));
+
+    if hits.is_empty() {
+        let mut s = match path {
+            Some(p) => format!("No results for {query:?} in scope {scope} under {p:?}.\n"),
+            None => format!("No results for {query:?} in scope {scope}.\n"),
+        };
+        s.push_str(&building);
+        return Ok(Some(s));
+    }
+
+    let has_code_hit = hits.iter().any(|h| h.kind == "code");
+    let has_memory_hit = hits.iter().any(|h| h.kind != "code");
+    let mut s = format!("{} result(s) for {query:?}:\n", hits.len());
+    for h in &hits {
+        s.push_str(&format!(
+            "  {:.3}  {}  {}\n         {}\n",
+            h.score, h.id, h.title, h.preview
+        ));
+    }
+    let mut hints = Vec::new();
+    if has_memory_hit {
+        hints.push("read_adr/read_glossary to open a memory hit");
+    }
+    if has_code_hit {
+        hints.push("ts_read_symbol (by name) or fs_read_file at path:line to open a code hit");
+    }
+    s.push_str(&format!("\nUse {}.", hints.join("; ")));
+    if !building.is_empty() {
+        s.push('\n');
+        s.push_str(&building);
+    }
+    Ok(Some(s))
 }
 
 /// The tool the agent calls to kick off a background index warm-up.

@@ -33,6 +33,35 @@ pub fn head_sha(root: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Project-root relative paths git would track or index: the tracked files plus
+/// untracked files that are NOT ignored (`--exclude-standard` honours
+/// `.gitignore`, `.git/info/exclude` and the user's global excludes). `None`
+/// when `root` is not a git repository, so the caller can fall back to walking
+/// the tree.
+///
+/// This is what keeps a big ignored tree out of the code index: a checkout whose
+/// `infra/.venv/` holds tens of thousands of dependency files lists only the
+/// real sources, so the index neither parses nor embeds them.
+pub fn listed_files(root: &Path) -> Option<Vec<String>> {
+    git(root, &["rev-parse", "--is-inside-work-tree"])?;
+    let out = git(
+        root,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )?;
+    Some(
+        out.split('\0')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+    )
+}
+
 /// Project-root relative paths that changed since `since` (a recorded HEAD) plus
 /// the whole working tree, or `None` when `root` is not a git repository (so the
 /// caller can fall back to stat-based change detection).
@@ -84,6 +113,7 @@ mod tests {
         let ok = Command::new("git")
             .arg("-C")
             .arg(dir)
+            .args(["-c", "commit.gpgsign=false"])
             .args(args)
             .status()
             .unwrap()
@@ -124,6 +154,33 @@ mod tests {
         let dir = scratch("plain");
         assert!(head_sha(&dir).is_none());
         assert!(dirty_files(&dir, None).is_none());
+        assert!(listed_files(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listed_files_honours_gitignore() {
+        let dir = scratch("listed");
+        run(&dir, &["init", "-q"]);
+        run(&dir, &["config", "user.email", "t@example.com"]);
+        run(&dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join(".gitignore"), "dep/\n").unwrap();
+        std::fs::create_dir_all(dir.join("dep")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("dep/vendored.py"), "x = 1\n").unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        run(&dir, &["add", "-A"]);
+        run(&dir, &["commit", "-qm", "init"]);
+        // An untracked, non-ignored file is listed too; the ignored one is not.
+        std::fs::write(dir.join("src/b.rs"), "fn b() {}\n").unwrap();
+
+        let files = listed_files(&dir).expect("a repo lists files");
+        assert!(files.contains(&"src/a.rs".to_string()), "{files:?}");
+        assert!(files.contains(&"src/b.rs".to_string()), "{files:?}");
+        assert!(
+            !files.iter().any(|f| f.starts_with("dep/")),
+            "ignored tree leaked: {files:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
