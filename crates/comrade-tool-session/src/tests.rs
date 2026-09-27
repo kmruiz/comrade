@@ -5,14 +5,14 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use async_trait::async_trait;
 use comrade_tool::{
-    AGENT_MODEL, PlanStatus, PlanStep, PlanStepDraft, PlanTarget, SessionControl, Tool,
-    ToolContext, UndoLog, UserIo, UserPrompt, UserReply,
+    AGENT_MODEL, PlanStatus, PlanStep, PlanStepDraft, PlanTarget, RequirementTest, SessionControl,
+    Tool, ToolContext, UndoLog, UserIo, UserPrompt, UserReply,
 };
 use serde_json::json;
 
 use super::{
-    AskForm, AskUpwards, SelfFinishPlan, SelfSetPlan, SelfSetStepContext, SelfSetStepModel,
-    SelfUpdatePlan,
+    AskForm, AskUpwards, SelfFinishPlan, SelfSetPlan, SelfSetRequirementTests, SelfSetStepContext,
+    SelfSetStepModel, SelfUpdatePlan,
 };
 
 /// A real-enough session: stores the plan and which steps the `delegate`
@@ -35,6 +35,7 @@ impl StubSession {
                 verification: d.verification,
                 model: d.model,
                 context: d.context,
+                tests: Vec::new(),
                 status: PlanStatus::Pending,
                 note: None,
                 started_at_ms: None,
@@ -143,6 +144,49 @@ impl SessionControl for StubSession {
                 Some("ready reset: context changed".into()),
             );
         }
+        Ok(true)
+    }
+    fn set_step_tests(
+        &self,
+        target: &PlanTarget,
+        tests: Vec<RequirementTest>,
+    ) -> std::result::Result<bool, String> {
+        let mut cleaned = Vec::with_capacity(tests.len());
+        for t in tests {
+            let name = t.name.trim();
+            let file = t.file.trim();
+            if name.is_empty() {
+                return Err("each requirement test needs a non-empty `name`".to_string());
+            }
+            if file.is_empty() {
+                return Err(format!(
+                    "requirement test {name:?} needs a non-empty `file`"
+                ));
+            }
+            cleaned.push(RequirementTest {
+                name: name.to_string(),
+                file: file.to_string(),
+                line: t.line,
+            });
+        }
+        if cleaned.is_empty() {
+            return Err("a step needs at least one requirement test".to_string());
+        }
+        let mut plan = self.plan.lock().unwrap();
+        let Some(step) = plan.iter_mut().find(|s| match target {
+            PlanTarget::Id(id) => s.id == *id,
+            PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+        }) else {
+            return Ok(false);
+        };
+        if matches!(step.status, PlanStatus::InProgress | PlanStatus::Done) {
+            return Err(format!(
+                "plan step {} is {} — a step's requirement tests can only be changed while \
+                 it is pending, ready or blocked",
+                step.id, step.status
+            ));
+        }
+        step.tests = cleaned;
         Ok(true)
     }
     fn set_status(&self, _s: &str) {}
@@ -454,6 +498,71 @@ async fn set_step_context_targets_by_goal_text() {
         .unwrap();
     assert_eq!(c.session.plan()[1].context, "new ctx");
     assert_eq!(c.session.plan()[0].context, String::new());
+}
+
+#[tokio::test]
+async fn set_requirement_tests_records_name_file_and_line() {
+    let c = ctx(StubSession::with_plan(vec![plain_step()]));
+    let out = SelfSetRequirementTests
+        .invoke(
+            &c,
+            json!({ "index": 1, "tests": [
+                { "name": "it_works", "file": "src/lib.rs", "line": 42 },
+                { "name": "it_fails_loudly", "file": "src/lib.rs", "line": 99 }
+            ]}),
+        )
+        .await
+        .unwrap();
+    assert!(out.contains("Requirement tests of step 1 set (2)"), "{out}");
+    let tests = &c.session.plan()[0].tests;
+    assert_eq!(tests.len(), 2);
+    assert_eq!(tests[0].name, "it_works");
+    assert_eq!(tests[0].file, "src/lib.rs");
+    assert_eq!(tests[0].line, 42);
+    assert_eq!(tests[1].name, "it_fails_loudly");
+    assert_eq!(tests[1].line, 99);
+}
+
+#[tokio::test]
+async fn set_requirement_tests_can_target_by_goal_text() {
+    let c = ctx(StubSession::with_plan(vec![plain_step(), delegated_step()]));
+    SelfSetRequirementTests
+        .invoke(
+            &c,
+            json!({ "text": "helper fn", "tests": [ { "name": "t", "file": "a.rs" } ] }),
+        )
+        .await
+        .unwrap();
+    // The entry was attached to the second step, and `line` defaulted to 0.
+    assert_eq!(c.session.plan()[1].tests.len(), 1);
+    assert_eq!(c.session.plan()[1].tests[0].file, "a.rs");
+    assert_eq!(c.session.plan()[1].tests[0].line, 0);
+    assert!(c.session.plan()[0].tests.is_empty());
+}
+
+#[tokio::test]
+async fn set_requirement_tests_needs_an_index_or_text() {
+    let c = ctx(StubSession::with_plan(vec![plain_step()]));
+    let err = SelfSetRequirementTests
+        .invoke(&c, json!({ "tests": [ { "name": "t", "file": "a.rs" } ] }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("index"), "{err}");
+    assert!(c.session.plan()[0].tests.is_empty());
+}
+
+#[tokio::test]
+async fn set_requirement_tests_rejects_a_blank_name() {
+    let c = ctx(StubSession::with_plan(vec![plain_step()]));
+    let err = SelfSetRequirementTests
+        .invoke(
+            &c,
+            json!({ "index": 1, "tests": [ { "name": "  ", "file": "a.rs" } ] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("non-empty"), "{err}");
+    assert!(c.session.plan()[0].tests.is_empty());
 }
 
 #[tokio::test]

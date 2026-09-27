@@ -11,8 +11,8 @@ use std::sync::LazyLock;
 use anyhow::Result;
 use async_trait::async_trait;
 use comrade_tool::{
-    AGENT_MODEL, FormSpec, PlanStatus, PlanTarget, Tool, ToolContext, ToolSpec, UserPrompt,
-    UserReply,
+    AGENT_MODEL, FormSpec, PlanStatus, PlanTarget, RequirementTest, Tool, ToolContext, ToolSpec,
+    UserPrompt, UserReply,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -45,6 +45,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(SelfUpdatePlan),
         Box::new(SelfSetStepModel),
         Box::new(SelfSetStepContext),
+        Box::new(SelfSetRequirementTests),
         Box::new(SelfFinishPlan),
         Box::new(SelfSetStatusBar),
         Box::new(AskForm),
@@ -447,6 +448,105 @@ impl Tool for SelfSetStepContext {
                     "Context of step {id} replaced. Re-run ask_advise step = {id} so the \
                      delegate can confirm the step is `ready`."
                 ))
+            }
+            Ok(false) => anyhow::bail!("no step matched the given index/text"),
+            Err(why) => anyhow::bail!("{why}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// self_set_requirement_tests
+// ---------------------------------------------------------------------------
+
+struct SelfSetRequirementTests;
+
+static SELF_SET_REQUIREMENT_TESTS_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
+    ToolSpec {
+    name: "self_set_requirement_tests".into(),
+    description: "Declare the requirement tests for a plan step - the tests that must pass for the step to be done. Identify the step by its 1-based `index` (or `text` when the index is unknown) and pass one entry per test with its `name`, `file` and `line`. They are shown in the plan under the step, so the human can see what the implementation must satisfy; re-declaring replaces the step's list. Refused while the step is in_progress or done.".into(),
+    json_schema: json!({
+        "type": "object",
+        "properties": {
+            "index": { "type": "integer", "minimum": 1, "description": "1-based step id." },
+            "text": { "type": "string", "description": "Text contained in the step goal; used only when `index` is unknown." },
+            "tests": {
+                "type": "array",
+                "minItems": 1,
+                "description": "The requirement tests for this step, one entry per test.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "The test's function/name." },
+                        "file": { "type": "string", "description": "Path of the file that holds the test." },
+                        "line": { "type": "integer", "minimum": 0, "description": "1-based line of the test in `file`; 0 when unknown." }
+                    },
+                    "required": ["name", "file"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["tests", "index"],
+        "additionalProperties": false
+    }),
+}
+});
+
+#[async_trait]
+impl Tool for SelfSetRequirementTests {
+    fn spec(&self) -> &ToolSpec {
+        &SELF_SET_REQUIREMENT_TESTS_SPEC
+    }
+
+    async fn invoke(&self, ctx: &ToolContext, args: Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct TestArg {
+            name: String,
+            file: String,
+            #[serde(default)]
+            line: u32,
+        }
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            index: Option<u64>,
+            #[serde(default)]
+            text: Option<String>,
+            tests: Vec<TestArg>,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let target = match (args.index, args.text.as_deref()) {
+            (Some(i), _) if i >= 1 => PlanTarget::Id(i),
+            (None, Some(t)) if !t.is_empty() => PlanTarget::Text(t.to_string()),
+            _ => anyhow::bail!(
+                "self_set_requirement_tests requires either a 1-based `index` or non-empty `text`"
+            ),
+        };
+        let tests: Vec<RequirementTest> = args
+            .tests
+            .into_iter()
+            .map(|t| RequirementTest {
+                name: t.name.trim().to_string(),
+                file: t.file.trim().to_string(),
+                line: t.line,
+            })
+            .collect();
+
+        // Report the matched step's id on success, like the other step tools.
+        let steps = ctx.session.plan();
+        let matched_id = steps
+            .iter()
+            .find(|s| match &target {
+                PlanTarget::Id(id) => s.id == *id,
+                PlanTarget::Text(text) => s.goal.contains(text.as_str()),
+            })
+            .map(|s| s.id);
+
+        let count = tests.len();
+        match ctx.session.set_step_tests(&target, tests) {
+            Ok(true) => {
+                let id = matched_id.expect("set_step_tests matched, so the id exists");
+                Ok(format!("Requirement tests of step {id} set ({count})."))
             }
             Ok(false) => anyhow::bail!("no step matched the given index/text"),
             Err(why) => anyhow::bail!("{why}"),

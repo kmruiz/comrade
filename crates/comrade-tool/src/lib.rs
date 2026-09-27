@@ -19,7 +19,9 @@ pub use ask::{
 pub use decl::{declarations, removed_declarations};
 
 pub use form::{DiffOption, FieldKind, FormField, FormSpec, truthy};
-pub use plan::{AGENT_MODEL, PlanStatus, PlanStep, PlanStepDraft, PlanTarget, SessionControl};
+pub use plan::{
+    AGENT_MODEL, PlanStatus, PlanStep, PlanStepDraft, PlanTarget, RequirementTest, SessionControl,
+};
 pub use policy::{SecurityPolicy, check_command, confine, policy, set_policy, with_policy};
 pub use repo::changed_files_abs;
 pub use task_runner::{TaskRun, TaskRunner};

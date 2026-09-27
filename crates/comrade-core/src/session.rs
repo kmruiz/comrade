@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use comrade_tool::{ActivityEvents, PlanStatus, PlanStep, PlanTarget, SessionControl};
+use comrade_tool::{
+    ActivityEvents, PlanStatus, PlanStep, PlanTarget, RequirementTest, SessionControl,
+};
 use tokio::sync::mpsc;
 
 /// Loose goal match for `PlanTarget::Text`: case-insensitive substring either
@@ -268,6 +270,7 @@ impl SessionControl for AgentSession {
                     verification: draft.verification,
                     model: draft.model,
                     context: draft.context,
+                    tests: Vec::new(),
                     status: PlanStatus::Pending,
                     note: None,
                     started_at_ms: None,
@@ -395,6 +398,54 @@ impl SessionControl for AgentSession {
                 PlanStatus::Pending,
                 Some("ready reset: context changed".into()),
             );
+        }
+        self.emit(AgentEvent::PlanChanged);
+        Ok(true)
+    }
+
+    fn set_step_tests(
+        &self,
+        target: &PlanTarget,
+        tests: Vec<RequirementTest>,
+    ) -> Result<bool, String> {
+        let mut cleaned = Vec::with_capacity(tests.len());
+        for t in tests {
+            let name = t.name.trim();
+            let file = t.file.trim();
+            if name.is_empty() {
+                return Err("each requirement test needs a non-empty `name`".to_string());
+            }
+            if file.is_empty() {
+                return Err(format!(
+                    "requirement test {name:?} needs a non-empty `file`"
+                ));
+            }
+            cleaned.push(RequirementTest {
+                name: name.to_string(),
+                file: file.to_string(),
+                line: t.line,
+            });
+        }
+        if cleaned.is_empty() {
+            return Err("a step needs at least one requirement test".to_string());
+        }
+        {
+            let mut plan = self.plan.write().unwrap();
+            let hit = plan.iter_mut().find(|s| match target {
+                PlanTarget::Id(id) => s.id == *id,
+                PlanTarget::Text(text) => goal_matches(&s.goal, text),
+            });
+            let Some(step) = hit else {
+                return Ok(false);
+            };
+            if matches!(step.status, PlanStatus::InProgress | PlanStatus::Done) {
+                return Err(format!(
+                    "plan step {} is {} — a step's requirement tests can only be changed while \
+                     it is pending, ready or blocked",
+                    step.id, step.status
+                ));
+            }
+            step.tests = cleaned;
         }
         self.emit(AgentEvent::PlanChanged);
         Ok(true)
@@ -663,6 +714,64 @@ mod tests {
     }
 
     #[test]
+    fn set_step_tests_replaces_tests_and_guards_terminal_steps() {
+        let (tx, _rx) = mpsc::channel(16);
+        let s = AgentSession::new(tx);
+        s.set_plan(vec![draft("implement the feature", "cargo test")]);
+
+        let tests = vec![
+            RequirementTest {
+                name: " it_works ".into(),
+                file: " src/lib.rs ".into(),
+                line: 42,
+            },
+            RequirementTest {
+                name: "it_fails_loudly".into(),
+                file: "src/lib.rs".into(),
+                line: 99,
+            },
+        ];
+        assert!(s.set_step_tests(&PlanTarget::Id(1), tests.clone()).unwrap());
+        // name and file are trimmed.
+        assert_eq!(s.plan()[0].tests[0].name, "it_works");
+        assert_eq!(s.plan()[0].tests[0].file, "src/lib.rs");
+        assert_eq!(s.plan()[0].tests[0].line, 42);
+        assert_eq!(s.plan()[0].tests.len(), 2);
+
+        // Re-declaring replaces the whole list; the step can be matched by text.
+        assert!(
+            s.set_step_tests(
+                &PlanTarget::Text("implement".into()),
+                vec![tests[0].clone()]
+            )
+            .unwrap()
+        );
+        assert_eq!(s.plan()[0].tests.len(), 1);
+
+        // A malformed test or an empty list is rejected.
+        let bad = vec![RequirementTest {
+            name: "  ".into(),
+            file: "src/lib.rs".into(),
+            line: 1,
+        }];
+        assert!(s.set_step_tests(&PlanTarget::Id(1), bad).is_err());
+        assert!(s.set_step_tests(&PlanTarget::Id(1), Vec::new()).is_err());
+
+        // A step already being worked or finished keeps its tests.
+        s.update_plan(PlanTarget::Id(1), PlanStatus::InProgress, None);
+        assert!(s.set_step_tests(&PlanTarget::Id(1), tests.clone()).is_err());
+        s.update_plan(PlanTarget::Id(1), PlanStatus::Done, None);
+        assert!(s.set_step_tests(&PlanTarget::Id(1), tests.clone()).is_err());
+
+        // Unknown target -> Ok(false).
+        assert!(!s.set_step_tests(&PlanTarget::Id(99), tests).unwrap());
+
+        // Re-setting the plan clears the tests.
+        s.set_plan(vec![draft("fresh", "")]);
+        assert!(s.plan()[0].tests.is_empty());
+    }
+
+    #[test]
     fn restore_replaces_title_status_plan_delegated_and_finished() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let s = AgentSession::new(tx);
@@ -682,6 +791,7 @@ mod tests {
                 verification: "verify 1".into(),
                 model: "model1".into(),
                 context: "ctx1".into(),
+                tests: Vec::new(),
                 status: PlanStatus::Done,
                 note: None,
                 started_at_ms: None,
@@ -693,6 +803,7 @@ mod tests {
                 verification: "verify 2".into(),
                 model: "model2".into(),
                 context: "ctx2".into(),
+                tests: Vec::new(),
                 status: PlanStatus::Pending,
                 note: None,
                 started_at_ms: None,
@@ -735,6 +846,7 @@ mod tests {
                 verification: "".into(),
                 model: "".into(),
                 context: "".into(),
+                tests: Vec::new(),
                 status: PlanStatus::Pending,
                 note: None,
                 started_at_ms: None,
@@ -746,6 +858,7 @@ mod tests {
                 verification: "".into(),
                 model: "".into(),
                 context: "".into(),
+                tests: Vec::new(),
                 status: PlanStatus::Pending,
                 note: None,
                 started_at_ms: None,
@@ -757,6 +870,7 @@ mod tests {
                 verification: "".into(),
                 model: "".into(),
                 context: "".into(),
+                tests: Vec::new(),
                 status: PlanStatus::Pending,
                 note: None,
                 started_at_ms: None,

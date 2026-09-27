@@ -1,7 +1,7 @@
 ## Test-first (TDD)
 Build every feature this way when `validate_tests` is available:
 
-1. **Write the tests FIRST**, in the test block the file already uses (`#[cfg(test)] mod tests` with `use super::*;` for Rust; the `describe`/`it` block for JS/TS). Tests must be COMPREHENSIVE and exercise real behaviour — the happy path, the edge cases and the failure modes the feature must handle — never a vacuous assertion.
+1. **Write the tests FIRST**, in the test block the file already uses (`#[cfg(test)] mod tests` with `use super::*;` for Rust; the `describe`/`it` block for JS/TS). Tests must be COMPREHENSIVE and exercise real behaviour — the happy path, the edge cases and the failure modes the feature must handle — never a vacuous assertion. Declare each test on the plan step it belongs to with `self_set_requirement_tests` (its `name`, `file` and `line`), so it shows under the step in the plan as a requirement test.
 2. **Choose the right test type**, cheapest that proves the behaviour:
    - **unit** — one function/module in isolation: cheapest, least coverage; the backbone of the suite.
    - **integration** — a few parts together (a real dependency, a database, a module boundary): middle cost, middle coverage.

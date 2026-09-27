@@ -91,6 +91,21 @@ pub struct PlanStepDraft {
     pub context: String,
 }
 
+/// One requirement test the lead declared for a plan step: the tests that must
+/// pass for the step to be done. Shown in the plan panel under the step, so the
+/// human can see what the implementation is required to satisfy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RequirementTest {
+    /// The test's function/name.
+    pub name: String,
+    /// Path of the file that holds the test, as the lead gave it.
+    #[serde(default)]
+    pub file: String,
+    /// 1-based line of the test in `file`; 0 means the lead did not give one.
+    #[serde(default)]
+    pub line: u32,
+}
+
 /// One row of the session plan the agent presents in the UI.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlanStep {
@@ -108,6 +123,10 @@ pub struct PlanStep {
     /// Summarised context for the executing model (never shown in the UI).
     #[serde(default)]
     pub context: String,
+    /// Requirement tests the lead declared for this step (name + `file:line`).
+    /// Shown in the plan panel under the step; empty when none were declared.
+    #[serde(default)]
+    pub tests: Vec<RequirementTest>,
     pub status: PlanStatus,
     #[serde(default)]
     pub note: Option<String>,
@@ -269,6 +288,26 @@ pub trait SessionControl: Send + Sync {
         Err("setting a step's context is not supported by this session".to_string())
     }
 
+    /// Replace the requirement tests declared for an existing plan step — the
+    /// tests that must pass for the step to be done. They are shown in the plan
+    /// panel under the step, so a human can see what the implementation is
+    /// required to satisfy.
+    ///
+    /// Allowed only while the step is `Pending`, `Ready` or `Blocked`: a step
+    /// that is `InProgress` (a model is already working it) or `Done` keeps the
+    /// tests it was given. The step's status is left unchanged.
+    ///
+    /// Returns `Ok(true)` when the tests were replaced, `Ok(false)` when no step
+    /// matched `target`, and `Err(reason)` when the matched step may not be
+    /// changed or the tests are malformed.
+    fn set_step_tests(
+        &self,
+        _target: &PlanTarget,
+        _tests: Vec<RequirementTest>,
+    ) -> Result<bool, String> {
+        Err("setting a step's requirement tests is not supported by this session".to_string())
+    }
+
     fn set_status(&self, status: &str);
     fn status(&self) -> String;
 
@@ -299,6 +338,7 @@ mod tests {
             verification: String::new(),
             model: String::new(),
             context: String::new(),
+            tests: Vec::new(),
             status: PlanStatus::Pending,
             note: None,
             started_at_ms: None,
@@ -416,6 +456,7 @@ mod tests {
             verification: "test verification".to_string(),
             model: "test model".to_string(),
             context: "test context".to_string(),
+            tests: Vec::new(),
             status: PlanStatus::Ready,
             note: Some("n".to_string()),
             started_at_ms: Some(1),

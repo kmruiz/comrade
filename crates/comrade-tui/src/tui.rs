@@ -20,8 +20,8 @@ use comrade_core::{
     build_session_context, run_agent_with_history,
 };
 use comrade_tool::{
-    AGENT_MODEL, FieldKind, FormSpec, PlanStatus, PlanStep, PlanTarget, SessionControl,
-    ToolContext, UserIo, UserPrompt, UserReply,
+    AGENT_MODEL, FieldKind, FormSpec, PlanStatus, PlanStep, PlanTarget, RequirementTest,
+    SessionControl, ToolContext, UserIo, UserPrompt, UserReply,
 };
 
 use serde::{Deserialize, Serialize};
@@ -7681,6 +7681,10 @@ fn draw_plan(app: &mut App, frame: &mut Frame, area: Rect) {
                 push_tok_line(&mut lines, &line);
             }
         }
+        // requirement tests: what the implementation must satisfy.
+        for line in requirement_tests_lines(&step.tests, width) {
+            push_tok_line(&mut lines, &line);
+        }
     }
     // Scroll the plan to the requested offset, clamped to the content height so
     // the offset can never scroll past the end.
@@ -7885,6 +7889,43 @@ fn collapsed_done_toks(step: &PlanStep, width: usize) -> Vec<Tok> {
         toks.push(t);
     }
     toks
+}
+
+/// The "requirement tests" block for a plan step: a labelled header followed by
+/// one row per test the lead declared, showing the test's name and its
+/// `file:line`. Returns no lines when the step declares no tests, so the plan
+/// panel is unchanged for steps without them.
+fn requirement_tests_lines(tests: &[RequirementTest], width: usize) -> Vec<Vec<Tok>> {
+    if tests.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let header = vec![tok(
+        "requirement tests:",
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    )];
+    out.extend(wrap_toks(&header, width));
+    for test in tests {
+        // A `line` of 0 means the lead did not give one: show just the file.
+        let file = flat(&test.file);
+        let location = if test.line > 0 {
+            format!("{file}:{}", test.line)
+        } else {
+            file
+        };
+        let toks = vec![
+            tok("  - ", Style::default().fg(Color::Magenta)),
+            tok(flat(&test.name), Style::default().fg(Color::White)),
+            tok(
+                format!(" ({location})"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        out.extend(wrap_toks(&toks, width));
+    }
+    out
 }
 
 /// The Ctrl-x C-b session switcher overlay: pick an open session to switch to.
@@ -11744,6 +11785,7 @@ mod tests {
             verification: "v".into(),
             model: String::new(),
             context: String::new(),
+            tests: Vec::new(),
             status,
             note: None,
             started_at_ms: None,
@@ -13062,10 +13104,63 @@ mod plan_step_tests {
             verification: "cargo test".into(),
             model: model.into(),
             context: String::new(),
+            tests: Vec::new(),
             status: PlanStatus::Done,
             note: Some("working: fix 1/5".into()),
             started_at_ms: Some(1_000),
             took_ms: took,
+        }
+    }
+
+    #[test]
+    fn requirement_tests_show_name_and_file_line() {
+        let tests = vec![
+            RequirementTest {
+                name: "it_works".into(),
+                file: "src/lib.rs".into(),
+                line: 42,
+            },
+            RequirementTest {
+                name: "it_fails_loudly".into(),
+                file: "src/lib.rs".into(),
+                line: 99,
+            },
+        ];
+        let lines = requirement_tests_lines(&tests, 80);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(line_text(&lines[0]), "requirement tests:");
+        assert_eq!(line_text(&lines[1]), "- it_works (src/lib.rs:42)");
+        assert_eq!(line_text(&lines[2]), "- it_fails_loudly (src/lib.rs:99)");
+    }
+
+    #[test]
+    fn requirement_tests_render_nothing_when_absent() {
+        assert!(requirement_tests_lines(&[], 80).is_empty());
+    }
+
+    #[test]
+    fn requirement_test_without_a_line_omits_it() {
+        let tests = vec![RequirementTest {
+            name: "t".into(),
+            file: "a.rs".into(),
+            line: 0,
+        }];
+        let lines = requirement_tests_lines(&tests, 80);
+        assert_eq!(line_text(&lines[1]), "- t (a.rs)");
+    }
+
+    #[test]
+    fn requirement_tests_wrap_to_the_panel_width() {
+        let tests = vec![RequirementTest {
+            name: "a_very_long_test_name_that_should_wrap".into(),
+            file: "some/deep/path/to/a/file.rs".into(),
+            line: 1234,
+        }];
+        let lines = requirement_tests_lines(&tests, 24);
+        assert!(lines.len() > 2, "expected the test row to wrap");
+        for line in &lines {
+            let w: usize = line.iter().map(|t| t.text.chars().count()).sum();
+            assert!(w <= 24, "line too wide ({w}): {}", line_text(line));
         }
     }
 
