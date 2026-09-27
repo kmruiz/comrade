@@ -92,7 +92,7 @@ pub(crate) async fn run_jobs(
 
     // Isolation needs a git repo; when the project is not one, fall back to the
     // shared workspace so parallel delegation still works everywhere.
-    let can_isolate = crate::worktree::Worktree::isolation_available(&ctx.project_root).await;
+    let can_isolate = crate::worktree::Worktree::isolation_available(&ctx.project_root);
 
     // Gate every job up front so a single denial aborts before anything runs.
     for (i, p) in prepared.iter().enumerate() {
@@ -120,7 +120,6 @@ pub(crate) async fn run_jobs(
             let worktree = if isolated {
                 Some(
                     crate::worktree::Worktree::create(&ctx.project_root, next_worktree_id())
-                        .await
                         .with_context(|| format!("isolating delegate {}", p.model))?,
                 )
             } else {
@@ -182,7 +181,7 @@ pub(crate) async fn run_jobs(
             Ok((reply, worktree)) => {
                 out.push_str(&format!("\n=== job {} ({}) ===\n{reply}\n", i + 1, p.model));
                 if let Some(w) = worktree {
-                    if w.has_changes().await {
+                    if w.has_changes() {
                         let wt = w.path().display();
                         let repo = ctx.project_root.display();
                         out.push_str(&format!(
@@ -190,7 +189,7 @@ pub(crate) async fn run_jobs(
                             i + 1,
                         ));
                     } else {
-                        let _ = w.remove().await;
+                        let _ = w.remove();
                         out.push_str(&format!(
                             "[job {} isolated in a worktree; it made no changes, so it was removed]\n",
                             i + 1
