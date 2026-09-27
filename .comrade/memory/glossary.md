@@ -693,6 +693,14 @@ Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; othe
 - `release.sh`
 - `.github/scripts/release-notes.sh`
 
+## RequirementTest
+> A test the tech lead declared for a plan step: the tests that must pass for that step to be done. Declared with `self_set_requirement_tests` (name + file:line), stored on the `PlanStep.tests` field, and shown in the plan panel under the step.
+
+**References:**
+- `crates/comrade-tool/src/plan.rs`
+- `crates/comrade-tool-session/src/lib.rs`
+- `crates/comrade-tui/src/tui.rs`
+
 ## resident semantic index
 > The resident per-project vector index for `semantic_search` (crates/comrade-tool-memory/src/semantic/mod.rs): `MEM_STORE`/`CODE_STORE` are process-global `Mutex<HashMap<PathBuf, Store>>` maps holding the memory and code `Store` for each project root. A search loads a store from disk at most once, reuses it across calls, and writes it back only when the CONTENT actually changed — `refresh`/`code_refresh` return `(Store, bool)` where the bool comes from `same_docs` (order-independent `(id, hash)` signatures), the per-file `FileStamp` map and the recorded HEAD, so a dirty tree that re-parses to identical chunks is NOT a change (no full-cache rewrite). Vectors are stored pre-normalised (L2) so ranking is a plain dot product (`dot`), not `cosine`.
 
