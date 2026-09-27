@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use comrade_tool::{UpwardAsk, Verdict};
+use comrade_tool::{Recovery, UpwardAsk, Verdict};
 
 use crate::llm::{ChatMessage, LlmClient, Role};
 
@@ -92,6 +92,36 @@ impl UpwardAsk for ParentAsk {
         }
     }
 
+    async fn recover(&self, status: &str) -> Result<Option<Recovery>> {
+        let prompt = format!(
+            "One of your sub-agents (a developer model) you delegated to is STUCK IN A LOOP. Its \
+             task, the context you gave it, and what it has done follow.\n\n--- status ---\n{status}\n\
+             --- end status ---\n\n\
+             Decide what YOU will do next. Choose exactly one:\n\
+             SELF - you will do the task yourself now, instead of delegating it again.\n\
+             SPLIT - you will split the task into smaller, self-contained steps and delegate each \
+             of them again.\n\
+             RESTART - you will re-delegate the same task with a better context; write the improved \
+             context after the keyword.\n\n\
+             Reply with exactly one line and nothing else:\n\
+             SELF\n\
+             or\n\
+             SPLIT\n\
+             or\n\
+             RESTART: <the improved context you will give the next delegate>"
+        );
+        let messages = vec![
+            ChatMessage::new(Role::System, self.system.clone()),
+            ChatMessage::new(Role::User, prompt),
+        ];
+        // Bounded like the other upward calls: no decision simply means the
+        // caller reports a plain "stopped" answer.
+        match tokio::time::timeout(RECOVERY_TIMEOUT, self.client.chat(&messages)).await {
+            Ok(Ok(text)) => Ok(parse_recovery(&text)),
+            _ => Ok(None),
+        }
+    }
+
     async fn supervise(&self, briefing: &str) -> Result<Option<String>> {
         let prompt = format!(
             "One of your sub-agents (a developer model) is STILL RUNNING the step you delegated. \
@@ -137,6 +167,10 @@ const SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
 /// simply left on its current path, so a slow tech lead never becomes a way to
 /// hold a delegate open.
 const SUPERVISION_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long the parent model gets to decide how to recover from a delegate stuck
+/// in a loop (see [`UpwardAsk::recover`]). Bounded like the others.
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Read a permission verdict out of the parent's reply. Fail closed: only a reply
 /// whose first substantive line OPENS with `APPROVE` approves; `DENY: <why>`
@@ -233,6 +267,53 @@ pub fn parse_supervision(reply: &str) -> Option<String> {
     }
 }
 
+/// Read the parent's loop-recovery decision: `None` when it did not give a
+/// usable one (the caller then reports a plain "stopped" answer). The first
+/// substantive line must OPEN with `SELF`, `SPLIT` or `RESTART` at a word
+/// boundary; `RESTART` collects everything after the keyword plus any following
+/// lines as the improved context.
+pub fn parse_recovery(reply: &str) -> Option<Recovery> {
+    let mut lines = reply.lines().map(clean_line).filter(|l| !l.is_empty());
+    let first = lines.next()?;
+    let upper = first.to_ascii_uppercase();
+    // `SELFISH…` / `SPLITTING…` are prose, not decisions: the keyword must end at
+    // a word boundary.
+    let keyword = |kw: &str| -> Option<&str> {
+        if upper.starts_with(kw)
+            && !upper[kw.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric())
+        {
+            Some(&first[kw.len()..])
+        } else {
+            None
+        }
+    };
+    if let Some(_rest) = keyword("SELF") {
+        return Some(Recovery::SelfWork);
+    }
+    if let Some(_rest) = keyword("SPLIT") {
+        return Some(Recovery::Split);
+    }
+    let rest = keyword("RESTART")?;
+    let mut text = clean_line(rest.trim_start_matches([':', '-', '.', ' ', '\t']));
+    for line in lines {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&line);
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        // `RESTART` with no context has nothing to restart with; treat it as
+        // undecided rather than inventing a context.
+        None
+    } else {
+        Some(Recovery::Restart(text.to_string()))
+    }
+}
+
 /// One line of a parent's reply, stripped of surrounding whitespace and markdown
 /// noise - the same cleaning `parse_verdict` applies before it looks at a line.
 fn clean_line(raw: &str) -> String {
@@ -285,6 +366,28 @@ mod tests {
         // A blank reply is not a summary: the caller must keep its transcript.
         assert_eq!(usable_summary("   \n"), None);
         assert_eq!(usable_summary(""), None);
+    }
+
+    #[test]
+    fn parse_recovery_reads_the_three_decisions() {
+        assert_eq!(parse_recovery("SELF"), Some(Recovery::SelfWork));
+        assert_eq!(parse_recovery("self.\n"), Some(Recovery::SelfWork));
+        assert_eq!(parse_recovery("SPLIT"), Some(Recovery::Split));
+        assert_eq!(
+            parse_recovery("**RESTART:** use fs_edit, keep greet_works\nand run cargo test"),
+            Some(Recovery::Restart(
+                "use fs_edit, keep greet_works\nand run cargo test".to_string()
+            ))
+        );
+        // A word boundary matters: prose is not a decision.
+        assert_eq!(parse_recovery("SELFISH choice"), None);
+        assert_eq!(parse_recovery("SPLITTING the work later"), None);
+        // RESTART with nothing to restart with is undecided.
+        assert_eq!(parse_recovery("RESTART"), None);
+        assert_eq!(parse_recovery("RESTART:"), None);
+        // A rambling non-answer is never a decision.
+        assert_eq!(parse_recovery("I'm not sure what you mean."), None);
+        assert_eq!(parse_recovery(""), None);
     }
 
     #[test]

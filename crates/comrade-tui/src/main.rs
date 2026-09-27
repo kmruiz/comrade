@@ -350,6 +350,12 @@ pub(crate) fn session_bundle(
             deps.root.display()
         ),
     )));
+    // The guardrail (Jev/TypeSafe) judges a RUNNING delegate and can tell the
+    // lead to continue, steer or stop it. Absent a key, the lead model supervises
+    // as before (see `[guardrails]` in the config).
+    if let Some(guardrail) = comrade_core::guardrail_from_cfg(&deps.cfg.guardrails) {
+        session.set_guardrail(guardrail);
+    }
     let undo = Arc::new(MemoryUndo::new(deps.root.clone()));
     // Install the configured filesystem/shell guardrails process-wide so the fs
     // and shell tools honour `[security] extra_roots`/`shell_allow`/`shell_deny`.

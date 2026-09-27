@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::llm::ChatMessage;
 
 /// Crude token estimate (~4 chars/token) used for budget enforcement. Cheap
@@ -7,6 +9,24 @@ pub fn estimate_tokens(text: &str) -> usize {
         return 0;
     }
     text.chars().count().div_ceil(4) + 4
+}
+
+/// Stable header for harness steering notes. The wording makes their origin
+/// explicit so a model does not read them as content coming from a tool result
+/// or the project.
+const HARNESS_NOTES_HEADER: &str = "## Harness notes\n\
+     These notes come from the Comrade harness itself, not from any tool result \
+     and not from a project file. Treat them as authoritative operating \
+     instructions for your next action:";
+
+/// Render queued steering notes as one system-message block.
+fn render_harness_notes(notes: &[String]) -> String {
+    let mut out = String::from(HARNESS_NOTES_HEADER);
+    for note in notes {
+        out.push_str("\n\n");
+        out.push_str(note.trim());
+    }
+    out
 }
 
 /// Holds the rolling message history and enforces a token budget.
@@ -45,6 +65,11 @@ pub struct ContextManager {
     history: Vec<ChatMessage>,
     /// Compacted summary of evicted turns ("Earlier context").
     rollup: String,
+    /// Harness steering notes awaiting delivery on the next model request. They
+    /// are rendered into the SYSTEM message (a trusted channel), never folded
+    /// into tool output, so the model reads them as authoritative directives
+    /// instead of instructions smuggled inside tool data.
+    notes: Vec<String>,
     /// Number of messages evicted so far (informational).
     pub evicted: usize,
 }
@@ -56,6 +81,7 @@ impl ContextManager {
             max_tool_output_chars,
             history: Vec::new(),
             rollup: String::new(),
+            notes: Vec::new(),
             evicted: 0,
         }
     }
@@ -81,6 +107,10 @@ impl ContextManager {
     /// results"). So the note is folded into whatever role is pending — a ReAct
     /// observation (user) or a native tool result (tool) — and only pushed as a
     /// new user turn when the last message is an assistant one.
+    ///
+    /// Prefer [`Self::push_note`] for HARNESS steering: folding a directive into
+    /// a tool result makes it look like a prompt-injection planted in tool
+    /// output, which models increasingly flag.
     pub fn push_user_merged(&mut self, text: &str) {
         if let Some(last) = self.history.last_mut() {
             let mergeable = match last.role {
@@ -97,6 +127,47 @@ impl ContextManager {
             }
         }
         self.push(ChatMessage::new(crate::llm::Role::User, text));
+    }
+
+    /// Queue a steering note from the HARNESS (a nudge, a correction, a human
+    /// steer) for delivery on the next model request.
+    ///
+    /// The note is rendered into the SYSTEM message by [`Self::request_messages`]
+    /// — a trusted channel — so it is never welded onto a tool result, never
+    /// disturbs the user/assistant/tool role alternation, and cannot be mistaken
+    /// for instructions injected through tool data. Notes are one-shot: they are
+    /// cleared once the model has answered (see [`Self::clear_notes`]).
+    pub fn push_note(&mut self, text: impl Into<String>) {
+        self.notes.push(text.into());
+    }
+
+    /// Drop any queued steering notes after the model has seen them.
+    pub fn clear_notes(&mut self) {
+        self.notes.clear();
+    }
+
+    /// The message list to send for the next model request: [`Self::messages`],
+    /// with any queued steering notes appended to the system message under a
+    /// clear "harness" header. The history itself is untouched, so the notes are
+    /// transient and never replay in later turns.
+    pub fn request_messages(&self) -> Cow<'_, [ChatMessage]> {
+        if self.notes.is_empty() {
+            return Cow::Borrowed(&self.history);
+        }
+        let mut msgs = self.history.clone();
+        let block = render_harness_notes(&self.notes);
+        match msgs.iter_mut().find(|m| m.role == crate::llm::Role::System) {
+            Some(sys) => {
+                if !sys.content.is_empty() {
+                    sys.content.push_str("\n\n");
+                }
+                sys.content.push_str(&block);
+            }
+            // No system message (should not happen): fall back to a user turn so
+            // a steering note is never dropped.
+            None => msgs.push(ChatMessage::new(crate::llm::Role::User, block)),
+        }
+        Cow::Owned(msgs)
     }
 
     pub fn messages(&self) -> &[ChatMessage] {
@@ -123,6 +194,7 @@ impl ContextManager {
             max_tool_output_chars,
             history,
             rollup,
+            notes: Vec::new(),
             evicted,
         }
     }
@@ -417,6 +489,38 @@ mod tests {
         assert_eq!(cm.messages().len(), 7);
         assert_eq!(cm.messages().last().unwrap().role, Role::User);
         assert_eq!(cm.messages().last().unwrap().content, "note");
+    }
+
+    #[test]
+    fn harness_notes_ride_the_system_message_and_are_transient() {
+        let mut cm = ContextManager::with_system("SYS", 10_000, 100);
+        cm.push(ChatMessage::new(Role::User, "the task"));
+        cm.push(ChatMessage::new(Role::Assistant, "working"));
+        cm.push(ChatMessage::tool_result("c1", "raw tool output"));
+        cm.push_note("STOP investigating.");
+        cm.push_note("The user sent: hurry up.");
+
+        // The tool result is untouched: a harness note is never welded onto it,
+        // which is exactly what made it look like injected prompt text.
+        let req = cm.request_messages();
+        let last = req.last().unwrap();
+        assert_eq!(last.role, Role::Tool);
+        assert_eq!(last.content, "raw tool output");
+        // The notes arrive in the system message, the trusted channel.
+        assert_eq!(req[0].role, Role::System);
+        assert!(req[0].content.starts_with("SYS"));
+        assert!(req[0].content.contains("Harness notes"));
+        assert!(req[0].content.contains("STOP investigating."));
+        assert!(req[0].content.contains("hurry up"));
+        // The stored history is unchanged, so notes do not replay every turn.
+        assert!(!cm.messages()[0].content.contains("Harness notes"));
+
+        cm.clear_notes();
+        let req = cm.request_messages();
+        assert!(
+            !req[0].content.contains("Harness notes"),
+            "cleared notes must not come back"
+        );
     }
 
     #[test]

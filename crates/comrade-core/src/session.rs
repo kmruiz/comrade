@@ -140,6 +140,13 @@ impl ActivityEvents for SessionEvents {
             })
             .await;
     }
+
+    async fn notice(&self, author: &str, text: &str) {
+        let _ = self
+            .0
+            .send(AgentEvent::Notice(format!("{author}: {text}")))
+            .await;
+    }
 }
 
 /// Observable session state. Doubles as the [`SessionControl`] implementation
@@ -158,6 +165,9 @@ pub struct AgentSession {
     /// Handle sub-agents use to ask this session's model a question
     /// (`ask_upwards`). Installed once when the session is wired up.
     upward: RwLock<Option<comrade_tool::Upward>>,
+    /// The guardrail consulted while a delegated sub-agent runs (the Jev
+    /// mechanism). `None` means no guardrail is configured.
+    guardrail: RwLock<Option<comrade_tool::Guard>>,
 }
 
 impl AgentSession {
@@ -171,6 +181,7 @@ impl AgentSession {
             next_id: RwLock::new(1),
             delegated: RwLock::new(HashSet::new()),
             upward: RwLock::new(None),
+            guardrail: RwLock::new(None),
         }
     }
 
@@ -178,6 +189,12 @@ impl AgentSession {
     /// question when they are stuck (the `ask_upwards` tool).
     pub fn set_upward(&self, upward: comrade_tool::Upward) {
         *self.upward.write().unwrap() = Some(upward);
+    }
+
+    /// Install the guardrail consulted while a delegated sub-agent runs (the Jev
+    /// mechanism). Absent, the lead model supervises as before.
+    pub fn set_guardrail(&self, guardrail: comrade_tool::Guard) {
+        *self.guardrail.write().unwrap() = Some(guardrail);
     }
 
     fn emit(&self, event: AgentEvent) {
@@ -394,6 +411,10 @@ impl SessionControl for AgentSession {
 
     fn upward(&self) -> Option<comrade_tool::Upward> {
         self.upward.read().unwrap().clone()
+    }
+
+    fn guardrail(&self) -> Option<comrade_tool::Guard> {
+        self.guardrail.read().unwrap().clone()
     }
 }
 

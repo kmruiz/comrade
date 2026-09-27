@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use comrade_tool::{
-    PlanStatus, PlanTarget, Tool, ToolContext, ToolRegistry, ToolSpec, Verdict, declarations,
-    removed_declarations,
+    GuardInput, GuardOutcome, PlanStatus, PlanTarget, Recovery, Tool, ToolContext, ToolRegistry,
+    ToolSpec, Verdict, declarations, removed_declarations,
 };
 use futures_util::future::join_all;
 use serde::Deserialize;
@@ -544,6 +544,8 @@ impl Tool for DelegateTool {
             &self.tools,
             ctx,
             system,
+            &task,
+            &context,
             user_prompt,
             &target.cfg.name,
             native,
@@ -851,15 +853,7 @@ fn supervise_briefing(ctxm: &ContextManager) -> String {
         .find(|m| m.role == Role::User && m.tool_calls.is_none())
         .map(|m| m.content.trim().to_string())
         .unwrap_or_else(|| "(the delegated task is no longer in the transcript)".to_string());
-    let mut transcript = crate::compact::render_transcript(ctxm.messages());
-    if transcript.len() > SUPERVISION_TRANSCRIPT_CHARS {
-        let cut = transcript.len() - SUPERVISION_TRANSCRIPT_CHARS;
-        // Never cut a UTF-8 character in half.
-        let cut = (cut..transcript.len())
-            .find(|i| transcript.is_char_boundary(*i))
-            .unwrap_or(cut);
-        transcript = format!("[... earlier turns elided ...]\n{}", &transcript[cut..]);
-    }
+    let transcript = transcript_tail(ctxm);
     format!(
         "TASK IT WAS GIVEN: {task}\n\nWHAT IT HAS DONE SO FAR (oldest first; the last assistant \
          turn is what it intends to do next):\n--- transcript ---\n{transcript}\n--- end \
@@ -867,20 +861,120 @@ fn supervise_briefing(ctxm: &ContextManager) -> String {
     )
 }
 
+/// The tail of a delegate's transcript, capped at [`SUPERVISION_TRANSCRIPT_CHARS`]
+/// bytes (never cutting a UTF-8 character in half) so an old, long run cannot
+/// make a parent request arbitrarily expensive.
+fn transcript_tail(ctxm: &ContextManager) -> String {
+    let mut transcript = crate::compact::render_transcript(ctxm.messages());
+    if transcript.len() > SUPERVISION_TRANSCRIPT_CHARS {
+        let cut = transcript.len() - SUPERVISION_TRANSCRIPT_CHARS;
+        let cut = (cut..transcript.len())
+            .find(|i| transcript.is_char_boundary(*i))
+            .unwrap_or(cut);
+        transcript = format!("[... earlier turns elided ...]\n{}", &transcript[cut..]);
+    }
+    transcript
+}
+
+/// A delegate got stuck in a loop. Ask the lead whether to take the task over,
+/// split it, or restart it with a better context, show that decision in the chat,
+/// and return an answer the lead then acts on. When no parent is wired or it
+/// cannot decide, fall back to a plain "stopped" answer.
+async fn loop_recovery(
+    dctx: &ToolContext,
+    author: &str,
+    task: &str,
+    context: &str,
+    reason: &str,
+    ctxm: &ContextManager,
+    last: &str,
+) -> String {
+    let Some(parent) = dctx.session.upward() else {
+        return guardrail_stop_answer(author, reason, last);
+    };
+    let status = recovery_status(task, context, reason, ctxm);
+    let Some(decision) = parent.recover(&status).await.ok().flatten() else {
+        return guardrail_stop_answer(author, reason, last);
+    };
+    let action = match &decision {
+        Recovery::SelfWork => "do the task itself",
+        Recovery::Split => "split the task and delegate again",
+        Recovery::Restart(_) => "restart with a better context",
+    };
+    dctx.events
+        .notice(author, &format!("stuck in a loop - lead will {action}"))
+        .await;
+    recovery_answer(author, task, &decision, last)
+}
+
+/// The status a lead sees when deciding how to recover from a loop: the guardrail
+/// reason, the task and context the delegate was given, and what it has done.
+fn recovery_status(task: &str, context: &str, reason: &str, ctxm: &ContextManager) -> String {
+    let context = if context.trim().is_empty() {
+        "(none)"
+    } else {
+        context.trim()
+    };
+    format!(
+        "{reason}\n\nDELEGATED TASK:\n{}\n\nCONTEXT IT WAS GIVEN:\n{context}\n\nWHAT IT HAS DONE \
+         SO FAR (oldest first):\n--- transcript ---\n{}\n--- end transcript ---",
+        task.trim(),
+        transcript_tail(ctxm),
+    )
+}
+
+/// The tool result a lead receives after a loop, encoding the recovery it chose.
+fn recovery_answer(author: &str, task: &str, decision: &Recovery, last: &str) -> String {
+    let task = task.trim();
+    let head = format!("[delegate {author}: stopped in a loop]");
+    let tail = if last.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nBest effort with what it had gathered so far:\n\n{}",
+            last.trim()
+        )
+    };
+    match decision {
+        Recovery::SelfWork => format!(
+            "{head} RECOVERY: do this task yourself now, without delegating it again. The task \
+             was:\n{task}{tail}"
+        ),
+        Recovery::Split => format!(
+            "{head} RECOVERY: split the task into smaller, self-contained steps and call `delegate` \
+             again for each. The task was:\n{task}{tail}"
+        ),
+        Recovery::Restart(context) => format!(
+            "{head} RECOVERY: re-delegate the SAME task with this improved context:\n{context}\n\
+             \nTask:\n{task}{tail}"
+        ),
+    }
+}
+
+/// The guardrail's verdict on a running delegate, or `None` when no guardrail is
+/// configured or it could not answer - the caller then falls back to the lead
+/// model's own supervision.
+async fn guardrail_check(dctx: &ToolContext, input: &GuardInput) -> Option<GuardOutcome> {
+    let guardrail = dctx.session.guardrail()?;
+    guardrail.check(input).await.ok()
+}
+
+/// The structured material a guardrail judges: what the parent delegated (its
+/// `task` and `context`) plus the tail of the delegate's conversation.
+fn guard_input(ctxm: &ContextManager, task: &str, context: &str) -> GuardInput {
+    crate::guardrails::guard_input(ctxm, task, context)
+}
+
 /// Ask the tech lead to review a delegate that is still running and return its
 /// correction, if any. `None` when no parent is wired, when the parent has no
 /// objection, or when it did not answer in time - the delegate then simply
 /// carries on.
-async fn supervise_delegate(dctx: &ToolContext, ctxm: &ContextManager) -> Option<String> {
+async fn supervise_with(dctx: &ToolContext, briefing: &str) -> Option<String> {
     let parent = dctx.session.upward()?;
     // The parent sees the transcript as data in a standalone request: its own
     // conversation is never touched, so supervising a delegate cannot cost the
     // tech lead's context.
-    parent
-        .supervise(&supervise_briefing(ctxm))
-        .await
-        .ok()
-        .flatten()
+    parent.supervise(briefing).await.ok().flatten()
 }
 
 /// Cap the `ask_upwards` tool per delegate run. Returns the refusal message for
@@ -937,13 +1031,17 @@ fn history_is_material(ctxm: &ContextManager) -> bool {
 /// `allow_read_step` (agent.rs): once the delegate has done twenty consecutive
 /// read-only calls with no state change in between, the next read is refused
 /// and the delegate is nudged to make progress instead of keep reading. Any
-/// non-read action resets the counter. Returns the refusal message when the
-/// read must not run, `None` when it may.
+/// non-read action resets the counter. Returns the STEERING nudge when the read
+/// must not run, `None` when it may.
 ///
-/// `nudge` is the wording of the refusal and may contain a `{count}`
-/// placeholder for the number of consecutive reads; each caller passes wording
-/// that fits its sub-agent (a working delegate is told to implement, an
-/// advisor consulted via `ask_advise` is told to answer).
+/// The caller answers the refused call with a plain factual tool result and
+/// delivers the returned nudge through [`ContextManager::push_note`], so the
+/// instruction is never embedded in tool output.
+///
+/// `nudge` contains a `{count}` placeholder for the number of consecutive
+/// reads; each caller passes wording that fits its sub-agent (a working
+/// delegate is told to implement, an advisor consulted via `ask_advise` is told
+/// to answer).
 fn refuse_reading(name: &str, consecutive_reads: &mut usize, nudge: &str) -> Option<String> {
     if allow_read_step(name, consecutive_reads) {
         return None;
@@ -986,6 +1084,10 @@ pub(crate) async fn run_delegate_subagent(
     tools: &ToolRegistry,
     parent_ctx: &ToolContext,
     system: String,
+    // The parent's `task` (what the delegate was asked to do) and its `context`,
+    // passed separately from the rendered `user_prompt` for the guardrail.
+    task: &str,
+    context: &str,
     user_prompt: String,
     author: &str,
     native: bool,
@@ -1068,31 +1170,69 @@ pub(crate) async fn run_delegate_subagent(
         // own conversation at its next rest point (drained from the shared bus
         // cloned into `dctx`).
         crate::agent::drain_steer(dctx.steer.as_ref(), &mut ctxm).await;
-        // Supervision: every `limits.supervise` the tech lead re-reads what this
-        // still-running delegate has done and may send back ONE correction, which
-        // is injected as a user turn at this rest point (the same place a human
-        // steer lands, so message ordering with tool calls stays API-valid). A
-        // parent that is not wired, has nothing to add or is slow costs nothing:
-        // the delegate simply carries on. The call is bounded by the idle clock,
-        // so a slow parent cannot eat the delegate's inactivity budget, and the
-        // rounds are capped so one run cannot turn into a conversation.
+        // Guardrail / supervision: every `limits.supervise` the running delegate
+        // is judged, and the lead acts on the verdict. With a guardrail (Jev)
+        // configured it decides first: `continue` costs nothing, `stop` ends the
+        // run and reports to the lead, and `steer` has the lead model write the
+        // correction. Without a guardrail (or when it fails), the lead model
+        // reviews the transcript itself, exactly as before. A correction is
+        // injected as a harness note at this rest point (the same place a human
+        // steer lands, so message ordering with tool calls stays API-valid). The
+        // call is bounded by the idle clock, so a slow judge cannot eat the
+        // delegate's inactivity budget, and the rounds are capped so one run
+        // cannot turn into a conversation.
         if !limits.supervise.is_zero()
             && interventions < MAX_DELEGATE_INTERVENTIONS
-            && dctx.session.upward().is_some()
+            && (dctx.session.upward().is_some() || dctx.session.guardrail().is_some())
             && Instant::now() >= next_supervision
         {
-            // Re-arm before the call: reviewing takes time, and a correction must
-            // not be requested again on the very next iteration.
+            // Re-arm before the call: judging takes time, and a verdict must not
+            // be requested again on the very next iteration.
             next_supervision = Instant::now() + limits.supervise;
             interventions += 1;
-            let review = invoke_within(
+            let briefing = supervise_briefing(&ctxm);
+            let decision = invoke_within(
                 idle_left(last_progress, idle_nudged),
-                supervise_delegate(&dctx, &ctxm),
+                guardrail_check(&dctx, &guard_input(&ctxm, task, context)),
             )
             .await
             .flatten();
-            if let Some(correction) = review {
-                ctxm.push_user_merged(&format!("{SUPERVISE_PREFIX}{correction}"));
+            match &decision {
+                // A loop: hand the decision to the lead (take it over, split it,
+                // or restart with a better context) and show it in the chat.
+                Some(GuardOutcome::Loop(reason)) => {
+                    return Ok(loop_recovery(
+                        &dctx, author, task, context, reason, &ctxm, &last_text,
+                    )
+                    .await);
+                }
+                Some(GuardOutcome::Stop(reason)) => {
+                    return Ok(guardrail_stop_answer(author, reason, &last_text));
+                }
+                // A clear situation: nothing to do, and no model call.
+                Some(GuardOutcome::Continue) => {}
+                // `steer`, or no guardrail / it failed: the lead model reviews
+                // the transcript and writes the correction (the historical path).
+                // A guardrail reason is appended so the lead addresses the real
+                // issue (e.g. supply missing context).
+                other => {
+                    let briefing = match other {
+                        Some(GuardOutcome::Steer(hint)) => format!(
+                            "{briefing}\n\nGUARDRAIL ISSUE: {hint}. Write the correction that \
+                             addresses it."
+                        ),
+                        _ => briefing,
+                    };
+                    if let Some(correction) = invoke_within(
+                        idle_left(last_progress, idle_nudged),
+                        supervise_with(&dctx, &briefing),
+                    )
+                    .await
+                    .flatten()
+                    {
+                        ctxm.push_note(format!("{SUPERVISE_PREFIX}{correction}"));
+                    }
+                }
             }
         }
         // Prefer a parent-written summary over the lossy trim once the context is
@@ -1118,16 +1258,17 @@ pub(crate) async fn run_delegate_subagent(
             }
             if !idle_nudged && idle >= idle_nudge_at {
                 idle_nudged = true;
-                ctxm.push_user_merged(IDLE_NUDGE);
+                ctxm.push_note(IDLE_NUDGE);
             }
         }
         // One-shot nudges mirrored from the main loop, so a small delegate does
         // not edit forever without testing, or keep re-verifying after it has
-        // finished. Injected as a user turn so the next request sees it.
+        // finished. Delivered as harness notes (trusted system channel) so they
+        // are never mistaken for instructions planted in tool output.
         if tracker.needs_verify_nudge() {
-            ctxm.push_user_merged(crate::agent::VERIFY_NUDGE);
+            ctxm.push_note(crate::agent::VERIFY_NUDGE);
         } else if tracker.needs_stall_nudge() {
-            ctxm.push_user_merged(crate::agent::STALL_NUDGE);
+            ctxm.push_note(crate::agent::STALL_NUDGE);
         }
         let specs: Option<Vec<comrade_tool::ToolSpec>> = if native {
             // After a fixed-footprint overflow (`slim_specs`) advertise fewer
@@ -1142,22 +1283,21 @@ pub(crate) async fn run_delegate_subagent(
             None
         };
 
-        // Every model request is bounded by what is left of the budget.
+        // Every model request is bounded by what is left of the budget. Harness
+        // steering notes ride in the SYSTEM message (trusted channel) instead of
+        // being folded into tool output.
+        let request = ctxm.request_messages();
         let model_call = async {
             match &stop {
                 Some(stop) => {
                     tokio::select! {
-                        r = client.chat_turn_once(ctxm.messages(), specs.as_deref()) => r,
+                        r = client.chat_turn_once(&request, specs.as_deref()) => r,
                         _ = stop.cancelled() => {
                             bail!("delegate interrupted: the run was cancelled while waiting for the model")
                         }
                     }
                 }
-                None => {
-                    client
-                        .chat_turn_once(ctxm.messages(), specs.as_deref())
-                        .await
-                }
+                None => client.chat_turn_once(&request, specs.as_deref()).await,
             }
         };
         let Some(res) = invoke_within(idle_left(last_progress, idle_nudged), model_call).await
@@ -1166,6 +1306,7 @@ pub(crate) async fn run_delegate_subagent(
             // above nudges (at `idle_nudge_at`) or stops (at `idle_stop_at`).
             continue;
         };
+        drop(request);
         let turn = match res {
             Ok(turn) => turn,
             Err(e) if is_context_overflow(&e) => {
@@ -1185,6 +1326,8 @@ pub(crate) async fn run_delegate_subagent(
             }
             Err(e) => return Err(e),
         };
+        // The model has seen any steering notes; do not replay them next turn.
+        ctxm.clear_notes();
         // A request that came back is progress: reset the idle clock.
         last_progress = Instant::now();
         idle_nudged = false;
@@ -1214,11 +1357,14 @@ pub(crate) async fn run_delegate_subagent(
                 let args = serde_json::from_str(&tc.arguments).unwrap_or_default();
                 let args_pretty = serde_json::to_string(&args).unwrap_or_default();
                 let sig = format!("{} {}", tc.name, args_pretty);
-                if let Some(msg) = refuse_reading(&tc.name, &mut consecutive_reads, read_nudge) {
-                    // Too many reads in a row: nudge to implement. Still answer
-                    // the call with a tool result so history stays API-valid.
-                    let clamped = ctxm.truncate_observation(&msg);
+                if let Some(nudge) = refuse_reading(&tc.name, &mut consecutive_reads, read_nudge) {
+                    // Too many reads in a row: answer the call with a factual
+                    // refusal (history stays API-valid) and steer out of band.
+                    let refusal =
+                        format!("ERROR: too many reads in a row; `{}` was not run.", tc.name);
+                    let clamped = ctxm.truncate_observation(&refusal);
                     ctxm.push(ChatMessage::tool_result(tc.id, clamped));
+                    ctxm.push_note(nudge);
                     continue;
                 }
                 if let Some(msg) = refuse_upward(&tc.name, &mut upward_asks) {
@@ -1238,9 +1384,11 @@ pub(crate) async fn run_delegate_subagent(
                 }
                 if let Some(msg) = refuse_repeat(&mut tracker, &sig)? {
                     // Refused as a no-progress repeat: still answer the call
-                    // with a tool result so the history stays API-valid.
+                    // with a tool result so the history stays API-valid. The
+                    // steering rides the harness note channel, not the result.
                     let clamped = ctxm.truncate_observation(&msg);
                     ctxm.push(ChatMessage::tool_result(tc.id, clamped));
+                    ctxm.push_note(crate::agent::LOOP_REFUSAL_NUDGE);
                     continue;
                 }
                 let output = match tools.get(&tc.name) {
@@ -1316,12 +1464,17 @@ pub(crate) async fn run_delegate_subagent(
         };
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
         let sig = format!("{} {}", tool_call.name, args_pretty);
-        if let Some(msg) = refuse_reading(&tool_call.name, &mut consecutive_reads, read_nudge) {
-            let obs = ctxm.truncate_observation(&msg);
+        if let Some(nudge) = refuse_reading(&tool_call.name, &mut consecutive_reads, read_nudge) {
+            let refusal = format!(
+                "ERROR: too many reads in a row; `{}` was not run.",
+                tool_call.name
+            );
+            let obs = ctxm.truncate_observation(&refusal);
             ctxm.push(ChatMessage::new(
                 Role::User,
                 render_observation(&tool_call.name, &obs),
             ));
+            ctxm.push_note(nudge);
             continue;
         }
         if let Some(msg) = refuse_upward(&tool_call.name, &mut upward_asks) {
@@ -1354,6 +1507,7 @@ pub(crate) async fn run_delegate_subagent(
                 Role::User,
                 render_observation(&tool_call.name, &obs),
             ));
+            ctxm.push_note(crate::agent::LOOP_REFUSAL_NUDGE);
             continue;
         }
         let Some(tool) = tools.get(&tool_call.name) else {
@@ -1443,6 +1597,22 @@ fn timeout_answer(author: &str, idle: Duration, last: &str) -> String {
         format!(
             "{head} It had not produced an answer yet, so treat its result as unavailable and \
              continue without it (re-delegate a smaller, tightly-scoped task if you still need it)."
+        )
+    } else {
+        format!("{head}\n\nBest effort with what it had gathered so far:\n\n{last}")
+    }
+}
+
+/// The reply a delegate returns when the guardrail STOPPED it: the reason the
+/// guardrail gave, plus whatever partial answer it had, so the lead can re-plan
+/// instead of losing the work entirely.
+fn guardrail_stop_answer(author: &str, reason: &str, last: &str) -> String {
+    let head = format!("[delegate {author}: stopped by the guardrail - {reason}]");
+    let last = last.trim();
+    if last.is_empty() {
+        format!(
+            "{head} It had not produced an answer yet, so treat its result as unavailable and \
+             re-delegate a smaller, tightly-scoped task if you still need it."
         )
     } else {
         format!("{head}\n\nBest effort with what it had gathered so far:\n\n{last}")

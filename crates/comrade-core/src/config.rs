@@ -192,6 +192,66 @@ impl Default for AgentCfg {
     }
 }
 
+/// The guardrail mechanism: an external service that watches a RUNNING delegated
+/// sub-agent and tells the tech lead whether to leave it, steer it or stop it.
+/// Configured under `[guardrails]`.
+///
+/// With a Jev (TypeSafe) API key set, every supervision interval Comrade calls
+/// `POST https://api.typesafe.ai/v1/systemone` with the delegate's task and
+/// transcript and reads back a structured decision. When no key is set, the
+/// service is disabled, or the call fails, the lead model supervises as before.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GuardrailsCfg {
+    /// Whether the guardrail is active. Defaults to true; it only takes effect
+    /// when a `jev_api_key` is present.
+    pub enabled: bool,
+    /// TypeSafe/Jev API key, sent as `Authorization: Bearer <key>`. The presence
+    /// of a non-empty key is what turns the guardrail on.
+    pub jev_api_key: Option<String>,
+    /// Override the evaluation endpoint (defaults to the TypeSafe
+    /// `https://api.typesafe.ai/v1/systemone`).
+    pub jev_url: Option<String>,
+    /// Model to evaluate with (defaults to `jev-latest`).
+    pub jev_model: Option<String>,
+    /// How long a guardrail call may take before the lead model supervises
+    /// instead. `0` disables the guardrail (same as `enabled = false`).
+    pub jev_timeout_secs: u64,
+    /// How often the ROOT agent's guardrail is consulted as a periodic advisory
+    /// tick, in seconds. Read/stall/verify triggers still apply; `0` disables
+    /// only the tick.
+    pub interval_secs: u64,
+}
+
+impl Default for GuardrailsCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            jev_api_key: None,
+            jev_url: None,
+            jev_model: None,
+            jev_timeout_secs: 30,
+            interval_secs: 60,
+        }
+    }
+}
+
+impl GuardrailsCfg {
+    /// The configured API key, trimmed; an empty value counts as unset.
+    pub fn api_key(&self) -> Option<&str> {
+        self.jev_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+    }
+
+    /// Whether a usable guardrail is configured: enabled, not timed out to zero,
+    /// and given a key.
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.jev_timeout_secs != 0 && self.api_key().is_some()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CtxCfg {
@@ -355,6 +415,9 @@ pub struct Config {
     pub agent: AgentCfg,
     pub context: CtxCfg,
     pub security: SecurityCfg,
+    /// The guardrail mechanism for steering/stopping running delegates (see the
+    /// `[guardrails]` table and [`GuardrailsCfg`]).
+    pub guardrails: GuardrailsCfg,
     /// Extra developer models the tech lead can delegate sub-tasks to (see the
     /// `delegate` tool).
     pub delegates: Vec<DelegateCfg>,

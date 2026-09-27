@@ -279,6 +279,13 @@ pub trait SessionControl: Send + Sync {
     fn upward(&self) -> Option<crate::ask::Upward> {
         None
     }
+
+    /// The guardrail consulted while a delegated sub-agent is RUNNING, to decide
+    /// whether to leave it, steer it or stop it. `None` (the default) means no
+    /// guardrail is configured, so the lead model supervises as before.
+    fn guardrail(&self) -> Option<crate::ask::Guard> {
+        None
+    }
 }
 
 #[cfg(test)]

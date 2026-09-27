@@ -234,6 +234,8 @@ async fn cancelled_run_aborts_a_delegate_stuck_waiting_for_the_model() {
         &ToolRegistry::new(),
         &ctx,
         "You are a test delegate.".into(),
+        "do the thing",
+        "",
         "do the thing".into(),
         "silent",
         false,
@@ -1089,6 +1091,62 @@ impl UpwardAsk for SteeringParent {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.last_briefing.lock().unwrap() = briefing.to_string();
         Ok(self.steer.clone())
+    }
+}
+
+/// A guardrail that returns a fixed verdict and records how often it was asked
+/// and the structured input it saw.
+struct StubGuardrail {
+    outcome: GuardOutcome,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    last_input: Arc<Mutex<GuardInput>>,
+}
+
+#[async_trait::async_trait]
+impl comrade_tool::Guardrail for StubGuardrail {
+    async fn check(&self, input: &GuardInput) -> Result<GuardOutcome> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.last_input.lock().unwrap() = input.clone();
+        Ok(self.outcome.clone())
+    }
+}
+
+/// A parent model that answers a loop-recovery request with a fixed decision.
+struct RecoveringParent {
+    recovery: Recovery,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    last_status: Arc<Mutex<String>>,
+}
+
+#[async_trait::async_trait]
+impl UpwardAsk for RecoveringParent {
+    async fn ask(&self, _question: &str) -> Result<String> {
+        Ok(String::new())
+    }
+
+    async fn recover(&self, status: &str) -> Result<Option<Recovery>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.last_status.lock().unwrap() = status.to_string();
+        Ok(Some(self.recovery.clone()))
+    }
+}
+
+/// An `ActivityEvents` sink that records the informational notices a delegate
+/// run emits, so a test can assert the recovery decision is shown in the chat.
+#[derive(Default)]
+struct RecordingEvents {
+    notices: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl comrade_tool::ActivityEvents for RecordingEvents {
+    async fn tool_call(&self, _author: &str, _name: &str, _args: &str) {}
+    async fn tool_result(&self, _author: &str, _name: &str, _output: &str, _ok: bool) {}
+    async fn notice(&self, author: &str, text: &str) {
+        self.notices
+            .lock()
+            .unwrap()
+            .push(format!("{author}: {text}"));
     }
 }
 
@@ -2397,6 +2455,256 @@ async fn a_running_delegate_is_steered_by_its_parent() {
     let seen = briefing.lock().unwrap().clone();
     assert!(seen.contains("write src/a.rs"), "task missing: {seen}");
     assert!(seen.contains("transcript"), "transcript missing: {seen}");
+}
+
+/// Build the standard gated delegate run used by the guardrail tests: a delegate
+/// that issues one tool call and blocks in it, so a supervision interval can
+/// lapse while it is "running". Returns the run handle, the scripted request
+/// bodies, the gate to release the tool, and the guardrail/parent counters.
+struct GuardrailHarness {
+    run: Option<tokio::task::JoinHandle<String>>,
+    bodies: std::sync::mpsc::Receiver<String>,
+    guard_calls: Arc<std::sync::atomic::AtomicUsize>,
+    supervised: Arc<std::sync::atomic::AtomicUsize>,
+    guard_input: Arc<Mutex<GuardInput>>,
+}
+
+impl GuardrailHarness {
+    async fn finish(&mut self) -> String {
+        self.run.take().unwrap().await.unwrap()
+    }
+}
+
+fn guardrail_harness(outcome: GuardOutcome, parent_steer: Option<&str>) -> GuardrailHarness {
+    let supervised = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let parent = Arc::new(SteeringParent {
+        steer: parent_steer.map(str::to_string),
+        supervised: supervised.clone(),
+        last_briefing: Arc::new(Mutex::new(String::new())),
+    });
+    let mut h = guardrail_harness_with(outcome, parent, Arc::new(comrade_tool::NoopEvents));
+    h.supervised = supervised;
+    h
+}
+
+/// Like [`guardrail_harness`] but with an explicit parent and event sink.
+fn guardrail_harness_with(
+    outcome: GuardOutcome,
+    parent: Arc<dyn UpwardAsk>,
+    events: Arc<dyn comrade_tool::ActivityEvents>,
+) -> GuardrailHarness {
+    let (called_tx, called_rx) = tokio::sync::oneshot::channel();
+    let gate = Arc::new(Gate {
+        called: std::sync::Mutex::new(Some(called_tx)),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(GatedWriteTool { gate: gate.clone() }));
+
+    let tool_call_turn = json!({
+        "choices": [{
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {
+                        "name": "fs_write_file",
+                        "arguments": "{\"path\":\"src/a.rs\",\"content\":\"pub fn a(){}\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let final_turn =
+        json!({"choices": [{"message": {"content": "done after the guardrail"}}]}).to_string();
+    let (base, bodies) = scripted_spy(vec![tool_call_turn, final_turn]);
+
+    let cfg = Config {
+        delegates: vec![delegate("cheap", &base)],
+        ..Config::default()
+    };
+    let limits = DelegateLimits {
+        supervise: std::time::Duration::from_millis(50),
+        ..DelegateLimits::default()
+    };
+    let tool = DelegateTool::new(&cfg.delegates, registry, limits)
+        .unwrap()
+        .unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let session = Arc::new(AgentSession::new(tx));
+    session.set_upward(parent);
+    let guard_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let guard_input = Arc::new(Mutex::new(GuardInput::default()));
+    session.set_guardrail(Arc::new(StubGuardrail {
+        outcome,
+        calls: guard_calls.clone(),
+        last_input: guard_input.clone(),
+    }));
+
+    let mut ctx = test_ctx();
+    ctx.session = session.as_control();
+    ctx.events = events;
+
+    let run = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            tool.invoke(
+                &ctx,
+                json!({"jobs": [{
+                    "model": "cheap",
+                    "task": "write src/a.rs",
+                    "context": "use fs_edit and keep the pom"
+                }]}),
+            )
+            .await
+            .unwrap()
+        }
+    });
+
+    // Drive the tool into its blocking call and let the interval lapse, so the
+    // next rest point runs the guardrail.
+    let gate_for_task = gate.clone();
+    tokio::spawn(async move {
+        let _ = called_rx.await;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        gate_for_task.release.notify_one();
+    });
+
+    GuardrailHarness {
+        run: Some(run),
+        bodies,
+        guard_calls,
+        supervised: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        guard_input,
+    }
+}
+
+/// A `continue` verdict costs no lead-model call and leaves the delegate alone.
+#[tokio::test]
+async fn guardrail_continue_skips_the_lead_model() {
+    let mut h = guardrail_harness(GuardOutcome::Continue, Some("should not be used"));
+    let out = h.finish().await;
+    assert!(out.contains("done after the guardrail"), "{out}");
+    assert!(
+        h.guard_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the guardrail was never consulted"
+    );
+    assert_eq!(
+        h.supervised.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "continue must not call the lead model"
+    );
+    // Its structured input carried the parent's task AND context, plus the
+    // recent conversation.
+    let seen = h.guard_input.lock().unwrap().clone();
+    assert!(
+        seen.task.contains("write src/a.rs"),
+        "task missing: {seen:?}"
+    );
+    assert!(
+        seen.context.contains("keep the pom"),
+        "context missing: {seen:?}"
+    );
+    assert!(!seen.messages.is_empty(), "conversation missing: {seen:?}");
+}
+
+/// A `steer` verdict still has the LEAD MODEL write the correction, and that
+/// correction reaches the delegate's next request.
+#[tokio::test]
+async fn guardrail_steer_asks_the_lead_to_write_the_correction() {
+    const CORRECTION: &str = "stop rewriting src/a.rs and run the test instead";
+    let mut h = guardrail_harness(
+        GuardOutcome::Steer("the sub-agent has drifted off the task".into()),
+        Some(CORRECTION),
+    );
+    let first = recv_body(&h.bodies).await;
+    assert!(!first.contains(CORRECTION), "correction leaked early");
+    // Release happens in the harness task; the second request carries the steer.
+    let second = recv_body(&h.bodies).await;
+    assert!(
+        second.contains(CORRECTION),
+        "the steer never reached the delegate: {second}"
+    );
+    let out = h.finish().await;
+    assert!(out.contains("done after the guardrail"), "{out}");
+    assert_eq!(
+        h.supervised.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "steer must call the lead model exactly once"
+    );
+}
+
+/// A `stop` verdict ends the run with the guardrail's reason, without a further
+/// model request and without a lead-model call.
+#[tokio::test]
+async fn guardrail_stop_ends_the_run_and_reports_to_the_lead() {
+    let mut h = guardrail_harness(
+        GuardOutcome::Stop("stuck on an error or a decision it cannot resolve".into()),
+        None,
+    );
+    let out = h.finish().await;
+    assert!(out.contains("stopped by the guardrail"), "{out}");
+    assert!(out.contains("stuck on an error"), "{out}");
+    assert_eq!(
+        h.supervised.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "stop must not call the lead model"
+    );
+    // Exactly one request was made, then the run stopped at the rest point.
+    assert!(h.bodies.try_recv().is_ok(), "the first request is missing");
+    assert!(
+        h.bodies.try_recv().is_err(),
+        "the run must not make a second request after a stop"
+    );
+}
+
+/// A loop hands the decision to the lead (take over / split / restart), returns
+/// an answer encoding it, and shows the decision in the chat.
+#[tokio::test]
+async fn guardrail_loop_asks_the_lead_to_recover_and_shows_it() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let status = Arc::new(Mutex::new(String::new()));
+    let parent = Arc::new(RecoveringParent {
+        recovery: Recovery::Split,
+        calls: calls.clone(),
+        last_status: status.clone(),
+    });
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(RecordingEvents {
+        notices: notices.clone(),
+    });
+
+    let mut h = guardrail_harness_with(
+        GuardOutcome::Loop("the guardrail stopped this run: it is repeating actions".into()),
+        parent,
+        events,
+    );
+    let out = h.finish().await;
+    assert!(out.contains("RECOVERY: split the task"), "{out}");
+    assert!(out.contains("write src/a.rs"), "task missing: {out}");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the lead must be asked exactly once how to recover"
+    );
+    // What the lead saw: the task, the context, and the transcript.
+    let seen = status.lock().unwrap().clone();
+    assert!(seen.contains("write src/a.rs"), "task missing: {seen}");
+    assert!(seen.contains("keep the pom"), "context missing: {seen}");
+    assert!(seen.contains("transcript"), "transcript missing: {seen}");
+    // The decision is shown in the chat.
+    let shown = notices.lock().unwrap().clone();
+    assert!(
+        shown
+            .iter()
+            .any(|n| n.contains("stuck in a loop") && n.contains("split the task")),
+        "the recovery decision was not shown: {shown:?}"
+    );
+    // Only one model request was made: the run stopped at the loop.
+    assert!(h.bodies.try_recv().is_ok());
+    assert!(h.bodies.try_recv().is_err());
 }
 
 /// Supervision is a bounded conversation: one run spends at most

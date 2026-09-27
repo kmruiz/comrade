@@ -50,6 +50,8 @@ pub(crate) async fn run_jobs(
         display: String,
         native: bool,
         prompt: String,
+        task: String,
+        context: String,
     }
     let mut prepared: Vec<Prepared> = Vec::new();
     for (i, job) in args.jobs.iter().enumerate() {
@@ -83,6 +85,8 @@ pub(crate) async fn run_jobs(
             display: target.cfg.llm.display(),
             native: target.cfg.llm.protocol.native_enabled(),
             prompt,
+            task: job.task.trim().to_string(),
+            context: job.context.trim().to_string(),
         });
     }
 
@@ -137,6 +141,8 @@ pub(crate) async fn run_jobs(
                 tools,
                 &job_ctx,
                 system,
+                &p.task,
+                &p.context,
                 p.prompt.clone(),
                 &p.model,
                 p.native,

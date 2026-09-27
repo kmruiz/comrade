@@ -252,11 +252,15 @@ impl Tool for AskAdviseTool {
             &self.tools,
             native,
         );
+        // An advice run never supervises (`supervise` is ZERO), so the guardrail
+        // task/context are unused here.
         let reply = run_delegate_subagent(
             &target.client,
             &self.tools,
             ctx,
             system,
+            "",
+            "",
             user_prompt,
             &target.cfg.name,
             native,

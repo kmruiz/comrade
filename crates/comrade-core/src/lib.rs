@@ -12,8 +12,10 @@ pub mod compact;
 pub mod config;
 pub mod context;
 pub mod delegate;
+pub mod guardrails;
 pub mod hooks;
 pub mod instructions;
+pub mod jev;
 pub mod llm;
 pub mod react;
 pub mod redact;
@@ -27,13 +29,15 @@ pub use advise::AskAdviseTool;
 pub use agent::{build_session_context, run_agent, run_agent_with_history};
 pub use compact::{CompactReport, compact_history};
 pub use config::{
-    Autonomy, Config, DelegateCfg, LoadedConfig, McpAuth, McpConfig, McpServerCfg, McpTransport,
-    SensorCfg, SensorMode, expand_env_value,
+    Autonomy, Config, DelegateCfg, GuardrailsCfg, LoadedConfig, McpAuth, McpConfig, McpServerCfg,
+    McpTransport, SensorCfg, SensorMode, expand_env_value,
 };
 pub use context::{ContextManager, estimate_tokens};
 pub use delegate::{DelegateLimits, DelegateTool};
+pub use guardrails::guardrail_from_cfg;
 pub use hooks::Hooks;
 pub use instructions::load_project_instructions;
+pub use jev::Jev;
 pub use llm::{ChatMessage, LlmClient, Role};
 pub use redact::Redactor;
 pub use session::{AgentEvent, AgentSession};

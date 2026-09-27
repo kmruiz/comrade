@@ -266,6 +266,10 @@ pub trait ActivityEvents: Send + Sync {
     /// a no-op so an implementor that only cares about tool activity need not
     /// handle it.
     async fn reasoning(&self, _author: &str, _text: &str) {}
+
+    /// A one-line informational note about a sub-agent run (e.g. the lead's
+    /// loop-recovery decision) to show in the chat. Defaults to a no-op.
+    async fn notice(&self, _author: &str, _text: &str) {}
 }
 
 /// An [`ActivityEvents`] sink that discards everything: the default when no UI

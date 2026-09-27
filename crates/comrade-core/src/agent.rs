@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::context::ContextManager;
 use crate::hooks::Hooks;
 use crate::llm::{ChatMessage, LlmClient, Role, Usage};
-use crate::react::{build_system_prompt, parse_turn, render_observation};
+use crate::react::{build_system_prompt_for, parse_turn, render_observation};
 use crate::redact::Redactor;
 use crate::session::AgentEvent;
 
@@ -164,6 +164,12 @@ pub(crate) const VERIFY_NUDGE: &str = "You have edited the code several times wi
      tests. STOP editing. Run `pom_run_tests` NOW, read its result, and only then edit again to fix \
      what it reports. If it passes, you are done.";
 
+/// Injected (once) when the model starts acting without first calling
+/// `self_set_plan`.
+pub(crate) const PLAN_FIRST_NUDGE: &str = "Every task starts with a plan. Call `self_set_plan` \
+     first with your steps - each step needs a goal, a verification and the `model` that will run \
+     it (\"self\" or a delegate name) - before taking any other action.";
+
 /// Process monitor: if the model keeps reading without doing anything, stop it.
 /// Returns `true` when the tool may run (and updates the counter); `false` when
 /// the read should be refused as "enough context".
@@ -187,6 +193,53 @@ fn read_guard_message(count: usize) -> String {
          implement now (write or edit a file), or call update_plan to revise your steps. Do not \
          keep reading."
     )
+}
+
+/// Advisory root-loop guard (the "guardrail mechanism" for the root agent).
+///
+/// Consults the session's guardrail (Jev) about the agent's current state and
+/// delivers its diagnosis as a chat [`AgentEvent::Notice`] and a harness note the
+/// agent can act on. It NEVER refuses a tool or stops the run: the agent steers
+/// itself. `fallback` is the canned nudge delivered when no guardrail is
+/// configured or it could not answer; `None` means stay silent in that case (the
+/// periodic tick has no canned text). When the guardrail says `Continue`, nothing
+/// is delivered.
+async fn root_guard(
+    ctxm: &mut ContextManager,
+    ctx: &ToolContext,
+    tx: &mpsc::Sender<AgentEvent>,
+    fallback: Option<&str>,
+) {
+    let (text, from_guardrail) = match ctx.session.guardrail() {
+        Some(guard) => {
+            let input = crate::guardrails::guard_input(ctxm, &crate::guardrails::task_of(ctxm), "");
+            match guard.check(&input).await {
+                Ok(outcome) => match crate::guardrails::render_advice(&outcome) {
+                    Some(text) => (text, true),
+                    None => return,
+                },
+                Err(_) => match fallback {
+                    Some(f) => (f.to_string(), false),
+                    None => return,
+                },
+            }
+        }
+        None => match fallback {
+            Some(f) => (f.to_string(), false),
+            None => return,
+        },
+    };
+    if from_guardrail {
+        let _ = tx
+            .send(AgentEvent::Notice(format!("guardrail: {text}")))
+            .await;
+        ctxm.push_note(format!("GUARDRAIL: {text}"));
+    } else {
+        let _ = tx
+            .send(AgentEvent::Notice(format!("loop guard: {text}")))
+            .await;
+        ctxm.push_note(text);
+    }
 }
 
 /// Classify a failed tool output and attach one short corrective hint.
@@ -382,14 +435,21 @@ impl LoopTracker {
     }
 }
 
-/// Message fed back when a tool call is refused as a no-progress repeat.
+/// Factual tool result when a call is refused as a no-progress repeat. The
+/// steering that goes with it is delivered through the harness note channel
+/// ([`LOOP_REFUSAL_NUDGE`]), not embedded in this tool output.
 pub(crate) fn loop_refusal(tool: &str) -> String {
     format!(
-        "tool `{tool}` was already called with exactly these arguments and nothing changed since. \
-         Repeating it will not make progress. Change something first (edit a file, run a different \
-         tool, verify state) or give your final answer. Do NOT call `{tool}` again with identical arguments."
+        "ERROR: `{tool}` was already called with exactly these arguments and nothing changed since; \
+         it was not run again."
     )
 }
+
+/// Steering delivered (as a trusted harness note) for a refused no-progress
+/// repeat.
+pub(crate) const LOOP_REFUSAL_NUDGE: &str = "A repeated no-op call was just refused. Repeating it \
+     will not make progress. Change something first (edit a file, run a different tool, verify \
+     state) or give your final answer. Do NOT call that tool again with identical arguments.";
 
 /// Result of a finished agent run.
 #[derive(Debug)]
@@ -411,9 +471,13 @@ pub(crate) async fn drain_steer(steer: Option<&Steer>, history: &mut ContextMana
         return;
     };
     for text in steer.drain().await {
-        // Merged so a steer cannot produce two user turns in a row (which some
-        // strict providers reject).
-        history.push_user_merged(&text);
+        // Delivered as a harness note in the system message: it reaches the model
+        // as trusted steering, never welded onto a tool result (which models read
+        // as a prompt-injection attempt) and never breaking role alternation.
+        history.push_note(format!(
+            "The user sent this message while you were working:\n{}",
+            text.trim()
+        ));
     }
 }
 
@@ -428,7 +492,12 @@ pub fn build_session_context(
 ) -> ContextManager {
     let budget = cfg.effective_budget();
     ContextManager::with_system(
-        build_system_prompt(project_root, tools, budget),
+        build_system_prompt_for(
+            project_root,
+            tools,
+            budget,
+            cfg.llm.protocol.native_enabled(),
+        ),
         budget,
         cfg.context.max_tool_output_chars,
     )
@@ -547,6 +616,10 @@ async fn run_agent_loop(
     // smaller than the system prompt) from firing a summariser call on every
     // iteration.
     let mut auto_compact_armed = true;
+    // Advisory guardrail (Jev) for the root agent: the periodic tick's next due
+    // time. The read/stall/verify triggers consult the guardrail independently.
+    let guard_interval = std::time::Duration::from_secs(cfg.guardrails.interval_secs.max(1));
+    let mut next_guard_check = std::time::Instant::now() + guard_interval;
 
     loop {
         if stop.is_cancelled() {
@@ -656,29 +729,25 @@ async fn run_agent_loop(
 
         ctxm.enforce_budget();
 
-        // One-shot stall nudge: the model has changed the repo and is now only
-        // re-checking without editing again, so tell it to finish. Injected as
-        // a user turn so it is seen by the model request below.
+        // Advisory guardrail (Jev): a periodic tick, plus the one-shot stall and
+        // verify nudges. It NEVER refuses a tool or stops the run - it delivers a
+        // diagnosis (or the canned nudge when no guardrail is configured) as a
+        // harness note the agent can act on.
+        if cfg.guardrails.interval_secs > 0
+            && cfg.guardrails.is_active()
+            && std::time::Instant::now() >= next_guard_check
+        {
+            next_guard_check = std::time::Instant::now() + guard_interval;
+            root_guard(ctxm, &ctx, &tx, None).await;
+        }
         if tracker.needs_stall_nudge() {
-            let _ = tx
-                .send(AgentEvent::ToolResult {
-                    name: "loop_guard".into(),
-                    output: STALL_NUDGE.to_string(),
-                    ok: false,
-                })
-                .await;
-            ctxm.push_user_merged(STALL_NUDGE);
+            // The model has changed the repo and is now only re-checking without
+            // editing again: tell it to finish.
+            root_guard(ctxm, &ctx, &tx, Some(STALL_NUDGE)).await;
         } else if tracker.needs_verify_nudge() {
             // Mirror nudge for the opposite pathology: editing forever without
             // ever running the tests.
-            let _ = tx
-                .send(AgentEvent::ToolResult {
-                    name: "loop_guard".into(),
-                    output: VERIFY_NUDGE.to_string(),
-                    ok: false,
-                })
-                .await;
-            ctxm.push_user_merged(VERIFY_NUDGE);
+            root_guard(ctxm, &ctx, &tx, Some(VERIFY_NUDGE)).await;
         }
 
         // Advertise native tools unless the protocol is strictly ReAct.
@@ -736,8 +805,12 @@ async fn run_agent_loop(
             }
         });
 
+        // Harness steering notes ride in the SYSTEM message (a trusted channel)
+        // rather than being welded onto tool output, which models flag as prompt
+        // injection. The borrow must be released before `clear_notes` below.
+        let request = ctxm.request_messages();
         let stream_result = tokio::select! {
-            r = client.chat_turn(ctxm.messages(), tool_specs.as_deref(), {
+            r = client.chat_turn(&request, tool_specs.as_deref(), {
                 let delta_tx = delta_tx.clone();
                 move |piece: &str| { let _ = delta_tx.send(piece.to_string()); }
             }) => r.context("llm call failed"),
@@ -745,6 +818,9 @@ async fn run_agent_loop(
                 Err(anyhow::anyhow!("agent interrupted by user"))
             }
         };
+        drop(request);
+        // The model has now seen the notes; do not replay them next turn.
+        ctxm.clear_notes();
         let turn = match stream_result {
             Ok(turn) => turn,
             Err(e) => {
@@ -789,18 +865,13 @@ async fn run_agent_loop(
                     matches!(first, "self_set_plan" | "self_rename_session" | "ask_form");
                 if !is_plan_tool {
                     plan_nudged = true;
-                    let msg = "Every task starts with a plan. Call self_set_plan first with your steps - \
-                               each step needs a goal, a verification and the `model` that will run it \
-                               (\"self\" or a delegate name) - before taking any other action.";
-                    ctxm.push(ChatMessage::new(Role::Assistant, turn.content.clone()));
                     let _ = tx
-                        .send(AgentEvent::ToolResult {
-                            name: first.to_string(),
-                            output: msg.to_string(),
-                            ok: false,
-                        })
+                        .send(AgentEvent::Notice(format!(
+                            "loop guard: {} was skipped - plan first",
+                            first
+                        )))
                         .await;
-                    ctxm.push(ChatMessage::new(Role::User, render_observation(first, msg)));
+                    ctxm.push_note(PLAN_FIRST_NUDGE);
                     continue;
                 }
             }
@@ -894,40 +965,45 @@ async fn run_agent_loop(
             );
             if !is_plan_tool {
                 plan_nudged = true;
-                let msg = "Every task starts with a plan. Call self_set_plan first with your steps - each step \
-                     needs a goal, a verification and the `model` that will run it (\"self\" or a delegate \
-                     name) - before taking any other action.";
+                let _ = tx
+                    .send(AgentEvent::Notice(format!(
+                        "loop guard: {} was skipped - plan first",
+                        tool_call.name
+                    )))
+                    .await;
+                ctxm.push_note(PLAN_FIRST_NUDGE);
+                continue;
+            }
+        }
+
+        // Read guard: after many reads in a row, ADVISE via the guardrail (Jev)
+        // and let the read run, so the agent can steer itself. With no guardrail
+        // configured, keep the hard refusal.
+        if !allow_read_step(&tool_call.name, &mut consecutive_reads) {
+            let count = consecutive_reads;
+            if ctx.session.guardrail().is_some() {
+                consecutive_reads = 0;
+                let fallback = read_guard_message(count);
+                root_guard(ctxm, &ctx, &tx, Some(&fallback)).await;
+            } else {
+                let refusal = format!(
+                    "ERROR: read limit reached after {count} reads with no change; `{}` was not run.",
+                    tool_call.name
+                );
                 let _ = tx
                     .send(AgentEvent::ToolResult {
                         name: tool_call.name.clone(),
-                        output: msg.to_string(),
+                        output: refusal.clone(),
                         ok: false,
                     })
                     .await;
                 ctxm.push(ChatMessage::new(
                     Role::User,
-                    render_observation(&tool_call.name, msg),
+                    render_observation(&tool_call.name, &refusal),
                 ));
+                ctxm.push_note(read_guard_message(count));
                 continue;
             }
-        }
-
-        // Read guard: stop the model from reading forever without doing work.
-        if !allow_read_step(&tool_call.name, &mut consecutive_reads) {
-            let count = consecutive_reads;
-            let msg = read_guard_message(count);
-            let _ = tx
-                .send(AgentEvent::ToolResult {
-                    name: tool_call.name.clone(),
-                    output: msg.clone(),
-                    ok: false,
-                })
-                .await;
-            ctxm.push(ChatMessage::new(
-                Role::User,
-                render_observation(&tool_call.name, &msg),
-            ));
-            continue;
         }
 
         let args_pretty = serde_json::to_string(&tool_call.args).unwrap_or_default();
@@ -957,11 +1033,12 @@ async fn run_agent_loop(
                     ok: false,
                 })
                 .await;
-            let obs = ctxm.truncate_observation(&format!("ERROR: {msg}"));
+            let obs = ctxm.truncate_observation(&msg);
             ctxm.push(ChatMessage::new(
                 Role::User,
                 render_observation(&tool_call.name, &obs),
             ));
+            root_guard(ctxm, &ctx, &tx, Some(LOOP_REFUSAL_NUDGE)).await;
             continue;
         }
         let _ = tx
@@ -1154,19 +1231,30 @@ async fn run_native_calls(
         }
         let args_pretty = serde_json::to_string(&p.args).unwrap_or_default();
         let sig = format!("{} {args_pretty}", p.name);
-        // Read guard: refuse further exploration once nothing has changed.
+        // Read guard: after many reads in a row, ADVISE via the guardrail (Jev)
+        // and let the read run; with no guardrail configured, keep the refusal.
         if !allow_read_step(&p.name, consecutive_reads) {
             let count = *consecutive_reads;
-            let msg = read_guard_message(count);
-            let _ = tx
-                .send(AgentEvent::ToolResult {
-                    name: p.name.clone(),
-                    output: msg.clone(),
-                    ok: false,
-                })
-                .await;
-            ctxm.push(ChatMessage::tool_result(p.id, msg));
-            continue;
+            if ctx.session.guardrail().is_some() {
+                *consecutive_reads = 0;
+                let fallback = read_guard_message(count);
+                root_guard(ctxm, ctx, tx, Some(&fallback)).await;
+            } else {
+                let refusal = format!(
+                    "ERROR: read limit reached after {count} reads with no change; `{}` was not run.",
+                    p.name
+                );
+                let _ = tx
+                    .send(AgentEvent::ToolResult {
+                        name: p.name.clone(),
+                        output: refusal.clone(),
+                        ok: false,
+                    })
+                    .await;
+                ctxm.push(ChatMessage::tool_result(p.id, refusal));
+                ctxm.push_note(read_guard_message(count));
+                continue;
+            }
         }
         let _ = tx
             .send(AgentEvent::ToolCall {
@@ -1201,6 +1289,7 @@ async fn run_native_calls(
                 })
                 .await;
             ctxm.push(ChatMessage::tool_result(p.id, msg));
+            root_guard(ctxm, ctx, tx, Some(LOOP_REFUSAL_NUDGE)).await;
             continue;
         }
 
@@ -1397,11 +1486,11 @@ mod tests {
 
     use crate::config::Config;
     use crate::context::ContextManager;
-    use crate::llm::LlmClient;
+    use crate::llm::{ChatMessage, LlmClient, Role};
     use crate::session::{AgentEvent, AgentSession};
     use crate::undo::MemoryUndo;
 
-    use super::{run_agent, run_agent_with_history};
+    use super::{root_guard, run_agent, run_agent_with_history};
 
     struct FakeUser;
     #[async_trait]
@@ -2609,6 +2698,76 @@ mod tests {
         // the gated tool now runs with no justification, after the human confirms
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A guardrail that always returns the same verdict.
+    struct StubGuard(comrade_tool::GuardOutcome);
+
+    #[async_trait]
+    impl comrade_tool::Guardrail for StubGuard {
+        async fn check(
+            &self,
+            _input: &comrade_tool::GuardInput,
+        ) -> anyhow::Result<comrade_tool::GuardOutcome> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// The root advisory guardrail: Jev's diagnosis is shown in the chat and
+    /// injected as a harness note, and the fallback is used only without a
+    /// guardrail (or when it fails).
+    #[tokio::test]
+    async fn root_guard_delivers_advice_and_falls_back() {
+        let root = std::env::temp_dir().join(format!("comrade-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mk_ctx = |session: Arc<AgentSession>| ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.as_control(),
+            user: Arc::new(FakeUser),
+            undo: Arc::new(MemoryUndo::new(root.clone())),
+            auto_approve: true,
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            stop: None,
+            compact: None,
+        };
+
+        // With a guardrail: its advice wins, delivered as an advisory.
+        let session = Arc::new(AgentSession::new(mpsc::channel(16).0));
+        session.set_guardrail(Arc::new(StubGuard(comrade_tool::GuardOutcome::Steer(
+            "missing information it needs to proceed".into(),
+        ))));
+        let ctx = mk_ctx(session);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut ctxm = ContextManager::with_system("SYS", 10_000, 1000);
+        ctxm.push(ChatMessage::new(Role::User, "do the task"));
+        root_guard(&mut ctxm, &ctx, &tx, Some("fallback nudge")).await;
+        match rx.try_recv() {
+            Ok(AgentEvent::Notice(n)) => {
+                assert!(n.starts_with("guardrail:"), "{n}");
+                assert!(n.contains("missing information"), "{n}");
+            }
+            other => panic!("expected a guardrail notice, got {other:?}"),
+        }
+        let req = ctxm.request_messages();
+        assert!(
+            req[0].content.contains("GUARDRAIL: missing information"),
+            "{}",
+            req[0].content
+        );
+
+        // Without a guardrail: the canned fallback is delivered instead.
+        let session = Arc::new(AgentSession::new(mpsc::channel(16).0));
+        let ctx = mk_ctx(session);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut ctxm = ContextManager::with_system("SYS", 10_000, 1000);
+        ctxm.push(ChatMessage::new(Role::User, "do the task"));
+        root_guard(&mut ctxm, &ctx, &tx, Some("fallback nudge")).await;
+        match rx.try_recv() {
+            Ok(AgentEvent::Notice(n)) => assert!(n.contains("fallback nudge"), "{n}"),
+            other => panic!("expected the fallback notice, got {other:?}"),
+        }
     }
 }
 

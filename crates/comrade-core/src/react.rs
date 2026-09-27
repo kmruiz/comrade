@@ -30,9 +30,28 @@ const MEMORY: &str = include_str!("../prompts/memory.md");
 const TRUST_BOUNDARIES: &str = include_str!("../prompts/trust-boundaries.md");
 const TOOLS_INTRO: &str = include_str!("../prompts/tools-intro.md");
 const PROTOCOL: &str = include_str!("../prompts/protocol.md");
+const PROTOCOL_NATIVE: &str = include_str!("../prompts/protocol-native.md");
 const FINISHING: &str = include_str!("../prompts/finishing.md");
 
+/// Build the ReAct (text-protocol) system prompt. Kept as the default so callers
+/// that do not care about the protocol - and the prompt tests - keep working;
+/// the agent loop uses [`build_system_prompt_for`] with the configured protocol.
 pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usize) -> String {
+    build_prompt(project_root, tools, budget, false)
+}
+
+/// Like [`build_system_prompt`] but selecting the tool protocol: native function
+/// calling gets the native protocol section, text mode gets the ReAct one.
+pub fn build_system_prompt_for(
+    project_root: &str,
+    tools: &ToolRegistry,
+    budget: usize,
+    native: bool,
+) -> String {
+    build_prompt(project_root, tools, budget, native)
+}
+
+fn build_prompt(project_root: &str, tools: &ToolRegistry, budget: usize, native: bool) -> String {
     let mut prompt = String::new();
     prompt.push_str(INTRO);
     prompt.push_str(&format!("Working directory: {project_root}\n"));
@@ -60,7 +79,7 @@ pub fn build_system_prompt(project_root: &str, tools: &ToolRegistry, budget: usi
         prompt.push_str(&render_tool(tool.spec()));
         prompt.push('\n');
     }
-    prompt.push_str(PROTOCOL);
+    prompt.push_str(if native { PROTOCOL_NATIVE } else { PROTOCOL });
     prompt
 }
 
@@ -648,6 +667,26 @@ mod dev_prompt_tests {
     }
 
     #[test]
+    fn native_function_calling_gets_the_native_protocol() {
+        let reg = ToolRegistry::new();
+        // The default (ReAct) prompt carries the text protocol, not the native one.
+        let react = build_system_prompt("/x", &reg, 100);
+        assert!(react.contains("Protocol (text mode)"), "{react}");
+        assert!(
+            !react.contains("Protocol (native function calling)"),
+            "{react}"
+        );
+        // Native gets its own; the ReAct format must not be there.
+        let native = build_system_prompt_for("/x", &reg, 100, true);
+        assert!(
+            native.contains("Protocol (native function calling)"),
+            "{native}"
+        );
+        assert!(!native.contains("Protocol (text mode)"), "{native}");
+        assert!(!native.contains("Tool: <tool_name>"), "{native}");
+    }
+
+    #[test]
     fn prompt_orientates_the_model_to_the_project() {
         let reg = ToolRegistry::new();
         let prompt = build_system_prompt("/x", &reg, 6000);
@@ -672,7 +711,7 @@ mod dev_prompt_tests {
         // ask_form when a concept is unclear and not in the glossary.
         assert!(prompt.contains("read memory BEFORE planning"), "{prompt}");
         assert!(
-            prompt.contains("ADRs relevant to the new functionality"),
+            prompt.contains("decisions that already cover this area"),
             "{prompt}"
         );
         assert!(prompt.contains("ask_form before you plan"), "{prompt}");
@@ -680,10 +719,15 @@ mod dev_prompt_tests {
         assert!(prompt.contains("read_adr"), "{prompt}");
         assert!(prompt.contains("find_glossary"), "{prompt}");
         assert!(prompt.contains("read_glossary"), "{prompt}");
-        // record_adr is reserved for important long-term decisions; the "mini run
-        // book" phrase exists only as ephemeral plan-step context guidance.
-        assert!(prompt.contains("important decision"), "{prompt}");
-        assert!(prompt.contains("long term"), "{prompt}");
+        // record_adr is reserved for durable architectural guidelines others must
+        // follow; the "mini run book" phrase exists only as ephemeral plan-step
+        // context guidance.
+        assert!(prompt.contains("ARCHITECTURAL GUIDELINES"), "{prompt}");
+        assert!(
+            prompt.contains("important architectural/design decision"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("lasting consequences"), "{prompt}");
         assert!(prompt.contains("record_glossary"), "{prompt}");
         assert!(prompt.contains("a mini run book"), "{prompt}");
         let memory_section = &prompt[prompt.find("## Memory").unwrap()..];
@@ -751,7 +795,7 @@ mod dev_prompt_tests {
         assert!(prompt.contains("PARALLELISE"), "{prompt}");
         assert!(prompt.contains("simplest delegate"), "{prompt}");
         assert!(prompt.contains("advisors"), "{prompt}");
-        assert!(prompt.contains("local environment"), "{prompt}");
+        assert!(prompt.contains("run locally"), "{prompt}");
         // Delegation must be shown in the plan, both models verify, and the
         // parent retries the delegate with feedback up to 5 fix rounds.
         assert!(prompt.contains("working: <model>"), "{prompt}");

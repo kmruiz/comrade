@@ -13,7 +13,9 @@ pub mod repo;
 pub mod task_runner;
 pub mod tool;
 
-pub use ask::{Upward, UpwardAsk, Verdict};
+pub use ask::{
+    Guard, GuardInput, GuardMessage, GuardOutcome, Guardrail, Recovery, Upward, UpwardAsk, Verdict,
+};
 pub use decl::{declarations, removed_declarations};
 
 pub use form::{DiffOption, FieldKind, FormField, FormSpec, truthy};
