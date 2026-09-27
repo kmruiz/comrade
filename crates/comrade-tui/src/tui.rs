@@ -59,6 +59,10 @@ const PROMPT_MAX_ROWS: usize = 5;
 /// Mode-line background while auto-approve is active: a warm orange so the
 /// bar reads as "warning: changes are applied without asking".
 const AUTO_BAR_BG: Color = Color::Rgb(203, 106, 15);
+
+/// Purple mode-line background for edit mode: mutating approvals are accepted
+/// automatically, but questions still stop for the human.
+const EDIT_BAR_BG: Color = Color::Rgb(147, 112, 219);
 /// App name shown right-aligned on the mode line (Emacs-style), where the
 /// keybinding legend used to live.
 const APP_TAG: &str = " comrade ";
@@ -676,6 +680,7 @@ enum MxCommand {
     CancelRun,
     CompactContext,
     Copy,
+    CycleMode,
     EndOfLine,
     FocusMode,
     ForkSession,
@@ -708,7 +713,6 @@ enum MxCommand {
     StopBackgroundJob,
     SubmitPrompt,
     SwitchSession,
-    ToggleAutoAccept,
     TogglePlanFollow,
     ToggleToolCard,
     Undo,
@@ -724,6 +728,7 @@ impl MxCommand {
         MxCommand::CancelRun,
         MxCommand::CompactContext,
         MxCommand::Copy,
+        MxCommand::CycleMode,
         MxCommand::EndOfLine,
         MxCommand::FocusMode,
         MxCommand::ForkSession,
@@ -756,7 +761,6 @@ impl MxCommand {
         MxCommand::StopBackgroundJob,
         MxCommand::SubmitPrompt,
         MxCommand::SwitchSession,
-        MxCommand::ToggleAutoAccept,
         MxCommand::TogglePlanFollow,
         MxCommand::ToggleToolCard,
         MxCommand::Undo,
@@ -771,6 +775,7 @@ impl MxCommand {
             MxCommand::CancelRun => "cancel-run",
             MxCommand::CompactContext => "compact-context",
             MxCommand::Copy => "copy",
+            MxCommand::CycleMode => "cycle-mode",
             MxCommand::EndOfLine => "end-of-line",
             MxCommand::FocusMode => "focus-mode",
             MxCommand::ForkSession => "fork-session",
@@ -803,7 +808,6 @@ impl MxCommand {
             MxCommand::StopBackgroundJob => "stop-background-job",
             MxCommand::SubmitPrompt => "submit-prompt",
             MxCommand::SwitchSession => "switch-session",
-            MxCommand::ToggleAutoAccept => "toggle-auto-accept",
             MxCommand::TogglePlanFollow => "toggle-plan-follow",
             MxCommand::ToggleToolCard => "toggle-tool-card",
             MxCommand::Undo => "undo",
@@ -820,6 +824,7 @@ impl MxCommand {
             MxCommand::CancelRun => Some("esc"),
             MxCommand::CompactContext => Some("M-c"),
             MxCommand::Copy => Some("C-S-c / M-w"),
+            MxCommand::CycleMode => Some("C-SPC"),
             MxCommand::EndOfLine => Some("<end>"),
             MxCommand::FocusMode => Some("M-f"),
             MxCommand::ForkSession => Some("C-x C-w"),
@@ -856,7 +861,6 @@ impl MxCommand {
             MxCommand::StopBackgroundJob => None,
             MxCommand::SubmitPrompt => Some("<return>"),
             MxCommand::SwitchSession => Some("C-x C-b"),
-            MxCommand::ToggleAutoAccept => Some("C-SPC"),
             // Palette-only: turns plan-panel autofollow back on after a scroll.
             MxCommand::TogglePlanFollow => None,
             MxCommand::ToggleToolCard => Some("tab"),
@@ -876,6 +880,7 @@ impl MxCommand {
                 "summarise the context and replace the conversation with that summary"
             }
             MxCommand::Copy => "copy the prompt selection or the chat block under the cursor",
+            MxCommand::CycleMode => "cycle the approval mode (ask/auto/edit)",
             MxCommand::EndOfLine => "move the prompt cursor to the end of the line",
             MxCommand::FocusMode => "filter the chat to the conversation (hide tool calls)",
             MxCommand::ForkSession => "fork the current session into an independent copy",
@@ -912,7 +917,6 @@ impl MxCommand {
             }
             MxCommand::SubmitPrompt => "send the prompt to the agent",
             MxCommand::SwitchSession => "switch to another open session",
-            MxCommand::ToggleAutoAccept => "toggle auto-accept of approvals",
             MxCommand::TogglePlanFollow => {
                 "follow the active plan step automatically (or stop following)"
             }
@@ -1330,8 +1334,8 @@ struct App {
     /// to ~30 fps while a run is streaming (a fast local model can otherwise
     /// flood the repaint path; see freeze notes #25/#29).
     last_draw: std::time::Instant,
-    /// Auto-accept mode: approvals are answered "yes" without prompting.
-    auto_accept: bool,
+    /// Current approval mode (ask/auto/edit), cycled by Ctrl-Space.
+    mode: Mode,
     /// Focus mode: hide tool noise so the chat reads as pure conversation.
     focus_mode: bool,
     /// Latest repo snapshot for the mode line.
@@ -3211,12 +3215,6 @@ impl App {
         }
     }
 
-    /// True when approvals run without prompting: either the config autonomy
-    /// is `auto` (`ctx_base.auto_approve`) or the user toggled ctrl-space.
-    fn auto_mode_on(&self) -> bool {
-        self.auto_accept || self.ctx_base.auto_approve
-    }
-
     /// Store a freshly fetched repo snapshot.
     fn on_git(&mut self, info: GitBarInfo) {
         let backoff = if info.repo {
@@ -3547,21 +3545,26 @@ impl App {
         }
     }
 
-    /// Toggle auto-approve mode (Ctrl-Space): flips the flag, reports the new
-    /// state in the chat, and accepts an already-waiting approval when turning
-    /// on.
-    fn toggle_auto_accept(&mut self) {
-        self.auto_accept = !self.auto_accept;
+    /// Advance to the next approval mode (Ctrl-Space): ask -> auto -> edit ->
+    /// ask, reports the new mode in the chat, and accepts an already-waiting
+    /// approval when the new mode auto-approves.
+    fn cycle_mode(&mut self) {
+        self.mode = self.mode.cycle();
         self.push_msg(Msg::text(
             MsgKind::Meta,
-            if self.auto_accept {
-                "auto-accept ON: approvals will be accepted automatically (ctrl-space to disable)"
-                    .to_string()
-            } else {
-                "auto-accept off".to_string()
+            match self.mode {
+                Mode::Ask => "mode: ask — every action and question stops for you".to_string(),
+                Mode::Auto => {
+                    "mode: auto — approvals and questions are auto-answered (ctrl-space to cycle)"
+                        .to_string()
+                }
+                Mode::Edit => {
+                    "mode: edit — approvals are auto-accepted, but questions still stop for you"
+                        .to_string()
+                }
             },
         ));
-        if self.auto_accept {
+        if self.mode.auto_approves() {
             self.accept_top_confirm();
         }
     }
@@ -3581,6 +3584,7 @@ impl App {
                 // under the cursor.
                 self.copy_prompt_or_block();
             }
+            MxCommand::CycleMode => self.cycle_mode(),
             MxCommand::EndOfLine => self.input.move_end(false),
             MxCommand::ForkSession => self.fork_session(),
             MxCommand::ForwardWord => self.input.move_word_right(false),
@@ -3612,7 +3616,6 @@ impl App {
             MxCommand::StopBackgroundJob => self.open_jobs_pick(),
             MxCommand::SubmitPrompt => self.submit_prompt(),
             MxCommand::SwitchSession => self.switch_session(),
-            MxCommand::ToggleAutoAccept => self.toggle_auto_accept(),
             MxCommand::TogglePlanFollow => self.toggle_plan_follow(),
             MxCommand::ToggleToolCard => {
                 if let Some(idx) = self.sel {
@@ -4061,7 +4064,7 @@ fn build_app(
         queued_prompt: None,
         run_cancelled: false,
         last_draw: std::time::Instant::now(),
-        auto_accept: false,
+        mode: Mode::initial(deps.cfg.auto_approve()),
         // Focus mode is on by default so the chat opens as pure conversation;
         // M-f / M-x focus-mode toggles it off.
         focus_mode: true,
@@ -4216,12 +4219,11 @@ pub async fn run(deps: &Deps) -> Result<()> {
             ask = app.asks_rx.recv() => {
                 match ask {
                     Some(ask) => {
-                        // Auto-accept mode answers any prompt that carries a
-                        // recommended value (a confirm, or a form with
-                        // recommendations) without asking the human.
-                        if app.auto_accept
-                            && let Some(reply) = auto_reply(&ask.prompt)
-                        {
+                        // The current mode answers a prompt that carries a
+                        // recommended value without asking the human: `auto`
+                        // answers approvals and questions, `edit` only
+                        // approvals, `ask` neither.
+                        if let Some(reply) = auto_reply_for(app.mode, &ask.prompt) {
                             let label = auto_reply_label(&ask.prompt);
                             if let UserPrompt::Form(spec) = &ask.prompt {
                                 app.push_msg(Msg::text(
@@ -4313,7 +4315,7 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
             let ctrl_space = key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('\0'));
             if ctrl_space {
-                app.toggle_auto_accept();
+                app.cycle_mode();
                 return false;
             }
             if let KeyCode::Char(ch) = key.code {
@@ -5238,15 +5240,18 @@ fn draw(app: &mut App, frame: &mut Frame) {
 
     // ---- Emacs-style mode line (bottom row) -----------------------------
     // Left: repo (branch + inserted/removed lines, added/deleted files),
-    // agent state (IDLE/RUNNING) and mode (auto/ask). The whole bar turns a
-    // warm orange while auto-approve is active so the "changes land without
-    // asking" mode reads as a warning. The app name sits on the far right
-    // when the terminal is wide enough.
-    let auto = app.auto_mode_on();
+    // agent state (IDLE/RUNNING) and mode (ask/auto/edit). The bar is blue in
+    // ask mode, warm orange in auto mode ("changes and questions land without
+    // asking") and purple in edit mode (mutations auto-accepted, questions
+    // still stop). The app name sits on the far right when the terminal is
+    // wide enough.
+    let mode = app.mode;
+    let auto = mode.auto_approves();
     let on_auto = |fg: Color| -> Color { if auto { Color::Black } else { fg } };
-    let bar_style = Style::default()
-        .bg(if auto { AUTO_BAR_BG } else { Color::Blue })
-        .fg(if auto { Color::Black } else { Color::White });
+    let bar_style =
+        Style::default()
+            .bg(bar_bg(mode))
+            .fg(if auto { Color::Black } else { Color::White });
 
     let mut spans: Vec<Span> = Vec::new();
     if app.git.repo {
@@ -5301,10 +5306,10 @@ fn draw(app: &mut App, frame: &mut Frame) {
     ));
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
-        if auto { "auto" } else { "ask" },
+        mode.label(),
         bar_style.add_modifier(Modifier::BOLD),
     ));
-    // Focus mode state, next to the auto/ask mode token.
+    // Focus mode state, next to the mode token.
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
         if app.focus_mode {
@@ -8372,6 +8377,76 @@ fn form_field_line(field: &comrade_tool::FormField, value: &str, focused: bool) 
     Line::from(spans)
 }
 
+/// How the cockpit answers the human prompts a run raises: the approval token
+/// in the mode line. Ctrl-Space cycles ask -> auto -> edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Blue: ask before every mutation and every question.
+    Ask,
+    /// Orange: auto-answer everything — approvals and questions.
+    Auto,
+    /// Purple: auto-approve mutations, but still stop at questions.
+    Edit,
+}
+
+impl Mode {
+    /// The mode Ctrl-Space cycles to next: ask -> auto -> edit -> ask.
+    fn cycle(self) -> Mode {
+        match self {
+            Mode::Ask => Mode::Auto,
+            Mode::Auto => Mode::Edit,
+            Mode::Edit => Mode::Ask,
+        }
+    }
+
+    /// The mode a fresh app opens in: `auto` when the config auto-approves
+    /// mutating tools, otherwise `ask`.
+    fn initial(auto_approve: bool) -> Mode {
+        if auto_approve { Mode::Auto } else { Mode::Ask }
+    }
+
+    /// The lower-case token shown in the mode line.
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Ask => "ask",
+            Mode::Auto => "auto",
+            Mode::Edit => "edit",
+        }
+    }
+
+    /// Whether approvals are accepted without asking.
+    fn auto_approves(self) -> bool {
+        !matches!(self, Mode::Ask)
+    }
+
+    /// Whether questions (forms) are answered without asking.
+    fn answers_questions(self) -> bool {
+        matches!(self, Mode::Auto)
+    }
+}
+
+/// The mode-line background colour for `mode`.
+fn bar_bg(mode: Mode) -> Color {
+    match mode {
+        Mode::Ask => Color::Blue,
+        Mode::Auto => AUTO_BAR_BG,
+        Mode::Edit => EDIT_BAR_BG,
+    }
+}
+
+/// The reply `mode` gives `prompt` without asking the human, or `None` when the
+/// prompt must be shown. `ask` shows everything; `edit` auto-approves
+/// confirmations but still stops at questions; `auto` answers both.
+fn auto_reply_for(mode: Mode, prompt: &UserPrompt) -> Option<UserReply> {
+    if !mode.auto_approves() {
+        return None;
+    }
+    if !mode.answers_questions() && matches!(prompt, UserPrompt::Form(_)) {
+        return None;
+    }
+    auto_reply(prompt)
+}
+
 /// The reply auto-accept mode gives a prompt without asking the human, or
 /// `None` when the prompt must still be shown (e.g. a form whose required
 /// fields the recommended values do not satisfy).
@@ -9393,6 +9468,81 @@ mod tests {
             "fields": [{ "id": "n", "label": "N", "kind": "text", "required": true }]
         }));
         assert!(auto_reply(&UserPrompt::Form(pending)).is_none());
+    }
+
+    #[test]
+    fn mode_cycles_ask_auto_edit() {
+        assert_eq!(Mode::Ask.cycle(), Mode::Auto);
+        assert_eq!(Mode::Auto.cycle(), Mode::Edit);
+        assert_eq!(Mode::Edit.cycle(), Mode::Ask);
+        // A full cycle returns to the start.
+        assert_eq!(Mode::Ask.cycle().cycle().cycle(), Mode::Ask);
+    }
+
+    #[test]
+    fn mode_labels_are_the_status_bar_tokens() {
+        assert_eq!(Mode::Ask.label(), "ask");
+        assert_eq!(Mode::Auto.label(), "auto");
+        assert_eq!(Mode::Edit.label(), "edit");
+    }
+
+    #[test]
+    fn mode_approval_policy_differs_only_on_questions() {
+        // ask: nothing is auto-answered.
+        assert!(!Mode::Ask.auto_approves());
+        assert!(!Mode::Ask.answers_questions());
+        // auto: both approvals and questions are auto-answered.
+        assert!(Mode::Auto.auto_approves());
+        assert!(Mode::Auto.answers_questions());
+        // edit: approvals are auto-answered, questions still stop.
+        assert!(Mode::Edit.auto_approves());
+        assert!(!Mode::Edit.answers_questions());
+    }
+
+    #[test]
+    fn initial_mode_follows_config_autonomy() {
+        assert_eq!(Mode::initial(true), Mode::Auto);
+        assert_eq!(Mode::initial(false), Mode::Ask);
+    }
+
+    #[test]
+    fn mode_bar_colours_are_blue_orange_purple() {
+        assert_eq!(bar_bg(Mode::Ask), Color::Blue);
+        assert_eq!(bar_bg(Mode::Auto), AUTO_BAR_BG);
+        assert_eq!(bar_bg(Mode::Edit), EDIT_BAR_BG);
+        // The three modes read as distinct colours.
+        assert_ne!(bar_bg(Mode::Ask), bar_bg(Mode::Auto));
+        assert_ne!(bar_bg(Mode::Auto), bar_bg(Mode::Edit));
+        assert_ne!(bar_bg(Mode::Ask), bar_bg(Mode::Edit));
+    }
+
+    #[test]
+    fn auto_reply_for_stops_at_questions_in_edit_mode() {
+        let confirm = UserPrompt::Confirm {
+            title: "rm -rf x".into(),
+            diff: None,
+        };
+        let question = UserPrompt::Form(form_spec(serde_json::json!({
+            "fields": [{ "id": "n", "label": "N", "kind": "text", "required": true, "recommended": "hi" }]
+        })));
+        // ask: neither an approval nor a question is auto-answered.
+        assert!(auto_reply_for(Mode::Ask, &confirm).is_none());
+        assert!(auto_reply_for(Mode::Ask, &question).is_none());
+        // auto: both are answered from the recommendations.
+        assert!(matches!(
+            auto_reply_for(Mode::Auto, &confirm),
+            Some(UserReply::Answer(a)) if a == "yes"
+        ));
+        assert!(matches!(
+            auto_reply_for(Mode::Auto, &question),
+            Some(UserReply::Form(_))
+        ));
+        // edit: the approval is accepted, but the question stops for the human.
+        assert!(matches!(
+            auto_reply_for(Mode::Edit, &confirm),
+            Some(UserReply::Answer(_))
+        ));
+        assert!(auto_reply_for(Mode::Edit, &question).is_none());
     }
 
     #[test]

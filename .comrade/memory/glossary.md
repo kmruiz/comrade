@@ -72,6 +72,12 @@ Loaded by crates/comrade-core/src/instructions.rs (load_project_instructions) an
 **Notes:**
 Reuses the Autonomy enum (ask/auto/deny). Delegates with ask/deny are annotated in listings via delegate::cfg_line.
 
+## approval mode (ask/auto/edit)
+> How the Comrade cockpit answers the prompts a run raises: `ask` (blue) answers nothing automatically, `auto` (orange) auto-answers both tool confirmations and ask_form questions from their recommended values, and `edit` (purple) auto-accepts confirmations but still stops at questions. Ctrl-Space cycles ask -> auto -> edit -> ask.
+
+**References:**
+- `crates/comrade-tui/src/tui.rs`
+
 ## ask_advise
 > Consultations normally need no approval, but the chosen delegate's `approval` policy applies (see "approval ([[delegates]])"): `ask` pauses for human approval before the advice runs, `deny` refuses outright.
 
