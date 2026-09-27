@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result, bail};
-use comrade_tool::{Steer, ToolContext, ToolRegistry};
+use comrade_tool::{PlanStatus, SessionControl, Steer, ToolContext, ToolRegistry};
 use futures_util::future::join_all;
 use std::future::Future;
 use std::pin::Pin;
@@ -508,6 +508,24 @@ pub async fn run_agent(
     run_agent_with_history(cfg, client, ctx, tools, user_input, &mut history, tx, stop).await
 }
 
+/// Clear a plan whose every step succeeded, so the session is left with no plan
+/// and the next task is forced to make one: the agent loop's "plan first" guard
+/// fires exactly when the plan is empty (`ctx.session.plan().is_empty()`).
+///
+/// A plan with any unfinished (pending/ready/in-progress) or blocked step is
+/// left alone - it still describes outstanding work, and "blocked" is not
+/// success. An empty plan is already clear. Returns whether it cleared one.
+fn clear_completed_plan(session: &dyn SessionControl) -> bool {
+    let plan = session.plan();
+    if plan.is_empty() || !plan.iter().all(|s| s.status == PlanStatus::Done) {
+        return false;
+    }
+    // Replacing the whole plan with nothing also drops the delegation records
+    // and the finished summary, which belong to the plan being retired.
+    session.set_plan(Vec::new());
+    true
+}
+
 /// Run an agent task against a caller-owned history (see
 /// [`build_session_context`]). The history is kept across calls, so a session
 /// that processes many tasks retains the earlier conversation; the manager
@@ -542,12 +560,25 @@ pub async fn run_agent_with_history(
     history.push(ChatMessage::new(Role::User, user_input));
     history.enforce_budget();
 
+    // The session outlives the loop (`ctx` is moved into it): the plan is
+    // inspected again once the run is over.
+    let session = ctx.session.clone();
     let result = run_agent_loop(cfg, client, tools, ctx, history, tx.clone(), &stop).await;
 
     // Guarantee the UI always sees an error (if any) and a terminal event, on
     // every exit path.
     if let Err(e) = &result {
         let _ = tx.send(AgentEvent::Error(format!("{e:#}"))).await;
+    }
+    // A run that ends with every step succeeded leaves no plan worth keeping:
+    // clear it on EVERY exit path, so the next task must make its own. The note
+    // explains the plan panel emptying on its own.
+    if clear_completed_plan(&*session) {
+        let _ = tx
+            .send(AgentEvent::Notice(
+                "plan complete: cleared, so the next task plans afresh".to_string(),
+            ))
+            .await;
     }
     let _ = tx.send(AgentEvent::RunEnd).await;
     result
@@ -1457,7 +1488,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use comrade_tool::{ToolContext, ToolRegistry, UserIo, UserPrompt, UserReply};
+    use comrade_tool::{
+        PlanStatus, SessionControl, ToolContext, ToolRegistry, UserIo, UserPrompt, UserReply,
+    };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -2018,6 +2051,105 @@ mod tests {
             "expected the unknown-tool error observation"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Drive one whole run against a fake model that answers immediately, with a
+    /// session whose plan holds one step already in `status`. Returns the session
+    /// and the run's event stream, so a test can assert what the user is told.
+    async fn run_once_with_one_step(
+        status: PlanStatus,
+    ) -> (Arc<AgentSession>, mpsc::Receiver<AgentEvent>) {
+        let port = spawn_model_with(&["All done."]);
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "fake".into();
+        let (tx, events) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx.clone()));
+        session.set_plan(vec![comrade_tool::PlanStepDraft {
+            goal: "do it".into(),
+            verification: "verifies".into(),
+            model: comrade_tool::AGENT_MODEL.into(),
+            context: String::new(),
+        }]);
+        assert!(session.update_plan(comrade_tool::PlanTarget::Id(1), status, None));
+        let root = std::env::temp_dir().join(format!(
+            "comrade-plan-reset-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ToolContext {
+            project_root: root.clone(),
+            cwd: root.clone(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: Arc::new(MemoryUndo::new(root.clone())),
+            auto_approve: true,
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            compact: None,
+            stop: None,
+        };
+        let client = LlmClient::new(&cfg.llm).unwrap();
+        let mut history = ContextManager::with_system("test system", 6000, 5000);
+        run_agent_with_history(
+            &cfg,
+            &client,
+            ctx,
+            &ToolRegistry::new(),
+            "do the thing".to_string(),
+            &mut history,
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        (session, events)
+    }
+
+    /// The `plan complete` notice, when the run sent one.
+    fn cleared_notice(events: &mut mpsc::Receiver<AgentEvent>) -> Option<String> {
+        let mut found = None;
+        while let Ok(ev) = events.try_recv() {
+            if let AgentEvent::Notice(text) = ev
+                && text.contains("plan complete")
+            {
+                found = Some(text);
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_retires_a_completed_plan() {
+        let (session, mut events) = run_once_with_one_step(PlanStatus::Done).await;
+        // The plan is gone once the run is over, which is what makes the next
+        // run call self_set_plan first.
+        assert!(
+            session.plan().is_empty(),
+            "a run that finished with every step done leaves no plan behind"
+        );
+        // ...and the user is told, so the panel emptying is not a mystery.
+        assert!(
+            cleared_notice(&mut events).is_some(),
+            "the plan being cleared must be announced in the chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_keeps_a_plan_with_work_outstanding() {
+        let (session, mut events) = run_once_with_one_step(PlanStatus::Pending).await;
+        let plan = session.plan();
+        assert_eq!(plan.len(), 1, "outstanding work keeps the plan");
+        assert_eq!(plan[0].status, PlanStatus::Pending);
+        assert!(
+            cleared_notice(&mut events).is_none(),
+            "nothing was cleared, so nothing is announced"
+        );
     }
 
     /// A stand-in for an approval-gated tool: records invocations and asks for
@@ -3132,5 +3264,101 @@ mod session_merge_wiring_tests {
         assert!(crate::delegate::DelegateTool::denied_for_delegates(
             "git_merge_session"
         ));
+    }
+}
+
+/// Retiring a finished plan: when a run ends with every step done the plan is
+/// cleared, which is what forces the next run to plan afresh (the loop's
+/// "plan first" guard fires exactly when the plan is empty).
+#[cfg(test)]
+mod plan_reset_tests {
+    use super::*;
+    use crate::session::AgentSession;
+    use comrade_tool::{PlanStepDraft, PlanTarget};
+    use std::sync::Arc;
+
+    fn draft(goal: &str) -> PlanStepDraft {
+        PlanStepDraft {
+            goal: goal.into(),
+            verification: "tests pass".into(),
+            model: comrade_tool::AGENT_MODEL.into(),
+            context: String::new(),
+        }
+    }
+
+    /// A session whose plan holds `steps` with the given statuses.
+    fn session_with(steps: Vec<(&str, PlanStatus)>) -> Arc<AgentSession> {
+        let (tx, _rx) = mpsc::channel(8);
+        let session = Arc::new(AgentSession::new(tx));
+        session.set_plan(steps.iter().map(|(g, _)| draft(g)).collect());
+        for (i, (_, status)) in steps.iter().enumerate() {
+            assert!(
+                session.update_plan(PlanTarget::Id(i as u64 + 1), *status, None),
+                "step {} exists",
+                i + 1
+            );
+        }
+        session
+    }
+
+    #[test]
+    fn a_completed_plan_is_cleared_so_the_next_run_must_plan() {
+        let session = session_with(vec![("one", PlanStatus::Done), ("two", PlanStatus::Done)]);
+        // A delegate ran step 1: its record must not survive into the new plan.
+        session.mark_step_delegated(1);
+
+        assert!(
+            clear_completed_plan(&*session),
+            "a fully-done plan is cleared"
+        );
+
+        // An EMPTY plan is exactly the condition the agent loop's "plan first"
+        // guard tests, so the next run must call self_set_plan before anything
+        // else.
+        assert!(session.plan().is_empty(), "the completed plan is gone");
+        assert!(
+            session.delegated_ids().is_empty(),
+            "no stale delegation record"
+        );
+        assert!(
+            session.finished_summary().is_none(),
+            "no stale finished summary"
+        );
+    }
+
+    #[test]
+    fn a_plan_with_a_blocked_step_is_kept() {
+        let session = session_with(vec![
+            ("one", PlanStatus::Done),
+            ("two", PlanStatus::Blocked),
+        ]);
+
+        assert!(
+            !clear_completed_plan(&*session),
+            "a blocked step is not success, so the plan still describes work"
+        );
+        let plan = session.plan();
+        assert_eq!(plan.len(), 2, "the plan is preserved");
+        assert_eq!(plan[1].status, PlanStatus::Blocked);
+    }
+
+    #[test]
+    fn a_plan_with_outstanding_work_is_kept() {
+        for status in [
+            PlanStatus::Pending,
+            PlanStatus::Ready,
+            PlanStatus::InProgress,
+        ] {
+            let session = session_with(vec![("one", PlanStatus::Done), ("two", status)]);
+            assert!(!clear_completed_plan(&*session), "{status} keeps the plan");
+            assert_eq!(session.plan().len(), 2, "{status} keeps both steps");
+        }
+    }
+
+    #[test]
+    fn an_empty_plan_is_left_alone() {
+        let session = session_with(vec![]);
+        assert!(!clear_completed_plan(&*session));
+        assert!(session.plan().is_empty());
     }
 }

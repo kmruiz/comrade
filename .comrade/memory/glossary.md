@@ -546,6 +546,15 @@ Only `*-linux-gnu` Linux triples are published (aarch64- and x86_64-unknown-linu
 **References:**
 - `crates/comrade-tui/src/tui.rs (handle_path_prompt_key, complete_path, complete_names, split_dir_prefix, read_dir_entries, draw_path_matches)`
 
+## plan reset (cleared plan)
+> The retirement of a finished plan at the end of a root run: in `run_agent_with_history` (crates/comrade-core/src/agent.rs), `clear_completed_plan` replaces the session's plan with nothing when it is non-empty and EVERY step is `PlanStatus::Done`, which also drops the delegation records and the finished summary, and announces it with `AgentEvent::Notice("plan complete: cleared, so the next task plans afresh")` (a Meta chat line, hidden in focus mode). A plan with any Pending/Ready/InProgress or Blocked step is kept. This is what forces the NEXT task to plan: the loop's "plan first" guard only fires when `ctx.session.plan().is_empty()`. It happens on every exit path (including errors and user cancels) and before `AgentEvent::RunEnd`. See ADR 0092.
+
+**References:**
+- `crates/comrade-core/src/agent.rs`
+
+**Notes:**
+Don't rely on a completed plan surviving a run — after a successful task the panel reads "(no plan yet)". Not to be confused with `self_finish_plan` (which marks the remaining non-done/non-blocked steps Done and stores a summary) or with the plan-first guard itself. The rule is ADR 0092 (its file name is mangled by the memory tool, so it is cited by id).
+
 ## plan_rect
 > The last rendered Rect of the TUI plan panel, stored on App by draw_plan and used by handle_mouse to hit-test the mouse wheel so a scroll over the plan panel moves plan_scroll instead of the chat.
 
