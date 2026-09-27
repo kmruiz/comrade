@@ -23,7 +23,7 @@ Covers the test-summary rendering for the Cargo and npm ecosystems only. Does NO
 pom_run_tests output is now small and never truncated by the agent loop, and shows only failing tests (plus per-binary totals). Cost: passing-test detail is no longer shown, and very large per-test stdout is cut to 15 lines per failure (the panic message, which cargo prints in a separate stderr block, is preserved).
 
 
-## Merged from #0048 - pom_run_tests runs the whole Cargo workspace
+## Merged: pom_run_tests runs the whole Cargo workspace
 status: accepted
 date: 2026-09-14
 tags: pom, cargo, tools, workspace
@@ -48,4 +48,4 @@ Covers the Cargo backend's verb resolution for `test` (crates/comrade-tool-proje
 A root-level pom_run_tests on a workspace now returns the aggregate pass/fail + failing test names of every member in one call. Existing subproject-scoped runs and all other verbs are unchanged. Bundled into v0.2.0.
 
 ## Note
-Rollup of pom_run_tests output: this ADR made the summary failure-only and hard-bounded; #0048 makes a root-level run cover the whole Cargo workspace. Body preserved under "Merged from".
+Rollup of pom_run_tests output: this ADR made the summary failure-only and hard-bounded; the merged section below makes a root-level run cover the whole Cargo workspace. Body preserved under "Merged".

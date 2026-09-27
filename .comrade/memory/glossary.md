@@ -15,8 +15,16 @@ Project keywords and their meaning, with references to the code or documentation
 **Notes:**
 Merged as `toml::Value` trees BEFORE deserializing into `Config`, so key presence (e.g. an explicit `llm.base_url`) survives the merge and `apply_provider` stays correct. Because it comes from the repo it can also set `[security]`/`[hooks]` — treat as trusted input. See ADR #0051.
 
+## ADR (when to record)
+> An ADR (.comrade/memory/NNNN-*.md) is a durable architectural/design GUIDELINE that the agent, other developers and DELEGATES must follow - not a task log. Record one with record_adr ONLY for an important decision with lasting consequences, written to be read by someone implementing a feature (decision, rationale, alternatives, scope, impact). Do NOT record task notes, session logs, bugfixes, refactors, "we added X", how-tos or one-off choices; ask "would another developer or delegate need this as a RULE?" first. The lead reads relevant ADRs before planning and cites their ids in a delegate's step `context` (a delegate has `find_adr`/`read_adr` and must follow any ADR the Context names). Guidance lives in the prompts: crates/comrade-core/prompts/memory.md, crates/comrade-core/prompts/tools-intro.md, crates/comrade-core/prompts/working-style.md, crates/comrade-core/prompts/delegate-by-default.md, crates/comrade-core/prompts/delegate-system.md.
+
+**References:**
+- `crates/comrade-core/prompts/memory.md`
+- `crates/comrade-core/prompts/delegate-by-default.md`
+- `.comrade/memory/0082-adrs-are-durable-architectural-guidelines-not-task-logs.md`
+
 ## ADR rollup
-> A canonical ADR that has absorbed several closely-related decisions about one feature or thread, so the memory holds one entry per topic instead of many fragments. Produced by merge_adr: each source's full body is appended to the target under a `## Merged from #NNNN` heading and the source is marked status `superseded` but KEPT on disk, so existing ADR/glossary references to it still resolve (stale_memory stays green). Read the canonical entry; a superseded rollup is still searchable and its body is intact. Example rollups: #0022 (semantic_search), #0001 (delegation/approval model), #0020 (context compaction), #0047 (approval-gate simplifications), #0030 (polyglot POM), #0033 (pom_run_tests output), #0045 (release), #0013 (sessions), #0023 (parallel delegates).
+> A canonical ADR that has absorbed several closely-related decisions about one feature or thread, so the memory holds one entry per topic instead of many fragments. Produced by merge_adr: each source's full body is appended to the target under a `## Merged: <title>` heading and the SOURCE IS REMOVED (its body now lives in the target), so the memory cannot silt up with superseded fragments - a merged id no longer resolves, so de-number any references to it when you merge. Read the canonical entry; the merged bodies are intact under the `## Merged:` headings. Example rollups: #0022 (semantic_search), #0001 (delegation/approval model), #0020 (context compaction), #0047 (approval-gate simplifications), #0030 (polyglot POM), #0033 (pom_run_tests output), #0045 (release), #0013 (sessions), #0083 (proactive sensors), #0084 (LLM client), #0085 (harness tool additions).
 
 **References:**
 - `.comrade/memory/0022-semantic-memory-search-fastembed-model-persisted-flat-cosine-index.md`
@@ -50,7 +58,7 @@ Loaded by crates/comrade-core/src/instructions.rs (load_project_instructions) an
 **References:**
 - `crates/comrade-core/src/config.rs (provider_base_url)`
 - `crates/comrade-core/src/llm/context_window.rs (heuristic_context)`
-- `.comrade/memory/0050-support-anthropic-models-via-the-openai-compatibility-provider-preset.md`
+- `.comrade/memory/0084-llm-client-provider-presets-prompt-caching-and-the-m-x-undo-command.md`
 
 ## approval ([[delegates]])
 > Per-[[delegates]] config key (crates/comrade-core/src/config.rs DelegateCfg.approval) controlling whether delegate/ask_advise may run that model without asking: "auto" (default) runs directly, "ask" pauses via ToolContext::confirm (skipped when the context is auto-approved), "deny" refuses to run that model through delegate/ask_advise at all. Enforced by delegate::enforce_approval inside DelegateTool::invoke and AskAdviseTool::invoke before a run starts (and before a delegated plan step is marked working).
@@ -59,7 +67,7 @@ Loaded by crates/comrade-core/src/instructions.rs (load_project_instructions) an
 - `crates/comrade-core/src/config.rs`
 - `crates/comrade-core/src/delegate.rs (enforce_approval, cfg_line)`
 - `crates/comrade-core/src/advise/mod.rs`
-- `.comrade/memory/0003-per-delegate-approval-policy-for-delegateask-advise.md`
+- `.comrade/memory/0001-ask-advise-tool-read-only-advisory-consult-of-a-delegate.md`
 
 **Notes:**
 Reuses the Autonomy enum (ask/auto/deny). Delegates with ask/deny are annotated in listings via delegate::cfg_line.
@@ -69,7 +77,7 @@ Reuses the Autonomy enum (ask/auto/deny). Delegates with ask/deny are annotated 
 
 **References:**
 - `crates/comrade-core/src/advise/mod.rs`
-- `.comrade/memory/0003-per-delegate-approval-policy-for-delegateask-advise.md`
+- `.comrade/memory/0001-ask-advise-tool-read-only-advisory-consult-of-a-delegate.md`
 
 **Notes:**
 Replaces the former unconditional "no approval" wording.
@@ -94,7 +102,7 @@ Enabled by the UserPrompt::Form(FormSpec) / UserReply::Form(BTreeMap<String,Stri
 - `crates/comrade-core/src/upward.rs (ParentAsk, parse_verdict)`
 - `crates/comrade-core/src/delegate.rs (MAX_UPWARD_ASKS, refuse_upward, refuse_destructive)`
 - `crates/comrade-tui/src/main.rs (delegate_registry, session_bundle)`
-- `.comrade/memory/0061-a«redacted».md`
+- `.comrade/memory/0061-ask-upwards-a-capped-escalation-path-from-a-delegate-to-its-tech-lead.md`
 - `.comrade/memory/0063-destructive-delegate-writes-need-the-tech-leads-permission-fail-closed.md`
 
 **Notes:**
@@ -115,7 +123,7 @@ The dialog wraps its body to the popup's real inner width (popup = min(area.widt
 
 **References:**
 - `crates/comrade-tool-project/src/bg.rs`
-- `.comrade/memory/0024-background-jobs-detached-processes-with-a-shared-bghub-in-comrade-tool-project.md`
+- `.comrade/memory/0085-harness-tool-additions-background-jobs-search-web-git-check-tools-summarise-and-show-diagram.md`
 
 **Notes:**
 Children run with `kill_on_drop(true)`; output is captured into a 200 KB bounded buffer; `run_bg` is approval-gated and all four are DENIED_FOR_DELEGATES. See ADR #24.
@@ -229,20 +237,64 @@ Distinct from the call-count guards STALL_NUDGE / VERIFY_NUDGE / DELEGATE_READ_N
 **Notes:**
 Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by render_row_line's `sub: Option<Color>` param. Folded MsgKind::Run digests keep no sub-chat styling.
 
-## Delegate supervision
-> The tech lead re-reading the transcript of a delegate that is still RUNNING (every `[agent].delegate_supervise_secs`, default 60s) and injecting at most one correction back into the delegate's own conversation. Implemented as `UpwardAsk::supervise` (one tool-less, bounded parent model call parsed by `parse_supervision`: `OK` = leave it alone, `STEER: <text>` = a correction), applied at the delegate loop's rest point via `push_user_merged`. Distinct from `ask_upwards` (the DELEGATE asking its lead).
+## guardrail mechanism
+> The judge consulted while a delegated sub-agent is still RUNNING (every `[agent].delegate_supervise_secs`, default 60s) to decide whether the lead should `continue` (leave it alone), `steer` (write a correction for it) or `stop` (end the run and report the reason). The seam is `comrade_tool::Guardrail` + `GuardOutcome` + `GuardInput`/`GuardMessage` (crates/comrade-tool/src/ask.rs); the session carries it via `SessionControl::guardrail()` / `AgentSession::set_guardrail`. The implementation is `JevGuardrail` (crates/comrade-core/src/guardrails.rs): it sends structured `state` (`delegated_task` = the parent's own `{task, context}`, plus the last ~20 `recent_conversation` entries as `{role, content}`, each message capped at 20,000 chars) to TypeSafe's `POST https://api.typesafe.ai/v1/systemone` with FIVE typed `noul` questions and maps the probabilities to a verdict ITSELF via the pure `decide`. Configured under `[guardrails]` (`jev_api_key`, `jev_url`, `jev_model`, `jev_timeout_secs`); `guardrail_from_cfg` builds it (None without a key). Applied at the delegate loop's rest point in crates/comrade-core/src/delegate.rs.
 
 **References:**
+- `crates/comrade-core/src/guardrails.rs`
 - `crates/comrade-core/src/delegate.rs`
 - `crates/comrade-core/src/upward.rs`
 - `crates/comrade-tool/src/ask.rs`
 - `crates/comrade-core/src/config.rs`
+- `.comrade/memory/0079-the-guardrail-mechanism-uses-jev-to-continue-steer-or-stop-a-running-delegate.md`
 
 **Notes:**
-`Duration::ZERO` / `delegate_supervise_secs = 0` disables it; comrade-tui passes ZERO for the `ask_advise` tool (advice runs are short and read-only). The parent is a plain tool-less chat, so it cannot revert files itself - it can only tell the delegate to discard a dead end. Budget: supervision and context-overflow recovery (`recover_context`) draw on ONE shared pool, `MAX_DELEGATE_INTERVENTIONS = 5` parent calls per run (`const` in crates/comrade-core/src/delegate.rs); there is no separate `MAX_DELEGATE_SUPERVISIONS` / `MAX_DELEGATE_COMPACTIONS` any more. When the pool is spent, neither happens again and an overflow returns `overflow_answer` ("spent its N parent interventions"), so the lead re-delegates the step itself.
+The five diagnostics are `on_task`, `looping`, `needs_context`, `blocked`, `making_progress` (each a `noul` yes/no probability). COMRADE decides, not Jev: LOOP if `looping >= 0.8`; else STOP if `blocked >= 0.8`; else STEER if `needs_context >= 0.7` (hint: supply the context), `on_task <= 0.3` (drift), or `making_progress <= 0.3` (stall); else CONTINUE. Missing answers default benign (on task, progressing, not looping) so a partial/empty response fails open to `continue`; thresholds are constants in guardrails.rs. Jev returns probabilities, not prose, so on `steer` the lead MODEL writes the correction via the historical `UpwardAsk::supervise` path with the diagnostic hint appended to the briefing; `continue` costs no model call. Jev is first, model is the fallback: no key, a disabled guardrail, an error or a timeout (`invoke_within`) makes `guardrail_check` return None and the loop supervises with the model as before. `stop` returns `guardrail_stop_answer` to the lead. A LOOP is special: `loop_recovery` (delegate.rs) sends the lead a status (reason + the delegate's `task`/`context` + transcript tail), calls `UpwardAsk::recover` to pick `Recovery::{SelfWork, Split, Restart(context)}`, SHOWS the decision in the chat via `ActivityEvents::notice` ("stuck in a loop - lead will …", SessionEvents -> AgentEvent::Notice), and returns `recovery_answer` so the lead takes the task over, splits it and re-delegates, or re-delegates with the improved context. Budget unchanged: a guardrail round and `recover_context` share `MAX_DELEGATE_INTERVENTIONS = 5` parent calls per run. `Duration::ZERO` / `delegate_supervise_secs = 0` disables the mechanism; comrade-tui passes ZERO for `ask_advise`. The SAME guardrail also advises the ROOT agent (`root_guard` in crates/comrade-core/src/agent.rs), ADVISORY ONLY (never refuses a tool or stops the run): consulted on a periodic tick (`[guardrails].interval_secs`, default 60) and when the root read guard fires, its diagnosis replaces the canned stall/verify/loop-refusal guidance and is delivered as `AgentEvent::Notice("guardrail: …")` + a harness note. With a guardrail configured, the consecutive-read threshold now ADVISES and lets the read run (the agent steers itself); with no guardrail the old hard read refusal and canned nudges stand. Tests: guardrails.rs unit tests, upward.rs `parse_recovery_reads_the_three_decisions`, agent.rs `root_guard_delivers_advice_and_falls_back`, and the delegate tests `guardrail_continue_skips_the_lead_model`, `guardrail_steer_asks_the_lead_to_write_the_correction`, `guardrail_stop_ends_the_run_and_reports_to_the_lead`, `guardrail_loop_asks_the_lead_to_recover_and_shows_it`.
+
+## Jev client
+> The shared TypeSafe/SystemOne transport, `crates/comrade-core/src/jev.rs`: `Jev::from_cfg(&GuardrailsCfg)` builds it from `[guardrails]` (None without a key), `Jev::evaluate(state, questions)` POSTs `{ state, model, questions }` to the endpoint with `Authorization: Bearer` and returns the `answers` map, and `noul`/`score`/`top_level` read one answer's fields. `JevGuardrail` (guardrails.rs) and `validate_tests` (tdd.rs) both build on it.
+
+**References:**
+- `crates/comrade-core/src/jev.rs`
+- `crates/comrade-core/src/guardrails.rs`
+- `crates/comrade-core/src/tdd.rs`
+
+## validate_tests (TDD coverage check)
+> The lead-only tool `validate_tests` (crates/comrade-core/src/tdd.rs, registered in comrade-tui only when Jev is configured) that scores how well the tests written for a feature cover it before any implementation. Input `{ feature, tests }` (tests is an array, a lone string is also accepted); it sends `state = { feature, tests }` and ONE Jev `score` question over five levels `none / sparse / partial / good / comprehensive`. ACCEPTED when the weighted `score >= 3.0` of 4 (the top two levels). The result is DATA - one line `Test coverage X/4 (label): ACCEPTED|NOT ENOUGH (threshold 3.0/4)`, no imperative - and the prompt section drives the action: ACCEPTED -> delegate the IMPLEMENTATION with the tests as the spec (they must fail first and must not be weakened) and refactor once green; NOT ENOUGH -> strengthen the tests and call again, do not implement. ADVISORY - it returns a verdict and does not gate `delegate`. The score question's instructions also weigh the TEST PYRAMID. The workflow is in the conditional prompt section `crates/comrade-core/prompts/tdd.md` (included by react::build_system_prompt only when the tool is advertised), pointed at from working-style.md steps 4-5; it also demands the LEAST code that makes the accepted tests pass, treats refactoring as ESSENTIAL, and picks test types by cost/coverage (unit cheapest/least, integration middle, functional most expensive/most) with more unit than integration and more integration than functional.
+
+**References:**
+- `crates/comrade-core/src/tdd.rs`
+- `crates/comrade-core/prompts/tdd.md`
+- `crates/comrade-tui/src/main.rs`
+- `.comrade/memory/0080-test-first-write-tests-validate-coverage-with-jev-then-delegate-the-implementation.md`
+
+## evaluate_questions (requirements filter)
+> The lead-only tool `evaluate_questions` (crates/comrade-core/src/requirements.rs, registered in comrade-tui only when Jev is configured) that filters the lead's CLARIFYING questions before it asks the user. Input `{ request, questions }` (questions is an array, a lone string is also accepted); it sends `state = { user_request }` and ONE Jev `noul` per candidate question - "is this a GOOD clarifying question to ask the user?" - whose criteria demand a FEATURE-level question and allow a technical one only for a big architectural change. The result is DATA: each question with its probability and an `ACCEPTED`/`REJECTED` label (accept at `>= 0.60`), never an imperative. The workflow is in the conditional prompt section `crates/comrade-core/prompts/requirements.md` (included by react::build_system_prompt only when the tool is advertised), pointed at from tools-intro.md and working-style.md step 2: for a feature or bug, consult a delegate with `ask_advise`, draft feature-level questions, filter them with `evaluate_questions`, and ask the user the accepted ones with `ask_form` - every field carrying a `recommended` value and a rationale - before planning.
+
+**References:**
+- `crates/comrade-core/src/requirements.rs`
+- `crates/comrade-core/prompts/requirements.md`
+- `crates/comrade-tui/src/main.rs`
+- `.comrade/memory/0086-gather-requirements-before-planning-delegate-drafted-jev-filtered-questions-answered-by-the-user-with-suggestions.md`
+
+## score_feature (feature scoring)
+> The lead-only tool `score_feature` (crates/comrade-core/src/scoring.rs, registered in comrade-tui only when Jev is configured) that scores a feature BEFORE planning. Input `{ feature }`; it asks Jev three `score` questions over four levels (0-3) - `customer_value`, `technical_challenge`, `ux_challenge` - plus two `noul` risks (`architecture_risk`, `product_risk`, 0-1). The result is DATA (the numbers + level labels), no imperative. The `## Requirements` prompt turns them into decisions: a high architecture/product risk (>= 0.6) is RAISED with the user at once, a low customer value (<= 1) questions whether to build it, and a high technical/UX challenge (>= 2) means gather MORE information before planning.
+
+**References:**
+- `crates/comrade-core/src/scoring.rs`
+- `crates/comrade-core/src/jev.rs`
+- `.comrade/memory/0088-score-a-feature-0-3-for-value-challenge-and-risk-and-let-the-scores-drive-the-requirements.md`
+
+## rank_alternatives (alternative ranking)
+> The lead-only tool `rank_alternatives` (crates/comrade-core/src/alternatives.rs, registered in comrade-tui only when Jev is configured) that challenges an approach before the lead commits. Input `{ request, alternatives }` (2-4 options, a lone string also accepted); it sends `state = { user_request, alternatives }` and ONE Jev `choice` question - "which single alternative is best?" (soundness, then simplicity and cost) - and returns the full probability distribution as DATA, best first (the `jev::probabilities` helper; Jev's single `choice` is put first if no distribution comes back). The `## Challenge the approach` prompt tells the lead to present the TOP 3 to the user with its reasoning via `ask_form`, then treat the user's decision as FINAL.
+
+**References:**
+- `crates/comrade-core/src/alternatives.rs`
+- `crates/comrade-core/prompts/challenge.md`
+- `.comrade/memory/0087-challenge-the-approach-rank-alternatives-with-jev-then-the-user-decides.md`
 
 ## Delegate timeout
-> A wall-clock budget (`[agent].delegate_timeout_secs`, default **300s / 5 minutes**; `0` = no limit) applied to every delegated sub-agent run (`delegate`, `delegate_parallel`, `ask_advise`). Enforced in `crates/comrade-core/src/delegate.rs::run_delegate_subagent`: each model request and tool call is bounded by the time left, and when the budget runs out the delegate returns `timeout_answer(...)` — a partial answer if it had one, else a notice that it did not finish. Prevents a slow/hung model request or hanging tool from holding the parent run open. (Originally 60s; raised to 300s on 2026-09-14 — the 60s default was too aggressive.)
+> A wall-clock budget (`[agent].delegate_timeout_secs`, default **300s / 5 minutes**; `0` = no limit) applied to every delegated sub-agent run (`delegate`, `delegate_parallel`, `ask_advise`). Enforced in `crates/comrade-core/src/delegate.rs`: each model request and tool call is bounded by the time left, and when the budget runs out the delegate returns `timeout_answer(...)` — a partial answer if it had one, else a notice that it did not finish. Prevents a slow/hung model request or hanging tool from holding the parent run open. (Originally 60s; raised to 300s on 2026-09-14 — the 60s default was too aggressive.)
 
 **References:**
 - `crates/comrade-core/src/delegate.rs`
@@ -258,7 +310,7 @@ Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by rende
 - `crates/comrade-core/prompts/delegate-by-default.md`
 
 **Notes:**
-Every `jobs` entry is ALWAYS isolated in its own git worktree under `.comrade/worktrees/` - the old `isolate` flag is gone. A non-git project falls back to the shared workspace with a notice. If every job in a batch fails, the tool returns `Err`; a partial batch returns `Ok` with per-job `FAILED` lines. Delegates themselves never get this tool (it is in DENIED_FOR_DELEGATES, so no recursion).
+Every `jobs` entry is ALWAYS isolated in its own git worktree under .comrade/worktrees/ - the old `isolate` flag is gone. A non-git project falls back to the shared workspace with a notice. If every job in a batch fails, the tool returns `Err`; a partial batch returns `Ok` with per-job `FAILED` lines. Delegates themselves never get this tool (it is in DENIED_FOR_DELEGATES, so no recursion).
 
 ## delegate_parallel
 > `delegate_parallel` (comrade-core delegate.rs, `DelegateParallelTool`): runs up to 8 independent delegate jobs concurrently in ONE call (jobs: [{model, task, context}]) and returns each reply. Works under both native and ReAct protocols, unlike the loop's own parallel dispatch of a pure-delegate native batch.
@@ -266,7 +318,7 @@ Every `jobs` entry is ALWAYS isolated in its own git worktree under `.comrade/wo
 **References:**
 - `crates/comrade-core/src/delegate.rs`
 - `crates/comrade-tui/src/main.rs (build_tools)`
-- `.comrade/memory/0023-parallel-delegates-via-a-one-call-delegate-parallel-tool.md`
+- `.comrade/memory/0072-merge-delegate-parallel-into-delegate-as-a-jobs-only-tool-always-isolated.md`
 
 **Notes:**
 Each job's approval policy is enforced before any run starts; it never touches the plan; it is DENIED_FOR_DELEGATES so a delegate cannot fan out recursively. See ADR #23.
@@ -418,14 +470,14 @@ Known remaining exceptions (measured harmless, flattened only if they misbehave)
 - `.comrade/memory/0037-tool-dispatch-prepost-hooks-per-tool-timeout-per-run-budget.md`
 
 ## index warm-up
-> The background build of the semantic index (memory + code) so the first `semantic_search` is instant. Triggered automatically by comrade-tui's main() at startup (comrade_tool_memory::warm, a detached, idempotent thread), by the `warm_semantic_index` tool for the agent, or by `comrade --warm-index` (blocking) for run_bg/bg jobs. It is incremental: an already-warm index is a no-op (~0.04s).
+> The background build of the semantic index (memory + code) so the first `semantic_search` is instant. Triggered automatically by comrade-tui's main() at startup (comrade_tool_memory::warm, a detached, idempotent thread), by the `warm_semantic_index` tool for the agent, by every `semantic_search` call (idempotent), or by `comrade --warm-index` (blocking) for run_bg/bg jobs. It is incremental: an already-warm index is a no-op (~0.04s). On completion it writes a small `<key>.status` marker beside the index; that marker is what tells a later process (or a search during the build) that the persisted index is ready to serve.
 
 **References:**
 - `crates/comrade-tool-memory/src/semantic/mod.rs`
 - `crates/comrade-tui/src/main.rs`
 
 **Notes:**
-Not a background-job-registry job: no jobs-panel entry, not killable via bg_kill. See the ADR 'Warm the semantic index in the background at startup'. Measured cold 67.6s / incremental 2.0s / no-op 0.04s on this repo.
+Not a background-job-registry job: no jobs-panel entry, not killable via bg_kill. See the ADR 'Warm the semantic index in the background at startup' and ADR 0077. Measured cold 67.6s / incremental 2.0s / no-op 0.04s on this repo; on the much larger chatapp checkout, excluding its ignored `.venv` cut the candidate files from 15,037 to 268 and the cold build to 153s (3,819 code chunks), with a 0.09s no-op and a 6.8 MB index (was 16.3 MB when the dependency tree leaked in).
 
 ## LangId
 > A source language the tree-sitter tools understand: Rust, JavaScript, TypeScript, Tsx, Css, Html. engine.rs maps a file extension to a LangId (`lang_of`), a LangId to its tree-sitter grammar (`grammar`), to the node kinds counted as identifier occurrences (`ident_kinds`), and to a declaration-kind -> short-label table (`decl_label`), plus `container_body` (which declarations nest others) and `decl_name` (display name). Non-Rust files are walked via `walk_sources` over `SUPPORTED_EXTS`.
@@ -440,16 +492,16 @@ Not a background-job-registry job: no jobs-panel entry, not killable via bg_kill
 **References:**
 - `crates/comrade-tui/src/tui.rs`
 
-## loop-guard nudge (STALL_NUDGE / VERIFY_NUDGE)
-> Harness-injected steering strings (not user input, not an injection attack). `STALL_NUDGE` (agent.rs:148) and `VERIFY_NUDGE` (agent.rs:165) are sent as `AgentEvent::ToolResult { name: \"loop_guard\", ok: false }` and merged into the conversation by `ContextManager::push_user_merged` (context.rs:84). A third inline nudge ("Every task starts with a plan. Call self_set_plan first…") is injected at agent.rs:795 and agent.rs:900. Triggers: `LoopTracker::needs_stall_nudge` (agent.rs:353, once after STALL_NUDGE_AT=8 idle calls post-change) and `needs_verify_nudge` (agent.rs:342, after VERIFY_NUDGE_AFTER_EDITS=3 edits without a test run). The delegate sub-loop reuses the same two constants (delegate.rs:874-878).
+## harness note (steering channel)
+> The trusted channel for harness-authored steering. `ContextManager::push_note` (crates/comrade-core/src/context.rs) queues a note; `request_messages` renders queued notes into the SYSTEM message under a `## Harness notes` header (one-shot, cleared with `clear_notes`) and the history itself is untouched. Every harness nudge, correction and human steer goes through it: `STALL_NUDGE`/`VERIFY_NUDGE`/`PLAN_FIRST_NUDGE` (agent.rs), `LOOP_REFUSAL_NUDGE` and `read_guard_message`, the delegate `IDLE_NUDGE`/`VERIFY_NUDGE`/`STALL_NUDGE` and `SUPERVISE_PREFIX` corrections (delegate.rs), and messages drained from the human `Steer` bus. The UI is told via `AgentEvent::Notice("loop guard: …")`, never a fake `ToolResult`. `ContextManager::push_user_merged` still exists for genuine user turns but is no longer used for harness steering.
 
 **References:**
-- `crates/comrade-core/src/agent.rs`
 - `crates/comrade-core/src/context.rs`
+- `crates/comrade-core/src/agent.rs`
 - `crates/comrade-core/src/delegate.rs`
 
 **Notes:**
-IMPORTANT presentation trap: `push_user_merged` appends the nudge with `\n\n` onto the LAST message when it is Role::Tool or a ReAct user observation, so the "STOP investigating…" text appears WELDED TO THE TAIL OF THE PRECEDING TOOL OUTPUT (e.g. a semantic_search or fs_rgrep result) instead of as its own message. This makes a benign loop guard look exactly like a prompt-injection planted in tool data. Merging is intentional: LM Studio's Mistral template rejects two user turns in a row / a user turn straight after tool results (comment at context.rs:78-83). If you see this text in a tool result, the source is our own agent loop, not the tool.
+Replaced the earlier `push_user_merged` delivery, which folded the nudge `\n\n` onto the trailing tool result (or ReAct observation). That made a benign loop guard look exactly like a prompt-injection planted in tool output — a model using this build flagged it as such. Delivering in the system message keeps the directive trusted, never disturbs the user/assistant/tool role alternation (the reason `push_user_merged` existed), and leaves tool results as pure data. ADR 0078 records the decision; ADR 0059's merge rule is superseded for harness notes (it still applies to genuine user text). Tests: `harness_notes_ride_the_system_message_and_are_transient` (context.rs), plus the delegate read-guard/idle/supervision tests.
 
 ## MAX_DELEGATE_INTERVENTIONS
 > One shared per-run budget for every time the tech lead is called into a delegate run: `const MAX_DELEGATE_INTERVENTIONS: usize = 5` in crates/comrade-core/src/delegate.rs. A supervision round (`UpwardAsk::supervise`) and a context-overflow recovery (`recover_context`) both spend from it, so a run makes at most 5 parent model calls of either kind; when it is exhausted an overflow returns `overflow_answer` instead of summarising again.
@@ -502,14 +554,14 @@ Private items cannot be re-exported, so a moved item used by a sibling submodule
 - `crates/comrade-tool-project/src/ecosystem/mod.rs`
 
 ## ort prebuilt (dfbin)
-> The prebuilt ONNX Runtime static library that `ort-sys` downloads at build time (the `download-binaries` path, enabled here through fastembed's `ort-download-binaries-native-tls` feature). It is cached per target triple under `~/.cache/ort.pyke.io/dfbin/<triple>/<sha256>/libonnxruntime.a` and is ~105 MB before the linker prunes it; the target list lives in ort-sys `build/download/dist.tsv`.
+> The prebuilt ONNX Runtime static library that `ort-sys` downloads at build time (the `download-binaries` path, enabled here through fastembed's `ort-download-binaries-native-tls` feature). It is cached per target triple under `~/.cache/ort.pyke.io/dfbin/<triple>/<sha256>/libonnxruntime.a` and is ~105 MB before the linker prunes it; the target list lives in ort-sys's own build/download/dist.tsv.
 
 **References:**
 - `crates/comrade-tool-memory/Cargo.toml`
 - `.comrade/memory/0075-reject-muslstatic-linking-for-the-linux-release-binary-it-is-larger-not-smaller.md`
 
 **Notes:**
-Only `*-linux-gnu` Linux triples are published (aarch64- and x86_64-unknown-linux-gnu, plus android); there is NO musl build. When a target has no row, ort-sys `build/download/resolve.rs` aborts with `no prebuilt binaries available for target {target}` and tells you to compile ONNX Runtime from source — which is why the Linux binary cannot simply be rebuilt for x86_64-unknown-linux-musl (see ADR 75).
+Only `*-linux-gnu` Linux triples are published (aarch64- and x86_64-unknown-linux-gnu, plus android); there is NO musl build. When a target has no row, ort-sys's build/download/resolve.rs aborts with `no prebuilt binaries available for target {target}` and tells you to compile ONNX Runtime from source — which is why the Linux binary cannot simply be rebuilt for x86_64-unknown-linux-musl (see ADR 75).
 
 ## path completion (session prompt)
 > Emacs find-file style Tab completion in the Ctrl-x C-s / Ctrl-x C-f session path minibuffer (crates/comrade-tui/src/tui.rs). KeyCode::Tab in handle_path_prompt_key runs complete_path(input, base = app root): it splits the typed path at the last `/` (split_dir_prefix) into a verbatim directory part and a partial name, reads the resulting directory (read_dir_entries; dirs carry a trailing `/`), and extends the name via complete_names — one match completes fully, several extend to their longest common prefix (longest_common_prefix, built on common_prefix from the M-x palette). `~` expands (expand_tilde); a path with no directory part is completed relative to the project root. Matches live in PathPrompt.matches and are drawn by draw_path_matches (a popup like draw_mx_list); cleared on the next edit.
@@ -552,7 +604,7 @@ Runs with `--message-format=json`; `parse_check_json`/`format_diagnostic` parse 
 
 **References:**
 - `crates/comrade-core/src/llm.rs`
-- `.comrade/memory/0039-opt-in-prompt-caching-m-x-undo-command.md`
+- `.comrade/memory/0084-llm-client-provider-presets-prompt-caching-and-the-m-x-undo-command.md`
 
 ## provider preset
 > A named provider in `LlmCfg.provider` (ollama, openai, deepseek, mistral, anthropic, openrouter, groq, together) that resolves to a preset base URL via `provider_base_url()` when the config omits an explicit `base_url`. All providers are spoken to through the single OpenAI-compatible `LlmClient` (Bearer auth, `/chat/completions` with native tool calls).
@@ -642,10 +694,14 @@ Set by AskAdviseTool step-mode on an explicit final `VERDICT: READY` reply; othe
 - `.github/scripts/release-notes.sh`
 
 ## resident semantic index
-> The resident per-project vector index for `semantic_search` (crates/comrade-tool-memory/src/semantic/mod.rs): `MEM_STORE`/`CODE_STORE` are process-global `Mutex<HashMap<PathBuf, Store>>` maps holding the memory and code `Store` for each project root. A search loads a store from disk at most once, reuses it across calls, and writes it back only when the CONTENT actually changed — `refresh`/`code_refresh` return `(Store, bool)` where the bool comes from `same_docs` (order-independent `(id, hash)` signatures), the per-file `FileStamp` map and the recorded HEAD, so a dirty tree that re-parses to identical chunks is NOT a change (no full-cache rewrite). On a clean repo (recorded HEAD matches and `git::dirty_files` empty) the code file walk is skipped entirely. Vectors are stored pre-normalised (L2) so ranking is a plain dot product (`dot`), not `cosine`.
+> The resident per-project vector index for `semantic_search` (crates/comrade-tool-memory/src/semantic/mod.rs): `MEM_STORE`/`CODE_STORE` are process-global `Mutex<HashMap<PathBuf, Store>>` maps holding the memory and code `Store` for each project root. A search loads a store from disk at most once, reuses it across calls, and writes it back only when the CONTENT actually changed — `refresh`/`code_refresh` return `(Store, bool)` where the bool comes from `same_docs` (order-independent `(id, hash)` signatures), the per-file `FileStamp` map and the recorded HEAD, so a dirty tree that re-parses to identical chunks is NOT a change (no full-cache rewrite). Vectors are stored pre-normalised (L2) so ranking is a plain dot product (`dot`), not `cosine`.
 
 **References:**
 - `crates/comrade-tool-memory/src/semantic/mod.rs`
+- `.comrade/memory/0077-semantic-search-indexes-only-git-visible-files-persists-a-readiness-marker-and-never-blocks.md`
+
+**Notes:**
+The code file SET comes from git when the project is a repo: `git::listed_files` = `git ls-files --cached --others --exclude-standard`, so an ignored dependency tree (e.g. `.venv`) is never walked; a non-git project walks with a skip list in `SKIP_DIRS`. A `Kind::Memory`/`Kind::Code` `load_if_ready` gates ranking: a search only ranks an index whose build FINISHED (resident, or a `<key>.status` marker on disk). It never builds synchronously — if nothing is ready it returns a not-ready message at once and the background `warm` does the work. `take_or_load` moves the resident store out of the map while building, so no lock is held during embedding.
 
 ## retryable provider error
 > A provider request failure the LLM client retries rather than surfacing: a transport error (reqwest timeout/connect/request/body, e.g. connection reset/refused) or an HTTP status in 408|425|429|500|502|503|504|529. Classified by `is_retryable`/`is_retryable_status` in crates/comrade-core/src/llm.rs; a non-success status is carried as the typed `LlmHttpError`. Retried with exponential backoff (`[llm] max_retries`, `retry_backoff_ms`); mid-stream failures after the first emitted delta are NOT retried.
@@ -690,7 +746,7 @@ Added by ADR #36. deny wins over allow: any command containing a deny string is 
 Backed by fastembed (quantized BGE-small-en-v1.5, in-process ONNX) + a flat cosine index persisted in the user cache dir and rebuilt incrementally by text hash; see ADR #22. Read-only for the loop (advisors/delegates may call it).
 
 ## Sensor
-> A `[[sensors]]` entry in `config.toml`: a shell command Comrade polls on `interval_secs`; when the command's stdout changes (diffed line-by-line) it emits a `SensorEvent`, and per its `mode` Comrade either notifies+asks (`ask`) or opens a session to handle it (`auto`). Fields: name, command, interval_secs (default 300, floored 10), mode, prompt, enabled.
+> A `[[sensors]]` entry in the config (`.comrade.toml` or the user config): a shell command Comrade polls on `interval_secs`; when the command's stdout changes (diffed line-by-line) it emits a `SensorEvent`, and per its `mode` Comrade either notifies+asks (`ask`) or opens a session to handle it (`auto`). Fields: name, command, interval_secs (default 300, floored 10), mode, prompt, enabled.
 
 **References:**
 - `crates/comrade-core/src/config.rs`
@@ -715,7 +771,7 @@ Backed by fastembed (quantized BGE-small-en-v1.5, in-process ONNX) + a flat cosi
 
 **References:**
 - `crates/comrade-tui/src/tui.rs`
-- `.comrade/memory/0054-tool-capable-sensors-and-a-sensors-queue-panel.md`
+- `.comrade/memory/0083-proactive-sensors-polled-config-sensors-that-notify-act-and-queue-changes.md`
 
 ## session (TUI)
 > A named unit owning its own plan and chat. In the TUI the active session's live state is the App's own fields (AgentSession plan/title, ContextManager history, Vec<Msg> chat); every other opened session is an OpenSession slot holding a Box<SessionFile> snapshot. Ctrl-x C-b switches, C-s saves, C-f loads, C-k closes (kill-session) and C-w forks; the M-x names are switch-session/save-session/load-session/kill-session/fork-session.
@@ -753,7 +809,7 @@ SessionFile is the on-disk JSON form (version/title/status/plan/delegated/finish
 Frontmatter is parsed by hand (no YAML crate in the workspace). Discovery/parse live in crates/comrade-tool-skill (parse_skill_md, discover_in, discover, all); the TUI registers the tools in main.rs build_tools/delegate_registry/advise_registry, which now take the project root.
 
 ## stale reference check
-> How `stale_memory` decides a reference is missing (crates/comrade-tool-memory/src/store.rs): it extracts BACKTICK-QUOTED spans (`extract_paths`) that look like paths (contain `/` or end in a source/doc extension, and have no spaces/globs/placeholders), then reports those that don't exist under the project root. It ignores a token that starts with `~`, `$` or `/` (home-relative/absolute — not repo paths) and strips a trailing `:line` or `:line:col` suffix (`repo_path`), so `crates/…/lib.rs:251` is checked as `crates/…/lib.rs`. So the memory convention is: a real file reference is written as a backticked repo-relative path; prose mentions, placeholders (`<name>.rs`) and locations outside the repo are not checked.
+> How `stale_memory` decides a reference is missing (crates/comrade-tool-memory/src/store.rs): it extracts BACKTICK-QUOTED spans (`extract_paths`) that look like paths (contain `/` or end in a source/doc extension, and have no spaces/globs/placeholders), then reports those that don't exist under the project root. It ignores a token that starts with `~`, `$` or `/` (home-relative/absolute — not repo paths) and strips a trailing `:line` or `:line:col` suffix (`repo_path`), so a trailing `:line` or `:line:col` suffix is stripped before the existence check. So the memory convention is: a real file reference is written as a backticked repo-relative path; prose mentions, placeholders (`<name>.rs`) and locations outside the repo are not checked.
 
 **References:**
 - `crates/comrade-tool-memory/src/store.rs`
@@ -766,7 +822,7 @@ Frontmatter is parsed by hand (no YAML crate in the workspace). Discovery/parse 
 - `crates/comrade-tool/src/task_runner.rs`
 - `crates/comrade-tool-project/src/lib.rs (ProjectTaskRunner)`
 - `crates/comrade-tui/src/main.rs (build_tools)`
-- `.comrade/memory/0042-add-a-summarise-tool-that-returns-a-delegate-written-summary-of-a-commands-output.md`
+- `.comrade/memory/0085-harness-tool-additions-background-jobs-search-web-git-check-tools-summarise-and-show-diagram.md`
 
 **Notes:**
 Auto-pick: pick_default_model scores each enabled delegate on name+llm.model+description against SUMMARISER_HINTS (summar/cheap/fast/quick/small/light/econom/budget), highest wins, config order breaks ties, falls back to the first.
@@ -867,7 +923,7 @@ Practical consequence: a full-suite `pom_run_tests` output is often truncated by
 **References:**
 - `crates/comrade-core/src/worktree.rs`
 - `crates/comrade-core/src/delegate.rs`
-- `.comrade/memory/0023-parallel-delegates-via-a-one-call-delegate-parallel-tool.md`
+- `.comrade/memory/0072-merge-delegate-parallel-into-delegate-as-a-jobs-only-tool-always-isolated.md`
 
 ## Worktree isolation
 > Running a delegate_parallel job inside its own detached git worktree (<repo>/.comrade/worktrees/<id>) so parallel jobs cannot clobber each other's files. It is the DEFAULT for parallel jobs; pass isolate=false to share the workspace, and non-git projects fall back to sharing. Changed worktrees are kept for the tech lead to merge back with `git apply --3way`; unchanged ones are removed.

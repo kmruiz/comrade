@@ -19,7 +19,7 @@ Two rules, in `crates/comrade-tool-project`:
 
 1. TRUNCATION KEEPS BOTH ENDS. `tasks::cap` now keeps the head (a third of the budget is reserved for the tail, minus the elision marker) and elides the middle with an explicit `... (output truncated) ...` marker, instead of keeping the head only. The two ends carry different information and each verb needs a different one: the head has the compile errors, the tail has the `test result:` totals the simplifier parses.
 
-2. DIAGNOSTICS MUST MATCH A SHAPE, NOT A SUBSTRING. `ecosystem::is_error_header` (private, in `ecosystem/mod.rs`) replaces the `contains("error")` test. It rejects test-runner output outright (lines starting with `test ` or `test result:`) and otherwise accepts only real diagnostic shapes: `error:` / `error[`, a diagnostic code (`error[e`), or one of the stock failure phrases (`cannot find`, `mismatched types`, `could not compile`, `failed to compile`).
+2. DIAGNOSTICS MUST MATCH A SHAPE, NOT A SUBSTRING. `ecosystem::is_error_header` (private, in `crates/comrade-tool-project/src/ecosystem/mod.rs`) replaces the `contains("error")` test. It rejects test-runner output outright (lines starting with `test ` or `test result:`) and otherwise accepts only real diagnostic shapes: `error:` / `error[`, a diagnostic code (`error[e`), or one of the stock failure phrases (`cannot find`, `mismatched types`, `could not compile`, `failed to compile`).
 
 The structured cargo JSON path (`parse_check_json`) is unchanged and still tried first.
 

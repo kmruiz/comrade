@@ -23,7 +23,7 @@ covers comrade-core AskAdviseTool, its prompt (prompts/advise-system.md), advise
 The lead can consult cheaper/faster configured delegates as advisors (prompt delegate-by-default.md now points advisory reviews at ask_advise). Registry building in comrade-tui is duplicated across delegate_registry()/advise_registry() but both are thin filters over shared name-level truth. Tool only exists when [[delegates]] are configured. UI: ask_advise shares the delegate tool icon/headline/reply-card parsing.
 
 
-## Merged from #0002 - delegate runs without handoff approval; nested delegate calls stay auto-approved
+## Merged: delegate runs without handoff approval; nested delegate calls stay auto-approved
 status: superseded
 date: 2026-09-09
 tags: tools, delegate, approval, security, autonomy
@@ -51,7 +51,7 @@ Delegating now has no human checkpoint: the lead can spawn sub-agents that auto-
 ## Note
 Superseded by #3: delegation is no longer unconditionally approval-free. Each [[delegates]] entry can opt back into an approval pause (`approval = "ask"`) or a hard refusal (`approval = "deny"`); the default (`"auto"`) keeps ADR #2's ungated behaviour. delegate.rs/advise.rs enforce the per-delegate gate with ctx.confirm before running.
 
-## Merged from #0003 - Per-delegate approval policy for delegate/ask_advise
+## Merged: Per-delegate approval policy for delegate/ask_advise
 status: accepted
 date: 2026-09-09
 tags: tools, delegate, ask_advise, approval, config, security
@@ -75,7 +75,7 @@ Covers the config field on [[delegates]], enforcement inside DelegateTool::invok
 ## Impact
 A user with a cheap + expensive model pair writes `approval = "ask"` on the expensive [[delegates]] entry; every delegate/ask_advise use of it then pauses for the human while the cheap one stays automatic. The model's justification line is NOT surfaced on these dialogs (deliberately: no ApprovalNotes plumbing for dynamically-gated calls); the dialog shows the delegate name plus the task/question preview. Follow-ups: optionally surface the lead's Justification on ask-gated dialogs; a docs/config example for the cheap/expensive setup.
 
-## Merged from #0004 - Plan-step readiness handshake before delegation
+## Merged: Plan-step readiness handshake before delegation
 status: accepted
 date: 2026-09-09
 tags: delegate, plan, ask_advise, readiness, plan-status
@@ -99,7 +99,7 @@ PlanStatus lifecycle and session tooling across comrade-tool (plan.rs), comrade-
 ## Impact
 Plan steps assigned to delegates now move pending -> ready -> in_progress; ready is visible in the TUI (blue ●). Reassigning a ready step's model or rewriting its context resets it to pending (readiness is stale). set_step_context and ask_advise step= are denied to delegate sub-agents. Future: could make the gate hard (refuse delegating non-ready steps) once flows mature.
 
-## Merged from #0018 - Per-delegate `enabled` flag to disable a model without removing it
+## Merged: Per-delegate `enabled` flag to disable a model without removing it
 status: accepted
 date: 2026-09-13
 tags: config, delegate, ask_advise, tui, models
@@ -124,4 +124,4 @@ Covers the config field, the fill/parse behaviour, build_targets/DelegateTool::n
 A user writes `enabled = false` on a [[delegates]] entry to park a model: it disappears from the delegate/ask_advise options and the Ctrl-A picker but stays visible (dimmed, ` (disabled)`) in the model panel and remains in config.toml to flip back on. Applies to both `delegate` and `ask_advise`. Follow-up: the TUI model panel test covers the marker; a docs/config example could mention `enabled`.
 
 ## Note
-Rollup of the delegation model: this ADR is the spine (ask_advise, read-only advisory sub-agent), #0002 makes delegate ungated, #0003 adds the per-delegate approval policy (ask/auto/deny), #0004 adds the plan-step readiness handshake, #0018 adds the per-delegate enabled flag. Bodies preserved under "Merged from".
+Rollup of the delegation model: this ADR is the spine (ask_advise, read-only advisory sub-agent). The merged sections below add: delegate is ungated; the per-delegate approval policy (ask/auto/deny); the plan-step readiness handshake; and the per-delegate enabled flag. Bodies preserved under "Merged".

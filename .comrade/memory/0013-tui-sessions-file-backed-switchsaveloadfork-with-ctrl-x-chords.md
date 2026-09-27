@@ -32,7 +32,7 @@ Superseded in part by ADR 0015: new-session/switch/load/kill are no longer refus
 ## Note
 The Ctrl-x C-s / C-f path minibuffer now does emacs find-file style Tab completion (crates/comrade-tui/src/tui.rs): KeyCode::Tab in handle_path_prompt_key calls the free fn complete_path(input, base=self.root), which splits the typed path into (dir_part, prefix) via split_dir_prefix, reads that directory (read_dir_entries, dirs marked with a trailing `/`), and extends the name with complete_names — a single match completes fully (dir => trailing `/`), several matches extend to their longest common prefix (longest_common_prefix, reusing common_prefix from the M-x palette). `~` is expanded (expand_tilde) and a path with no directory part is read relative to the project root. Candidates are stored in PathPrompt.matches and shown by draw_path_matches (a popup modelled on draw_mx_list); they are cleared on the next Char/Backspace edit. All logic is pure/testable (complete_names/split_dir_prefix/complete_path unit tests).
 
-## Merged from #0015 - Sessions keep live state; runs continue in the background
+## Merged: Sessions keep live state; runs continue in the background
 status: accepted
 date: 2026-09-13
 tags: tui, session, concurrency, events
@@ -61,4 +61,4 @@ New/switch/load/kill now work while runs are in flight; a parked session keeps s
 Follow-up implemented: dialogs/asks are now attributed to their owning session. Each session gets its own TuiUserIo (built in App::make_ctx_base with the session id; stored asks_tx on App), so PendingAsk and Dialog carry `session: u64`. A session whose run is blocked on a user dialog is shown as "waiting": the mode-line session-count label buckets open sessions into a mutually-exclusive running/blocked/idle partition via fn session_status_marker (waiting takes precedence over running), and the Ctrl-x C-b switcher appends "  [waiting]" instead of "  [running]".
 
 ## Note
-Rollup of the session architecture: this ADR made sessions file-backed (switch/save/load/fork); #0015 gives each open session a live state so runs continue in the background and events are id-tagged per session. Body preserved under "Merged from".
+Rollup of the session architecture: this ADR made sessions file-backed (switch/save/load/fork); the merged section below gives each open session a live state so runs continue in the background and events are id-tagged per session. Body preserved under "Merged".

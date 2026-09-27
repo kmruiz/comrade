@@ -23,7 +23,7 @@ Covers comrade-core (context, compact, agent loop, session event), comrade-tool 
 M-c during a run compacts at the next model-iteration boundary; M-c while idle compacts immediately. The gauge updates to the post-compaction estimate. Only the root loop compacts (a nested delegate keeps its own context). Follow-up ideas (not done): let the user pick N advisory models to summarise in parallel, and a confirmation prompt.
 
 
-## Merged from #0034 - Auto-compaction in the agent loop (CtxCfg.auto_compact, default on)
+## Merged: Auto-compaction in the agent loop (CtxCfg.auto_compact, default on)
 status: accepted
 date: 2026-09-13
 tags: context, agent-loop, compaction
@@ -48,4 +48,4 @@ Covers the agent loop's automatic context compaction and its config flag. Does N
 Over-budget long runs are now summarised by the model instead of degraded lossily. Costs one extra (non-streaming) model call per over-budget episode. Set `[context] auto_compact = false` to restore manual-only behaviour. Files: crates/comrade-core/src/agent.rs, context.rs, config.rs; tests: agent::tests::over_budget_history_is_auto_compacted, context::tests::needs_auto_compaction_tracks_the_trim_target, config::tests::auto_compact_defaults_on_and_can_be_disabled.
 
 ## Note
-Rollup of context compaction: this ADR adds user-triggered M-c compaction; #0034 adds automatic compaction in the agent loop (CtxCfg.auto_compact, default on). Both share compact_history/ContextManager::compact. Body preserved under "Merged from".
+Rollup of context compaction: this ADR adds user-triggered M-c compaction; the merged section below adds automatic compaction in the agent loop (CtxCfg.auto_compact, default on). Both share compact_history/ContextManager::compact. Body preserved under "Merged".

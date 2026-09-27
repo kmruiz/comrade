@@ -23,7 +23,7 @@ Covers the approval gate's justification requirement across agent loop, ReAct pa
 The model no longer emits or is refused for a Justification; approval-gated tools are advertised with their plain schema. Public API narrowed: ApprovalNotes and AgentEvent::ToolCall.justification are gone. Bundled with the v0.2.0 minor release.
 
 
-## Merged from #0008 - Ungate ADR/glossary memory writes (record_adr, amend_adr, record_glossary)
+## Merged: Ungate ADR/glossary memory writes (record_adr, amend_adr, record_glossary)
 status: accepted
 date: 2026-09-09
 tags: approval, memory, tools, autonomy
@@ -47,7 +47,7 @@ Covers the three memory tools' approval classification in agent.rs (APPROVAL_GAT
 ## Impact
 The agent can now record and amend ADRs and glossary terms with no human checkpoint, matching git_commit/pom_run_tests/delegate. The remaining approval-gated tools are fs_write_file, ts_rename and shell. If unattended memory writes ever need a checkpoint, a config knob (like the delegate approval policy in ADR #3) is the follow-up.
 
-## Merged from #0032 - Remove the verify-then-commit gate on git_commit
+## Merged: Remove the verify-then-commit gate on git_commit
 status: accepted
 date: 2026-09-13
 tags: agent-loop, git, guard
@@ -72,4 +72,4 @@ Covers the verify-then-commit enforcement inside the agent loop only. Does NOT c
 The model can commit without a preceding green test run in the same turn; it must judge for itself when the suite is green. The false refusals disappear. The guidance to verify before committing remains in the prompts (crates/comrade-core/prompts/*), so the behaviour is unchanged when the model follows its instructions. `git_commit`'s own argument validation (git_diff/git_status advice, path scoping) is untouched.
 
 ## Note
-Rollup of approval-gate simplifications: this ADR removed the model-supplied justification argument; #0008 ungated the memory writes (record_adr/amend_adr/record_glossary); #0032 removed the verify-then-commit gate on git_commit. Bodies preserved under "Merged from".
+Rollup of approval-gate simplifications: this ADR removed the model-supplied justification argument; the merged sections below ungated the memory writes (record_adr/amend_adr/record_glossary) and removed the verify-then-commit gate on git_commit. Bodies preserved under "Merged".

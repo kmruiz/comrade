@@ -26,7 +26,7 @@ ts_find_references/rename/list_symbols/structural_map/read_symbol/find_symbol an
 ## Note
 Follow-up resolved: JS/TS test discovery is now implemented. engine::test_functions finds JS/TS `it`/`test`/`specify` cases (incl. member forms `it.only`/`test.skip`/… and `xit`/`xtest`/`fit`; `describe` is treated as a container, not a case) and `decl_names_in_text` is language-aware (picks the grammar by file extension). ts_test_impact now maps changed files of any supported language, adds a same-directory heuristic for colocated tests, and lists affected JS/TS test files in its suggested runs. See crates/comrade-tool-syntax/src/engine.rs (js_tests) and src/lib.rs (ts_test_impact).
 
-## Merged from #0026 - Ecosystem seam for the pom_* tools (Cargo backend, npm/Maven/Go later)
+## Merged: Ecosystem seam for the pom_* tools (Cargo backend, npm/Maven/Go later)
 status: accepted
 date: 2026-09-13
 tags: project, ecosystem, architecture, tools
@@ -51,4 +51,4 @@ Covers the `pom_*` build/run/check/format surface of `comrade-tool-project`. Doe
 Adding npm/Maven/Go later is "implement `Ecosystem` + one arm in `detect`" with no `pom_*` tool change; `pom_check` degrades gracefully via `generic_error_lines` for toolchains without structured diagnostics. Cargo behaviour is unchanged (existing tests still pass, plus new ecosystem tests). The trait is a compile-time seam (no dynamic loading).
 
 ## Note
-Rollup of the POM multi-ecosystem work: this ADR adds multi-language tree-sitter support and all-ecosystem (Cargo + npm) detection; #0026 introduced the Ecosystem trait seam the detection is built on. Body preserved under "Merged from".
+Rollup of the POM multi-ecosystem work: this ADR adds multi-language tree-sitter support and all-ecosystem (Cargo + npm) detection; the merged section below introduced the Ecosystem trait seam the detection is built on. Body preserved under "Merged".
