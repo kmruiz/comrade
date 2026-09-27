@@ -8347,9 +8347,23 @@ fn form_question_text(spec: &FormSpec) -> String {
     s
 }
 
-/// One line of a form dialog: focus arrow, label, required marker and the
-/// component's current rendering (text box, spinner, date, select, checkbox).
-fn form_field_line(field: &comrade_tool::FormField, value: &str, focused: bool) -> Line<'static> {
+/// The lines a form dialog draws for one field: the QUESTION (the field's label,
+/// plus a required marker) on its own line(s), then the ANSWER (the component's
+/// current rendering) indented beneath it. The question and the answer each wrap
+/// to `width`, so a long label or option can never run past the popup edge — and
+/// because the caller counts these lines, the dialog grows to fit them.
+fn form_field_lines(
+    field: &comrade_tool::FormField,
+    value: &str,
+    focused: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let width = width.max(4);
+    let mut lines = Vec::new();
+
+    // The question: a focus arrow (or a 2-cell indent, so the label stays
+    // aligned) + the label + a required marker. Wrapped to the width left after
+    // the arrow, which is then prefixed to every produced row.
     let arrow = if focused { "▶ " } else { "  " };
     let label_style = if focused {
         Style::default()
@@ -8358,14 +8372,31 @@ fn form_field_line(field: &comrade_tool::FormField, value: &str, focused: bool) 
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
-    let mut spans = vec![
-        Span::styled(arrow.to_string(), Style::default().fg(Color::Yellow)),
-        Span::styled(field.label.clone(), label_style),
-    ];
+    let mut head = vec![tok(field.label.clone(), label_style)];
     if field.required {
-        spans.push(Span::styled(" *", Style::default().fg(Color::Red)));
+        head.push(tok(" *", Style::default().fg(Color::Red)));
     }
-    spans.push(Span::raw(": "));
+    let head_lines = wrap_toks(&head, width.saturating_sub(2));
+    if head_lines.is_empty() {
+        push_tok_line(
+            &mut lines,
+            &[tok(arrow.to_string(), Style::default().fg(Color::Yellow))],
+        );
+    }
+    for (i, line) in head_lines.into_iter().enumerate() {
+        let mut toks = vec![tok(
+            if i == 0 {
+                arrow.to_string()
+            } else {
+                "  ".to_string()
+            },
+            Style::default().fg(Color::Yellow),
+        )];
+        toks.extend(line);
+        push_tok_line(&mut lines, &toks);
+    }
+
+    // The answer: the component's rendering, indented under the question.
     let (widget, style) = match &field.kind {
         FieldKind::Text { placeholder } => {
             if value.is_empty() {
@@ -8400,22 +8431,27 @@ fn form_field_line(field: &comrade_tool::FormField, value: &str, focused: bool) 
             Style::default().fg(Color::Green),
         ),
     };
-    spans.push(Span::styled(widget, style));
+    let mut answer = vec![tok(widget, style)];
     if focused
         && matches!(
             field.kind,
             FieldKind::Text { .. } | FieldKind::Number { .. } | FieldKind::Date
         )
     {
-        spans.push(Span::styled("_", Style::default().fg(Color::Green)));
+        answer.push(tok("_", Style::default().fg(Color::Green)));
     }
     if field.has_recommended() {
-        spans.push(Span::styled(
-            " (recommended)",
-            Style::default().fg(Color::DarkGray),
-        ));
+        answer.push(tok(" (recommended)", Style::default().fg(Color::DarkGray)));
     }
-    Line::from(spans)
+    // Wrap to the width left after the indent, then indent every row (adding it
+    // after wrapping keeps it, since the wrapper drops leading spaces).
+    for line in wrap_toks(&answer, width.saturating_sub(2)) {
+        let mut toks = vec![tok("  ", Style::default())];
+        toks.extend(line);
+        push_tok_line(&mut lines, &toks);
+    }
+
+    lines
 }
 
 /// How the cockpit answers the human prompts a run raises: the approval token
@@ -8564,7 +8600,7 @@ fn draw_dialog(app: &App, dialog: &Dialog, frame: &mut Frame) {
                     .and_then(|e| e.values.get(i))
                     .cloned()
                     .unwrap_or_else(|| f.initial_value());
-                lines.push(form_field_line(f, &value, focused));
+                lines.extend(form_field_lines(f, &value, focused, inner_w));
                 // A diff-choice field shows the diff of its currently-selected
                 // option so the human can read the patch before deciding.
                 if let FieldKind::DiffChoice { options } = &f.kind
@@ -10172,6 +10208,151 @@ mod tests {
             "fields": [{ "id": "n", "label": "N", "kind": "number" }]
         }));
         assert_eq!(form_question_text(&untitled), "Question\n  N (n)");
+    }
+
+    /// The visible text of a rendered `Line` (styles dropped).
+    fn line_text_of(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn form_field_lines_put_the_question_and_answer_on_separate_lines() {
+        let spec = form_spec(serde_json::json!({
+            "fields": [
+                { "id": "room", "label": "Which room?", "kind": "select",
+                  "options": ["single", "double"] }
+            ]
+        }));
+        let field = &spec.fields[0];
+        let lines = form_field_lines(field, "double", true, 60);
+        // The question is one line, the answer the next: they never share a row.
+        assert_eq!(lines.len(), 2);
+        assert!(line_text_of(&lines[0]).contains("Which room?"));
+        assert!(
+            !line_text_of(&lines[0]).contains("double"),
+            "the answer must not sit on the question line: {:?}",
+            line_text_of(&lines[0])
+        );
+        assert!(
+            line_text_of(&lines[1]).starts_with("  "),
+            "answer is indented"
+        );
+        assert!(line_text_of(&lines[1]).contains("‹ double ›"));
+    }
+
+    #[test]
+    fn form_field_lines_wrap_a_long_question_and_a_long_answer() {
+        let spec = form_spec(serde_json::json!({
+            "fields": [
+                { "id": "q", "kind": "text",
+                  "label": "A very long question that certainly has to wrap across several rows in a narrow dialog" }
+            ]
+        }));
+        let field = &spec.fields[0];
+        let lines = form_field_lines(
+            field,
+            "an answer that is also far too long to fit",
+            true,
+            20,
+        );
+        assert!(
+            lines.len() > 2,
+            "expected wrapping, got {} lines",
+            lines.len()
+        );
+        for l in &lines {
+            assert!(
+                line_text_of(l).chars().count() <= 20,
+                "line overflows the dialog: {:?}",
+                line_text_of(l)
+            );
+        }
+    }
+
+    #[test]
+    fn form_field_lines_show_required_marker_and_recommended_value() {
+        let spec = form_spec(serde_json::json!({
+            "fields": [
+                { "id": "n", "label": "Guests", "kind": "number", "min": 1,
+                  "required": true, "recommended": "2" }
+            ]
+        }));
+        let field = &spec.fields[0];
+        let text = form_field_lines(field, "2", false, 40)
+            .iter()
+            .map(line_text_of)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Guests *"), "{text}");
+        assert!(text.contains("‹ 2 ›"), "{text}");
+        assert!(text.contains("(recommended)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn form_dialog_grows_and_wraps_a_long_question_instead_of_overflowing() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let app = test_app();
+        let spec = form_spec(serde_json::json!({
+            "title": "Where should the new configuration file live for this project",
+            "description": "Pick one of the following locations.",
+            "fields": [
+                { "id": "loc", "kind": "select",
+                  "label": "Which directory should hold the new configuration file for the application",
+                  "options": ["the project root next to Cargo.toml", "a dotted config directory"] }
+            ]
+        }));
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let dialog = Dialog {
+            prompt: UserPrompt::Form(spec.clone()),
+            buf: String::new(),
+            reply: reply_tx,
+            session: 0,
+            form: Some(FormEdit::new(&spec)),
+        };
+
+        // A narrow terminal: without wrapping the long label/option would be cut.
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| draw_dialog(&app, &dialog, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let area = *buf.area();
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect()
+            })
+            .collect();
+
+        // The modal grows past its 5-row minimum so the wrapped body fits.
+        let modal_rows = rows.iter().filter(|r| r.contains('│')).count();
+        assert!(modal_rows > 5, "modal did not grow: {modal_rows} rows");
+
+        // Nothing is clipped: the full label and the full option survive the wrap.
+        // Drop the box-drawing glyphs so wrapped rows rejoin into one sentence.
+        let flat: String = rows
+            .join("\n")
+            .chars()
+            .map(|c| {
+                if "│┌┐└┘─".contains(c) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(
+                "Which directory should hold the new configuration file for the application"
+            ),
+            "the question was truncated:\n{flat}"
+        );
+        assert!(
+            flat.contains("the project root next to Cargo.toml"),
+            "the answer was truncated:\n{flat}"
+        );
     }
 
     #[test]
