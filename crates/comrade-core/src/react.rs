@@ -26,6 +26,9 @@ pub struct ToolCall {
 const INTRO: &str = include_str!("../prompts/intro.md");
 const DELEGATE_BY_DEFAULT: &str = include_str!("../prompts/delegate-by-default.md");
 const WORKING_STYLE: &str = include_str!("../prompts/working-style.md");
+const TDD: &str = include_str!("../prompts/tdd.md");
+const REQUIREMENTS: &str = include_str!("../prompts/requirements.md");
+const CHALLENGE: &str = include_str!("../prompts/challenge.md");
 const MEMORY: &str = include_str!("../prompts/memory.md");
 const TRUST_BOUNDARIES: &str = include_str!("../prompts/trust-boundaries.md");
 const TOOLS_INTRO: &str = include_str!("../prompts/tools-intro.md");
@@ -71,6 +74,27 @@ fn build_prompt(project_root: &str, tools: &ToolRegistry, budget: usize, native:
         prompt.push_str(DELEGATE_BY_DEFAULT);
     }
     prompt.push_str(WORKING_STYLE);
+    // The test-first workflow is only relevant when the `validate_tests` tool is
+    // advertised (which needs a configured Jev key), so include it conditionally.
+    if tools.iter().any(|t| t.spec().name == crate::tdd::TOOL_NAME) {
+        prompt.push_str(TDD);
+    }
+    // Requirements gathering needs the `evaluate_questions` tool (a configured
+    // Jev key), so include its section only when that tool is advertised.
+    if tools
+        .iter()
+        .any(|t| t.spec().name == crate::requirements::TOOL_NAME)
+    {
+        prompt.push_str(REQUIREMENTS);
+    }
+    // Challenging the approach needs the `rank_alternatives` tool (a configured
+    // Jev key), so include its section only when that tool is advertised.
+    if tools
+        .iter()
+        .any(|t| t.spec().name == crate::alternatives::TOOL_NAME)
+    {
+        prompt.push_str(CHALLENGE);
+    }
     prompt.push_str(FINISHING);
     prompt.push_str(MEMORY);
     prompt.push_str(TRUST_BOUNDARIES);
@@ -684,6 +708,44 @@ mod dev_prompt_tests {
         );
         assert!(!native.contains("Protocol (text mode)"), "{native}");
         assert!(!native.contains("Tool: <tool_name>"), "{native}");
+    }
+
+    #[test]
+    fn tdd_section_is_included_only_when_validate_tests_is_advertised() {
+        // The section body (not the cross-references to its title) is conditional.
+        let marker = "Follow the TEST PYRAMID";
+        let reg = ToolRegistry::new();
+        let without = build_system_prompt("/x", &reg, 6000);
+        assert!(!without.contains(marker), "{without}");
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(NamedTool::with_name("validate_tests")));
+        let with = build_system_prompt("/x", &reg, 6000);
+        assert!(with.contains(marker), "{with}");
+    }
+
+    #[test]
+    fn requirements_section_is_included_only_with_evaluate_questions() {
+        let marker = "## Requirements (ask before you build)";
+        let reg = ToolRegistry::new();
+        let without = build_system_prompt("/x", &reg, 6000);
+        assert!(!without.contains(marker), "{without}");
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(NamedTool::with_name("evaluate_questions")));
+        let with = build_system_prompt("/x", &reg, 6000);
+        assert!(with.contains(marker), "{with}");
+        assert!(with.contains("evaluate_questions"), "{with}");
+    }
+
+    #[test]
+    fn challenge_section_is_included_only_with_rank_alternatives() {
+        let marker = "## Challenge the approach (before you commit to it)";
+        let reg = ToolRegistry::new();
+        let without = build_system_prompt("/x", &reg, 6000);
+        assert!(!without.contains(marker), "{without}");
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(NamedTool::with_name("rank_alternatives")));
+        let with = build_system_prompt("/x", &reg, 6000);
+        assert!(with.contains(marker), "{with}");
     }
 
     #[test]

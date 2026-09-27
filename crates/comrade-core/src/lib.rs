@@ -8,6 +8,7 @@
 
 pub mod advise;
 pub mod agent;
+pub mod alternatives;
 pub mod compact;
 pub mod config;
 pub mod context;
@@ -19,14 +20,18 @@ pub mod jev;
 pub mod llm;
 pub mod react;
 pub mod redact;
+pub mod requirements;
+pub mod scoring;
 pub mod session;
 pub mod summarise;
+pub mod tdd;
 pub mod undo;
 pub mod upward;
 pub mod worktree;
 
 pub use advise::AskAdviseTool;
 pub use agent::{build_session_context, run_agent, run_agent_with_history};
+pub use alternatives::RankAlternativesTool;
 pub use compact::{CompactReport, compact_history};
 pub use config::{
     Autonomy, Config, DelegateCfg, GuardrailsCfg, LoadedConfig, McpAuth, McpConfig, McpServerCfg,
@@ -40,8 +45,11 @@ pub use instructions::load_project_instructions;
 pub use jev::Jev;
 pub use llm::{ChatMessage, LlmClient, Role};
 pub use redact::Redactor;
+pub use requirements::EvaluateQuestionsTool;
+pub use scoring::ScoreFeatureTool;
 pub use session::{AgentEvent, AgentSession};
 pub use summarise::SummariseTool;
+pub use tdd::ValidateTestsTool;
 pub use undo::MemoryUndo;
 pub use upward::ParentAsk;
 pub use worktree::Worktree;

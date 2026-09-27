@@ -206,6 +206,22 @@ fn build_tools(
     if let Some(summarise) = SummariseTool::new(&cfg.delegates, Some(task_runner))? {
         reg.register(Box::new(summarise));
     }
+    // TDD: when Jev is configured, advertise `validate_tests` so the lead can
+    // have its tests scored for coverage before delegating the implementation.
+    if let Some(jev) = comrade_core::Jev::from_cfg(&cfg.guardrails) {
+        reg.register(Box::new(comrade_core::ValidateTestsTool::new(jev.clone())));
+        // Requirements gathering: filter the lead's clarifying questions before
+        // it asks the user.
+        reg.register(Box::new(comrade_core::EvaluateQuestionsTool::new(
+            jev.clone(),
+        )));
+        // Challenge the approach: rank the alternatives before the lead commits.
+        reg.register(Box::new(comrade_core::RankAlternativesTool::new(
+            jev.clone(),
+        )));
+        // Score a feature's value/challenge/risk before gathering requirements.
+        reg.register(Box::new(comrade_core::ScoreFeatureTool::new(jev)));
+    }
     Ok((reg, jobs))
 }
 
