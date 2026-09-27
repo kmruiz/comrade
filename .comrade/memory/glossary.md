@@ -225,7 +225,7 @@ The project declares `license = "MIT OR Apache-2.0"` in Cargo.toml but only an A
 - `crates/comrade-core/src/delegate/tests.rs`
 
 **Notes:**
-Distinct from the call-count guards STALL_NUDGE / VERIFY_NUDGE / DELEGATE_READ_NUDGE, which fire on non-progress CALLS (loop-guard nudge entry); this one fires on idle TIME. A hung tool is cut off at the gate and ANSWERED with an error tool result (so the history stays API-valid and the delegate gets another turn) rather than aborting the run. Replaced the wall-clock budget of ADR #53 (see ADR #68). Tests: crates/comrade-core/src/delegate/tests.rs `a_frozen_delegate_is_nudged_to_act`, `a_progressing_delegate_is_never_cut_off`, `a_hanging_tool_is_cut_off_and_the_delegate_recovers`.
+Distinct from the call-count guards STALL_NUDGE / VERIFY_NUDGE / DELEGATE_READ_NUDGE, which fire on non-progress CALLS; this one fires on idle TIME. Those call-count guards only ADVISE - the root's call-count STOP was removed (ADR #91). Unlike them, this gate does stop the delegate run. A hung tool is cut off at the gate and ANSWERED with an error tool result (so the history stays API-valid and the delegate gets another turn) rather than aborting the run. Replaced the wall-clock budget of ADR #53 (see ADR #68). Tests: crates/comrade-core/src/delegate/tests.rs `a_frozen_delegate_is_nudged_to_act`, `a_progressing_delegate_is_never_cut_off`, `a_hanging_tool_is_cut_off_and_the_delegate_recovers`.
 
 ## delegate sub-chat
 > The chat rows authored by a delegate model (its tool cards and its reply), rendered indented 2 columns under a "| " rule in the delegate's agent color with a dim per-agent background band, visually nested under the parent's delegate tool call.
@@ -816,6 +816,16 @@ Frontmatter is parsed by hand (no YAML crate in the workspace). Discovery/parse 
 
 **References:**
 - `crates/comrade-tool-memory/src/store.rs`
+
+## stall nudge (root)
+> The root agent's one-shot steering nudge: after `STALL_NUDGE_AT` (20 = `READ_GUARD_THRESHOLD`) consecutive non-progress CALLS following the first workspace change, `LoopTracker::needs_stall_nudge()` fires once (crates/comrade-core/src/agent.rs) and the caller delivers `STALL_NUDGE` as a harness note telling the model to finish. It is ADVICE ONLY — there is no longer any call-count gate that ENDS the run (the old `STALL_END_AT` = 40 stop was removed, ADR #91), so a root run is bounded only by `[agent].max_iterations` (default 30) and `run_timeout_secs`. `idle` counts calls, not turns: every non-progress call extends the run, so a batch of parallel calls can advance it several times in one turn, and it is reset by any progress call (`is_progress`).
+
+**References:**
+- `crates/comrade-core/src/agent.rs`
+- `.comrade/memory/0091-no-call-count-stall-gate-a-root-run-is-bounded-by-max-iterations-not-a-spin-counter.md`
+
+**Notes:**
+A pre-first-change read-only exploration never arms it (`progress > 0` is required). Do not re-introduce a call-count stop next to it: stuckness is judged by the guardrail (ADR #91, ADR #0079).
 
 ## summarise
 > A tech-lead-only tool (crates/comrade-core/src/summarise.rs, `SummariseTool`) that runs ONE command whose output is expected to be large/noisy and returns a DELEGATE-WRITTEN summary of that output instead of the raw text. Takes EITHER `command` (raw shell, run behind the same policy + approval gate as `shell`: comrade_tool::check_command + ctx.confirm) OR `task` (a project task verb/alias resolved via `comrade_tool::TaskRunner`, optionally scoped with `subproject`/`ecosystem`, run WITHOUT approval like pom_run_task) - the two are mutually exclusive. Full output (uncapped) is saved to `<root>/.comrade/artifacts/<secs>-<slug>.txt` (gitignored) and its path returned, then a [[delegates]] model summarises it (one LlmClient::chat). The delegate is chosen by `model`, else auto-picked (best-fit blurb); an `approval = \"deny\"` delegate is refused. Denied for delegates.

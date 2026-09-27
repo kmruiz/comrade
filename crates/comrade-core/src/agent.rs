@@ -101,11 +101,10 @@ const READ_GUARD_THRESHOLD: usize = 20;
 
 /// After ≥ this many consecutive non-progress calls following the first
 /// workspace change, nudge the model once to finish (small models otherwise
-/// keep re-verifying until `max_iterations`).
+/// keep re-verifying until `max_iterations`). This is ADVICE only: the harness
+/// does not end the run on a call count, and the guardrail (Jev) judges whether
+/// the agent is genuinely stuck.
 const STALL_NUDGE_AT: usize = READ_GUARD_THRESHOLD;
-
-/// At ≥ this many, end the run gracefully instead of burning the budget.
-const STALL_END_AT: usize = READ_GUARD_THRESHOLD * 2;
 
 /// Tools that push a task forward: they change the repo or the plan. Anything
 /// else (reads, tests, checks, shell, jobs) only inspects state, so a long run
@@ -409,19 +408,6 @@ impl LoopTracker {
         false
     }
 
-    /// Some(reason) once the model has kept spinning well past the nudge, so
-    /// the loop can end gracefully with an explanation instead of hitting
-    /// `max_iterations`.
-    pub(crate) fn stall_reason(&self) -> Option<String> {
-        (self.progress > 0 && self.idle >= STALL_END_AT).then(|| {
-            format!(
-                "Stopped: {} calls in a row without a further change after making progress - the \
-                 work looks complete. (Last step: re-run your verification only if it truly failed.)",
-                self.idle
-            )
-        })
-    }
-
     /// Stop the run gracefully (not an error) because the model kept repeating.
     pub(crate) fn mark_stuck(&mut self, sig: &str) {
         if self.stuck.is_none() {
@@ -646,16 +632,6 @@ async fn run_agent_loop(
 
         // End gracefully (not as an error) when the model kept repeating.
         if let Some(reason) = tracker.stuck_reason() {
-            let _ = tx.send(AgentEvent::FinalAnswer(reason.clone())).await;
-            return Ok(AgentOutcome {
-                final_answer: reason,
-                iterations,
-            });
-        }
-
-        // End gracefully when the model keeps re-verifying long after it has
-        // already changed the repo (the nudge above was ignored).
-        if let Some(reason) = tracker.stall_reason() {
             let _ = tx.send(AgentEvent::FinalAnswer(reason.clone())).await;
             return Ok(AgentOutcome {
                 final_answer: reason,
@@ -3071,7 +3047,7 @@ mod usage_tests {
 
 #[cfg(test)]
 mod stall_tests {
-    use super::{LoopTracker, STALL_END_AT, STALL_NUDGE_AT};
+    use super::{LoopTracker, STALL_NUDGE_AT};
 
     fn read(t: &mut LoopTracker, i: usize) {
         t.record("fs_read_file", format!("r{i}"));
@@ -3085,11 +3061,10 @@ mod stall_tests {
             read(&mut t, i);
         }
         assert!(!t.needs_stall_nudge());
-        assert!(t.stall_reason().is_none());
     }
 
     #[test]
-    fn a_progress_call_resets_the_idle_run_and_the_nudge_is_one_shot() {
+    fn the_stall_nudge_fires_once_at_the_threshold() {
         let mut t = LoopTracker::default();
         t.record("fs_edit", "e1".into());
         for i in 0..STALL_NUDGE_AT - 1 {
@@ -3103,22 +3078,27 @@ mod stall_tests {
         read(&mut t, STALL_NUDGE_AT - 1);
         assert!(t.needs_stall_nudge());
         assert!(!t.needs_stall_nudge(), "the nudge fires at most once");
-        // A further edit is progress and resets the idle run.
-        t.record("fs_edit", "e2".into());
-        read(&mut t, 0);
-        assert!(t.stall_reason().is_none());
     }
 
+    /// A progress call resets the idle run, so the nudge counts only the calls
+    /// since the last real change (a fresh tracker, since the nudge is one-shot
+    /// per run).
     #[test]
-    fn stall_reason_only_after_the_end_threshold() {
+    fn a_progress_call_resets_the_idle_run() {
         let mut t = LoopTracker::default();
-        t.record("fs_write_file", "w1".into());
-        for i in 0..STALL_END_AT - 1 {
+        t.record("fs_edit", "e1".into());
+        for i in 0..STALL_NUDGE_AT - 1 {
             read(&mut t, i);
         }
-        assert!(t.stall_reason().is_none());
-        read(&mut t, STALL_END_AT - 1);
-        assert!(t.stall_reason().is_some());
+        // The edit that follows is progress: the idle run starts over.
+        t.record("fs_edit", "e2".into());
+        for i in 0..STALL_NUDGE_AT - 1 {
+            read(&mut t, i);
+        }
+        assert!(
+            !t.needs_stall_nudge(),
+            "the idle run was reset by the second edit"
+        );
     }
 
     #[test]
