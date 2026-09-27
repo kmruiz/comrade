@@ -68,7 +68,7 @@ struct RecordAdr;
 static RECORD_ADR_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "record_adr".into(),
-    description: "Record an ADR decision (.comrade/memory/) for an important long-term architectural/design choice: date, context/rationale, decision, alternatives, scope, impact. Do NOT persist small operational notes or how-tos. Runs directly without approval.".into(),
+    description: "Record an ADR (.comrade/memory/): a durable architectural/design GUIDELINE that other developers and delegates must follow, written to be read by someone implementing a feature (date, context/rationale, decision, alternatives, scope, impact). Record ONLY rules a future agent needs - never task notes, bugfixes, refactors or one-off choices. Runs directly without approval.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -590,12 +590,12 @@ struct MergeAdr;
 static MERGE_ADR_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| {
     ToolSpec {
     name: "merge_adr".into(),
-    description: "Merge one or more decisions into a target decision: each source's body is appended under a `## Merged from #NNNN` heading and the source is marked `superseded`. Use to consolidate duplicate or fragmented decisions. Runs directly without approval.".into(),
+    description: "Merge one or more decisions into a target decision: each source's body is appended under a `## Merged:` heading and the SOURCE IS REMOVED (its body now lives in the target), so the memory cannot silt up with superseded fragments. Use to consolidate duplicate or fragmented decisions. Runs directly without approval.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
             "into": { "type": "integer", "minimum": 1, "description": "Target decision id (kept and updated)." },
-            "from": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "description": "Decision ids to merge in and supersede." },
+            "from": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "description": "Decision ids to merge in; each source is removed after its body is folded into the target." },
             "note": { "type": "string", "description": "Optional note appended to the target explaining the merge." }
         },
         "required": ["into", "from"],

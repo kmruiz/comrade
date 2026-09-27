@@ -428,8 +428,9 @@ fn title_of(body: &str) -> String {
 }
 
 /// Merge `sources` into `target`: append each source's body under a
-/// `## Merged from #NNNN - title` heading and mark the source `superseded`.
-/// Returns a one-line summary of what happened.
+/// `## Merged: title` heading and REMOVE the source file, so the merged copy in
+/// the target is the only one left and the memory cannot silt up with
+/// superseded fragments. Returns a one-line summary of what happened.
 pub fn merge(root: &Path, target: u32, sources: &[u32], note: Option<&str>) -> Result<String> {
     if !path_for(root, target)?.exists() {
         anyhow::bail!("no decision #{target}");
@@ -449,16 +450,10 @@ pub fn merge(root: &Path, target: u32, sources: &[u32], note: Option<&str>) -> R
         if !text.ends_with('\n') {
             text.push('\n');
         }
-        text.push_str(&format!(
-            "\n## Merged from #{src:04} - {title}\n{}\n",
-            src_body.trim()
-        ));
-        amend(
-            root,
-            src,
-            Some("superseded"),
-            Some(&format!("merged into #{target:04}")),
-        )?;
+        text.push_str(&format!("\n## Merged: {title}\n{}\n", src_body.trim()));
+        // Consume the source: its body now lives in the target.
+        std::fs::remove_file(path_for(root, src)?)
+            .with_context(|| format!("cannot remove merged decision #{src:04}"))?;
         merged.push(format!("#{src:04}"));
     }
     if let Some(n) = note.map(str::trim).filter(|n| !n.is_empty()) {
@@ -779,22 +774,21 @@ mod tests {
     }
 
     #[test]
-    fn merge_appends_and_supersedes_sources() {
+    fn merge_appends_and_removes_the_source() {
         let root = scratch();
         let a = write(&root, draft("Alpha", "first", None, None, vec![])).unwrap();
         let b = write(&root, draft("Beta", "second", None, None, vec![])).unwrap();
         let msg = merge(&root, a, &[b], Some("consolidated")).unwrap();
         assert!(msg.contains(&format!("#{b:04}")), "{msg}");
         let target = read(&root, a).unwrap();
-        assert!(
-            target.body.contains(&format!("Merged from #{b:04}")),
-            "{}",
-            target.body
-        );
+        assert!(target.body.contains("## Merged: Beta"), "{}", target.body);
         assert!(target.body.contains("consolidated"), "{}", target.body);
-        let src = read(&root, b).unwrap();
-        assert_eq!(src.meta.status, "superseded");
-        assert!(src.body.contains(&format!("merged into #{a:04}")));
+        // The source is CONSUMED, not kept as a superseded stub.
+        assert!(read(&root, b).is_err(), "the merged source must be removed");
+        assert!(
+            !list(&root).unwrap().iter().any(|m| m.id == b),
+            "the source must not be listed"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
