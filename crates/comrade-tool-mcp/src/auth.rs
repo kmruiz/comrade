@@ -17,7 +17,17 @@ pub async fn http_transport_config(
     cfg.uri = url.to_string().into();
     if let Some((name, value)) = resolve_auth_header(auth, url).await? {
         if name.eq_ignore_ascii_case("authorization") {
-            cfg.auth_header = Some(value);
+            // rmcp sends `auth_header` through reqwest's `bearer_auth`, which adds the
+            // `Bearer ` scheme itself: keeping the scheme here would put
+            // `Authorization: Bearer Bearer <token>` on the wire, and a server that
+            // verifies the credential it was given answers 401. The token alone is
+            // what this field takes, for the API key and the OIDC access token alike.
+            cfg.auth_header = Some(
+                value
+                    .strip_prefix("Bearer ")
+                    .map(str::to_string)
+                    .unwrap_or(value),
+            );
         } else {
             let header_name = http::HeaderName::from_bytes(name.as_bytes())?;
             let header_value = http::HeaderValue::from_str(&value)?;
@@ -375,6 +385,22 @@ mod tests {
                 .unwrap(),
             ("Authorization".to_string(), "Bearer sekrit".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn api_key_transport_config_carries_a_bare_token() {
+        let auth = McpAuth::ApiKey {
+            key: "sekrit".into(),
+            header: None,
+        };
+        let cfg = http_transport_config("https://x.example/mcp", Some(&auth))
+            .await
+            .unwrap();
+        // rmcp sends `auth_header` through reqwest's `bearer_auth`, which prepends the
+        // `Bearer ` scheme itself - so a scheme here would reach the server as
+        // `Authorization: Bearer Bearer sekrit` and be rejected as an unknown credential.
+        assert_eq!(cfg.auth_header.as_deref(), Some("sekrit"));
+        assert!(cfg.custom_headers.is_empty());
     }
 
     #[tokio::test]
