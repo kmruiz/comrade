@@ -33,6 +33,7 @@ const MEMORY: &str = include_str!("../prompts/memory.md");
 const TRUST_BOUNDARIES: &str = include_str!("../prompts/trust-boundaries.md");
 const TOOLS_INTRO: &str = include_str!("../prompts/tools-intro.md");
 const PROGRESS: &str = include_str!("../prompts/progress.md");
+const SESSION_WORKTREE: &str = include_str!("../prompts/session-worktree.md");
 const PROTOCOL: &str = include_str!("../prompts/protocol.md");
 const PROTOCOL_NATIVE: &str = include_str!("../prompts/protocol-native.md");
 const FINISHING: &str = include_str!("../prompts/finishing.md");
@@ -105,6 +106,7 @@ fn build_prompt(project_root: &str, tools: &ToolRegistry, budget: usize, native:
         prompt.push('\n');
     }
     prompt.push_str(PROGRESS);
+    prompt.push_str(SESSION_WORKTREE);
     prompt.push_str(if native { PROTOCOL_NATIVE } else { PROTOCOL });
     prompt
 }
@@ -955,5 +957,18 @@ mod progress_prompt_tests {
             prompt.contains("Do not narrate every single call"),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn prompt_teaches_the_worktree_and_merge_workflow() {
+        let reg = ToolRegistry::new();
+        let prompt = build_system_prompt("/x", &reg, 6000);
+        assert!(
+            prompt.contains("## Working in an isolated worktree"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("git_merge_session"), "{prompt}");
+        // The agent must understand its commits are not on the main branch yet.
+        assert!(prompt.contains("YOUR branch"), "{prompt}");
     }
 }

@@ -1071,6 +1071,10 @@ struct LiveState {
     ctx_budget: usize,
     ctx_estimated: bool,
     activity: Option<String>,
+    /// This session's own git worktree, when the project is a git repository:
+    /// the session edits and commits there, so the repository's checkout stays
+    /// untouched until the agent merges back with `git_merge_session`.
+    worktree: Option<comrade_core::Worktree>,
     session_file: Option<std::path::PathBuf>,
     sel: Option<usize>,
     scroll_top: usize,
@@ -1403,6 +1407,9 @@ struct App {
     balance: Option<String>,
     /// Name of the tool currently running (auto status while no agent text).
     activity: Option<String>,
+    /// This session's own git worktree (see [`LiveState`]); `None` when the
+    /// project is not a git repository and the session shares the directory.
+    worktree: Option<comrade_core::Worktree>,
     /// Lazily-created system-clipboard handle, kept alive for the whole
     /// session. Creating and dropping a `Clipboard` per write makes arboard
     /// (X11) hand the clipboard window over to a clipboard manager and destroy
@@ -2641,16 +2648,20 @@ impl App {
     fn fresh_live(&self, id: u64) -> LiveState {
         let run_tx = spawn_tagged_relay(id, self.events_tx.clone());
         let session = Arc::new(AgentSession::new(run_tx.clone()));
+        let (root, worktree) = App::session_root(&self.root, id);
         let ctx_base = self.make_ctx_base(
             id,
+            &root,
             session.clone(),
-            Arc::new(comrade_core::MemoryUndo::new(self.root.clone())),
+            Arc::new(comrade_core::MemoryUndo::new(root.clone())),
         );
         let history = Arc::new(tokio::sync::Mutex::new(build_session_context(
             &self.cfg,
-            &self.root.to_string_lossy(),
+            &root.to_string_lossy(),
             &self.tools,
         )));
+        let mut chat = Vec::new();
+        chat.extend(App::worktree_note(id, &worktree));
         LiveState {
             session,
             ctx_base,
@@ -2663,7 +2674,8 @@ impl App {
             compact: None,
             queued_prompt: None,
             run_cancelled: false,
-            chat: Vec::new(),
+            worktree,
+            chat,
             section_collapsed: Vec::new(),
             chat_epoch: 0,
             chat_rows_cache: None,
@@ -2687,16 +2699,69 @@ impl App {
         }
     }
 
+    /// The directory a session works in, plus its own worktree when the project
+    /// is a git repository. An isolated session edits and commits in its worktree
+    /// on branch `comrade/session-<id>`, so the repository's own checkout is
+    /// untouched until the agent publishes the work with `git_merge_session`.
+    /// A leftover worktree from a previous run of the same session id is
+    /// reopened rather than replaced, so unmerged work is never lost.
+    /// Everything else — a non-git project, a detached HEAD, a git failure —
+    /// falls back to sharing `root`, exactly as before.
+    fn session_root(
+        root: &std::path::Path,
+        id: u64,
+    ) -> (std::path::PathBuf, Option<comrade_core::Worktree>) {
+        let shared = || (root.to_path_buf(), None);
+        if !comrade_core::Worktree::isolation_available(root) {
+            return shared();
+        }
+        // The branch to cut from: whatever the repository has checked out.
+        let Ok(base) = comrade_core::Worktree::current_branch(root) else {
+            return shared();
+        };
+        if base.is_empty() {
+            return shared();
+        }
+        match comrade_core::Worktree::open_on_branch(
+            root,
+            &format!("session-{id}"),
+            &format!("comrade/session-{id}"),
+            &base,
+        ) {
+            Ok(wt) => {
+                let path = wt.path().to_path_buf();
+                (path, Some(wt))
+            }
+            Err(_) => shared(),
+        }
+    }
+
+    /// The chat note announcing a session's isolated worktree, when it has one,
+    /// so the user can see at a glance that the repository is not being edited.
+    fn worktree_note(id: u64, worktree: &Option<comrade_core::Worktree>) -> Option<Msg> {
+        worktree.as_ref().map(|wt| {
+            Msg::text(
+                MsgKind::Meta,
+                format!(
+                    "isolated worktree: {} (branch comrade/session-{id})",
+                    wt.path().display()
+                ),
+            )
+        })
+    }
+
     /// Build a [`ToolContext`] for a session from the shared per-app bits.
+    /// `root` is the session's own directory: its worktree when it is isolated.
     fn make_ctx_base(
         &self,
         id: u64,
+        root: &std::path::Path,
         session: Arc<AgentSession>,
         undo: Arc<comrade_core::MemoryUndo>,
     ) -> ToolContext {
         ToolContext {
-            project_root: self.root.clone(),
-            cwd: self.root.clone(),
+            project_root: root.to_path_buf(),
+            cwd: root.to_path_buf(),
             session: session.as_control(),
             user: Arc::new(TuiUserIo {
                 tx: self.asks_tx.clone(),
@@ -2720,10 +2785,12 @@ impl App {
     ) -> LiveState {
         let run_tx = spawn_tagged_relay(id, self.events_tx.clone());
         let session = Arc::new(AgentSession::new(run_tx.clone()));
+        let (root, worktree) = App::session_root(&self.root, id);
         let ctx_base = self.make_ctx_base(
             id,
+            &root,
             session.clone(),
-            Arc::new(comrade_core::MemoryUndo::new(self.root.clone())),
+            Arc::new(comrade_core::MemoryUndo::new(root.clone())),
         );
         let delegated: HashSet<u64> = file.delegated.iter().copied().collect();
         let budget = file.ctx_budget.max(1);
@@ -2735,6 +2802,8 @@ impl App {
             file.rollup,
             file.evicted,
         )));
+        let mut chat = file.chat;
+        chat.extend(App::worktree_note(id, &worktree));
         LiveState {
             session,
             ctx_base,
@@ -2747,7 +2816,8 @@ impl App {
             compact: None,
             queued_prompt: None,
             run_cancelled: false,
-            chat: file.chat,
+            worktree,
+            chat,
             section_collapsed: file.section_collapsed,
             chat_epoch: 0,
             chat_rows_cache: None,
@@ -2791,6 +2861,7 @@ impl App {
         std::mem::swap(&mut self.ctx_budget, &mut incoming.ctx_budget);
         std::mem::swap(&mut self.ctx_estimated, &mut incoming.ctx_estimated);
         std::mem::swap(&mut self.activity, &mut incoming.activity);
+        std::mem::swap(&mut self.worktree, &mut incoming.worktree);
         std::mem::swap(&mut self.session_file, &mut incoming.session_file);
         std::mem::swap(&mut self.sel, &mut incoming.sel);
         std::mem::swap(&mut self.scroll_top, &mut incoming.scroll_top);
@@ -3934,7 +4005,11 @@ fn build_app(
         tx: asks_tx.clone(),
         session: 0,
     });
-    let bundle = session_bundle(deps, user, run_tx.clone());
+    // Every session works in its own worktree (see ADR 0090), so sessions
+    // running at the same time cannot clobber the repository. The App's own
+    // live state is session 0.
+    let (session_dir, worktree) = App::session_root(&deps.root, 0);
+    let bundle = session_bundle(deps, user, run_tx.clone(), &session_dir);
 
     // Assign a stable color to each agent (main model + delegates) once, at
     // start: the chat's delegate sub-chats and the model windows use it.
@@ -3946,6 +4021,10 @@ fn build_app(
     // Placeholder proactive-mode channel; `run` rewires it to the configured
     // sensors. A sender kept in the App means `sensor_rx` never closes.
     let (sensor_tx, sensor_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // Tell the user at a glance that this session is not editing the repository.
+    let mut chat = Vec::new();
+    chat.extend(App::worktree_note(0, &worktree));
 
     App {
         cfg: deps.cfg.clone(),
@@ -3959,7 +4038,7 @@ fn build_app(
         ctx_base: bundle.ctx_base.clone(),
         history: Arc::new(tokio::sync::Mutex::new(build_session_context(
             &deps.cfg,
-            &deps.root.to_string_lossy(),
+            &session_dir.to_string_lossy(),
             &deps.tools,
         ))),
         events_tx,
@@ -3991,7 +4070,8 @@ fn build_app(
         git_tx,
         git_inflight: false,
         git_gate: None,
-        chat: Vec::new(),
+        chat,
+        worktree,
         chat_epoch: 0,
         chat_rows_cache: None,
         model_colors,
@@ -10210,6 +10290,79 @@ mod tests {
         let card = app.chat.last().expect("a message");
         assert_eq!(card.kind, MsgKind::Tool);
         assert!(!focus_visible(card));
+    }
+
+    // --- session worktrees --------------------------------------------------
+
+    /// A temp git repo on branch `main` with one commit.
+    fn scratch_git_repo() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "comrade-tui-worktree-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("readme.txt"), "hello\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        root
+    }
+
+    #[test]
+    fn a_session_gets_its_own_worktree_and_branch() {
+        let repo = scratch_git_repo();
+        let (root, worktree) = App::session_root(&repo, 3);
+        let wt = worktree
+            .as_ref()
+            .expect("a git repository gets an isolated worktree");
+        assert_eq!(root, wt.path());
+        assert!(root.ends_with("session-3"), "{}", root.display());
+        assert_eq!(
+            comrade_core::Worktree::current_branch(&root).unwrap(),
+            "comrade/session-3"
+        );
+        // The repository's own checkout is left exactly where the user had it.
+        assert_eq!(
+            comrade_core::Worktree::current_branch(&repo).unwrap(),
+            "main"
+        );
+        // The user is told, so an isolated session never looks like a plain one.
+        let note = App::worktree_note(3, &worktree).expect("a note for an isolated session");
+        assert!(note.text.contains("session-3"), "{:?}", note.text);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_non_git_project_shares_the_directory() {
+        let dir = std::env::temp_dir().join(format!("comrade-tui-nogit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (root, worktree) = App::session_root(&dir, 3);
+        assert_eq!(root, dir);
+        assert!(
+            worktree.is_none(),
+            "outside a git repository a session shares the directory"
+        );
+        assert!(App::worktree_note(3, &worktree).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

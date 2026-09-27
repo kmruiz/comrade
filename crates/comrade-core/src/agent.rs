@@ -33,6 +33,7 @@ const MUTATING_TOOLS: &[&str] = &[
     "fs_write_file",
     "ts_rename",
     "git_commit",
+    "git_merge_session",
     "git_stash",
     "git_branch",
     "git_checkout",
@@ -3130,5 +3131,26 @@ mod stall_tests {
             t.record("pom_run_tests", format!("t{i}"));
         }
         assert!(t.needs_stall_nudge());
+    }
+}
+
+/// Wiring rules for session isolation: the merge tool changes the repository
+/// (so the repeat tracker must count a repeat as progress when state changed),
+/// and a delegate must NEVER call it — a delegate's worktree is nested inside the
+/// session's, so from there the "main branch" is the user's own checkout.
+#[cfg(test)]
+mod session_merge_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn merging_counts_as_a_mutating_tool() {
+        assert!(is_mutating("git_merge_session"));
+    }
+
+    #[test]
+    fn a_delegate_may_not_merge_the_session_branch() {
+        assert!(crate::delegate::DelegateTool::denied_for_delegates(
+            "git_merge_session"
+        ));
     }
 }

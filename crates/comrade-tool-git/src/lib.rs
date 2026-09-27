@@ -13,6 +13,8 @@ use comrade_tool::{Tool, ToolContext, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod merge;
+
 const MAX_OUTPUT_CHARS: usize = 6000;
 
 pub fn all() -> Vec<Box<dyn Tool>> {
@@ -23,6 +25,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(GitLog),
         Box::new(GitBlame),
         Box::new(GitCommit),
+        Box::new(merge::GitMergeSession),
         Box::new(GitStash),
         Box::new(GitBranch),
         Box::new(GitCheckout),

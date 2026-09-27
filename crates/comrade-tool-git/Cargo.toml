@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 comrade-tool = { path = "../comrade-tool" }
+comrade-core = { path = "../comrade-core" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

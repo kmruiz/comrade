@@ -42,15 +42,39 @@ impl Worktree {
         })
     }
 
-    /// Create a worktree on a NEW branch `branch` cut from `base`, at
-    /// `<repo>/.comrade/worktrees/<name>`. Session isolation uses this: the
-    /// session edits and commits on its own branch, so the repository's own
-    /// checkout stays exactly as the user left it until [`Self::merge_branch_into_target`].
-    pub fn create_on_branch(repo: &Path, name: &str, branch: &str, base: &str) -> Result<Self> {
+    /// Open — or create — a session worktree on branch `branch`, cut from `base`
+    /// when the branch does not exist yet.
+    ///
+    /// A LEFTOVER worktree or branch from a previous run is REUSED, never
+    /// destroyed: it may hold unmerged commits, and both silently dropping them
+    /// and silently falling back to the shared directory would lose work. Only a
+    /// non-git repository or a real git failure makes this fail.
+    pub fn open_on_branch(repo: &Path, name: &str, branch: &str, base: &str) -> Result<Self> {
+        if !is_git_repo(repo) {
+            bail!("{} is not a git repository; cannot isolate", repo.display());
+        }
         let path = worktree_path(repo, name);
-        prepare(repo, &path)?;
+        // Still a live worktree of this repository: use it exactly as it stands.
+        if path.join(".git").exists() && Self::is_linked(&path) {
+            return Ok(Self {
+                repo: repo.to_path_buf(),
+                path,
+            });
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        // A stale directory (with no live worktree behind it) must go, or
+        // `worktree add` refuses.
+        let _ = std::fs::remove_dir_all(&path);
         let p = path.to_string_lossy().into_owned();
-        run_add(repo, &["-b", branch, &p, base])?;
+        if branch_exists(repo, branch) {
+            // Re-attach to the surviving branch so its commits are not stranded.
+            run_add(repo, &[&p, branch])?;
+        } else {
+            run_add(repo, &["-b", branch, &p, base])?;
+        }
         Ok(Self {
             repo: repo.to_path_buf(),
             path,
@@ -94,7 +118,9 @@ impl Worktree {
     /// The branch currently checked out in `dir` (an empty string when the HEAD
     /// is detached, as in a delegate's worktree).
     pub fn current_branch(dir: &Path) -> Result<String> {
-        Ok(git_ok(dir, &["branch", "--show-current"])?.trim().to_string())
+        Ok(git_ok(dir, &["branch", "--show-current"])?
+            .trim()
+            .to_string())
     }
 
     /// True when `dir` is a LINKED worktree rather than the repository's own
@@ -135,16 +161,22 @@ impl Worktree {
         branch: &str,
         target: &str,
     ) -> Result<String> {
-        if !git_ok(worktree, &["status", "--porcelain"])?.trim().is_empty() {
+        if !git_ok(worktree, &["status", "--porcelain"])?
+            .trim()
+            .is_empty()
+        {
             bail!(
                 "the worktree has uncommitted changes: commit them with git_commit before \
                  merging into `{target}`"
             );
         }
-        let ahead: usize = git_ok(worktree, &["rev-list", "--count", &format!("{target}..{branch}")])?
-            .trim()
-            .parse()
-            .unwrap_or(0);
+        let ahead: usize = git_ok(
+            worktree,
+            &["rev-list", "--count", &format!("{target}..{branch}")],
+        )?
+        .trim()
+        .parse()
+        .unwrap_or(0);
         if ahead == 0 {
             return Ok(format!(
                 "nothing to merge: `{branch}` has no commits beyond `{target}`"
@@ -206,6 +238,17 @@ fn run_add(repo: &Path, args: &[&str]) -> Result<()> {
 
 fn is_git_repo(repo: &Path) -> bool {
     matches!(git(repo, &["rev-parse", "--git-dir"]), Ok(o) if o.status.success())
+}
+
+/// Whether `repo` already has a local branch named `branch`.
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    matches!(
+        git(
+            repo,
+            &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]
+        ),
+        Ok(o) if o.status.success()
+    )
 }
 
 /// Resolve one of git's `--git-dir`/`--git-common-dir` answers to a comparable
@@ -337,8 +380,7 @@ mod tests {
     #[test]
     fn create_on_branch_makes_a_branch_worktree() {
         let repo = scratch_repo();
-        let wt = Worktree::create_on_branch(&repo, "session-1", "comrade/session-1", "main")
-            .unwrap();
+        let wt = Worktree::open_on_branch(&repo, "session-1", "comrade/session-1", "main").unwrap();
         assert!(
             wt.path()
                 .starts_with(repo.join(".comrade").join("worktrees"))
@@ -356,8 +398,7 @@ mod tests {
     #[test]
     fn merge_folds_the_target_in_then_fast_forwards_it() {
         let repo = scratch_repo();
-        let wt = Worktree::create_on_branch(&repo, "session-1", "comrade/session-1", "main")
-            .unwrap();
+        let wt = Worktree::open_on_branch(&repo, "session-1", "comrade/session-1", "main").unwrap();
         // The repository moves on while the session works, so the fold is real.
         std::fs::write(repo.join("main-only.txt"), "later\n").unwrap();
         commit_all(&repo, "main moves");
@@ -370,7 +411,10 @@ mod tests {
         assert!(msg.contains("1 commit"), "{msg}");
 
         // The work landed in the repository checkout and both refs now agree.
-        assert_eq!(std::fs::read_to_string(repo.join("feat.txt")).unwrap(), "work\n");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("feat.txt")).unwrap(),
+            "work\n"
+        );
         assert!(repo.join("main-only.txt").exists());
         assert_eq!(head(&repo), head(wt.path()));
         wt.remove().unwrap();
@@ -380,8 +424,7 @@ mod tests {
     #[test]
     fn a_conflict_aborts_and_leaves_the_target_branch_untouched() {
         let repo = scratch_repo();
-        let wt = Worktree::create_on_branch(&repo, "session-1", "comrade/session-1", "main")
-            .unwrap();
+        let wt = Worktree::open_on_branch(&repo, "session-1", "comrade/session-1", "main").unwrap();
         std::fs::write(wt.path().join("readme.txt"), "session edit\n").unwrap();
         commit_all(wt.path(), "session edit");
         // The same file changes on the repository side.
@@ -389,9 +432,8 @@ mod tests {
         commit_all(&repo, "main edit");
         let before = head(&repo);
 
-        let err =
-            Worktree::merge_branch_into_target(&repo, wt.path(), "comrade/session-1", "main")
-                .unwrap_err();
+        let err = Worktree::merge_branch_into_target(&repo, wt.path(), "comrade/session-1", "main")
+            .unwrap_err();
 
         assert!(err.to_string().contains("conflict"), "{err}");
         // The repository is exactly as it was: same commit, same file, no merge
@@ -411,14 +453,12 @@ mod tests {
     #[test]
     fn merge_refuses_uncommitted_work_and_changes_nothing() {
         let repo = scratch_repo();
-        let wt = Worktree::create_on_branch(&repo, "session-1", "comrade/session-1", "main")
-            .unwrap();
+        let wt = Worktree::open_on_branch(&repo, "session-1", "comrade/session-1", "main").unwrap();
         std::fs::write(wt.path().join("dirty.txt"), "not committed\n").unwrap();
         let before = head(&repo);
 
-        let err =
-            Worktree::merge_branch_into_target(&repo, wt.path(), "comrade/session-1", "main")
-                .unwrap_err();
+        let err = Worktree::merge_branch_into_target(&repo, wt.path(), "comrade/session-1", "main")
+            .unwrap_err();
 
         assert!(err.to_string().contains("commit"), "{err}");
         assert_eq!(head(&repo), before);
@@ -430,8 +470,7 @@ mod tests {
     #[test]
     fn merge_with_no_new_commits_is_a_no_op() {
         let repo = scratch_repo();
-        let wt = Worktree::create_on_branch(&repo, "session-1", "comrade/session-1", "main")
-            .unwrap();
+        let wt = Worktree::open_on_branch(&repo, "session-1", "comrade/session-1", "main").unwrap();
         let before = head(&repo);
 
         let msg = Worktree::merge_branch_into_target(&repo, wt.path(), "comrade/session-1", "main")
@@ -444,11 +483,60 @@ mod tests {
     }
 
     #[test]
+    fn open_on_branch_reuses_a_leftover_worktree_and_keeps_its_commits() {
+        let repo = scratch_repo();
+        {
+            // A session that ends without merging leaves its worktree behind,
+            // exactly as an app exit does.
+            let wt =
+                Worktree::open_on_branch(&repo, "session-1", "comrade/session-1", "main").unwrap();
+            std::fs::write(wt.path().join("wip.txt"), "unmerged\n").unwrap();
+            commit_all(wt.path(), "wip");
+        }
+        // The next run of that session reopens it instead of losing the work.
+        let again =
+            Worktree::open_on_branch(&repo, "session-1", "comrade/session-1", "main").unwrap();
+        assert!(again.path().join("wip.txt").exists());
+        assert_eq!(
+            Worktree::current_branch(again.path()).unwrap(),
+            "comrade/session-1"
+        );
+        // ...and the leftover work can still be published.
+        let msg =
+            Worktree::merge_branch_into_target(&repo, again.path(), "comrade/session-1", "main")
+                .unwrap();
+        assert!(msg.contains("1 commit"), "{msg}");
+        again.remove().unwrap();
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn open_on_branch_reattaches_a_branch_whose_checkout_is_gone() {
+        let repo = scratch_repo();
+        let wt = Worktree::open_on_branch(&repo, "session-1", "comrade/session-1", "main").unwrap();
+        std::fs::write(wt.path().join("wip.txt"), "unmerged\n").unwrap();
+        commit_all(wt.path(), "wip");
+        // The checkout goes away but the branch (and its commit) survives.
+        wt.remove().unwrap();
+
+        let again =
+            Worktree::open_on_branch(&repo, "session-1", "comrade/session-1", "main").unwrap();
+        assert!(
+            again.path().join("wip.txt").exists(),
+            "the branch's commits must be checked out again, not recreated empty"
+        );
+        again.remove().unwrap();
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn is_linked_tells_a_worktree_from_the_main_checkout() {
         let repo = scratch_repo();
-        assert!(!Worktree::is_linked(&repo), "the main checkout is not linked");
-        let wt = Worktree::create_on_branch(&repo, "session-1", "comrade/session-1", "main")
-            .unwrap();
+        assert!(
+            !Worktree::is_linked(&repo),
+            "the main checkout is not linked"
+        );
+        let wt = Worktree::open_on_branch(&repo, "session-1", "comrade/session-1", "main").unwrap();
         assert!(Worktree::is_linked(wt.path()), "a worktree is linked");
         assert_eq!(
             Worktree::repo_root(wt.path()).unwrap(),

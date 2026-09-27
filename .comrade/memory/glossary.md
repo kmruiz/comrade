@@ -777,6 +777,16 @@ Backed by fastembed (quantized BGE-small-en-v1.5, in-process ONNX) + a flat cosi
 **Notes:**
 SessionFile is the on-disk JSON form (version/title/status/plan/delegated/finished/chat/section_collapsed/ctx_*/history/rollup/evicted). Save/load prompt for a file path each time (find-file semantics). Ctrl-x is a prefix key handled in handle_event; PathPrompt and SessionPick are the two modals it drives. AgentSession::restore and ContextManager::from_parts rebuild the live session on load/switch/fork. new-session is non-destructive: it stashes the current session and opens a fresh empty slot (emacs scratch-buffer semantics); kill-session discards the active slot and activates a neighbour and refuses to close the only session.
 
+## session worktree
+> The per-session git worktree a TUI session runs in: `comrade/session-<id>`, checked out at `<repo>/.comrade/worktrees/session-<id>` and cut from the branch the repository has checked out at startup (auto-detected, so `main` or `master` both work). Every session gets one, so concurrent sessions (and their delegates, which nest inside it) cannot clobber the repository's own checkout: the session's `ToolContext.project_root`/`cwd`, its `MemoryUndo` root and its system prompt's working directory are all the worktree. Created/reused by `Worktree::open_on_branch` — a leftover worktree or branch from a previous run is REUSED, never destroyed, so unmerged work survives; a non-git project, a detached HEAD or a git failure falls back to sharing the repository directory. Published when the agent judges its work verified, via the approval-gated `git_merge_session` tool, which folds the target branch into the session branch (aborting any conflict inside the worktree) and only then fast-forwards the repository — see ADR 0090. Distinct from the delegate job worktree (a DETACHED worktree at `.comrade/worktrees/<numeric id>`, ADR 0072).
+
+**References:**
+- `crates/comrade-core/src/worktree.rs`
+- `crates/comrade-tool-git/src/merge.rs`
+- `crates/comrade-tui/src/tui.rs`
+- `crates/comrade-core/prompts/session-worktree.md`
+- `.comrade/memory/0090-every-session-works-in-its-own-worktree-and-merges-back-with-a-fold-then-fast-forward.md`
+
 ## show_diagram
 > The session tool models call to show an ASCII-art diagram in the chat. `kind="flow"` renders a sequence of `steps` as aligned boxes joined by `-->` arrows (horizontal by default, auto-falling back to vertical when the row is wider than `width`, default 100); `kind="raw"` frames ASCII the model supplies in `ascii`. Lives in crates/comrade-tool-session/src/diagram.rs and is registered by `comrade_tool_session::all()`. It takes no `self_` prefix (like `ask_form`) because it does not change the agent's own session state.
 

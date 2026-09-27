@@ -347,10 +347,14 @@ struct SessionBundle {
 
 /// Wire a fresh [`comrade_core::AgentSession`] + [`ToolContext`] to `tx`, the
 /// session's own run-facing event sender (see [`spawn_tagged_relay`]).
+///
+/// `root` is the directory the session works in — its own isolated worktree when
+/// the caller created one, otherwise the repository itself.
 pub(crate) fn session_bundle(
     deps: &Deps,
     user: Arc<dyn comrade_tool::UserIo>,
     tx: tokio::sync::mpsc::Sender<comrade_core::AgentEvent>,
+    root: &std::path::Path,
 ) -> SessionBundle {
     let session = Arc::new(comrade_core::AgentSession::new(tx));
     // The session's own model answers a stuck sub-agent's `ask_upwards`
@@ -363,7 +367,7 @@ pub(crate) fn session_bundle(
              Answer with a decision: the exact next action it should take, concrete and at most a \
              few sentences. Do not ask it questions back and do not tell it to find out itself.",
             deps.cfg.llm.display(),
-            deps.root.display()
+            root.display()
         ),
     )));
     // The guardrail (Jev/TypeSafe) judges a RUNNING delegate and can tell the
@@ -372,13 +376,15 @@ pub(crate) fn session_bundle(
     if let Some(guardrail) = comrade_core::guardrail_from_cfg(&deps.cfg.guardrails) {
         session.set_guardrail(guardrail);
     }
-    let undo = Arc::new(MemoryUndo::new(deps.root.clone()));
+    let undo = Arc::new(MemoryUndo::new(root.to_path_buf()));
     // Install the configured filesystem/shell guardrails process-wide so the fs
     // and shell tools honour `[security] extra_roots`/`shell_allow`/`shell_deny`.
+    // The policy is rooted at the repository so an isolated worktree inside it
+    // stays writable.
     comrade_tool::set_policy(deps.cfg.security.to_policy(&deps.root));
     let ctx_base = ToolContext {
-        project_root: deps.root.clone(),
-        cwd: deps.root.clone(),
+        project_root: root.to_path_buf(),
+        cwd: root.to_path_buf(),
         session: session.clone().as_control(),
         user,
         undo: undo.clone(),
@@ -402,7 +408,11 @@ fn new_session(
     let (tx, rx) = tokio::sync::mpsc::channel(512);
     let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_event_relay(rx, ui_tx);
-    (session_bundle(deps, user, tx.clone()), tx, ui_rx)
+    (
+        session_bundle(deps, user, tx.clone(), &deps.root),
+        tx,
+        ui_rx,
+    )
 }
 
 #[tokio::main]

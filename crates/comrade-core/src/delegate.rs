@@ -63,6 +63,7 @@ pub const TOOL_NAME: &str = "delegate";
 /// game because the delegate runs auto-approved under a one-shot human handoff.
 pub const DENIED_FOR_DELEGATES: &[&str] = &[
     "git_commit",
+    "git_merge_session",
     "git_stash",
     "git_branch",
     "git_checkout",
