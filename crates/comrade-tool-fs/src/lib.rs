@@ -13,14 +13,11 @@ use comrade_tool::{Tool, ToolContext, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Maximum characters a read/listing returns before truncation.
+/// Maximum characters a listing, search or explicit-window read returns before
+/// truncation. `fs_read_file` with no window is deliberately NOT clamped: the
+/// caller bounds a read itself with `start_line`/`end_line` (or `fs_read_ranges`),
+/// and the agent loop still truncates every observation it feeds back.
 const MAX_OUTPUT_CHARS: usize = 6000;
-
-/// A bare `read_file` (no window) on a file longer than this returns only the
-/// head of the file, not the whole thing, so reading one big file cannot burn
-/// the whole context budget. Pass `start_line`/`end_line` (or use `read_ranges`)
-/// to read past the default window; the footer reports the total line count.
-const MAX_UNWINDOWED_LINES: usize = 150;
 
 /// When `enabled`, returns the set of files that differ from HEAD; otherwise
 /// `None` (no restriction). Propagates the "not a git repository" error.
@@ -278,7 +275,7 @@ struct FsReadFile;
 static FS_READ_FILE_SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
     ToolSpec {
     name: "fs_read_file".into(),
-    description: "Read a text file (project-root relative). A bare read of a long file returns only its head: pass start_line/end_line or use fs_read_ranges to read a window.".into(),
+    description: "Read a text file (project-root relative). A bare read returns the whole file; pass start_line/end_line or use fs_read_ranges to read a window.".into(),
     json_schema: json!({
         "type": "object",
         "properties": {
@@ -330,39 +327,27 @@ impl Tool for FsReadFile {
         let text = String::from_utf8(bytes).context("file is not valid UTF-8")?;
         let lines: Vec<&str> = text.lines().collect();
         let total = lines.len();
-        // Explicit windows are honoured as requested; a bare read (no window at
-        // all) is capped to the head of the file so whole big files don't eat
-        // the context budget. The footer always reports the total line count
-        // and how to read the rest.
+        // Explicit windows are honoured exactly as requested; a bare read (no
+        // window at all) returns the whole file — the caller bounds the read
+        // with start_line/end_line or fs_read_ranges. The footer reports the
+        // total line count.
         let (lo, hi) = match (args.start_line, args.end_line) {
             (Some(s), Some(e)) => (s.saturating_sub(1), e.min(total)),
             (Some(s), None) => (s.saturating_sub(1), total),
             (None, Some(e)) => (0, e.min(total)),
-            (None, None) => (0, MAX_UNWINDOWED_LINES.min(total)),
+            (None, None) => (0, total),
         };
         if lo >= total || hi <= lo {
             return Ok(format!("({total} lines total; requested window is empty)"));
         }
-        let unwindowed_cap =
-            args.start_line.is_none() && args.end_line.is_none() && total > MAX_UNWINDOWED_LINES;
-        // Clamp the content first so the informative footer below always
-        // survives (a plain whole-output clamp would cut it off).
-        let mut content = String::new();
+        let mut out = String::new();
         for (idx, line) in lines[lo..hi].iter().enumerate() {
-            content.push_str(&format!("{:>6} {}\n", lo + idx + 1, line));
+            out.push_str(&format!("{:>6} {}\n", lo + idx + 1, line));
         }
-        let mut out = clamp(content);
         if !out.ends_with('\n') {
             out.push('\n');
         }
-        out.push_str(&format!("-- {}..{} of {total} lines", lo + 1, hi));
-        if unwindowed_cap {
-            out.push_str(&format!(
-                " (file longer than the {MAX_UNWINDOWED_LINES}-line default window: \
-                 pass start_line/end_line or use fs_read_ranges to read the rest)"
-            ));
-        }
-        out.push_str(" --\n");
+        out.push_str(&format!("-- {}..{} of {total} lines --\n", lo + 1, hi));
         Ok(out)
     }
 }
@@ -1734,7 +1719,7 @@ mod tests {
     }
 
     #[test]
-    fn read_file_default_window_caps_bare_reads_of_long_files() {
+    fn read_file_bare_read_returns_the_whole_file() {
         use std::sync::Arc;
 
         use async_trait::async_trait;
@@ -1792,7 +1777,11 @@ mod tests {
             std::thread::current().name().unwrap_or("t")
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let body: String = (1..=300).map(|i| format!("body line {i}\n")).collect();
+        // Each line is padded well past the old 6000-char output clamp, so the
+        // whole-file read below also proves no character cap is applied.
+        let body: String = (1..=300)
+            .map(|i| format!("body line {i} {}\n", "x".repeat(50)))
+            .collect();
         std::fs::write(root.join("big.rs"), &body).unwrap();
 
         let ctx = ToolContext {
@@ -1812,38 +1801,36 @@ mod tests {
             .build()
             .unwrap();
 
-        // A bare read of a 300-line file returns only the head window, still
-        // states the total, and tells the caller how to read the rest.
+        // A bare read (no window) returns the WHOLE file, not just a head of it,
+        // and does not cap the characters it hands back.
         let out = rt
             .block_on(FsReadFile.invoke(&ctx, json!({ "path": "big.rs" })))
             .unwrap();
-        assert!(out.contains("body line 1"), "{out}");
-        assert!(!out.contains("body line 200"), "{out}");
-        assert!(out.contains("-- 1..150 of 300 lines"), "{out}");
-        assert!(
-            out.contains("pass start_line/end_line or use fs_read_ranges to read the rest"),
-            "{out}"
-        );
+        assert!(out.contains("body line 1 "), "{out}");
+        assert!(out.contains("body line 200 "), "{out}");
+        assert!(out.contains("body line 300 "), "{out}");
+        assert!(!out.contains("output truncated"), "{out}");
+        assert!(out.contains("-- 1..300 of 300 lines --"), "{out}");
 
-        // An explicit window is honoured exactly, even past the default cap.
+        // An explicit window is honoured exactly.
         let out = rt
             .block_on(FsReadFile.invoke(
                 &ctx,
                 json!({ "path": "big.rs", "start_line": 250, "end_line": 260 }),
             ))
             .unwrap();
-        assert!(out.contains("body line 250"), "{out}");
-        assert!(out.contains("body line 260"), "{out}");
-        assert!(!out.contains("body line 1"), "{out}");
-        assert!(out.contains("-- 250..260 of 300 lines"), "{out}");
+        assert!(out.contains("body line 250 "), "{out}");
+        assert!(out.contains("body line 260 "), "{out}");
+        assert!(!out.contains("body line 100 "), "{out}");
+        assert!(out.contains("-- 250..260 of 300 lines --"), "{out}");
 
-        // A file small enough to fit the default window is returned whole.
+        // A small file is returned whole too.
         std::fs::write(root.join("small.rs"), "a\nb\nc\n").unwrap();
         let out = rt
             .block_on(FsReadFile.invoke(&ctx, json!({ "path": "small.rs" })))
             .unwrap();
         assert!(out.contains("a\n") && out.contains("c"), "{out}");
-        assert!(out.contains("-- 1..3 of 3 lines"), "{out}");
+        assert!(out.contains("-- 1..3 of 3 lines --"), "{out}");
 
         // A reversed window (start_line > end_line) must not panic: it used to
         // slice `lines[lo..hi]` with hi < lo. It reports an empty window instead.
