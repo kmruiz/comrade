@@ -166,13 +166,15 @@ bounded by `[agent].delegate_timeout_secs` (default `300`) seconds of INACTIVITY
 a delegate that completes nothing (no model reply, no tool result) is nudged to
 act after that long and stopped at twice it, while any completed request or tool
 call resets the clock, so a slow but working delegate is never cut off and a
-stuck one can never hang the parent run. While a delegate runs, the tech lead is
-shown its transcript every `[agent].delegate_supervise_secs` (default `60`) and
-replies either OK or a short correction — and every run gets at most 5 parent
-interventions in total, shared with the context-overflow recovery, so a delegate
-that drifts off its step — or outgrows its context window — is steered back
-instead of being left to loop, without turning into an endless conversation with
-the tech lead.
+stuck one can never hang the parent run. While a delegate runs, a guardrail is
+consulted every `[agent].delegate_supervise_secs` (default `60`) and returns one
+of `continue` (leave it), `steer` (the tech lead model writes a short
+correction) or `stop` (end the run and report the reason). The guardrail is Jev
+(TypeSafe) when `[guardrails].jev_api_key` is set, and the tech lead model
+otherwise. Every run gets at most 5 parent interventions in total, shared with
+the context-overflow recovery, so a delegate that drifts off its step — or
+outgrows its context window — is steered back instead of being left to loop,
+without turning into an endless conversation with the tech lead.
 
 ### `[agent]`
 
@@ -201,6 +203,91 @@ the tech lead.
 | `extra_roots` | `[]` | Extra directories the filesystem tools may touch. |
 | `shell_allow` | `[]` | If set, `shell`/`run_bg` commands must start with one of these. |
 | `shell_deny` | `[]` | `shell`/`run_bg` commands containing any of these are refused. |
+
+### `[guardrails]`
+
+The guardrail mechanism: an external service that judges a RUNNING delegated
+sub-agent and tells the tech lead whether to leave it, correct it or stop it.
+When `jev_api_key` is set, Comrade sends the parent's `task` and `context` for
+the delegate, plus its last ~20 messages (structured `state`, each message capped
+at 20 000 chars) to Jev (TypeSafe's `POST /v1/systemone`) and asks five typed
+`noul` (yes/no probability) questions about the situation — is it on task,
+looping, blocked, missing context, making progress. Comrade then maps
+those probabilities to an action itself. A **loop** stops the run and asks the
+tech lead to choose a recovery — do the task itself, split it and delegate
+again, or restart it with a better context — which is reported back and shown in
+the chat; a **block** stops the run with a reason; a context gap / drift / stall
+**steers** it; otherwise it **continues**. `continue` costs no model call;
+`steer` makes the tech lead model write the correction; `stop` ends the run and
+reports the reason back to the lead. With no key (or if the call fails or times
+out) the tech lead model supervises exactly as before. The thresholds live as
+named constants in `crates/comrade-core/src/guardrails.rs`.
+
+| Key | Default | Notes |
+|---|---|---|
+| `enabled` | `true` | Master switch; the guardrail is only active when a key is present. |
+| `jev_api_key` | – | TypeSafe/Jev API key, sent as `Authorization: Bearer …`. Setting a non-empty key turns the guardrail on. |
+| `jev_url` | `https://api.typesafe.ai/v1/systemone` | Evaluation endpoint. |
+| `jev_model` | `jev-latest` | Model alias to evaluate with. |
+| `jev_timeout_secs` | `30` | A guardrail call slower than this falls back to the lead model (`0` = off). |
+| `interval_secs` | `60` | How often the ROOT agent's guardrail is consulted as an advisory tick (`0` = only the read/stall/verify triggers). |
+
+The same guardrail also advises the **root agent**: at the periodic tick, when
+it has made many reads in a row, or when it stalls or stops verifying, Jev's
+diagnosis is delivered as a chat notice (`guardrail: …`) and a harness note the
+agent can act on. For the root it is **advisory only** — it never refuses a tool
+or stops the run, so the agent steers itself (with no key, the previous
+read-guard refusals and canned nudges apply unchanged).
+
+```toml
+[guardrails]
+jev_api_key = "$TYPESAFE_API_KEY"
+```
+
+### Test-first (TDD)
+
+The same Jev connection backs the `validate_tests` tool (advertised only when a
+`jev_api_key` is set). It makes the lead work test-first: write the tests for a
+feature, call `validate_tests` with `feature` and `tests`, and Jev scores how
+well the tests cover the feature (a `score` question over `none / sparse /
+partial / good / comprehensive`). The top two levels are **ACCEPTED** — the
+lead then delegates the implementation (the tests are the spec and must not be
+weakened) and refactors once they are green; below that the lead must strengthen
+the tests first. It is advisory: the tool returns a verdict, it does not gate the
+delegate. The prompt section `Test-first (TDD)` (included only when the tool is
+available) also tells the lead to keep the implementation MINIMAL and to refactor
+until the least code that passes remains, and to choose test types by cost and
+coverage — **unit** (cheapest, least), **integration** (middle), **functional**
+(most expensive, most) — following the test pyramid: more unit than integration,
+more integration than functional.
+
+### Requirements
+
+Two more Jev tools (advertised only with a `jev_api_key`) make the lead challenge
+a feature before it plans:
+
+- **`score_feature`** scores the request 0-3 for **customer value**,
+  **technical challenge** and **UX challenge**, plus the risk of a negative
+  **architecture** or **product** impact (0-1). The `Requirements` prompt uses
+  the scores to decide: raise a high architecture/product risk (≥ 0.6) with the
+  user at once, question a low customer value (≤ 1), and gather more information
+  when the technical/UX challenge is high (≥ 2).
+- **`evaluate_questions`** filters the lead's clarifying questions: it consults a
+  delegate (`ask_advise`) for clarity and questions, sends the request as `state`
+  and **one `noul` per question** ("is this a good clarifying question?"), and
+  the lead asks the user only the accepted **feature-level** ones with
+  `ask_form`, always attaching a `recommended` answer. Technical questions score
+  low unless the request implies a big architectural change.
+
+### Challenge the approach
+
+With `rank_alternatives` (same Jev key) the lead validates the approach before
+committing: it looks for prior art and alternatives (`web_search`/`web_fetch`
+and the repo), ranks them with **one Jev `choice` question** over the options,
+and presents the **top 3** to the user with its reasoning via `ask_form`. The
+user's decision is final — the lead does not reopen it. All three tool results
+are data-only; the conditional prompt sections drive the flow, and everything is
+skipped for trivial or unambiguous changes.
 
 ### `[[mcp.servers]]`
 
