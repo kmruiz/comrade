@@ -10134,6 +10134,84 @@ mod tests {
         assert!(text.contains("working"), "{text:?}");
     }
 
+    // --- progress narration (the agent's sign of life) ---------------------
+
+    #[tokio::test]
+    async fn a_progress_sentence_before_a_tool_call_survives_focus_mode() {
+        let mut app = test_app();
+        app.focus_mode = true;
+        app.on_agent_event(AgentEvent::Delta(
+            "Reading the prompt builder to find where the sections are assembled.".to_string(),
+        ));
+        app.on_agent_event(AgentEvent::ToolCall {
+            name: "fs_read_file".to_string(),
+            args: "{}".to_string(),
+            tokens: None,
+        });
+        let reasoning = app
+            .chat
+            .iter()
+            .find(|m| m.kind == MsgKind::Reasoning)
+            .expect("the progress sentence becomes a reasoning block");
+        assert!(
+            reasoning.text.contains("Reading the prompt builder"),
+            "{:?}",
+            reasoning.text
+        );
+        assert!(focus_visible(reasoning));
+        let tool = app
+            .chat
+            .iter()
+            .find(|m| m.kind == MsgKind::Tool)
+            .expect("the tool card is pushed too");
+        assert!(!focus_visible(tool));
+    }
+
+    #[tokio::test]
+    async fn one_progress_sentence_covers_a_whole_batch_of_tool_calls() {
+        let mut app = test_app();
+        app.focus_mode = true;
+        app.on_agent_event(AgentEvent::Delta(
+            "Reading three files at once.".to_string(),
+        ));
+        for name in ["fs_read_file", "fs_read_file", "fs_rgrep"] {
+            app.on_agent_event(AgentEvent::ToolCall {
+                name: name.to_string(),
+                args: "{}".to_string(),
+                tokens: None,
+            });
+        }
+        let n = app
+            .chat
+            .iter()
+            .filter(|m| m.kind == MsgKind::Reasoning)
+            .count();
+        assert_eq!(
+            n, 1,
+            "the batch's sentence is shown once, not once per call"
+        );
+    }
+
+    #[tokio::test]
+    async fn react_thought_is_focus_visible_while_its_tool_card_is_hidden() {
+        let mut app = test_app();
+        app.focus_mode = true;
+        app.on_agent_event(AgentEvent::Thought(
+            "Running the test suite to check the change.".to_string(),
+        ));
+        let note = app.chat.last().expect("a message");
+        assert_eq!(note.kind, MsgKind::Reasoning);
+        assert!(focus_visible(note));
+        app.on_agent_event(AgentEvent::ToolCall {
+            name: "pom_run_tests".to_string(),
+            args: "{}".to_string(),
+            tokens: None,
+        });
+        let card = app.chat.last().expect("a message");
+        assert_eq!(card.kind, MsgKind::Tool);
+        assert!(!focus_visible(card));
+    }
+
     #[test]
     fn layout_chat_rows_focus_run_with_reasoning_shows_reasoning() {
         let run_with_reasoning = Msg::run(vec![

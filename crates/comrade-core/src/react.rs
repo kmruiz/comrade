@@ -32,6 +32,7 @@ const CHALLENGE: &str = include_str!("../prompts/challenge.md");
 const MEMORY: &str = include_str!("../prompts/memory.md");
 const TRUST_BOUNDARIES: &str = include_str!("../prompts/trust-boundaries.md");
 const TOOLS_INTRO: &str = include_str!("../prompts/tools-intro.md");
+const PROGRESS: &str = include_str!("../prompts/progress.md");
 const PROTOCOL: &str = include_str!("../prompts/protocol.md");
 const PROTOCOL_NATIVE: &str = include_str!("../prompts/protocol-native.md");
 const FINISHING: &str = include_str!("../prompts/finishing.md");
@@ -103,6 +104,7 @@ fn build_prompt(project_root: &str, tools: &ToolRegistry, budget: usize, native:
         prompt.push_str(&render_tool(tool.spec()));
         prompt.push('\n');
     }
+    prompt.push_str(PROGRESS);
     prompt.push_str(if native { PROTOCOL_NATIVE } else { PROTOCOL });
     prompt
 }
@@ -919,5 +921,39 @@ mod dev_prompt_tests {
         let tools_head = p.find("## Tools").unwrap();
         let tool_line = p.find("### read_file").unwrap();
         assert!(tools_head < tool_line, "{p}");
+    }
+}
+
+#[cfg(test)]
+mod progress_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_asks_for_progress_updates_before_tool_calls() {
+        let reg = ToolRegistry::new();
+        let react = build_system_prompt("/x", &reg, 6000);
+        assert!(react.contains("## Keeping the user informed"), "{react}");
+        assert!(
+            react.contains("Open each batch of tool calls with ONE short sentence"),
+            "{react}"
+        );
+        assert!(react.contains("sign of life"), "{react}");
+        // Always on: the native function-calling prompt carries it too.
+        let native = build_system_prompt_for("/x", &reg, 6000, true);
+        assert!(native.contains("## Keeping the user informed"), "{native}");
+        assert!(
+            native.contains("Open each batch of tool calls with ONE short sentence"),
+            "{native}"
+        );
+    }
+
+    #[test]
+    fn progress_rule_is_bounded_so_it_does_not_spam() {
+        let reg = ToolRegistry::new();
+        let prompt = build_system_prompt("/x", &reg, 6000);
+        assert!(
+            prompt.contains("Do not narrate every single call"),
+            "{prompt}"
+        );
     }
 }

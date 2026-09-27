@@ -237,62 +237,6 @@ Distinct from the call-count guards STALL_NUDGE / VERIFY_NUDGE / DELEGATE_READ_N
 **Notes:**
 Detected per row by subchat_model(msg.author, app.cfg.delegates); drawn by render_row_line's `sub: Option<Color>` param. Folded MsgKind::Run digests keep no sub-chat styling.
 
-## guardrail mechanism
-> The judge consulted while a delegated sub-agent is still RUNNING (every `[agent].delegate_supervise_secs`, default 60s) to decide whether the lead should `continue` (leave it alone), `steer` (write a correction for it) or `stop` (end the run and report the reason). The seam is `comrade_tool::Guardrail` + `GuardOutcome` + `GuardInput`/`GuardMessage` (crates/comrade-tool/src/ask.rs); the session carries it via `SessionControl::guardrail()` / `AgentSession::set_guardrail`. The implementation is `JevGuardrail` (crates/comrade-core/src/guardrails.rs): it sends structured `state` (`delegated_task` = the parent's own `{task, context}`, plus the last ~20 `recent_conversation` entries as `{role, content}`, each message capped at 20,000 chars) to TypeSafe's `POST https://api.typesafe.ai/v1/systemone` with FIVE typed `noul` questions and maps the probabilities to a verdict ITSELF via the pure `decide`. Configured under `[guardrails]` (`jev_api_key`, `jev_url`, `jev_model`, `jev_timeout_secs`); `guardrail_from_cfg` builds it (None without a key). Applied at the delegate loop's rest point in crates/comrade-core/src/delegate.rs.
-
-**References:**
-- `crates/comrade-core/src/guardrails.rs`
-- `crates/comrade-core/src/delegate.rs`
-- `crates/comrade-core/src/upward.rs`
-- `crates/comrade-tool/src/ask.rs`
-- `crates/comrade-core/src/config.rs`
-- `.comrade/memory/0079-the-guardrail-mechanism-uses-jev-to-continue-steer-or-stop-a-running-delegate.md`
-
-**Notes:**
-The five diagnostics are `on_task`, `looping`, `needs_context`, `blocked`, `making_progress` (each a `noul` yes/no probability). COMRADE decides, not Jev: LOOP if `looping >= 0.8`; else STOP if `blocked >= 0.8`; else STEER if `needs_context >= 0.7` (hint: supply the context), `on_task <= 0.3` (drift), or `making_progress <= 0.3` (stall); else CONTINUE. Missing answers default benign (on task, progressing, not looping) so a partial/empty response fails open to `continue`; thresholds are constants in guardrails.rs. Jev returns probabilities, not prose, so on `steer` the lead MODEL writes the correction via the historical `UpwardAsk::supervise` path with the diagnostic hint appended to the briefing; `continue` costs no model call. Jev is first, model is the fallback: no key, a disabled guardrail, an error or a timeout (`invoke_within`) makes `guardrail_check` return None and the loop supervises with the model as before. `stop` returns `guardrail_stop_answer` to the lead. A LOOP is special: `loop_recovery` (delegate.rs) sends the lead a status (reason + the delegate's `task`/`context` + transcript tail), calls `UpwardAsk::recover` to pick `Recovery::{SelfWork, Split, Restart(context)}`, SHOWS the decision in the chat via `ActivityEvents::notice` ("stuck in a loop - lead will …", SessionEvents -> AgentEvent::Notice), and returns `recovery_answer` so the lead takes the task over, splits it and re-delegates, or re-delegates with the improved context. Budget unchanged: a guardrail round and `recover_context` share `MAX_DELEGATE_INTERVENTIONS = 5` parent calls per run. `Duration::ZERO` / `delegate_supervise_secs = 0` disables the mechanism; comrade-tui passes ZERO for `ask_advise`. The SAME guardrail also advises the ROOT agent (`root_guard` in crates/comrade-core/src/agent.rs), ADVISORY ONLY (never refuses a tool or stops the run): consulted on a periodic tick (`[guardrails].interval_secs`, default 60) and when the root read guard fires, its diagnosis replaces the canned stall/verify/loop-refusal guidance and is delivered as `AgentEvent::Notice("guardrail: …")` + a harness note. With a guardrail configured, the consecutive-read threshold now ADVISES and lets the read run (the agent steers itself); with no guardrail the old hard read refusal and canned nudges stand. Tests: guardrails.rs unit tests, upward.rs `parse_recovery_reads_the_three_decisions`, agent.rs `root_guard_delivers_advice_and_falls_back`, and the delegate tests `guardrail_continue_skips_the_lead_model`, `guardrail_steer_asks_the_lead_to_write_the_correction`, `guardrail_stop_ends_the_run_and_reports_to_the_lead`, `guardrail_loop_asks_the_lead_to_recover_and_shows_it`.
-
-## Jev client
-> The shared TypeSafe/SystemOne transport, `crates/comrade-core/src/jev.rs`: `Jev::from_cfg(&GuardrailsCfg)` builds it from `[guardrails]` (None without a key), `Jev::evaluate(state, questions)` POSTs `{ state, model, questions }` to the endpoint with `Authorization: Bearer` and returns the `answers` map, and `noul`/`score`/`top_level` read one answer's fields. `JevGuardrail` (guardrails.rs) and `validate_tests` (tdd.rs) both build on it.
-
-**References:**
-- `crates/comrade-core/src/jev.rs`
-- `crates/comrade-core/src/guardrails.rs`
-- `crates/comrade-core/src/tdd.rs`
-
-## validate_tests (TDD coverage check)
-> The lead-only tool `validate_tests` (crates/comrade-core/src/tdd.rs, registered in comrade-tui only when Jev is configured) that scores how well the tests written for a feature cover it before any implementation. Input `{ feature, tests }` (tests is an array, a lone string is also accepted); it sends `state = { feature, tests }` and ONE Jev `score` question over five levels `none / sparse / partial / good / comprehensive`. ACCEPTED when the weighted `score >= 3.0` of 4 (the top two levels). The result is DATA - one line `Test coverage X/4 (label): ACCEPTED|NOT ENOUGH (threshold 3.0/4)`, no imperative - and the prompt section drives the action: ACCEPTED -> delegate the IMPLEMENTATION with the tests as the spec (they must fail first and must not be weakened) and refactor once green; NOT ENOUGH -> strengthen the tests and call again, do not implement. ADVISORY - it returns a verdict and does not gate `delegate`. The score question's instructions also weigh the TEST PYRAMID. The workflow is in the conditional prompt section `crates/comrade-core/prompts/tdd.md` (included by react::build_system_prompt only when the tool is advertised), pointed at from working-style.md steps 4-5; it also demands the LEAST code that makes the accepted tests pass, treats refactoring as ESSENTIAL, and picks test types by cost/coverage (unit cheapest/least, integration middle, functional most expensive/most) with more unit than integration and more integration than functional.
-
-**References:**
-- `crates/comrade-core/src/tdd.rs`
-- `crates/comrade-core/prompts/tdd.md`
-- `crates/comrade-tui/src/main.rs`
-- `.comrade/memory/0080-test-first-write-tests-validate-coverage-with-jev-then-delegate-the-implementation.md`
-
-## evaluate_questions (requirements filter)
-> The lead-only tool `evaluate_questions` (crates/comrade-core/src/requirements.rs, registered in comrade-tui only when Jev is configured) that filters the lead's CLARIFYING questions before it asks the user. Input `{ request, questions }` (questions is an array, a lone string is also accepted); it sends `state = { user_request }` and ONE Jev `noul` per candidate question - "is this a GOOD clarifying question to ask the user?" - whose criteria demand a FEATURE-level question and allow a technical one only for a big architectural change. The result is DATA: each question with its probability and an `ACCEPTED`/`REJECTED` label (accept at `>= 0.60`), never an imperative. The workflow is in the conditional prompt section `crates/comrade-core/prompts/requirements.md` (included by react::build_system_prompt only when the tool is advertised), pointed at from tools-intro.md and working-style.md step 2: for a feature or bug, consult a delegate with `ask_advise`, draft feature-level questions, filter them with `evaluate_questions`, and ask the user the accepted ones with `ask_form` - every field carrying a `recommended` value and a rationale - before planning.
-
-**References:**
-- `crates/comrade-core/src/requirements.rs`
-- `crates/comrade-core/prompts/requirements.md`
-- `crates/comrade-tui/src/main.rs`
-- `.comrade/memory/0086-gather-requirements-before-planning-delegate-drafted-jev-filtered-questions-answered-by-the-user-with-suggestions.md`
-
-## score_feature (feature scoring)
-> The lead-only tool `score_feature` (crates/comrade-core/src/scoring.rs, registered in comrade-tui only when Jev is configured) that scores a feature BEFORE planning. Input `{ feature }`; it asks Jev three `score` questions over four levels (0-3) - `customer_value`, `technical_challenge`, `ux_challenge` - plus two `noul` risks (`architecture_risk`, `product_risk`, 0-1). The result is DATA (the numbers + level labels), no imperative. The `## Requirements` prompt turns them into decisions: a high architecture/product risk (>= 0.6) is RAISED with the user at once, a low customer value (<= 1) questions whether to build it, and a high technical/UX challenge (>= 2) means gather MORE information before planning.
-
-**References:**
-- `crates/comrade-core/src/scoring.rs`
-- `crates/comrade-core/src/jev.rs`
-- `.comrade/memory/0088-score-a-feature-0-3-for-value-challenge-and-risk-and-let-the-scores-drive-the-requirements.md`
-
-## rank_alternatives (alternative ranking)
-> The lead-only tool `rank_alternatives` (crates/comrade-core/src/alternatives.rs, registered in comrade-tui only when Jev is configured) that challenges an approach before the lead commits. Input `{ request, alternatives }` (2-4 options, a lone string also accepted); it sends `state = { user_request, alternatives }` and ONE Jev `choice` question - "which single alternative is best?" (soundness, then simplicity and cost) - and returns the full probability distribution as DATA, best first (the `jev::probabilities` helper; Jev's single `choice` is put first if no distribution comes back). The `## Challenge the approach` prompt tells the lead to present the TOP 3 to the user with its reasoning via `ask_form`, then treat the user's decision as FINAL.
-
-**References:**
-- `crates/comrade-core/src/alternatives.rs`
-- `crates/comrade-core/prompts/challenge.md`
-- `.comrade/memory/0087-challenge-the-approach-rank-alternatives-with-jev-then-the-user-decides.md`
-
 ## Delegate timeout
 > A wall-clock budget (`[agent].delegate_timeout_secs`, default **300s / 5 minutes**; `0` = no limit) applied to every delegated sub-agent run (`delegate`, `delegate_parallel`, `ask_advise`). Enforced in `crates/comrade-core/src/delegate.rs`: each model request and tool call is bounded by the time left, and when the budget runs out the delegate returns `timeout_answer(...)` — a partial answer if it had one, else a notice that it did not finish. Prevents a slow/hung model request or hanging tool from holding the parent run open. (Originally 60s; raised to 300s on 2026-09-14 — the 60s default was too aggressive.)
 
@@ -419,6 +363,15 @@ Why a larger batch size makes the cold build slower, not faster. Measured on thi
 - `crates/comrade-core/src/delegate.rs`
 - `crates/comrade-tui/src/tui.rs`
 
+## evaluate_questions (requirements filter)
+> The lead-only tool `evaluate_questions` (crates/comrade-core/src/requirements.rs, registered in comrade-tui only when Jev is configured) that filters the lead's CLARIFYING questions before it asks the user. Input `{ request, questions }` (questions is an array, a lone string is also accepted); it sends `state = { user_request }` and ONE Jev `noul` per candidate question - "is this a GOOD clarifying question to ask the user?" - whose criteria demand a FEATURE-level question and allow a technical one only for a big architectural change. The result is DATA: each question with its probability and an `ACCEPTED`/`REJECTED` label (accept at `>= 0.60`), never an imperative. The workflow is in the conditional prompt section `crates/comrade-core/prompts/requirements.md` (included by react::build_system_prompt only when the tool is advertised), pointed at from tools-intro.md and working-style.md step 2: for a feature or bug, consult a delegate with `ask_advise`, draft feature-level questions, filter them with `evaluate_questions`, and ask the user the accepted ones with `ask_form` - every field carrying a `recommended` value and a rationale - before planning.
+
+**References:**
+- `crates/comrade-core/src/requirements.rs`
+- `crates/comrade-core/prompts/requirements.md`
+- `crates/comrade-tui/src/main.rs`
+- `.comrade/memory/0086-gather-requirements-before-planning-delegate-drafted-jev-filtered-questions-answered-by-the-user-with-suggestions.md`
+
 ## fixed-footprint overflow
 > A context-window overflow in which the FIXED part of a request - the sub-agent's system prompt plus the schemas of the tools advertised to it - already exceeds the model's window before any work has accumulated. Distinguished from a variable-history overflow, where what the agent accumulated (tool output, turns) is what grew past the window. Only the latter can be fixed by summarising; summarising an empty history still overflows.
 
@@ -444,10 +397,12 @@ Detected in the delegate loop by `history_is_material` (crates/comrade-core/src/
 Known remaining exceptions (measured harmless, flattened only if they misbehave): amend_adr's `anyOf` over status|note, and ask_form's nested `options` `anyOf` (string | {label,diff}) - interactive-only, off the small-model path.
 
 ## focus mode
-> A chat view filter in the TUI, toggled by M-f or M-x focus-mode (same chord turns it off). It is ON by default at startup (build_app sets focus_mode: true). When on it hides tool noise so the chat reads as pure conversation: it keeps MsgKind::User, MsgKind::Assistant, MsgKind::Delegate (advisories) and MsgKind::Reasoning, and drops MsgKind::Tool, MsgKind::Failure, MsgKind::Meta and the folded MsgKind::Run digest's summary row — but a folded Run still renders the Reasoning children inside it. While a run is in flight in focus mode, the bottom chat row shows a rotating activity spinner (activity_line) so a silent tool run never looks frozen. The mode line (bottom status bar) shows "focus mode enabled" (bold green) when on and "focus mode disabled" (dim gray) when off, right after the auto/ask token.
+> A chat view filter in the TUI, toggled by M-f or M-x focus-mode (same chord turns it off). It is ON by default at startup (build_app sets focus_mode: true). When on it hides tool noise so the chat reads as pure conversation: it keeps MsgKind::User, MsgKind::Assistant, MsgKind::Delegate (advisories) and MsgKind::Reasoning, and drops MsgKind::Tool, MsgKind::Failure, MsgKind::Meta and the folded MsgKind::Run digest's summary row — but a folded Run still renders the Reasoning children inside it. While a run is in flight in focus mode, the bottom chat row shows a rotating activity spinner (activity_line) so a silent tool run never looks frozen. The mode line (bottom status bar) shows "focus mode enabled" (bold green) when on and "focus mode disabled" (dim gray) when off, right after the auto/ask token. Because the view hides tool cards, the agent is ALSO told to narrate: the system prompt always carries the "Keeping the user informed" section (crates/comrade-core/prompts/progress.md) asking for one short sentence per batch of tool calls, which reaches the user as a MsgKind::Reasoning block — see ADR 0089.
 
 **References:**
 - `crates/comrade-tui/src/tui.rs`
+- `crates/comrade-core/prompts/progress.md`
+- `crates/comrade-core/src/react.rs`
 
 ## follow_plan
 > Per-session flag (App + LiveState, default true) controlling plan-panel autofollow: while true, draw_plan scrolls the plan so the active step (first InProgress, else first Pending/Ready; bottom when nothing is actionable) stays visible. Any manual scroll (App::scroll_plan from the wheel / PageUp / PageDown / M-x scroll-plan-*) sets it false; M-x toggle-plan-follow flips it.
@@ -460,6 +415,31 @@ Known remaining exceptions (measured harmless, flattened only if they misbehave)
 
 **References:**
 - `crates/comrade-tool/src/form.rs`
+
+## guardrail mechanism
+> The judge consulted while a delegated sub-agent is still RUNNING (every `[agent].delegate_supervise_secs`, default 60s) to decide whether the lead should `continue` (leave it alone), `steer` (write a correction for it) or `stop` (end the run and report the reason). The seam is `comrade_tool::Guardrail` + `GuardOutcome` + `GuardInput`/`GuardMessage` (crates/comrade-tool/src/ask.rs); the session carries it via `SessionControl::guardrail()` / `AgentSession::set_guardrail`. The implementation is `JevGuardrail` (crates/comrade-core/src/guardrails.rs): it sends structured `state` (`delegated_task` = the parent's own `{task, context}`, plus the last ~20 `recent_conversation` entries as `{role, content}`, each message capped at 20,000 chars) to TypeSafe's `POST https://api.typesafe.ai/v1/systemone` with FIVE typed `noul` questions and maps the probabilities to a verdict ITSELF via the pure `decide`. Configured under `[guardrails]` (`jev_api_key`, `jev_url`, `jev_model`, `jev_timeout_secs`); `guardrail_from_cfg` builds it (None without a key). Applied at the delegate loop's rest point in crates/comrade-core/src/delegate.rs.
+
+**References:**
+- `crates/comrade-core/src/guardrails.rs`
+- `crates/comrade-core/src/delegate.rs`
+- `crates/comrade-core/src/upward.rs`
+- `crates/comrade-tool/src/ask.rs`
+- `crates/comrade-core/src/config.rs`
+- `.comrade/memory/0079-the-guardrail-mechanism-uses-jev-to-continue-steer-or-stop-a-running-delegate.md`
+
+**Notes:**
+The five diagnostics are `on_task`, `looping`, `needs_context`, `blocked`, `making_progress` (each a `noul` yes/no probability). COMRADE decides, not Jev: LOOP if `looping >= 0.8`; else STOP if `blocked >= 0.8`; else STEER if `needs_context >= 0.7` (hint: supply the context), `on_task <= 0.3` (drift), or `making_progress <= 0.3` (stall); else CONTINUE. Missing answers default benign (on task, progressing, not looping) so a partial/empty response fails open to `continue`; thresholds are constants in guardrails.rs. Jev returns probabilities, not prose, so on `steer` the lead MODEL writes the correction via the historical `UpwardAsk::supervise` path with the diagnostic hint appended to the briefing; `continue` costs no model call. Jev is first, model is the fallback: no key, a disabled guardrail, an error or a timeout (`invoke_within`) makes `guardrail_check` return None and the loop supervises with the model as before. `stop` returns `guardrail_stop_answer` to the lead. A LOOP is special: `loop_recovery` (delegate.rs) sends the lead a status (reason + the delegate's `task`/`context` + transcript tail), calls `UpwardAsk::recover` to pick `Recovery::{SelfWork, Split, Restart(context)}`, SHOWS the decision in the chat via `ActivityEvents::notice` ("stuck in a loop - lead will …", SessionEvents -> AgentEvent::Notice), and returns `recovery_answer` so the lead takes the task over, splits it and re-delegates, or re-delegates with the improved context. Budget unchanged: a guardrail round and `recover_context` share `MAX_DELEGATE_INTERVENTIONS = 5` parent calls per run. `Duration::ZERO` / `delegate_supervise_secs = 0` disables the mechanism; comrade-tui passes ZERO for `ask_advise`. The SAME guardrail also advises the ROOT agent (`root_guard` in crates/comrade-core/src/agent.rs), ADVISORY ONLY (never refuses a tool or stops the run): consulted on a periodic tick (`[guardrails].interval_secs`, default 60) and when the root read guard fires, its diagnosis replaces the canned stall/verify/loop-refusal guidance and is delivered as `AgentEvent::Notice("guardrail: …")` + a harness note. With a guardrail configured, the consecutive-read threshold now ADVISES and lets the read run (the agent steers itself); with no guardrail the old hard read refusal and canned nudges stand. Tests: guardrails.rs unit tests, upward.rs `parse_recovery_reads_the_three_decisions`, agent.rs `root_guard_delivers_advice_and_falls_back`, and the delegate tests `guardrail_continue_skips_the_lead_model`, `guardrail_steer_asks_the_lead_to_write_the_correction`, `guardrail_stop_ends_the_run_and_reports_to_the_lead`, `guardrail_loop_asks_the_lead_to_recover_and_shows_it`.
+
+## harness note (steering channel)
+> The trusted channel for harness-authored steering. `ContextManager::push_note` (crates/comrade-core/src/context.rs) queues a note; `request_messages` renders queued notes into the SYSTEM message under a `## Harness notes` header (one-shot, cleared with `clear_notes`) and the history itself is untouched. Every harness nudge, correction and human steer goes through it: `STALL_NUDGE`/`VERIFY_NUDGE`/`PLAN_FIRST_NUDGE` (agent.rs), `LOOP_REFUSAL_NUDGE` and `read_guard_message`, the delegate `IDLE_NUDGE`/`VERIFY_NUDGE`/`STALL_NUDGE` and `SUPERVISE_PREFIX` corrections (delegate.rs), and messages drained from the human `Steer` bus. The UI is told via `AgentEvent::Notice("loop guard: …")`, never a fake `ToolResult`. `ContextManager::push_user_merged` still exists for genuine user turns but is no longer used for harness steering.
+
+**References:**
+- `crates/comrade-core/src/context.rs`
+- `crates/comrade-core/src/agent.rs`
+- `crates/comrade-core/src/delegate.rs`
+
+**Notes:**
+Replaced the earlier `push_user_merged` delivery, which folded the nudge `\n\n` onto the trailing tool result (or ReAct observation). That made a benign loop guard look exactly like a prompt-injection planted in tool output — a model using this build flagged it as such. Delivering in the system message keeps the directive trusted, never disturbs the user/assistant/tool role alternation (the reason `push_user_merged` existed), and leaves tool results as pure data. ADR 0078 records the decision; ADR 0059's merge rule is superseded for harness notes (it still applies to genuine user text). Tests: `harness_notes_ride_the_system_message_and_are_transient` (context.rs), plus the delegate read-guard/idle/supervision tests.
 
 ## Hooks (pre/post-tool)
 > `crates/comrade-core/src/hooks.rs`: user-configured shell commands run around a tool call. Configured as `[[hooks.pre_tool]]` / `[[hooks.post_tool]]` with `on` (match: `*`, exact name, or `name*` prefix) and `run` (bash -c). Exposes COMRADE_TOOL, COMRADE_ARGS, and (post only) COMRADE_OK. A failing pre-hook aborts the tool; a failing post-hook warns. Invoked from `agent::Dispatch`.
@@ -479,6 +459,14 @@ Known remaining exceptions (measured harmless, flattened only if they misbehave)
 **Notes:**
 Not a background-job-registry job: no jobs-panel entry, not killable via bg_kill. See the ADR 'Warm the semantic index in the background at startup' and ADR 0077. Measured cold 67.6s / incremental 2.0s / no-op 0.04s on this repo; on the much larger chatapp checkout, excluding its ignored `.venv` cut the candidate files from 15,037 to 268 and the cold build to 153s (3,819 code chunks), with a 0.09s no-op and a 6.8 MB index (was 16.3 MB when the dependency tree leaked in).
 
+## Jev client
+> The shared TypeSafe/SystemOne transport, `crates/comrade-core/src/jev.rs`: `Jev::from_cfg(&GuardrailsCfg)` builds it from `[guardrails]` (None without a key), `Jev::evaluate(state, questions)` POSTs `{ state, model, questions }` to the endpoint with `Authorization: Bearer` and returns the `answers` map, and `noul`/`score`/`top_level` read one answer's fields. `JevGuardrail` (guardrails.rs) and `validate_tests` (tdd.rs) both build on it.
+
+**References:**
+- `crates/comrade-core/src/jev.rs`
+- `crates/comrade-core/src/guardrails.rs`
+- `crates/comrade-core/src/tdd.rs`
+
 ## LangId
 > A source language the tree-sitter tools understand: Rust, JavaScript, TypeScript, Tsx, Css, Html. engine.rs maps a file extension to a LangId (`lang_of`), a LangId to its tree-sitter grammar (`grammar`), to the node kinds counted as identifier occurrences (`ident_kinds`), and to a declaration-kind -> short-label table (`decl_label`), plus `container_body` (which declarations nest others) and `decl_name` (display name). Non-Rust files are walked via `walk_sources` over `SUPPORTED_EXTS`.
 
@@ -491,17 +479,6 @@ Not a background-job-registry job: no jobs-panel entry, not killable via bg_kill
 
 **References:**
 - `crates/comrade-tui/src/tui.rs`
-
-## harness note (steering channel)
-> The trusted channel for harness-authored steering. `ContextManager::push_note` (crates/comrade-core/src/context.rs) queues a note; `request_messages` renders queued notes into the SYSTEM message under a `## Harness notes` header (one-shot, cleared with `clear_notes`) and the history itself is untouched. Every harness nudge, correction and human steer goes through it: `STALL_NUDGE`/`VERIFY_NUDGE`/`PLAN_FIRST_NUDGE` (agent.rs), `LOOP_REFUSAL_NUDGE` and `read_guard_message`, the delegate `IDLE_NUDGE`/`VERIFY_NUDGE`/`STALL_NUDGE` and `SUPERVISE_PREFIX` corrections (delegate.rs), and messages drained from the human `Steer` bus. The UI is told via `AgentEvent::Notice("loop guard: …")`, never a fake `ToolResult`. `ContextManager::push_user_merged` still exists for genuine user turns but is no longer used for harness steering.
-
-**References:**
-- `crates/comrade-core/src/context.rs`
-- `crates/comrade-core/src/agent.rs`
-- `crates/comrade-core/src/delegate.rs`
-
-**Notes:**
-Replaced the earlier `push_user_merged` delivery, which folded the nudge `\n\n` onto the trailing tool result (or ReAct observation). That made a benign loop guard look exactly like a prompt-injection planted in tool output — a model using this build flagged it as such. Delivering in the system message keeps the directive trusted, never disturbs the user/assistant/tool role alternation (the reason `push_user_merged` existed), and leaves tool results as pure data. ADR 0078 records the decision; ADR 0059's merge rule is superseded for harness notes (it still applies to genuine user text). Tests: `harness_notes_ride_the_system_message_and_are_transient` (context.rs), plus the delegate read-guard/idle/supervision tests.
 
 ## MAX_DELEGATE_INTERVENTIONS
 > One shared per-run budget for every time the tech lead is called into a delegate run: `const MAX_DELEGATE_INTERVENTIONS: usize = 5` in crates/comrade-core/src/delegate.rs. A supervision round (`UpwardAsk::supervise`) and a context-overflow recovery (`recover_context`) both spend from it, so a run makes at most 5 parent model calls of either kind; when it is exhausted an overflow returns `overflow_answer` instead of summarising again.
@@ -617,6 +594,14 @@ Runs with `--message-format=json`; `parse_check_json`/`format_diagnostic` parse 
 **Notes:**
 Mistral (https://api.mistral.ai/v1) is fully OpenAI-compatible: Bearer auth, /chat/completions, and `GET /models` advertising `max_context_length` (already parsed by model_context_from_openai). `anthropic` (alias `claude` -> https://api.anthropic.com/v1) uses Anthropic's OpenAI-compatibility layer; see the "Anthropic OpenAI-compatibility layer" entry. `heuristic_context` adds name-based fallbacks: 128K for mistral-*/devstral/pixtral/ministral/magistral, 32K for codestral, 200K for claude-*. Delegate entries resolve their own provider the same way.
 
+## rank_alternatives (alternative ranking)
+> The lead-only tool `rank_alternatives` (crates/comrade-core/src/alternatives.rs, registered in comrade-tui only when Jev is configured) that challenges an approach before the lead commits. Input `{ request, alternatives }` (2-4 options, a lone string also accepted); it sends `state = { user_request, alternatives }` and ONE Jev `choice` question - "which single alternative is best?" (soundness, then simplicity and cost) - and returns the full probability distribution as DATA, best first (the `jev::probabilities` helper; Jev's single `choice` is put first if no distribution comes back). The `## Challenge the approach` prompt tells the lead to present the TOP 3 to the user with its reasoning via `ask_form`, then treat the user's decision as FINAL.
+
+**References:**
+- `crates/comrade-core/src/alternatives.rs`
+- `crates/comrade-core/prompts/challenge.md`
+- `.comrade/memory/0087-challenge-the-approach-rank-alternatives-with-jev-then-the-user-decides.md`
+
 ## read window
 > The 1-based inclusive [start_line, end_line] (or [start,end] range) passed to the fs file readers to select lines; clamped to the file's line count, and an empty/reversed window (hi <= lo) or a start past EOF yields an "empty window" message rather than a slice panic.
 
@@ -722,6 +707,14 @@ The code file SET comes from git when the project is a repo: `git::listed_files`
 
 **Notes:**
 Adopted in ADR #6. Prompt sources: crates/comrade-core/prompts/*.md (assembled by react::build_system_prompt and delegate::render_subagent_system) and the ToolSpec.description strings in every comrade-tool-* crate. Known follow-ups: comrade-core delegate/ask_advise tool descriptions and json_schema per-property descriptions are still verbose.
+
+## score_feature (feature scoring)
+> The lead-only tool `score_feature` (crates/comrade-core/src/scoring.rs, registered in comrade-tui only when Jev is configured) that scores a feature BEFORE planning. Input `{ feature }`; it asks Jev three `score` questions over four levels (0-3) - `customer_value`, `technical_challenge`, `ux_challenge` - plus two `noul` risks (`architecture_risk`, `product_risk`, 0-1). The result is DATA (the numbers + level labels), no imperative. The `## Requirements` prompt turns them into decisions: a high architecture/product risk (>= 0.6) is RAISED with the user at once, a low customer value (<= 1) questions whether to build it, and a high technical/UX challenge (>= 2) means gather MORE information before planning.
+
+**References:**
+- `crates/comrade-core/src/scoring.rs`
+- `crates/comrade-core/src/jev.rs`
+- `.comrade/memory/0088-score-a-feature-0-3-for-value-challenge-and-risk-and-let-the-scores-drive-the-requirements.md`
 
 ## SecurityPolicy
 > The process-wide filesystem + shell guardrail in `crates/comrade-tool/src/policy.rs`: `{ extra_roots: Vec<PathBuf>, shell_allow: Vec<String>, shell_deny: Vec<String> }`. Stored in a `OnceLock<RwLock<..>>`, built from `[security]` via `SecurityCfg::to_policy` and installed with `comrade_tool::set_policy` at run/startup. Read back through `comrade_tool::policy()`. `confine(root, base, path, policy)` is the symlink-safe path check (fs tools use it via `comrade-tool-fs::resolve`); `check_command(cmd, policy)` is the shell allow/deny check used by `shell`/`run_bg`.
@@ -891,6 +884,15 @@ Heuristic, not a proof of coverage. Engine helpers: `test_functions`, `decl_name
 
 **Notes:**
 A prompt audit (2026-09-16) flagged the two-shape tools as violating ADR 0057, which requires flat schemas. They are NOT a defect: the two shapes cannot be expressed by any flat `required` list, the shape is pinned by tests (comrade-core/src/delegate/tests.rs:368, advise/tests.rs:233), and both `delegate step=N` and `ask_advise step=N` formed correct calls through the oneOf on the local OpenAI-compatible provider. ADR 0057 was amended to scope the flat-schema rule to tools whose fields are UNCONDITIONALLY required. Do not "fix" these by flattening them.
+
+## validate_tests (TDD coverage check)
+> The lead-only tool `validate_tests` (crates/comrade-core/src/tdd.rs, registered in comrade-tui only when Jev is configured) that scores how well the tests written for a feature cover it before any implementation. Input `{ feature, tests }` (tests is an array, a lone string is also accepted); it sends `state = { feature, tests }` and ONE Jev `score` question over five levels `none / sparse / partial / good / comprehensive`. ACCEPTED when the weighted `score >= 3.0` of 4 (the top two levels). The result is DATA - one line `Test coverage X/4 (label): ACCEPTED|NOT ENOUGH (threshold 3.0/4)`, no imperative - and the prompt section drives the action: ACCEPTED -> delegate the IMPLEMENTATION with the tests as the spec (they must fail first and must not be weakened) and refactor once green; NOT ENOUGH -> strengthen the tests and call again, do not implement. ADVISORY - it returns a verdict and does not gate `delegate`. The score question's instructions also weigh the TEST PYRAMID. The workflow is in the conditional prompt section `crates/comrade-core/prompts/tdd.md` (included by react::build_system_prompt only when the tool is advertised), pointed at from working-style.md steps 4-5; it also demands the LEAST code that makes the accepted tests pass, treats refactoring as ESSENTIAL, and picks test types by cost/coverage (unit cheapest/least, integration middle, functional most expensive/most) with more unit than integration and more integration than functional.
+
+**References:**
+- `crates/comrade-core/src/tdd.rs`
+- `crates/comrade-core/prompts/tdd.md`
+- `crates/comrade-tui/src/main.rs`
+- `.comrade/memory/0080-test-first-write-tests-validate-coverage-with-jev-then-delegate-the-implementation.md`
 
 ## verify-then-commit guard
 > The agent loop's monitor (agent.rs `update_verify_state` + the `git_commit` pre-check) that refuses a `git_commit` while unverified code changes exist. A change tool in CODE_CHANGES (fs_edit, fs_write_file, ts_rename, pom_format_code, shell, delegate) sets verified=false; only a successful `pom_run_tests`/`pom_run_task` whose observation contains the literal "test result: ok." sets it back to true.
