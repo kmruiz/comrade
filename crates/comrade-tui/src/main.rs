@@ -126,11 +126,9 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
     }
     let cfg = Arc::new(cfg);
 
-    // Connect configured MCP servers and register their tools alongside the
-    // built-ins. A dead/unreachable server is skipped with a warning instead
-    // of aborting startup (see connect_all).
-    let (mut reg, jobs) = build_tools(&cfg, &root)?;
-    reg.extend(comrade_tool_mcp::connect_all(&cfg.mcp.servers).await);
+    // Build the built-in tools plus every configured MCP server's adapters; a
+    // dead/unreachable server is skipped rather than aborting startup.
+    let (reg, jobs) = build_tools(&cfg, &root).await?;
     let tools = Arc::new(reg);
     Ok(Deps {
         cfg,
@@ -144,7 +142,11 @@ async fn build_deps(cli: &Cli) -> Result<Deps> {
     })
 }
 
-fn build_tools(
+/// Build the live tool registry: the built-in tools plus one adapter per tool
+/// advertised by every configured MCP server. Startup and a config reload both
+/// go through here, so neither can silently drop the MCP tools. A dead or
+/// unreachable server is skipped with a warning (`connect_all`), never fatal.
+async fn build_tools(
     cfg: &Config,
     root: &std::path::Path,
 ) -> Result<(ToolRegistry, comrade_tool_project::BgJobs)> {
@@ -222,6 +224,9 @@ fn build_tools(
         // Score a feature's value/challenge/risk before gathering requirements.
         reg.register(Box::new(comrade_core::ScoreFeatureTool::new(jev)));
     }
+    // Connect the configured MCP servers and register their tools alongside the
+    // built-ins.
+    reg.extend(comrade_tool_mcp::connect_all(&cfg.mcp.servers).await);
     Ok((reg, jobs))
 }
 

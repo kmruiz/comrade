@@ -1261,6 +1261,24 @@ fn complete_path(input: &str, base: &std::path::Path) -> PathCompletion {
     complete_names(dir_part, prefix, &read_dir_entries(&dir))
 }
 
+/// A config reload performed off the UI thread by [`App::reload_config`].
+///
+/// Reconnecting MCP servers is async, so the rebuild cannot run inline in the
+/// key handler; the freshly built state comes back through `App::reload_rx` and
+/// is swapped in by [`App::install_reload`].
+enum ReloadOutcome {
+    Loaded {
+        cfg: Arc<comrade_core::Config>,
+        client: Arc<comrade_core::LlmClient>,
+        tools: Arc<comrade_tool::ToolRegistry>,
+        jobs: comrade_tool_project::BgJobs,
+        /// Where the config was read from, for the chat note.
+        from: String,
+    },
+    /// The reload failed; the reason, already formatted for the user.
+    Failed(String),
+}
+
 struct App {
     cfg: Arc<comrade_core::Config>,
     client: Arc<comrade_core::LlmClient>,
@@ -1308,6 +1326,11 @@ struct App {
     /// A sender for `sensor_rx`, kept alive so the channel never closes and used
     /// to feed a human-confirmed `ask`-mode action back into the loop.
     sensor_tx: tokio::sync::mpsc::UnboundedSender<crate::proactive::SensorEvent>,
+    /// Config-reload result queue: a reload runs in a background task on a
+    /// clone of `reload_tx` and the main loop installs the built state here.
+    /// Holding the sender in the App means the receiver never closes.
+    reload_tx: mpsc::UnboundedSender<ReloadOutcome>,
+    reload_rx: mpsc::UnboundedReceiver<ReloadOutcome>,
     /// Owning handle of the running sensor polling tasks, held for the whole
     /// session so the tasks are not dropped.
     sensor_runtime: Option<crate::proactive::SensorRuntime>,
@@ -1460,6 +1483,57 @@ struct GitBarInfo {
     deleted_files: u64,
     /// True when the working directory is inside a git work tree.
     repo: bool,
+}
+
+/// Re-read the config, rebuild the model client and the tool registry —
+/// including reconnecting every configured MCP server, exactly as startup does
+/// (`build_deps`) — and hand the result back for the UI to install. A server
+/// that cannot be reached is skipped (see `connect_all`), so one dead server
+/// never blocks the whole reload.
+async fn reload_from_disk(
+    source: Option<std::path::PathBuf>,
+    root: std::path::PathBuf,
+    auto_forced: bool,
+    ctx_window: Option<usize>,
+    model_version: Option<String>,
+) -> ReloadOutcome {
+    let loaded = match comrade_core::Config::load_layered(source.as_deref(), Some(&root)) {
+        Ok(l) => l,
+        Err(e) => return ReloadOutcome::Failed(format!("{e:#}")),
+    };
+    let mut cfg = loaded.config;
+    let from = loaded
+        .source
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "defaults".into());
+    if auto_forced {
+        cfg.security.autonomy = comrade_core::Autonomy::Auto;
+    }
+    if cfg.llm.context_window.is_none() {
+        cfg.llm.context_window = ctx_window;
+    }
+    if cfg.llm.model_version.is_none() {
+        cfg.llm.model_version = model_version;
+    }
+    let client = match comrade_core::LlmClient::new(&cfg.llm) {
+        Ok(c) => c,
+        Err(e) => return ReloadOutcome::Failed(format!("{e:#}")),
+    };
+    // `build_tools` connects the configured MCP servers too, so a reload keeps
+    // their tools — leaving that out is exactly what made Ctrl-R silently drop
+    // every MCP tool.
+    let (reg, jobs) = match crate::build_tools(&cfg, &root).await {
+        Ok(t) => t,
+        Err(e) => return ReloadOutcome::Failed(format!("{e:#}")),
+    };
+    ReloadOutcome::Loaded {
+        cfg: Arc::new(cfg),
+        client: Arc::new(client),
+        tools: Arc::new(reg),
+        jobs,
+        from,
+    }
 }
 
 impl App {
@@ -2100,72 +2174,64 @@ impl App {
         self.push_meta("queued for the next run (ctrl-enter again to append)");
     }
 
-    /// Re-read the config file from disk and swap the live model client, tool
-    /// registry (so `[[delegates]]` changes take effect) and approval policy.
-    /// Only applies while idle: a run in flight keeps the config it started
-    /// with. On any error the old config stays active and the failure is shown.
+    /// Re-read the config file and swap the live model client, tool registry and
+    /// approval policy. The rebuild runs in a background task (reconnecting MCP
+    /// servers is async) and is installed by [`App::install_reload`] when it
+    /// finishes. Only starts while idle: a run in flight keeps the config it
+    /// started with. On any error the old config stays active and the failure
+    /// is shown.
     fn reload_config(&mut self) {
         if self.running {
             self.push_meta("cannot reload config while a run is in flight");
             return;
         }
-        let loaded = match comrade_core::Config::load_layered(
-            self.config_source.as_deref(),
-            Some(&self.root),
-        ) {
-            Ok(l) => l,
-            Err(e) => {
-                self.push_meta(format!("config reload failed: {e:#}"));
-                return;
-            }
-        };
-        let mut cfg = loaded.config;
-        let source = loaded.source;
-        if self.auto_forced {
-            cfg.security.autonomy = comrade_core::Autonomy::Auto;
-        }
+        self.push_meta("reloading config...");
         // The context window and model version are detected against the live
         // endpoint at startup; keep them across a reload unless the new config
         // pins them explicitly.
-        if cfg.llm.context_window.is_none() {
-            cfg.llm.context_window = self.cfg.llm.context_window;
-        }
-        if cfg.llm.model_version.is_none() {
-            cfg.llm.model_version = self.cfg.llm.model_version.clone();
-        }
-        let client = match comrade_core::LlmClient::new(&cfg.llm) {
-            Ok(c) => c,
-            Err(e) => {
-                self.push_meta(format!("config reload failed: {e:#}"));
-                return;
+        let source = self.config_source.clone();
+        let root = self.root.clone();
+        let auto_forced = self.auto_forced;
+        let ctx_window = self.cfg.llm.context_window;
+        let model_version = self.cfg.llm.model_version.clone();
+        let tx = self.reload_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(reload_from_disk(source, root, auto_forced, ctx_window, model_version).await);
+        });
+    }
+
+    /// Install a finished reload: swap the live config, client, tool registry
+    /// and job hub, re-apply the approval policy, and refresh the model colours
+    /// and chat layout. A failure only reports the reason — the live state is
+    /// left exactly as it was.
+    fn install_reload(&mut self, outcome: ReloadOutcome) {
+        match outcome {
+            ReloadOutcome::Failed(e) => self.push_meta(format!("config reload failed: {e}")),
+            ReloadOutcome::Loaded {
+                cfg,
+                client,
+                tools,
+                jobs,
+                from,
+            } => {
+                self.ctx_base.auto_approve = cfg.auto_approve();
+                self.ctx_budget = cfg.effective_budget();
+                self.push_meta(format!("config reloaded from {from}"));
+                self.cfg = cfg;
+                self.client = client;
+                self.tools = tools;
+                self.jobs = jobs;
+                // Pick up any newly-configured delegate: assign it a color the
+                // first time it is seen (existing agents keep theirs) and
+                // refresh the chat layout so the model panel and bands repaint.
+                let mut agent_names: Vec<String> =
+                    self.cfg.delegates.iter().map(|d| d.name.clone()).collect();
+                agent_names.push(self.cfg.llm.display());
+                self.model_colors.assign(&agent_names);
+                self.chat_epoch = self.chat_epoch.wrapping_add(1);
             }
-        };
-        let (tools, jobs) = match crate::build_tools(&cfg, &self.root) {
-            Ok(t) => t,
-            Err(e) => {
-                self.push_meta(format!("config reload failed: {e:#}"));
-                return;
-            }
-        };
-        self.ctx_base.auto_approve = cfg.auto_approve();
-        self.ctx_budget = cfg.effective_budget();
-        let from = source
-            .as_deref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "defaults".into());
-        self.push_meta(format!("config reloaded from {from}"));
-        self.cfg = Arc::new(cfg);
-        self.client = Arc::new(client);
-        self.tools = Arc::new(tools);
-        self.jobs = jobs;
-        // Pick up any newly-configured delegate: assign it a color the first
-        // time it is seen (existing agents keep theirs) and refresh the chat
-        // layout so the model panel and bands repaint.
-        let mut agent_names: Vec<String> =
-            self.cfg.delegates.iter().map(|d| d.name.clone()).collect();
-        agent_names.push(self.cfg.llm.display());
-        self.model_colors.assign(&agent_names);
-        self.chat_epoch = self.chat_epoch.wrapping_add(1);
+        }
     }
 
     /// M-x list-mcp-servers: open the modal showing every server configured
@@ -4025,6 +4091,10 @@ fn build_app(
     // sensors. A sender kept in the App means `sensor_rx` never closes.
     let (sensor_tx, sensor_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // Config-reload channel: `reload_config` spawns the rebuild and the main
+    // loop installs the result from here.
+    let (reload_tx, reload_rx) = tokio::sync::mpsc::unbounded_channel();
+
     // Tell the user at a glance that this session is not editing the repository.
     let mut chat = Vec::new();
     chat.extend(App::worktree_note(0, &worktree));
@@ -4055,6 +4125,8 @@ fn build_app(
         steer_tx: None,
         sensor_rx,
         sensor_tx,
+        reload_tx,
+        reload_rx,
         sensor_runtime: None,
         sensor_queue: Vec::new(),
         sensor_sel: 0,
@@ -4214,6 +4286,11 @@ pub async fn run(deps: &Deps) -> Result<()> {
                 match ae {
                     Some((id, e)) => app.on_agent_event_for(id, e),
                     None => break Err(anyhow::anyhow!("agent event channel closed")),
+                }
+            }
+            reload = app.reload_rx.recv() => {
+                if let Some(outcome) = reload {
+                    app.install_reload(outcome);
                 }
             }
             ask = app.asks_rx.recv() => {
@@ -11837,6 +11914,182 @@ mod tests {
         build_app(
             &deps, events_tx, events_rx, run_tx, asks_tx, asks_rx, git_tx, git_rx,
         )
+    }
+
+    // --- config reload (Ctrl-R) -------------------------------------------
+    //
+    // Regression: reload_config rebuilt the tool registry with build_tools()
+    // alone and never re-ran connect_all (the way startup does), so every MCP
+    // tool silently disappeared after Ctrl-R. A reload must now rebuild the
+    // registry exactly as startup does, reconnecting the MCP servers.
+
+    /// A temp dir unique to one test so parallel runs never clash.
+    fn reload_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("comrade-reload-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A tiny bash MCP *server* reading JSON-RPC from stdin and writing replies
+    /// to stdout: just enough of the handshake to advertise one `echo` tool.
+    /// Mirrors the in-process fixture in comrade-tool-mcp, so it is a faithful
+    /// stdio server for the stdio transport.
+    const MCP_FIXTURE_SCRIPT: &str = r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"0.0.1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo the message back","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}}]}}\n' "$id"
+      ;;
+    *'"method":"ping"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+    /// Write the fixture script plus a config pointing one `[[mcp.servers]]`
+    /// stdio server at it (`command` is the executable to spawn); return the
+    /// config path.
+    fn write_mcp_fixture_config(dir: &std::path::Path, command: &str) -> std::path::PathBuf {
+        let script = dir.join("fixture_mcp.sh");
+        std::fs::write(&script, MCP_FIXTURE_SCRIPT).unwrap();
+        let cfg = format!(
+            r#"
+[llm]
+provider = "ollama"
+model = "x"
+
+[[mcp.servers]]
+name = "fixture"
+
+[mcp.servers.transport]
+type = "stdio"
+command = "{command}"
+args = ["{script}"]
+"#,
+            script = script.display()
+        );
+        let path = dir.join("config.toml");
+        std::fs::write(&path, cfg).unwrap();
+        path
+    }
+
+    /// The registry names a reload produced (panics when the reload failed).
+    fn reload_tool_names(outcome: ReloadOutcome) -> Vec<String> {
+        match outcome {
+            ReloadOutcome::Loaded { tools, .. } => {
+                tools.iter_all().map(|t| t.spec().name.clone()).collect()
+            }
+            ReloadOutcome::Failed(e) => panic!("reload failed: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_reconnects_mcp_servers_so_their_tools_survive() {
+        let dir = reload_tmp_dir("mcp");
+        let cfg = write_mcp_fixture_config(&dir, "bash");
+        let names = reload_tool_names(reload_from_disk(Some(cfg), dir, false, None, None).await);
+        assert!(
+            names.iter().any(|n| n == "mcp_fixture_echo"),
+            "the MCP tool must survive a reload; got {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "pom_model"), "built-ins are kept");
+    }
+
+    #[tokio::test]
+    async fn reload_skips_a_dead_mcp_server_but_keeps_the_rest() {
+        let dir = reload_tmp_dir("mcp-dead");
+        let cfg = write_mcp_fixture_config(&dir, "comrade-no-such-binary-xyz");
+        let names = reload_tool_names(reload_from_disk(Some(cfg), dir, false, None, None).await);
+        assert!(names.iter().any(|n| n == "pom_model"), "built-ins are kept");
+        assert!(
+            !names.iter().any(|n| n.starts_with("mcp_fixture")),
+            "a dead server contributes no tools; got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_failure_leaves_the_live_state_untouched() {
+        let mut app = test_app();
+        let before = app.tools.clone();
+        let dir = reload_tmp_dir("bad");
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "this is = not [ valid toml").unwrap();
+        let outcome = reload_from_disk(Some(bad), dir, false, None, None).await;
+        assert!(
+            matches!(outcome, ReloadOutcome::Failed(_)),
+            "a broken config reports a failure"
+        );
+        app.install_reload(outcome);
+        assert!(
+            Arc::ptr_eq(&app.tools, &before),
+            "a failed reload must not swap the live registry"
+        );
+    }
+
+    /// A config with no MCP servers, so a test never falls back to the real
+    /// user config (`load_layered` reads it when no path is given).
+    fn write_plain_config(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("plain.toml");
+        std::fs::write(&path, "[llm]\nprovider = \"ollama\"\nmodel = \"x\"\n").unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn install_reload_swaps_the_live_registry() {
+        let mut app = test_app();
+        let before = app.tools.clone();
+        let epoch = app.chat_epoch;
+        let dir = reload_tmp_dir("install");
+        let cfg = write_plain_config(&dir);
+        let outcome = reload_from_disk(Some(cfg), dir, false, None, None).await;
+        app.install_reload(outcome);
+        assert!(
+            !Arc::ptr_eq(&app.tools, &before),
+            "a fresh registry is installed"
+        );
+        assert!(app.tools.iter().any(|t| t.spec().name == "pom_model"));
+        assert!(
+            app.chat_epoch > epoch,
+            "the reload asks the chat layout to repaint"
+        );
+    }
+
+    /// The headline bug: Ctrl-R (reload_config through the app's channel) keeps
+    /// the MCP tools.
+    #[tokio::test]
+    async fn ctrl_r_reload_keeps_mcp_tools() {
+        let mut app = test_app();
+        let dir = reload_tmp_dir("e2e");
+        app.config_source = Some(write_mcp_fixture_config(&dir, "bash"));
+        app.root = dir;
+        app.reload_config();
+        let outcome = app.reload_rx.recv().await.expect("a reload outcome");
+        app.install_reload(outcome);
+        assert!(
+            app.tools
+                .iter()
+                .any(|t| t.spec().name == "mcp_fixture_echo"),
+            "Ctrl-R must not drop the MCP tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_config_refuses_while_a_run_is_in_flight() {
+        let mut app = test_app();
+        app.running = true;
+        app.reload_config();
+        assert!(
+            app.reload_rx.try_recv().is_err(),
+            "no reload may start while a run is in flight"
+        );
+        let note = app.chat.last().expect("a meta note");
+        assert!(note.text.contains("in flight"), "got: {}", note.text);
     }
 
     #[tokio::test]
