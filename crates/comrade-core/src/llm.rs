@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use comrade_tool::ImagePart;
 use comrade_tool::ToolSpec;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -84,15 +85,24 @@ struct SerializedFunction<'a> {
     arguments: &'a str,
 }
 
+/// One message of the conversation.
+///
+/// `content` is a plain string on the wire — the shape every provider and the
+/// prompt cache already know — unless the message carries images, in which case
+/// it becomes an array of OpenAI-style content parts (the text, then one
+/// `image_url` per attachment). The images ride in the SAME message as the
+/// text, never as a second turn.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "WireMessage", into = "WireMessage")]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// Images attached to this message. Empty for every message that is not a
+    /// user prompt with an attachment.
+    pub images: Vec<ImagePart>,
     /// Assistant tool calls (native mode).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_calls: Option<Vec<ToolCallMsg>>,
     /// Links a `Role::Tool` result to the call that produced it.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_call_id: Option<String>,
 }
 
@@ -101,6 +111,18 @@ impl ChatMessage {
         Self {
             role,
             content: content.into(),
+            images: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// A prompt from the human: the text plus whatever images came with it.
+    pub fn user(text: impl Into<String>, images: Vec<ImagePart>) -> Self {
+        Self {
+            role: Role::User,
+            content: text.into(),
+            images,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -110,6 +132,7 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content,
+            images: Vec::new(),
             tool_calls: Some(calls),
             tool_call_id: None,
         }
@@ -119,8 +142,102 @@ impl ChatMessage {
         Self {
             role: Role::Tool,
             content: content.into(),
+            images: Vec::new(),
             tool_calls: None,
             tool_call_id: Some(id.into()),
+        }
+    }
+}
+
+/// The wire shape of a [`ChatMessage`]: `content` is a string when there is no
+/// image and a parts array when there is.
+#[derive(Serialize, Deserialize)]
+struct WireMessage {
+    role: Role,
+    content: WireContent,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    tool_calls: Option<Vec<ToolCallMsg>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum WireContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrlPart },
+}
+
+#[derive(Serialize, Deserialize)]
+struct ImageUrlPart {
+    url: String,
+}
+
+impl From<ChatMessage> for WireMessage {
+    fn from(msg: ChatMessage) -> Self {
+        let content = if msg.images.is_empty() {
+            WireContent::Text(msg.content)
+        } else {
+            let mut parts = Vec::with_capacity(msg.images.len() + 1);
+            if !msg.content.is_empty() {
+                parts.push(ContentPart::Text { text: msg.content });
+            }
+            for image in msg.images {
+                parts.push(ContentPart::ImageUrl {
+                    image_url: ImageUrlPart {
+                        url: image.data_uri(),
+                    },
+                });
+            }
+            WireContent::Parts(parts)
+        };
+        Self {
+            role: msg.role,
+            content,
+            tool_calls: msg.tool_calls,
+            tool_call_id: msg.tool_call_id,
+        }
+    }
+}
+
+impl From<WireMessage> for ChatMessage {
+    fn from(msg: WireMessage) -> Self {
+        let (content, images) = match msg.content {
+            WireContent::Text(text) => (text, Vec::new()),
+            WireContent::Parts(parts) => {
+                let mut text = String::new();
+                let mut images = Vec::new();
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text: t } => {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&t);
+                        }
+                        ContentPart::ImageUrl { image_url } => {
+                            if let Some(image) = ImagePart::from_data_uri(&image_url.url) {
+                                images.push(image);
+                            }
+                        }
+                    }
+                }
+                (text, images)
+            }
+        };
+        Self {
+            role: msg.role,
+            content,
+            images,
+            tool_calls: msg.tool_calls,
+            tool_call_id: msg.tool_call_id,
         }
     }
 }

@@ -1060,11 +1060,14 @@ struct LiveState {
     stop: Option<CancellationToken>,
     run_handle: Option<tokio::task::JoinHandle<()>>,
     running: bool,
-    steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    steer_tx: Option<tokio::sync::mpsc::UnboundedSender<comrade_tool::UserInput>>,
     /// One-shot "compact the context now" request handed to the running loop
     /// (`None` while idle).
     compact: Option<comrade_tool::CompactRequest>,
-    queued_prompt: Option<String>,
+    queued_prompt: Option<comrade_tool::UserInput>,
+    /// Images pasted off the system clipboard, held for the next message: they
+    /// go out with whatever text is typed (or alone).
+    pending_images: Vec<comrade_tool::ImagePart>,
     run_cancelled: bool,
     chat: Vec<Msg>,
     section_collapsed: Vec<bool>,
@@ -1318,7 +1321,7 @@ struct App {
     running: bool,
     /// Sender end of the in-flight run's steering pipe (`None` while idle).
     /// Sending fails once the run has ended and dropped its receiver.
-    steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    steer_tx: Option<tokio::sync::mpsc::UnboundedSender<comrade_tool::UserInput>>,
     /// Receiver of proactive-mode sensor events (a polled command changed, or a
     /// poll failed); drained in the main loop. Never closes while `sensor_tx`
     /// holds a sender, so even with no sensors configured the arm stays idle.
@@ -1350,7 +1353,10 @@ struct App {
     /// A prompt queued (ctrl-Enter) while a run was active: submitted as the
     /// next run when the current one ends, or given back to the prompt bar if
     /// the run was cancelled (never auto-run after an explicit cancel).
-    queued_prompt: Option<String>,
+    queued_prompt: Option<comrade_tool::UserInput>,
+    /// Images pasted off the system clipboard, held for the next message: they
+    /// go out with whatever text is typed (or alone).
+    pending_images: Vec<comrade_tool::ImagePart>,
     /// True once the in-flight run was cancelled by the user (Esc / cancel-run).
     run_cancelled: bool,
     /// Instant of the last terminal repaint, used to cap event-driven redraws
@@ -1748,13 +1754,81 @@ impl App {
         }
     }
 
-    /// Paste the system clipboard into the prompt at the cursor, replacing
-    /// any selection. Bound to C-y. Reports failures in the chat.
+    /// Paste the system clipboard into the prompt. An image on the clipboard
+    /// becomes an attachment to the next message — so the text of a copied
+    /// screenshot, if any, does not get in the way — and anything else is
+    /// inserted at the cursor exactly as before. Bound to C-y and Ctrl-V.
     fn paste_clipboard(&mut self) {
-        match self.with_clipboard(|clip| Ok(clip.get_text()?)) {
-            Ok(text) => self.input.insert_str(&text),
+        let outcome = self.with_clipboard(|clip| {
+            let image = match clip.get_image() {
+                Ok(data) => encode_png(data.width, data.height, &data.bytes)
+                    .map_err(|e| e.to_string())
+                    .and_then(|png| {
+                        comrade_tool::ImagePart::from_bytes("clipboard.png", &png)
+                            .map_err(|e| e.to_string())
+                    }),
+                Err(e) => Err(e.to_string()),
+            };
+            let text = clip.get_text().map_err(|e| e.to_string());
+            Ok(paste_outcome(image, text))
+        });
+        match outcome {
+            Ok(PasteOutcome::Image(part)) => self.attach_image(part),
+            Ok(PasteOutcome::Text(text)) => self.input.insert_str(&text),
+            Ok(PasteOutcome::Failed(e)) => self.push_meta(format!("paste failed: {e}")),
             Err(e) => self.push_meta(format!("paste failed: {e}")),
         }
+    }
+
+    /// Hold an image for the next message and say so in the chat (the prompt
+    /// bar itself only carries text). Refuses past the per-message limit.
+    fn attach_image(&mut self, part: comrade_tool::ImagePart) {
+        if self.pending_images.len() >= comrade_tool::MAX_IMAGES {
+            self.push_meta(format!(
+                "image not attached: at most {} images per message",
+                comrade_tool::MAX_IMAGES
+            ));
+            return;
+        }
+        self.push_meta(format!(
+            "attached {} ({} KiB) — it goes out with your next message (esc clears)",
+            part.name,
+            part.bytes().div_ceil(1024)
+        ));
+        self.pending_images.push(part);
+    }
+
+    /// Drop every image held for the next message.
+    fn clear_pending_images(&mut self) {
+        if self.pending_images.is_empty() {
+            return;
+        }
+        self.pending_images.clear();
+        self.push_meta("attachments cleared");
+    }
+
+    /// Take whatever is in the prompt bar as ONE message: the text, any image
+    /// file its text names (resolved against the project root), plus the images
+    /// held from a clipboard paste. Rejected images are reported in the chat.
+    /// The prompt bar and the holdings are left empty.
+    fn take_user_input(&mut self) -> comrade_tool::UserInput {
+        let text = self.input.take_text();
+        let (mut images, errors) = comrade_tool::images_in_text(&text, &self.root);
+        for err in errors {
+            self.push_meta(format!("image not attached: {err}"));
+        }
+        for part in std::mem::take(&mut self.pending_images) {
+            if images.len() >= comrade_tool::MAX_IMAGES {
+                self.push_meta(format!(
+                    "image not attached: at most {} images per message ({})",
+                    comrade_tool::MAX_IMAGES,
+                    part.name
+                ));
+                continue;
+            }
+            images.push(part);
+        }
+        comrade_tool::UserInput { text, images }
     }
 
     /// Put `text` on the system clipboard, reporting failures in the chat.
@@ -1950,10 +2024,11 @@ impl App {
         self.goto_search_match();
     }
 
-    fn start_run(&mut self, prompt: String) {
-        if self.running || prompt.trim().is_empty() {
+    fn start_run(&mut self, input: comrade_tool::UserInput) {
+        if self.running || input.is_empty() {
             return;
         }
+        let prompt = input;
         // Every run gets a fresh steering pipe: the UI keeps the sender and the
         // run task keeps the receiver (via `ctx.steer`), so a message typed
         // mid-run reaches the agent loop - and, nested inside it, a delegate's
@@ -2122,34 +2197,40 @@ impl App {
         self.push_msg(Msg::authored(MsgKind::User, "you", text));
     }
 
+    /// Show a message the human sent, with a line per attached image so the
+    /// transcript records what the model actually received.
+    fn show_user_input(&mut self, input: &comrade_tool::UserInput) {
+        self.show_user(&input.transcript());
+    }
+
     /// Submit whatever is in the prompt bar: when a run is in flight the text
     /// steers the running agent/delegate; when idle it starts a new run.
     fn submit_prompt(&mut self) {
-        let prompt = self.input.take_text();
-        if prompt.trim().is_empty() {
+        let input = self.take_user_input();
+        if input.is_empty() {
             return;
         }
         if self.running {
-            self.steer(prompt);
+            self.steer(input);
         } else {
-            self.start_run(prompt);
+            self.start_run(input);
         }
     }
 
-    /// Send the prompt text straight to the currently running agent or
-    /// delegate as a steering message: it is injected into that model's
-    /// conversation at the run's next rest point. If the run ended just as the
-    /// user pressed Enter the text is submitted as a normal new run instead,
-    /// so it is never silently dropped.
-    fn steer(&mut self, text: String) {
-        self.show_user(&text);
+    /// Send the prompt straight to the currently running agent or delegate as a
+    /// steering message: it is injected into that model's conversation at the
+    /// run's next rest point. If the run ended just as the user pressed Enter the
+    /// text is submitted as a normal new run instead, so it is never silently
+    /// dropped.
+    fn steer(&mut self, input: comrade_tool::UserInput) {
+        self.show_user_input(&input);
         let delivered = self
             .steer_tx
             .as_ref()
-            .is_some_and(|tx| tx.send(text.clone()).is_ok());
+            .is_some_and(|tx| tx.send(input.clone()).is_ok());
         if !delivered {
             self.push_meta("run ended before the steer landed; submitting as a new task");
-            self.start_run(text);
+            self.start_run(input);
         }
     }
 
@@ -2162,15 +2243,20 @@ impl App {
             self.submit_prompt();
             return;
         }
-        let text = self.input.take_text();
-        if text.trim().is_empty() {
+        let input = self.take_user_input();
+        if input.is_empty() {
             return;
         }
         match self.queued_prompt.take() {
-            Some(existing) => self.queued_prompt = Some(existing + "\n\n" + &text),
-            None => self.queued_prompt = Some(text.clone()),
+            Some(mut existing) => {
+                existing.text.push_str("\n\n");
+                existing.text.push_str(&input.text);
+                existing.images.extend(input.images.iter().cloned());
+                self.queued_prompt = Some(existing);
+            }
+            None => self.queued_prompt = Some(input.clone()),
         }
-        self.show_user(&text);
+        self.show_user_input(&input);
         self.push_meta("queued for the next run (ctrl-enter again to append)");
     }
 
@@ -2596,7 +2682,7 @@ impl App {
         // Back the new session with its temporary file straight away.
         let snapshot = self.session_snapshot();
         let _ = crate::session_store::save(&path, &snapshot);
-        self.start_run(seed);
+        self.start_run(seed.into());
     }
 
     /// Close the active session (emacs `C-x k`): discard its slot and activate a
@@ -2743,6 +2829,7 @@ impl App {
             steer_tx: None,
             compact: None,
             queued_prompt: None,
+            pending_images: Vec::new(),
             run_cancelled: false,
             worktree,
             chat,
@@ -2885,6 +2972,7 @@ impl App {
             steer_tx: None,
             compact: None,
             queued_prompt: None,
+            pending_images: Vec::new(),
             run_cancelled: false,
             worktree,
             chat,
@@ -2921,6 +3009,7 @@ impl App {
         std::mem::swap(&mut self.steer_tx, &mut incoming.steer_tx);
         std::mem::swap(&mut self.compact, &mut incoming.compact);
         std::mem::swap(&mut self.queued_prompt, &mut incoming.queued_prompt);
+        std::mem::swap(&mut self.pending_images, &mut incoming.pending_images);
         std::mem::swap(&mut self.run_cancelled, &mut incoming.run_cancelled);
         std::mem::swap(&mut self.chat, &mut incoming.chat);
         std::mem::swap(&mut self.section_collapsed, &mut incoming.section_collapsed);
@@ -3342,8 +3431,11 @@ impl App {
                     self.run_cancelled = false;
                     if let Some(queued) = queued {
                         if cancelled {
-                            for ch in queued.chars() {
+                            for ch in queued.text.chars() {
                                 self.input.insert(ch);
+                            }
+                            for image in queued.images {
+                                self.attach_image(image);
                             }
                             self.push_meta(
                                 "run cancelled: the queued prompt is back in the prompt bar",
@@ -3354,7 +3446,7 @@ impl App {
                     }
                 }
             }
-            AgentEvent::User(u) => self.show_user(&u),
+            AgentEvent::User(u) => self.show_user(&u.transcript()),
             AgentEvent::Delta(d) => {
                 self.stream.push_str(&d);
                 if self.stream.chars().count() > 40_000 {
@@ -4134,6 +4226,7 @@ fn build_app(
         next_sensor_id: 1,
         compact: None,
         queued_prompt: None,
+        pending_images: Vec::new(),
         run_cancelled: false,
         last_draw: std::time::Instant::now(),
         mode: Mode::initial(deps.cfg.auto_approve()),
@@ -4380,6 +4473,45 @@ pub async fn run(deps: &Deps) -> Result<()> {
     res
 }
 
+/// What a paste key should do, given what the system clipboard offered.
+enum PasteOutcome {
+    /// The clipboard held an image: hold it for the next message.
+    Image(comrade_tool::ImagePart),
+    /// The clipboard held text: insert it at the cursor, as it always did.
+    Text(String),
+    /// Neither was readable: report why.
+    Failed(String),
+}
+
+/// An image on the clipboard wins over its text, so copying a screenshot pastes
+/// the screenshot; anything else pastes as text, exactly as before.
+fn paste_outcome(
+    image: Result<comrade_tool::ImagePart, String>,
+    text: Result<String, String>,
+) -> PasteOutcome {
+    match image {
+        Ok(part) => PasteOutcome::Image(part),
+        Err(image_err) => match text {
+            Ok(text) if !text.is_empty() => PasteOutcome::Text(text),
+            Ok(_) => PasteOutcome::Failed("the clipboard is empty".into()),
+            Err(text_err) => PasteOutcome::Failed(format!("{image_err}; {text_err}")),
+        },
+    }
+}
+
+/// Encode raw RGBA8 pixels (what a clipboard hands over) as a PNG — the form a
+/// model request can carry.
+fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, width as u32, height as u32);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+    writer.write_image_data(rgba).map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
 /// Returns true when the app should quit.
 fn handle_event(app: &mut App, ev: Event) -> bool {
     match ev {
@@ -4482,10 +4614,14 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                 return false;
             }
             // Emacs-style kill/yank on the prompt editor: C-y pastes the
-            // system clipboard at the cursor; C-k kills to the end of the
+            // system clipboard at the cursor (an image on it becomes an
+            // attachment to the next message); C-k kills to the end of the
             // line (or the selection, when one is active), joining lines at
-            // the end of a line. Copy is M-w / Ctrl+Shift+C.
-            if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            // the end of a line. Copy is M-w / Ctrl+Shift+C. Ctrl-V does the
+            // same paste, for the muscle memory of every other editor.
+            if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
                 app.paste_clipboard();
                 return false;
             }
@@ -4559,6 +4695,10 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
                 KeyCode::Esc => {
                     if app.running {
                         app.cancel_run();
+                    } else {
+                        // Idle, Esc drops the images held for the next message (the
+                        // prompt text itself is the user's to clear with C-u).
+                        app.clear_pending_images();
                     }
                 }
                 KeyCode::Enter if ctrl => {
@@ -12442,6 +12582,149 @@ args = ["{script}"]
             reasoning_from_stream("Thought: just scaffolding\nTool: run_tests\nArgs: {}").is_none()
         );
         assert!(reasoning_from_stream("").is_none());
+    }
+
+    // --- image attachments --------------------------------------------------
+
+    fn shot_png() -> comrade_tool::ImagePart {
+        comrade_tool::ImagePart::from_bytes("shot.png", b"\x89PNG\r\n\x1a\n").unwrap()
+    }
+
+    fn image_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("comrade-images-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_clipboard_image_pastes_as_an_attachment() {
+        let outcome = paste_outcome(Ok(shot_png()), Ok("some text".into()));
+        assert!(matches!(outcome, PasteOutcome::Image(p) if p.name == "shot.png"));
+    }
+
+    #[test]
+    fn a_clipboard_without_an_image_pastes_its_text() {
+        match paste_outcome(Err("no image".into()), Ok("hello".into())) {
+            PasteOutcome::Text(t) => assert_eq!(t, "hello"),
+            _ => panic!("a text paste must keep working"),
+        }
+    }
+
+    #[test]
+    fn a_clipboard_with_neither_reports_the_failure() {
+        match paste_outcome(Err("no image".into()), Err("no text".into())) {
+            PasteOutcome::Failed(e) => assert!(e.contains("text") || e.contains("image"), "{e}"),
+            _ => panic!("expected a failure"),
+        }
+    }
+
+    #[test]
+    fn encode_png_writes_a_real_png() {
+        let bytes = encode_png(2, 1, &[255, 0, 0, 255, 0, 255, 0, 255]).unwrap();
+        assert_eq!(
+            comrade_tool::ImageMime::sniff(&bytes),
+            Some(comrade_tool::ImageMime::Png)
+        );
+        assert!(comrade_tool::ImagePart::from_bytes("clip.png", &bytes).is_ok());
+    }
+
+    #[tokio::test]
+    async fn submitting_a_prompt_that_names_an_image_attaches_it() {
+        let dir = image_dir("named");
+        std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        let mut app = test_app();
+        app.root = dir.clone();
+        app.input.insert_str("why is shot.png broken?");
+        let input = app.take_user_input();
+        assert_eq!(input.images.len(), 1);
+        assert_eq!(input.images[0].name, "shot.png");
+        assert!(input.text.contains("shot.png"), "the text is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn attachments_are_held_until_the_message_goes_out() {
+        let mut app = test_app();
+        app.attach_image(shot_png());
+        assert_eq!(app.pending_images.len(), 1);
+        assert!(
+            app.chat.iter().any(|m| m.text.contains("shot.png")),
+            "attaching is visible in the chat"
+        );
+        app.input.insert_str("what is this?");
+        let input = app.take_user_input();
+        assert_eq!(input.text, "what is this?");
+        assert_eq!(input.images.len(), 1);
+        assert!(app.pending_images.is_empty(), "the holding is consumed");
+    }
+
+    #[tokio::test]
+    async fn an_image_only_message_is_not_empty() {
+        let mut app = test_app();
+        app.attach_image(shot_png());
+        let input = app.take_user_input();
+        assert!(
+            !input.is_empty(),
+            "an image with no text is still a message"
+        );
+        assert!(input.text.is_empty());
+        assert_eq!(input.images.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn attachments_are_capped_across_the_text_and_the_clipboard() {
+        let dir = image_dir("cap");
+        let mut text = String::new();
+        for i in 0..2 {
+            std::fs::write(dir.join(format!("t{i}.png")), b"\x89PNG\r\n\x1a\n").unwrap();
+            text.push_str(&format!("t{i}.png "));
+        }
+        let mut app = test_app();
+        app.root = dir.clone();
+        for _ in 0..comrade_tool::MAX_IMAGES {
+            app.attach_image(shot_png());
+        }
+        assert_eq!(app.pending_images.len(), comrade_tool::MAX_IMAGES);
+        app.attach_image(shot_png());
+        assert_eq!(
+            app.pending_images.len(),
+            comrade_tool::MAX_IMAGES,
+            "a further paste is refused, not queued"
+        );
+        app.input.insert_str(&text);
+        let input = app.take_user_input();
+        assert_eq!(input.images.len(), comrade_tool::MAX_IMAGES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_transcript_names_the_attached_image() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::User(comrade_tool::UserInput {
+            text: "why is this wrong?".into(),
+            images: vec![shot_png()],
+        }));
+        let msg = app
+            .chat
+            .iter()
+            .rev()
+            .find(|m| m.kind == MsgKind::User)
+            .expect("the user's message");
+        assert!(msg.text.contains("why is this wrong?"), "{}", msg.text);
+        assert!(msg.text.contains("[image: shot.png]"), "{}", msg.text);
+    }
+
+    #[tokio::test]
+    async fn escape_clears_held_attachments_when_idle() {
+        let mut app = test_app();
+        app.attach_image(shot_png());
+        assert!(!app.pending_images.is_empty());
+        handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        assert!(app.pending_images.is_empty(), "esc drops the held image");
     }
 }
 

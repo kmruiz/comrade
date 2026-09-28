@@ -28,8 +28,8 @@ pub enum AgentEvent {
     PlanFinished(Option<String>),
     /// The agent run started.
     RunStart,
-    /// A message from the human user.
-    User(String),
+    /// A message from the human user: the text plus the images attached to it.
+    User(comrade_tool::UserInput),
     /// A raw assistant message arrived (may contain Thought/Tool text).
     AssistantText(String),
     /// A chunk of the assistant message as it is being streamed.

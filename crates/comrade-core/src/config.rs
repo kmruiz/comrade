@@ -43,6 +43,54 @@ impl Protocol {
     }
 }
 
+/// Whether the model can be sent images.
+///
+/// `auto` decides from the model name, so a vision model works with no config
+/// change and a text-only one is never handed an image it cannot read. `on`
+/// forces images on (for a model the heuristic does not know) and `off` keeps
+/// every request text-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Vision {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl Vision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Vision::Auto => "auto",
+            Vision::On => "on",
+            Vision::Off => "off",
+        }
+    }
+}
+
+/// Model-name fragments of models known to accept images, matched
+/// case-insensitively against the configured model id.
+const VISION_MODEL_HINTS: &[&str] = &[
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-4-turbo",
+    "gpt-5",
+    "chatgpt-4o",
+    "claude",
+    "gemini",
+    "-vl",
+    "vl-",
+    "llava",
+    "pixtral",
+    "gemma3",
+    "gemma-3",
+    "minicpm-v",
+    "moondream",
+    "internvl",
+    "vision",
+    "qvq",
+];
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LlmCfg {
@@ -74,6 +122,8 @@ pub struct LlmCfg {
     /// Optional display identity/version string detected from the provider
     /// (e.g. Ollama "7B (Q4_K_M)").
     pub model_version: Option<String>,
+    /// Whether images may be sent with a user message (see [`Vision`]).
+    pub vision: Vision,
     /// Send an Anthropic-style `cache_control: ephemeral` marker on the system
     /// message and the last tool definition, so a provider that supports prompt
     /// caching can reuse the (large, stable) prefix across turns. Providers that
@@ -95,7 +145,28 @@ impl Default for LlmCfg {
             protocol: Protocol::Auto,
             context_window: None,
             model_version: None,
+            vision: Vision::Auto,
             prompt_caching: false,
+        }
+    }
+}
+
+impl LlmCfg {
+    /// Whether this model may be sent images. `Auto` decides from the model
+    /// name (see [`VISION_MODEL_HINTS`]).
+    pub fn supports_vision(&self) -> bool {
+        match self.vision {
+            Vision::On => true,
+            Vision::Off => false,
+            Vision::Auto => {
+                let model = self.model.to_ascii_lowercase();
+                // The OpenAI reasoning models are vision-capable under a bare
+                // `oN` id, which must not match a fragment elsewhere in a name.
+                model.starts_with("o1")
+                    || model.starts_with("o3")
+                    || model.starts_with("o4")
+                    || VISION_MODEL_HINTS.iter().any(|hint| model.contains(hint))
+            }
         }
     }
 }

@@ -33,3 +33,4 @@ unicode-width.workspace = true
 arboard.workspace = true
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
+png = "0.18"

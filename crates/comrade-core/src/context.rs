@@ -58,6 +58,11 @@ const STUB_MIN_CHARS: usize = 600;
 const STUB_HEAD_CHARS: usize = 140;
 /// Upper bound on the accumulated "Earlier context" rollup.
 const ROLLUP_MAX_CHARS: usize = 2000;
+/// What one attached image is charged against the budget, in tokens. A request
+/// carrying an image really does consume context, but its base64 payload is NOT
+/// text: counting it as text would make a 1 MiB image look like ~250k tokens
+/// and evict the whole history.
+const IMAGE_TOKENS: usize = 1100;
 
 pub struct ContextManager {
     budget_tokens: usize,
@@ -127,6 +132,29 @@ impl ContextManager {
             }
         }
         self.push(ChatMessage::new(crate::llm::Role::User, text));
+    }
+
+    /// Append a message from the human, images included.
+    ///
+    /// Like [`Self::push_user_merged`] it folds into a trailing user turn rather
+    /// than opening a second one (strict providers reject two user turns in a
+    /// row). It must NOT fold into a tool result — there is nowhere to put an
+    /// image there — so in that case it opens its own user turn.
+    pub fn push_user_input(&mut self, input: &comrade_tool::UserInput) {
+        if let Some(last) = self.history.last_mut()
+            && last.role == crate::llm::Role::User
+            && last.tool_calls.is_none()
+        {
+            if !input.text.is_empty() {
+                if !last.content.is_empty() {
+                    last.content.push_str("\n\n");
+                }
+                last.content.push_str(&input.text);
+            }
+            last.images.extend(input.images.iter().cloned());
+            return;
+        }
+        self.push(ChatMessage::user(input.text.clone(), input.images.clone()));
     }
 
     /// Queue a steering note from the HARNESS (a nudge, a correction, a human
@@ -393,7 +421,7 @@ impl ContextManager {
     pub fn total_tokens(&self) -> usize {
         self.history
             .iter()
-            .map(|m| estimate_tokens(&m.content))
+            .map(|m| estimate_tokens(&m.content) + m.images.len() * IMAGE_TOKENS)
             .sum()
     }
 }
@@ -785,5 +813,70 @@ mod tool_role_invariant_tests {
         assert_eq!(cm.rollup(), rollup);
         assert_eq!(cm.evicted, 3);
         assert_eq!(cm.history_clone(), history);
+    }
+
+    fn image() -> comrade_tool::ImagePart {
+        comrade_tool::ImagePart::from_bytes("shot.png", b"\x89PNG\r\n\x1a\n").unwrap()
+    }
+
+    /// A steer carrying an image keeps the same rule as a text one: it is folded
+    /// into a trailing user turn instead of opening a second one.
+    #[test]
+    fn a_user_input_with_images_merges_into_a_trailing_user_turn() {
+        let mut cm = ContextManager::new(100_000, 10_000);
+        cm.push(ChatMessage::new(Role::System, "sys"));
+        cm.push_user_input(&comrade_tool::UserInput::text("look at this"));
+        cm.push_user_input(&comrade_tool::UserInput {
+            text: "now zoom in".into(),
+            images: vec![image()],
+        });
+
+        assert_eq!(cm.messages().len(), 2);
+        let last = cm.messages().last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert!(last.content.contains("look at this") && last.content.contains("now zoom in"));
+        assert_eq!(last.images.len(), 1, "the image joined the same message");
+    }
+
+    /// The text+images message must not be welded onto a tool result (there is
+    /// nowhere to put an image there), so it opens its own user turn.
+    #[test]
+    fn a_user_input_with_images_after_a_tool_result_opens_a_user_turn() {
+        let mut cm = ContextManager::new(100_000, 10_000);
+        cm.push(ChatMessage::new(Role::System, "sys"));
+        cm.push(ChatMessage::tool_result("c1", "tool output"));
+        cm.push_user_input(&comrade_tool::UserInput {
+            text: "here is the screenshot".into(),
+            images: vec![image()],
+        });
+
+        let last = cm.messages().last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.images.len(), 1);
+        assert_eq!(cm.messages()[1].content, "tool output");
+    }
+
+    /// Base64 payloads must not be counted as text tokens: a 1 MiB image would
+    /// otherwise look like ~250k tokens and evict the whole history.
+    #[test]
+    fn an_attached_image_is_charged_a_flat_token_cost() {
+        let mut cm = ContextManager::new(100_000, 10_000);
+        cm.push(ChatMessage::new(Role::System, "sys"));
+        let big = comrade_tool::ImagePart {
+            name: "big.png".into(),
+            mime: comrade_tool::ImageMime::Png,
+            base64: "A".repeat(1_000_000),
+        };
+        cm.push_user_input(&comrade_tool::UserInput {
+            text: "look".into(),
+            images: vec![big],
+        });
+
+        let tokens = cm.total_tokens();
+        assert!(
+            tokens < 5_000,
+            "an image is a flat cost, not its base64 size ({tokens} tokens)"
+        );
+        assert!(tokens > 500, "an image still costs something");
     }
 }

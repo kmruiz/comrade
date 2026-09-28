@@ -437,6 +437,7 @@ version = "0.9.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -597,6 +598,7 @@ dependencies = [
  "comrade-tool-syntax",
  "comrade-tool-web",
  "crossterm",
+ "png",
  "ratatui",
  "serde",
  "serde_json",

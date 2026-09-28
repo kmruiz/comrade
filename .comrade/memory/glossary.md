@@ -455,6 +455,15 @@ Replaced the earlier `push_user_merged` delivery, which folded the nudge `\n\n` 
 - `crates/comrade-core/src/agent.rs`
 - `.comrade/memory/0037-tool-dispatch-prepost-hooks-per-tool-timeout-per-run-budget.md`
 
+## ImagePart
+> One image attached to a user message: a display `name`, its real `ImageMime` (decided by magic bytes) and the base64 payload. Turns into `{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}` in a model request. The name is a UI label only — it is not part of the wire form.
+
+**References:**
+- `crates/comrade-tool/src/attach.rs`
+
+**Notes:**
+At most `MAX_IMAGES` (5) per message, at most `MAX_IMAGE_BYTES` (8 MiB) each; an oversized image is refused, never shrunk. Build one with `ImagePart::from_bytes`, read a file with `load_image_file`, or rebuild from a request with `from_data_uri`.
+
 ## index warm-up
 > The background build of the semantic index (memory + code) so the first `semantic_search` is instant. Triggered automatically by comrade-tui's main() at startup (comrade_tool_memory::warm, a detached, idempotent thread), by the `warm_semantic_index` tool for the agent, by every `semantic_search` call (idempotent), or by `comrade --warm-index` (blocking) for run_bg/bg jobs. It is incremental: an already-warm index is a no-op (~0.04s). On completion it writes a small `<key>.status` marker beside the index; that marker is what tells a later process (or a search during the build) that the persisted index is ready to serve.
 
@@ -928,6 +937,17 @@ Heuristic, not a proof of coverage. Engine helpers: `test_functions`, `decl_name
 **Notes:**
 A prompt audit (2026-09-16) flagged the two-shape tools as violating ADR 0057, which requires flat schemas. They are NOT a defect: the two shapes cannot be expressed by any flat `required` list, the shape is pinned by tests (comrade-core/src/delegate/tests.rs:368, advise/tests.rs:233), and both `delegate step=N` and `ask_advise step=N` formed correct calls through the oneOf on the local OpenAI-compatible provider. ADR 0057 was amended to scope the flat-schema rule to tools whose fields are UNCONDITIONALLY required. Do not "fix" these by flattening them.
 
+## UserInput
+> One message from the human: `{ text, images: Vec<ImagePart> }`. It is THE type of a user prompt — the TUI submit/queue/steer path, `run_agent*`, the `Steer` channel, `AgentEvent::User` and `ContextManager::push_user_input` all speak it, so the text and its images always travel as one message.
+
+**References:**
+- `crates/comrade-tool/src/attach.rs`
+- `crates/comrade-core/src/agent.rs`
+- `crates/comrade-tui/src/tui.rs`
+
+**Notes:**
+`transcript()` renders what the chat shows (`[image: name]`); `downgrade_images(reason)` moves the attachments into the text as `[image not sent: …]` for a model that cannot see. `From<String>`/`From<&str>` exist, and `run_agent*` takes `impl Into<UserInput>`, so a plain string still works.
+
 ## validate_tests (TDD coverage check)
 > The lead-only tool `validate_tests` (crates/comrade-core/src/tdd.rs, registered in comrade-tui only when Jev is configured) that scores how well the tests written for a feature cover it before any implementation. Input `{ feature, tests }` (tests is an array, a lone string is also accepted); it sends `state = { feature, tests }` and ONE Jev `score` question over five levels `none / sparse / partial / good / comprehensive`. ACCEPTED when the weighted `score >= 3.0` of 4 (the top two levels). The result is DATA - one line `Test coverage X/4 (label): ACCEPTED|NOT ENOUGH (threshold 3.0/4)`, no imperative - and the prompt section drives the action: ACCEPTED -> delegate the IMPLEMENTATION with the tests as the spec (they must fail first and must not be weakened) and refactor once green; NOT ENOUGH -> strengthen the tests and call again, do not implement. ADVISORY - it returns a verdict and does not gate `delegate`. The score question's instructions also weigh the TEST PYRAMID. The workflow is in the conditional prompt section `crates/comrade-core/prompts/tdd.md` (included by react::build_system_prompt only when the tool is advertised), pointed at from working-style.md steps 4-5; it also demands the LEAST code that makes the accepted tests pass, treats refactoring as ESSENTIAL, and picks test types by cost/coverage (unit cheapest/least, integration middle, functional most expensive/most) with more unit than integration and more integration than functional.
 
@@ -955,6 +975,16 @@ Trap: because the loop observes the TRUNCATED tool output, a huge test run can b
 
 **Notes:**
 Practical consequence: a full-suite `pom_run_tests` output is often truncated by the harness and hides the `test result: ok.` line, so it does NOT clear the guard. Running `pom_format_code` after tests re-arms the guard. To satisfy the commit guard cheaply, run a NARROW filtered test (e.g. `pom_run_tests args=<test_name>`) whose short output prints `test result: ok.`, then commit without any intervening code-changing tool.
+
+## Vision (llm.vision)
+> The `[llm] vision = "auto" | "on" | "off"` setting (crates/comrade-core/src/config.rs) that decides whether images may be sent with a user message. `auto` (the default) runs a model-name heuristic, `on`/`off` force it.
+
+**References:**
+- `crates/comrade-core/src/config.rs`
+- `crates/comrade-core/src/agent.rs`
+
+**Notes:**
+Read it through `LlmCfg::supports_vision()` — never test the model name yourself. When it is false the image is replaced by a placeholder in the text and an `AgentEvent::Notice` names the config key. Delegates are always treated as `vision: false`.
 
 ## Waiting session
 > A session whose in-flight run is paused waiting for human input (a pending ask/dialog: a tool confirmation or a question). Shown as "waiting" in BOTH places: the mode-line session-count label (e.g. "1 running, 1 waiting, 1 idle") and the Ctrl-x C-b switcher ("[waiting]"). A session is waiting iff app.dialogs holds a Dialog with that session's id; running/waiting/idle are a mutually-exclusive partition (waiting takes precedence over running). Each session's TuiUserIo is stamped with its id so PendingAsk/Dialog can be attributed (asks previously came through one shared user io). The internal local variable in session_counts_label is still named `blocked`.

@@ -2340,7 +2340,7 @@ async fn delegate_receives_a_steer_mid_run() {
     // The delegate is now executing fs_write_file: steer it, then let the
     // tool finish so the loop reaches its next rest point.
     called_rx.await.unwrap();
-    steer_tx.send(STEER.to_string()).unwrap();
+    steer_tx.send(STEER.into()).unwrap();
     gate.release.notify_one();
 
     // Request 2 must carry the steer as a user message.

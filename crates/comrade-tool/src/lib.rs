@@ -5,6 +5,7 @@
 //! defined here, never on each other.
 
 pub mod ask;
+pub mod attach;
 pub mod decl;
 pub mod form;
 pub mod plan;
@@ -15,6 +16,10 @@ pub mod tool;
 
 pub use ask::{
     Guard, GuardInput, GuardMessage, GuardOutcome, Guardrail, Recovery, Upward, UpwardAsk, Verdict,
+};
+pub use attach::{
+    AttachError, ImageMime, ImagePart, MAX_IMAGE_BYTES, MAX_IMAGES, UserInput, images_in_text,
+    load_image_file,
 };
 pub use decl::{declarations, removed_declarations};
 

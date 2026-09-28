@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::attach::UserInput;
 use crate::form::FormSpec;
 use crate::plan::SessionControl;
 
@@ -157,7 +158,7 @@ impl ToolRegistry {
 /// [`ToolContext::steer`] set to `None`.
 #[derive(Clone)]
 pub struct Steer {
-    rx: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    rx: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<UserInput>>>,
 }
 
 impl Steer {
@@ -165,7 +166,7 @@ impl Steer {
     /// run and hand the [`Steer`] (receiver side) to the run context. Sending
     /// fails once the run has ended and dropped its receiver, which is how the
     /// UI learns a steer was too late.
-    pub fn channel() -> (Steer, tokio::sync::mpsc::UnboundedSender<String>) {
+    pub fn channel() -> (Steer, tokio::sync::mpsc::UnboundedSender<UserInput>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (
             Steer {
@@ -176,11 +177,11 @@ impl Steer {
     }
 
     /// Take every steering message queued so far, without waiting.
-    pub async fn drain(&self) -> Vec<String> {
+    pub async fn drain(&self) -> Vec<UserInput> {
         let mut rx = self.rx.lock().await;
         let mut out = Vec::new();
-        while let Ok(text) = rx.try_recv() {
-            out.push(text);
+        while let Ok(message) = rx.try_recv() {
+            out.push(message);
         }
         out
     }

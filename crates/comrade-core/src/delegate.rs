@@ -1169,8 +1169,9 @@ pub(crate) async fn run_delegate_subagent(
         }
         // A steer typed while the delegate owned the loop reaches the delegate's
         // own conversation at its next rest point (drained from the shared bus
-        // cloned into `dctx`).
-        crate::agent::drain_steer(dctx.steer.as_ref(), &mut ctxm).await;
+        // cloned into `dctx`). Images are a main-agent feature: a delegate gets
+        // the steer's text and a placeholder, never the attached image.
+        crate::agent::drain_steer(dctx.steer.as_ref(), &mut ctxm, false).await;
         // Guardrail / supervision: every `limits.supervise` the running delegate
         // is judged, and the lead acts on the verdict. With a guardrail (Jev)
         // configured it decides first: `continue` costs nothing, `stop` ends the

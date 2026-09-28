@@ -453,17 +453,28 @@ pub struct AgentOutcome {
 /// delegate sub-loop drain the same [`Steer`] bus (shared via
 /// [`ToolContext::steer`]); whichever owns the loop at the moment receives the
 /// message, and leftovers are seen by the root once a delegate hands back.
-pub(crate) async fn drain_steer(steer: Option<&Steer>, history: &mut ContextManager) {
+pub(crate) async fn drain_steer(steer: Option<&Steer>, history: &mut ContextManager, vision: bool) {
     let Some(steer) = steer else {
         return;
     };
-    for text in steer.drain().await {
+    for mut message in steer.drain().await {
+        // An image has nowhere to live in a system note, so a steer that carries
+        // one goes in as a user message at the rest point.
+        if !message.images.is_empty() && vision {
+            history.push_user_input(&message);
+            continue;
+        }
+        if !message.images.is_empty() {
+            // The image cannot be delivered, so say so rather than drop it
+            // silently; the note stays the trusted channel for steering.
+            message.downgrade_images("the model has no vision support");
+        }
         // Delivered as a harness note in the system message: it reaches the model
         // as trusted steering, never welded onto a tool result (which models read
         // as a prompt-injection attempt) and never breaking role alternation.
         history.push_note(format!(
             "The user sent this message while you were working:\n{}",
-            text.trim()
+            message.text.trim()
         ));
     }
 }
@@ -499,7 +510,7 @@ pub async fn run_agent(
     client: &LlmClient,
     ctx: ToolContext,
     tools: &ToolRegistry,
-    user_input: String,
+    user_input: impl Into<comrade_tool::UserInput>,
     tx: mpsc::Sender<AgentEvent>,
     stop: CancellationToken,
 ) -> Result<AgentOutcome> {
@@ -537,7 +548,7 @@ pub async fn run_agent_with_history(
     client: &LlmClient,
     ctx: ToolContext,
     tools: &ToolRegistry,
-    user_input: String,
+    user_input: impl Into<comrade_tool::UserInput>,
     history: &mut ContextManager,
     tx: mpsc::Sender<AgentEvent>,
     stop: CancellationToken,
@@ -548,8 +559,25 @@ pub async fn run_agent_with_history(
     // read back by the tool crates through `comrade_tool::policy`).
     comrade_tool::set_policy(cfg.security.to_policy(&ctx.project_root));
 
+    let mut user_input = user_input.into();
+    // A model that cannot see must not be sent an image it would fail on, so the
+    // image becomes a placeholder naming what was left out and the human is told.
+    if !user_input.images.is_empty() && !cfg.llm.supports_vision() {
+        user_input.downgrade_images("the model has no vision support");
+        let _ = tx
+            .send(AgentEvent::Notice(format!(
+                "the attached image was not sent: {} cannot see images. \
+                 Set `vision = \"on\"` under [llm] in .comrade.toml if it can.",
+                cfg.llm.display()
+            )))
+            .await;
+    }
+
     if ctx.session.title().is_empty() || ctx.session.title() == "New session" {
-        let mut t = user_input.trim().to_string();
+        let mut t = user_input.text.trim().to_string();
+        if t.is_empty() {
+            t = "image attachment".into();
+        }
         if t.chars().count() > 60 {
             t = t.chars().take(60).collect::<String>() + "…";
         }
@@ -557,7 +585,10 @@ pub async fn run_agent_with_history(
     }
     let _ = tx.send(AgentEvent::User(user_input.clone())).await;
 
-    history.push(ChatMessage::new(Role::User, user_input));
+    history.push(ChatMessage::user(
+        user_input.text.clone(),
+        user_input.images.clone(),
+    ));
     history.enforce_budget();
 
     // The session outlives the loop (`ctx` is moved into it): the plan is
@@ -673,7 +704,7 @@ async fn run_agent_loop(
         // A steer typed while this run was in flight reaches the model at its
         // next rest point, injected BEFORE the budget is enforced so compaction
         // can still make room for it.
-        drain_steer(ctx.steer.as_ref(), ctxm).await;
+        drain_steer(ctx.steer.as_ref(), ctxm, cfg.llm.supports_vision()).await;
 
         // A compaction the user requested (M-c) is honoured at this rest point,
         // before the budget is enforced: replace the whole history with a
@@ -1419,7 +1450,7 @@ pub async fn run_headless(
     client: &LlmClient,
     ctx: ToolContext,
     tools: &ToolRegistry,
-    user_input: String,
+    user_input: impl Into<comrade_tool::UserInput>,
 ) -> Result<AgentOutcome> {
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(128);
     let printer = tokio::task::spawn(async move {
@@ -1442,7 +1473,7 @@ pub async fn run_headless(
                 }
                 AgentEvent::FinalAnswer(a) => format!("\n✅ {a}"),
                 AgentEvent::Error(e) => format!("❌ {e}"),
-                AgentEvent::User(u) => format!("🧑 {u}"),
+                AgentEvent::User(u) => format!("🧑 {}", u.transcript()),
                 // Sub-agent activity (delegate/ask_advise): indented so a
                 // delegate's own tool calls are visible in the run log.
                 AgentEvent::DelegateToolCall { model, name, args } => {
@@ -1500,7 +1531,7 @@ mod tests {
     use crate::session::{AgentEvent, AgentSession};
     use crate::undo::MemoryUndo;
 
-    use super::{root_guard, run_agent, run_agent_with_history};
+    use super::{drain_steer, root_guard, run_agent, run_agent_with_history};
 
     struct FakeUser;
     #[async_trait]
@@ -1675,7 +1706,7 @@ mod tests {
 
         let (steer, steer_tx) = comrade_tool::Steer::channel();
         steer_tx
-            .send("stop reading and implement now".to_string())
+            .send("stop reading and implement now".into())
             .unwrap();
         let ctx = ToolContext {
             project_root: root.clone(),
@@ -2877,6 +2908,200 @@ mod tests {
             Ok(AgentEvent::Notice(n)) => assert!(n.contains("fallback nudge"), "{n}"),
             other => panic!("expected the fallback notice, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // images in a user message
+    // -----------------------------------------------------------------------
+
+    fn png_part() -> comrade_tool::ImagePart {
+        comrade_tool::ImagePart::from_bytes("shot.png", b"\x89PNG\r\n\x1a\n").unwrap()
+    }
+
+    fn image_input(text: &str) -> comrade_tool::UserInput {
+        comrade_tool::UserInput {
+            text: text.into(),
+            images: vec![png_part()],
+        }
+    }
+
+    /// A context and a live event channel, ready for a `run_agent` call.
+    fn agent_ctx(root: &std::path::Path) -> (ToolContext, mpsc::Receiver<AgentEvent>) {
+        let (tx, rx) = mpsc::channel(64);
+        let session = Arc::new(AgentSession::new(tx));
+        let ctx = ToolContext {
+            project_root: root.to_path_buf(),
+            cwd: root.to_path_buf(),
+            session: session.clone().as_control(),
+            user: Arc::new(FakeUser),
+            undo: Arc::new(MemoryUndo::new(root.to_path_buf())),
+            auto_approve: true,
+            events: Arc::new(comrade_tool::NoopEvents),
+            steer: None,
+            stop: None,
+            compact: None,
+        };
+        (ctx, rx)
+    }
+
+    async fn notices(rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Notice(n) = event {
+                out.push(n);
+            }
+        }
+        out
+    }
+
+    /// A scratch project root for a run (one per process, shared by the tests
+    /// in this module that only need a directory that exists).
+    fn scratch_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("comrade-agent-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// A vision model receives the image as a content part of the ONE user
+    /// message that carries the text.
+    #[tokio::test]
+    async fn a_vision_model_receives_the_attached_image() {
+        let (port, bodies) = spawn_model_spy(&["All done."]);
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "gpt-4o".into(); // auto => vision
+
+        let root = scratch_root();
+        let (ctx, _rx) = agent_ctx(&root);
+        let (tx, _events) = mpsc::channel(64);
+        let client = LlmClient::new(&cfg.llm).unwrap();
+        let tools = ToolRegistry::new();
+
+        run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            image_input("what is wrong here?"),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = recv_body(&bodies).await;
+        assert!(body.contains("what is wrong here?"), "{body}");
+        assert!(
+            body.contains("\"image_url\""),
+            "the image rode along: {body}"
+        );
+        assert!(body.contains("data:image/png;base64,"), "{body}");
+    }
+
+    /// A model that cannot see still gets the text, plus a placeholder naming
+    /// what was left out, and the human is told once.
+    #[tokio::test]
+    async fn a_model_without_vision_gets_a_placeholder_and_a_notice() {
+        let (port, bodies) = spawn_model_spy(&["All done."]);
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "devstral-small-2".into(); // auto => no vision
+
+        let root = scratch_root();
+        let (ctx, _rx) = agent_ctx(&root);
+        let (tx, mut events) = mpsc::channel(64);
+        let client = LlmClient::new(&cfg.llm).unwrap();
+        let tools = ToolRegistry::new();
+
+        run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            image_input("what is wrong here?"),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = recv_body(&bodies).await;
+        assert!(!body.contains("image_url"), "no image is sent: {body}");
+        assert!(body.contains("what is wrong here?"), "{body}");
+        assert!(body.contains("image not sent"), "the gap is named: {body}");
+
+        let seen = notices(&mut events).await;
+        assert!(
+            seen.iter().any(|n| n.contains("vision")),
+            "the human is told the model cannot see: {seen:?}"
+        );
+    }
+
+    /// An explicit `vision = "off"` wins even for a model that could see.
+    #[tokio::test]
+    async fn vision_off_withholds_the_image_from_a_vision_model() {
+        let (port, bodies) = spawn_model_spy(&["All done."]);
+        let mut cfg = Config::default();
+        cfg.llm.base_url = format!("http://127.0.0.1:{port}/v1");
+        cfg.llm.model = "gpt-4o".into();
+        cfg.llm.vision = crate::config::Vision::Off;
+
+        let root = scratch_root();
+        let (ctx, _rx) = agent_ctx(&root);
+        let (tx, _events) = mpsc::channel(64);
+        let client = LlmClient::new(&cfg.llm).unwrap();
+        let tools = ToolRegistry::new();
+
+        run_agent(
+            &cfg,
+            &client,
+            ctx,
+            &tools,
+            image_input("look at this"),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = recv_body(&bodies).await;
+        assert!(!body.contains("image_url"), "{body}");
+    }
+
+    /// A steer typed while a run is in flight can carry an image; it reaches the
+    /// model at the next rest point as a user message with the parts.
+    #[tokio::test]
+    async fn a_steer_with_an_image_reaches_the_model() {
+        let (steer, steer_tx) = comrade_tool::Steer::channel();
+        steer_tx
+            .send(image_input("here is the screenshot"))
+            .unwrap();
+
+        let mut cm = ContextManager::with_system("SYS", 100_000, 10_000);
+        drain_steer(Some(&steer), &mut cm, true).await;
+
+        let last = cm.messages().last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert!(last.content.contains("here is the screenshot"));
+        assert_eq!(last.images.len(), 1);
+    }
+
+    /// Without vision the steer keeps the trusted harness-note channel and the
+    /// image becomes a placeholder, so nothing is silently dropped.
+    #[tokio::test]
+    async fn a_steer_with_an_image_is_downgraded_without_vision() {
+        let (steer, steer_tx) = comrade_tool::Steer::channel();
+        steer_tx
+            .send(image_input("here is the screenshot"))
+            .unwrap();
+
+        let mut cm = ContextManager::with_system("SYS", 100_000, 10_000);
+        drain_steer(Some(&steer), &mut cm, false).await;
+
+        let req = cm.request_messages();
+        assert!(req[0].content.contains("here is the screenshot"), "{req:?}");
+        assert!(req[0].content.contains("image not sent"), "{req:?}");
+        assert!(cm.messages().iter().all(|m| m.images.is_empty()));
     }
 }
 

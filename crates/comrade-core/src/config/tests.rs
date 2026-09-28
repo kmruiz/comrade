@@ -77,6 +77,70 @@ run = "echo post"
 }
 
 #[test]
+fn vision_defaults_to_auto_and_parses_an_explicit_setting() {
+    let d = Config::load(Some(&write_tmp(""))).unwrap().config;
+    assert_eq!(d.llm.vision, Vision::Auto);
+    assert_eq!(d.llm.vision.as_str(), "auto");
+
+    let on = Config::load(Some(&write_tmp("[llm]\nvision = \"on\"\n")))
+        .unwrap()
+        .config;
+    assert_eq!(on.llm.vision, Vision::On);
+    assert!(on.llm.supports_vision());
+
+    let off = Config::load(Some(&write_tmp("[llm]\nvision = \"off\"\n")))
+        .unwrap()
+        .config;
+    assert_eq!(off.llm.vision, Vision::Off);
+    assert!(!off.llm.supports_vision());
+}
+
+/// `auto` decides from the model name, so a vision model works with no config
+/// change and a text-only one is never sent an image it cannot read.
+#[test]
+fn auto_vision_follows_the_model_name() {
+    let mut llm = LlmCfg {
+        vision: Vision::Auto,
+        ..LlmCfg::default()
+    };
+    for model in [
+        "gpt-4o",
+        "gpt-4.1-mini",
+        "o3-mini",
+        "claude-sonnet-4-20250514",
+        "gemini-2.5-pro",
+        "qwen2.5-vl-7b",
+        "llava:13b",
+        "pixtral-12b",
+        "gemma3:12b",
+        "minicpm-v-2_6",
+        "moondream2",
+        "llama3.2-vision",
+    ] {
+        llm.model = model.into();
+        assert!(llm.supports_vision(), "{model} can see");
+    }
+    for model in [
+        "devstral-small-2",
+        "deepseek-chat",
+        "qwen2.5-coder:7b",
+        "mistral-7b-instruct",
+        "codestral",
+    ] {
+        llm.model = model.into();
+        assert!(!llm.supports_vision(), "{model} cannot see");
+    }
+
+    // An explicit setting always wins over the heuristic.
+    llm.vision = Vision::On;
+    llm.model = "devstral-small-2".into();
+    assert!(llm.supports_vision());
+    llm.vision = Vision::Off;
+    llm.model = "gpt-4o".into();
+    assert!(!llm.supports_vision());
+}
+
+#[test]
 fn deepseek_provider_fills_base_url() {
     let p = write_tmp(
         "[llm]\nprovider = \"deepseek\"\napi_key = \"sk-test\"\nmodel = \"deepseek-chat\"\n",
