@@ -2414,6 +2414,10 @@ impl App {
                 self.client = client;
                 self.tools = tools;
                 self.jobs = jobs;
+                // Rebuild the sensor polling tasks from the reloaded config, so
+                // added/edited/removed `[[sensors]]` entries take effect without
+                // restarting — pending requests stay queued.
+                self.restart_sensors();
                 // Pick up any newly-configured delegate: assign it a color the
                 // first time it is seen (existing agents keep theirs) and
                 // refresh the chat layout so the model panel and bands repaint.
@@ -2613,6 +2617,28 @@ impl App {
         self.path_prompt = None;
         self.session_pick = None;
         self.push_meta("opened a new session");
+    }
+
+    /// (Re)build the proactive sensor polling tasks from the current config and
+    /// tool registry. Called at startup and after every config reload, so a
+    /// reload picks up added, edited or removed sensors — the same rule the tool
+    /// registry already follows. The previous runtime is dropped, which aborts
+    /// its tasks; the pending request queue is left untouched.
+    fn restart_sensors(&mut self) {
+        // Sensors may invoke tools (an MCP tool, a skill, a built-in), so they
+        // get the tool registry and a context that runs unattended and does not
+        // spam the chat with tool events.
+        let mut ctx = self.ctx_base.clone();
+        ctx.auto_approve = true;
+        ctx.events = std::sync::Arc::new(comrade_tool::NoopEvents);
+        ctx.steer = None;
+        ctx.compact = None;
+        ctx.stop = None;
+        let (runtime, rx) =
+            crate::proactive::SensorRuntime::start(&self.cfg.sensors, self.tools.clone(), ctx);
+        self.sensor_tx = runtime.sender();
+        self.sensor_rx = rx;
+        self.sensor_runtime = Some(runtime);
     }
 
     /// React to a proactive-mode sensor event: a failure is only noted; a change
@@ -4427,20 +4453,9 @@ pub async fn run(deps: &Deps) -> Result<()> {
 
     // Start polling the configured proactive-mode sensors. The receiver is
     // drained by the main loop; the runtime is held for the session's lifetime.
-    // Sensors may invoke tools (an MCP tool, a skill, a built-in), so they get
-    // the tool registry and a context that runs unattended and does not spam the
-    // chat with tool events.
-    let mut sensor_ctx = app.ctx_base.clone();
-    sensor_ctx.auto_approve = true;
-    sensor_ctx.events = std::sync::Arc::new(comrade_tool::NoopEvents);
-    sensor_ctx.steer = None;
-    sensor_ctx.compact = None;
-    sensor_ctx.stop = None;
-    let (sensor_runtime, sensor_rx) =
-        crate::proactive::SensorRuntime::start(&deps.cfg.sensors, deps.tools.clone(), sensor_ctx);
-    app.sensor_tx = sensor_runtime.sender();
-    app.sensor_rx = sensor_rx;
-    app.sensor_runtime = Some(sensor_runtime);
+    // A config reload rebuilds them from the freshly loaded config, exactly as
+    // it rebuilds the tool registry.
+    app.restart_sensors();
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
@@ -12447,6 +12462,134 @@ args = ["{script}"]
                 .iter()
                 .any(|t| t.spec().name == "mcp_fixture_echo"),
             "Ctrl-R must not drop the MCP tools"
+        );
+    }
+
+    /// A config reload must (re)start the sensor polling tasks, not just swap the
+    /// config: a `[[sensors]]` entry added to the file and picked up with Ctrl-R
+    /// has to start polling at once — the same rule the tool registry follows.
+    #[tokio::test]
+    async fn a_reload_starts_a_newly_added_sensor() {
+        let mut app = test_app();
+        let dir = reload_tmp_dir("sensor-reload");
+        let cfg = dir.join("sensors.toml");
+        std::fs::write(
+            &cfg,
+            "[llm]\nprovider = \"ollama\"\nmodel = \"x\"\n\n\
+             [[sensors]]\nname = \"s\"\ntool = \"does_not_exist\"\ninterval_secs = 10\n",
+        )
+        .unwrap();
+        let outcome = reload_from_disk(Some(cfg), dir, false, None, None).await;
+        app.install_reload(outcome);
+
+        // The new sensor polls immediately, and an unknown tool fails on that
+        // first poll — so an error event proves the reloaded sensor is polled.
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), app.sensor_rx.recv())
+            .await
+            .expect("the reloaded sensor must be polled")
+            .expect("the channel stays open");
+        match ev {
+            crate::proactive::SensorEvent::Error { name, message } => {
+                assert_eq!(name, "s");
+                assert!(message.contains("no tool named"), "{message}");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// A second reload replaces the polled set: the sensor from the previous
+    /// config is no longer the one being polled — the freshly loaded entry is.
+    #[tokio::test]
+    async fn a_later_reload_polls_the_new_sensor_set() {
+        let mut app = test_app();
+
+        let dir_one = reload_tmp_dir("sensor-r1");
+        let cfg_one = dir_one.join("one.toml");
+        std::fs::write(
+            &cfg_one,
+            "[llm]\nprovider = \"ollama\"\nmodel = \"x\"\n\n\
+             [[sensors]]\nname = \"one\"\ntool = \"missing_one\"\ninterval_secs = 10\n",
+        )
+        .unwrap();
+        let first = reload_from_disk(Some(cfg_one), dir_one, false, None, None).await;
+        app.install_reload(first);
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), app.sensor_rx.recv())
+            .await
+            .expect("sensor \"one\" is polled after the reload")
+            .expect("the channel stays open");
+        match ev {
+            crate::proactive::SensorEvent::Error { name, .. } => assert_eq!(name, "one"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let dir_two = reload_tmp_dir("sensor-r2");
+        let cfg_two = dir_two.join("two.toml");
+        std::fs::write(
+            &cfg_two,
+            "[llm]\nprovider = \"ollama\"\nmodel = \"x\"\n\n\
+             [[sensors]]\nname = \"two\"\ntool = \"missing_two\"\ninterval_secs = 10\n",
+        )
+        .unwrap();
+        let second = reload_from_disk(Some(cfg_two), dir_two, false, None, None).await;
+        app.install_reload(second);
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), app.sensor_rx.recv())
+            .await
+            .expect("the new sensor \"two\" is polled after the second reload")
+            .expect("the channel stays open");
+        match ev {
+            crate::proactive::SensorEvent::Error { name, message } => {
+                assert_eq!(name, "two");
+                assert!(message.contains("missing_two"), "{message}");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// Restarting the sensors on a reload must not disturb the pending request
+    /// queue: a request received before the reload is still there afterwards.
+    #[tokio::test]
+    async fn a_reload_keeps_pending_sensor_requests() {
+        let mut app = test_app();
+        let d = crate::proactive::Delta {
+            added: vec!["x".to_string()],
+            removed: Vec::new(),
+        };
+        app.enqueue_sensor("keep".into(), comrade_core::SensorMode::Ask, None, d);
+        assert_eq!(app.sensor_queue.len(), 1);
+
+        let dir = reload_tmp_dir("sensor-queue");
+        let cfg = write_plain_config(&dir);
+        let outcome = reload_from_disk(Some(cfg), dir, false, None, None).await;
+        app.install_reload(outcome);
+
+        assert_eq!(
+            app.sensor_queue.len(),
+            1,
+            "a reload must not drop pending sensor requests"
+        );
+        assert_eq!(app.sensor_queue[0].name, "keep");
+    }
+
+    /// A sensor switched off with `enabled = false` is not started by the reload
+    /// either — its failing tool never runs, so no event ever arrives.
+    #[tokio::test]
+    async fn a_reload_does_not_poll_a_disabled_sensor() {
+        let mut app = test_app();
+        let dir = reload_tmp_dir("sensor-off");
+        let cfg = dir.join("off.toml");
+        std::fs::write(
+            &cfg,
+            "[llm]\nprovider = \"ollama\"\nmodel = \"x\"\n\n\
+             [[sensors]]\nname = \"off\"\ntool = \"missing\"\nenabled = false\n",
+        )
+        .unwrap();
+        let outcome = reload_from_disk(Some(cfg), dir, false, None, None).await;
+        app.install_reload(outcome);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), app.sensor_rx.recv())
+                .await
+                .is_err(),
+            "a disabled sensor must not be polled"
         );
     }
 
