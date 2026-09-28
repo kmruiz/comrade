@@ -29,6 +29,13 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "ti
 tokio-util.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+# Terminal image rendering. Pinned to 9.x because 10+ requires ratatui 0.30
+# (the workspace is on 0.29), and chafa is disabled: its default feature links
+# libchafa.so at runtime, which a distributed binary cannot rely on.
+ratatui-image = { version = "9", default-features = false, features = ["crossterm"] }
+# Decoding only — the four formats the harness accepts (see comrade-tool::attach),
+# instead of image's full default format set.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 unicode-width.workspace = true
 arboard.workspace = true
 clap = { version = "4", features = ["derive"] }

@@ -866,6 +866,7 @@ mod tool_role_invariant_tests {
             name: "big.png".into(),
             mime: comrade_tool::ImageMime::Png,
             base64: "A".repeat(1_000_000),
+            path: None,
         };
         cm.push_user_input(&comrade_tool::UserInput {
             text: "look".into(),

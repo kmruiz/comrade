@@ -139,6 +139,9 @@ pub(crate) enum MsgKind {
     Reasoning,
     /// A reply from a delegated model, shown under that model's name.
     Delegate,
+    /// An image: the human's attachment, or one the run produced. Collapsed
+    /// into a single line by default and opened inline on demand.
+    Image,
     /// A folded digest of one completed stretch of activity (tool calls,
     /// reasoning, failures, meta notes) between two spoken messages. The
     /// original messages are kept in `Msg::children` and unfolded back on
@@ -199,6 +202,9 @@ pub(crate) struct Msg {
     /// The original messages behind a folded [`MsgKind::Run`] digest. Empty for
     /// every other kind.
     children: Vec<Msg>,
+    /// The image this row shows, for [`MsgKind::Image`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<crate::images::ImageCard>,
     /// Unix seconds when the message was appended to the chat. None on rows
     /// restored from an older session file, which then show no timestamp.
     #[serde(default)]
@@ -215,6 +221,7 @@ impl Msg {
             author: None,
             open: false,
             children: Vec::new(),
+            image: None,
             ts: None,
         }
     }
@@ -227,6 +234,7 @@ impl Msg {
             author: Some(author.into()),
             open: false,
             children: Vec::new(),
+            image: None,
             ts: None,
         }
     }
@@ -239,6 +247,7 @@ impl Msg {
             author: None,
             open: false,
             children: Vec::new(),
+            image: None,
             ts: None,
         }
     }
@@ -255,6 +264,7 @@ impl Msg {
             author: None,
             open: false,
             children: Vec::new(),
+            image: None,
             ts: None,
         }
     }
@@ -268,9 +278,25 @@ impl Msg {
             author: None,
             open: false,
             children,
+            image: None,
             ts: None,
         }
     }
+    /// An image card, collapsed by default.
+    fn image(card: crate::images::ImageCard) -> Self {
+        Msg {
+            kind: MsgKind::Image,
+            text: String::new(),
+            tool: None,
+            fail: None,
+            author: None,
+            open: false,
+            children: Vec::new(),
+            image: Some(card),
+            ts: None,
+        }
+    }
+
     /// A thinking block under `author`, rendered like a spoken answer with a
     /// brain header, tinted with the model's colour. Visible by default.
     fn reasoning(author: impl Into<String>, text: impl Into<String>) -> Self {
@@ -287,6 +313,9 @@ struct RenderRow {
     spans: Vec<Span<'static>>,
     /// Some(msg index) when this row is the clickable header of a tool card.
     tool_header: Option<usize>,
+    /// Some(msg index) when this row is reserved for an opened image: the
+    /// renderer paints the picture over the (blank) rows carrying it.
+    image: Option<usize>,
 }
 
 /// Cached row layout of `chat` (the live stream preview is laid out fresh on
@@ -1068,6 +1097,9 @@ struct LiveState {
     /// Images pasted off the system clipboard, held for the next message: they
     /// go out with whatever text is typed (or alone).
     pending_images: Vec<comrade_tool::ImagePart>,
+    /// Image files already shown as cards in this session, so a chart the model
+    /// keeps naming is not rendered again in every following message.
+    seen_images: std::collections::HashSet<std::path::PathBuf>,
     run_cancelled: bool,
     chat: Vec<Msg>,
     section_collapsed: Vec<bool>,
@@ -1357,6 +1389,12 @@ struct App {
     /// Images pasted off the system clipboard, held for the next message: they
     /// go out with whatever text is typed (or alone).
     pending_images: Vec<comrade_tool::ImagePart>,
+    /// Image files already shown as cards in this session, so a chart the model
+    /// keeps naming is not rendered again in every following message.
+    seen_images: std::collections::HashSet<std::path::PathBuf>,
+    /// The terminal's image rendering state. Terminal-wide (not per session),
+    /// and built lazily: see `crate::images`.
+    images: crate::images::ImageRenderer,
     /// True once the in-flight run was cancelled by the user (Esc / cancel-run).
     run_cancelled: bool,
     /// Instant of the last terminal repaint, used to cap event-driven redraws
@@ -1671,6 +1709,11 @@ impl App {
                     }
                 }
                 MsgKind::Reasoning => m.open = !m.open,
+                MsgKind::Image => {
+                    if let Some(card) = &mut m.image {
+                        card.open = !card.open;
+                    }
+                }
                 _ => {}
             }
         }
@@ -2198,9 +2241,72 @@ impl App {
     }
 
     /// Show a message the human sent, with a line per attached image so the
-    /// transcript records what the model actually received.
+    /// transcript records what the model actually received, and one collapsed
+    /// image card per attachment so it can be opened inside the chat.
     fn show_user_input(&mut self, input: &comrade_tool::UserInput) {
         self.show_user(&input.transcript());
+        for part in &input.images {
+            // A file-backed attachment is shown from the file (so it follows the
+            // file's current contents); a clipboard paste has only its bytes.
+            let name = match &part.path {
+                Some(path) => self.display_path(path),
+                None => part.name.clone(),
+            };
+            let card = match &part.path {
+                Some(path) => crate::images::ImageCard::file(name, path.clone()),
+                None => crate::images::ImageCard::pixels(name, part.decode().unwrap_or_default()),
+            };
+            self.push_msg(Msg::image(card.probed()));
+        }
+    }
+
+    /// Whether any image in the chat is currently opened, i.e. whether the
+    /// terminal has to be asked what it can render.
+    fn has_open_image(&self) -> bool {
+        self.chat
+            .iter()
+            .any(|m| m.image.as_ref().is_some_and(|c| c.open))
+    }
+
+    /// Ask the terminal what it can render, once, the first time an image is
+    /// opened, with the event reader paused so this query owns stdin.
+    fn query_terminal_graphics(&mut self, paused: &std::sync::atomic::AtomicBool) {
+        paused.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Let the event thread leave the `poll` it may already be inside.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let protocol = self.images.query();
+        paused.store(false, std::sync::atomic::Ordering::SeqCst);
+        // The terminal's cell size is now known, so the rows an opened image
+        // reserves change: rebuild the layout.
+        self.chat_epoch = self.chat_epoch.wrapping_add(1);
+        self.push_meta(format!("terminal graphics: {protocol}"));
+    }
+
+    /// A path shown to the human: relative to the project root when it is inside
+    /// it (a chart in the worktree reads as `target/chart.png`), absolute
+    /// otherwise.
+    fn display_path(&self, path: &std::path::Path) -> String {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+
+    /// Show a collapsed card for every image this text names, skipping the ones
+    /// already shown in this session. Used for the model's own output, so a chart
+    /// the run produced (or that the assistant points at) can be looked at
+    /// without leaving the chat.
+    fn push_named_images(&mut self, text: &str) {
+        let root = self.root.clone();
+        let cards = crate::images::model_images(
+            text,
+            &root,
+            &mut self.seen_images,
+            comrade_tool::MAX_IMAGES,
+        );
+        for card in cards {
+            self.push_msg(Msg::image(card));
+        }
     }
 
     /// Submit whatever is in the prompt bar: when a run is in flight the text
@@ -2830,6 +2936,7 @@ impl App {
             compact: None,
             queued_prompt: None,
             pending_images: Vec::new(),
+            seen_images: std::collections::HashSet::new(),
             run_cancelled: false,
             worktree,
             chat,
@@ -2973,6 +3080,7 @@ impl App {
             compact: None,
             queued_prompt: None,
             pending_images: Vec::new(),
+            seen_images: std::collections::HashSet::new(),
             run_cancelled: false,
             worktree,
             chat,
@@ -3010,6 +3118,7 @@ impl App {
         std::mem::swap(&mut self.compact, &mut incoming.compact);
         std::mem::swap(&mut self.queued_prompt, &mut incoming.queued_prompt);
         std::mem::swap(&mut self.pending_images, &mut incoming.pending_images);
+        std::mem::swap(&mut self.seen_images, &mut incoming.seen_images);
         std::mem::swap(&mut self.run_cancelled, &mut incoming.run_cancelled);
         std::mem::swap(&mut self.chat, &mut incoming.chat);
         std::mem::swap(&mut self.section_collapsed, &mut incoming.section_collapsed);
@@ -3482,6 +3591,11 @@ impl App {
             AgentEvent::ToolResult { name, output, ok } => {
                 self.stream.clear();
                 self.activity = None;
+                // A tool the run just ran may have produced an image (a chart, a
+                // rendered screenshot): show it as a collapsed card directly
+                // under the tool card. Scanned here, before the branches below
+                // consume `output`, and deduped across the session.
+                self.push_named_images(&output);
                 if name == "delegate" || name == "ask_advise" {
                     self.on_delegate_result(&name, &output, ok);
                 } else if name == "pom_run_tests" {
@@ -3531,6 +3645,7 @@ impl App {
                 let t = t.trim();
                 if !t.is_empty() {
                     self.push_reasoning(t.to_string());
+                    self.push_named_images(t);
                 }
             }
             AgentEvent::FinalAnswer(a) => {
@@ -3542,6 +3657,7 @@ impl App {
                 let visible = strip_react_scaffolding(&a);
                 if !visible.trim().is_empty() {
                     let author = self.actor_label();
+                    self.push_named_images(&visible);
                     self.push_msg(Msg::authored(MsgKind::Assistant, author, visible));
                 }
             }
@@ -4227,6 +4343,8 @@ fn build_app(
         compact: None,
         queued_prompt: None,
         pending_images: Vec::new(),
+        seen_images: std::collections::HashSet::new(),
+        images: crate::images::ImageRenderer::deferred(),
         run_cancelled: false,
         last_draw: std::time::Instant::now(),
         mode: Mode::initial(deps.cfg.auto_approve()),
@@ -4341,10 +4459,19 @@ pub async fn run(deps: &Deps) -> Result<()> {
         )
     );
 
-    // Terminal events arrive on a background thread.
+    // Terminal events arrive on a background thread. While the main loop asks
+    // the terminal a question (the graphics-capability query, whose REPLY comes
+    // back on stdin), this thread must stay out of `event::read` — otherwise it
+    // would consume that reply as bogus key events.
     let (kev_tx, mut kev_rx) = mpsc::channel::<Event>(128);
+    let graphics_pause = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poller_pause = graphics_pause.clone();
     std::thread::spawn(move || {
         loop {
+            if poller_pause.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
             if event::poll(Duration::from_millis(100)).ok() != Some(true) {
                 continue;
             }
@@ -4457,6 +4584,12 @@ pub async fn run(deps: &Deps) -> Result<()> {
         // repaints at ~30 fps while running; idle frames are never throttled
         // (nothing floods when no run is in flight), and the plan spinner's
         // 100 ms tick clears the cap every time, so animation is unaffected.
+        // The terminal is asked what it can render only when it matters — the
+        // first time an image is actually opened — because the query blocks on a
+        // reply for up to two seconds on a terminal that does not answer.
+        if app.images.needs_query() && app.has_open_image() {
+            app.query_terminal_graphics(&graphics_pause);
+        }
         let now = std::time::Instant::now();
         let capped =
             app.running && now.duration_since(app.last_draw) < std::time::Duration::from_millis(33);
@@ -5166,6 +5299,9 @@ fn focus_visible(msg: &Msg) -> bool {
         // A diagram is content the model drew for the human, not tool noise:
         // focus mode keeps it while every other tool row stays hidden.
         MsgKind::Tool => diagram_block(msg).is_some(),
+        // An image is content the human either sent or the model produced for
+        // them, never tool noise: focus mode keeps it.
+        MsgKind::Image => true,
         MsgKind::Failure | MsgKind::Meta => false,
     }
 }
@@ -6239,6 +6375,43 @@ fn draw_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(lines).scroll((0, 0)), rows_rect);
+
+    // Paint the opened images into the rows they reserved. This runs AFTER the
+    // text, so a picture is never blanked by the placeholder rows above it, and
+    // only for rows actually on screen.
+    let mut pictures: Vec<(Rect, crate::images::ImageCard)> = Vec::new();
+    let mut row = offset;
+    while row < total_rows.min(offset + height) {
+        let Some(idx) = (row < chat_rows).then(|| cache.rows[row].image).flatten() else {
+            row += 1;
+            continue;
+        };
+        // One card owns a run of consecutive rows; find where the run ends.
+        let mut end = row;
+        while end + 1 < chat_rows
+            && cache.rows[end + 1].image.is_some()
+            && cache.owner[end + 1] == Some(idx)
+        {
+            end += 1;
+        }
+        if let Some(card) = app.chat.get(idx).and_then(|m| m.image.clone()) {
+            pictures.push((
+                Rect {
+                    x: rows_rect.x + 2,
+                    y: rows_rect.y + (row - offset) as u16,
+                    width: rows_rect.width.saturating_sub(2),
+                    height: (end - row + 1) as u16,
+                },
+                card,
+            ));
+        }
+        row = end + 1;
+    }
+    for (rect, card) in pictures {
+        if let Err(e) = app.images.draw(frame, rect, &card) {
+            app.push_meta(format!("cannot show {}: {e}", card.name));
+        }
+    }
     if spinner {
         let row = Rect {
             y: inner.y + view_h,
@@ -6297,6 +6470,38 @@ fn layout_chat_rows(
             continue;
         }
         match msg.kind {
+            MsgKind::Image => {
+                let Some(card) = &msg.image else {
+                    ranges.push((out.len(), 0));
+                    i += 1;
+                    continue;
+                };
+                let dim = Style::default().fg(Color::DarkGray);
+                out.push(RenderRow {
+                    rule: Some(Color::Magenta),
+                    spans: vec![Span::styled(cap(&card.line(), w), dim)],
+                    tool_header: Some(i),
+                    image: None,
+                });
+                if card.open {
+                    // Reserve the rows the picture will occupy. The renderer
+                    // paints them after the text, so they stay blank here.
+                    let rows = crate::images::preview_rows(
+                        card.dims,
+                        crate::images::cell_pixels(),
+                        w as u16,
+                        crate::images::MAX_PREVIEW_ROWS,
+                    );
+                    for _ in 0..rows {
+                        out.push(RenderRow {
+                            rule: None,
+                            spans: Vec::new(),
+                            tool_header: Some(i),
+                            image: Some(i),
+                        });
+                    }
+                }
+            }
             MsgKind::User => {
                 // A new exchange begins: recompute this section's visibility.
                 ord += 1;
@@ -6342,6 +6547,7 @@ fn layout_chat_rows(
                         rule: Some(Color::Green),
                         spans: row,
                         tool_header: Some(i),
+                        image: None,
                     });
                 }
                 if hiding && hidden > 0 {
@@ -6353,6 +6559,7 @@ fn layout_chat_rows(
                         rule: None,
                         spans: vec![Span::styled(marker, dim)],
                         tool_header: Some(i),
+                        image: None,
                     });
                 }
             }
@@ -6421,6 +6628,7 @@ fn layout_chat_rows(
                         rule: None,
                         spans: vec![Span::styled(s, dim)],
                         tool_header: None,
+                        image: None,
                     });
                 }
             }
@@ -6435,6 +6643,7 @@ fn layout_chat_rows(
                             rule: None,
                             spans: vec![Span::styled(chunk, style)],
                             tool_header: None,
+                            image: None,
                         });
                     }
                 }
@@ -6458,6 +6667,7 @@ fn layout_chat_rows(
                         rule: None,
                         spans,
                         tool_header: None,
+                        image: None,
                     });
                 }
             }
@@ -6472,6 +6682,7 @@ fn layout_chat_rows(
                         rule,
                         spans,
                         tool_header: None,
+                        image: None,
                     });
                 }
             }
@@ -6489,6 +6700,7 @@ fn layout_chat_rows(
                 rule: None,
                 spans,
                 tool_header: None,
+                image: None,
             });
             owner.push(None);
         }
@@ -6961,6 +7173,7 @@ fn author_header(
         rule: None,
         spans,
         tool_header: None,
+        image: None,
     });
 }
 
@@ -7002,6 +7215,7 @@ fn layout_reasoning(
         rule: None,
         spans,
         tool_header: None,
+        image: None,
     });
     if !open {
         return;
@@ -7012,6 +7226,7 @@ fn layout_reasoning(
                 rule,
                 spans,
                 tool_header: None,
+                image: None,
             });
         }
     }
@@ -7032,6 +7247,7 @@ fn layout_failure(out: &mut Vec<RenderRow>, msg_idx: usize, fail: &TestFail, wid
             Span::styled(fail.name.clone(), Style::default().fg(Color::White)),
         ],
         tool_header: Some(msg_idx),
+        image: None,
     });
     if !fail.open {
         return;
@@ -7045,6 +7261,7 @@ fn layout_failure(out: &mut Vec<RenderRow>, msg_idx: usize, fail: &TestFail, wid
                     Style::default().fg(Color::Red),
                 )],
                 tool_header: None,
+                image: None,
             });
         }
     }
@@ -7180,6 +7397,7 @@ fn layout_run(out: &mut Vec<RenderRow>, msg_idx: usize, children: &[Msg]) {
         rule: None,
         spans,
         tool_header: Some(msg_idx),
+        image: None,
     });
 }
 
@@ -7348,6 +7566,7 @@ fn layout_diagram(out: &mut Vec<RenderRow>, result: &str, width: usize) {
             rule: None,
             spans,
             tool_header: None,
+            image: None,
         });
     }
 }
@@ -7428,6 +7647,7 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
         rule: None,
         spans,
         tool_header: Some(msg_idx),
+        image: None,
     });
     if !card.open {
         return;
@@ -7441,6 +7661,7 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
                 Style::default().fg(Color::DarkGray),
             )],
             tool_header: None,
+            image: None,
         });
         const MAX_DIFF_ROWS: usize = 200;
         let pairs = lcs_pairs(old, new);
@@ -7457,6 +7678,7 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
                 rule: None,
                 spans,
                 tool_header: None,
+                image: None,
             });
         }
         if pairs.len() > MAX_DIFF_ROWS {
@@ -7467,6 +7689,7 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
                     Style::default().fg(Color::DarkGray),
                 )],
                 tool_header: None,
+                image: None,
             });
         }
     } else {
@@ -7476,12 +7699,14 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
                 rule: None,
                 spans: vec![Span::styled("args:", Style::default().fg(Color::DarkGray))],
                 tool_header: None,
+                image: None,
             });
             for line in lines {
                 out.push(RenderRow {
                     rule: None,
                     spans: vec![Span::styled(line, Style::default().fg(Color::Magenta))],
                     tool_header: None,
+                    image: None,
                 });
             }
         }
@@ -7497,12 +7722,14 @@ fn layout_tool(out: &mut Vec<RenderRow>, msg_idx: usize, card: &ToolCard, width:
             rule: None,
             spans: vec![Span::styled("result:", Style::default().fg(color))],
             tool_header: None,
+            image: None,
         });
         for row in result_rows(result, card.ok, width) {
             out.push(RenderRow {
                 rule: None,
                 spans: row,
                 tool_header: None,
+                image: None,
             });
         }
     }
@@ -10217,6 +10444,7 @@ mod tests {
             rule: Some(Color::Cyan),
             spans: vec![Span::raw("hi")],
             tool_header: None,
+            image: None,
         };
         let line = render_row_line(&row, false, false, Some(Color::Rgb(1, 2, 3)), 10, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -10232,6 +10460,7 @@ mod tests {
             rule: None,
             spans: vec![Span::raw("hi")],
             tool_header: None,
+            image: None,
         };
         let line = render_row_line(
             &row,
@@ -10255,6 +10484,7 @@ mod tests {
             rule: None,
             spans: vec![Span::raw("hi")],
             tool_header: None,
+            image: None,
         };
         let line = render_row_line(&row, false, false, None, 10, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -10267,6 +10497,7 @@ mod tests {
             rule: Some(Color::Cyan),
             spans: vec![Span::raw("hi")],
             tool_header: None,
+            image: None,
         };
         let line = render_row_line(&row, true, false, None, 10, None);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -12725,6 +12956,189 @@ args = ["{script}"]
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         );
         assert!(app.pending_images.is_empty(), "esc drops the held image");
+    }
+
+    // --- image cards in the transcript --------------------------------------
+
+    fn image_card(open: bool) -> crate::images::ImageCard {
+        let mut card =
+            crate::images::ImageCard::pixels("chart.png", crate::images::test_png(40, 20)).probed();
+        card.open = open;
+        card
+    }
+
+    fn layout(chat: &[Msg], width: usize) -> Vec<RenderRow> {
+        layout_chat_rows(chat, &[], "", width, &[], &ModelColors::default(), false, 0).0
+    }
+
+    fn row_text(row: &RenderRow) -> String {
+        row.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Collapsed by default: one line naming the image, and no reserved rows.
+    #[test]
+    fn a_closed_image_card_is_a_single_line() {
+        let chat = vec![Msg::image(image_card(false))];
+        let rows = layout(&chat, 60);
+        assert_eq!(rows.len(), 1, "a collapsed image is exactly one row");
+        assert!(
+            row_text(&rows[0]).contains("chart.png"),
+            "{}",
+            row_text(&rows[0])
+        );
+        assert!(
+            row_text(&rows[0]).contains("tab opens"),
+            "{}",
+            row_text(&rows[0])
+        );
+        assert!(rows[0].image.is_none(), "a collapsed card reserves nothing");
+        assert_eq!(rows[0].tool_header, Some(0), "the line is clickable");
+    }
+
+    /// Opened: the picture's rows are reserved under the line, and each row
+    /// points at the card that owns it so the renderer can paint it.
+    #[test]
+    fn an_opened_image_card_reserves_rows_for_the_picture() {
+        let chat = vec![Msg::image(image_card(true))];
+        let (rows, owner, ranges) =
+            layout_chat_rows(&chat, &[], "", 60, &[], &ModelColors::default(), false, 0);
+        assert!(rows.len() > 1, "an opened card takes more than one row");
+        let reserved: Vec<usize> = rows.iter().filter_map(|r| r.image).collect();
+        assert_eq!(
+            reserved.len(),
+            rows.len() - 1,
+            "every row but the line belongs to the picture"
+        );
+        assert!(reserved.iter().all(|idx| *idx == 0));
+        assert_eq!(owner[1..], vec![Some(0); rows.len() - 1], "rows are owned");
+        assert_eq!(ranges[0], (0, rows.len()), "the span covers the whole card");
+    }
+
+    /// A chat too narrow for a preview reserves nothing: the line is all there is.
+    #[test]
+    fn a_narrow_chat_reserves_no_preview_rows() {
+        let chat = vec![Msg::image(image_card(true))];
+        let rows = layout(&chat, crate::images::MIN_PREVIEW_COLS as usize - 1);
+        assert_eq!(rows.len(), 1, "too narrow to show anything useful");
+    }
+
+    /// Tab opens the selected image, exactly like a tool card.
+    #[tokio::test]
+    async fn tab_opens_a_collapsed_image_card() {
+        let mut app = test_app();
+        app.chat.push(Msg::image(image_card(false)));
+        app.sel = Some(app.chat.len() - 1);
+        handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        );
+        assert!(
+            app.chat.last().unwrap().image.as_ref().unwrap().open,
+            "tab must open the selected image"
+        );
+        handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        );
+        assert!(
+            !app.chat.last().unwrap().image.as_ref().unwrap().open,
+            "and close it again"
+        );
+    }
+
+    /// The whole point: an opened card paints the rows it reserved in the chat,
+    /// and a collapsed one paints nothing at all.
+    #[tokio::test]
+    async fn drawing_an_opened_image_card_paints_the_chat() {
+        /// Distinct cell styles in `rect` that a plain text row cannot produce:
+        /// a block glyph, or any cell carrying a background colour. The row text
+        /// itself and the coloured left rule never set a background.
+        fn painted(
+            terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+            rect: Rect,
+        ) -> Vec<String> {
+            use ratatui::style::Color;
+            let buf = terminal.backend().buffer();
+            let mut set = std::collections::BTreeSet::new();
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    if let Some(c) = buf.cell((x, y))
+                        && (c.bg != Color::Reset || matches!(c.symbol(), "▀" | "▄" | "█"))
+                    {
+                        set.insert(format!("{}/{:?}/{:?}", c.symbol(), c.fg, c.bg));
+                    }
+                }
+            }
+            set.into_iter().collect()
+        }
+
+        let mut app = test_app();
+        app.focus_mode = false;
+        app.chat.push(Msg::image(image_card(false)));
+        app.chat_epoch += 1;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| draw(&mut app, f)).unwrap();
+        assert!(
+            painted(&terminal, app.chat_rect).is_empty(),
+            "a collapsed card draws no picture: {:?}",
+            painted(&terminal, app.chat_rect)
+        );
+
+        app.chat.last_mut().unwrap().image.as_mut().unwrap().open = true;
+        app.chat_epoch += 1;
+        terminal.draw(|f| draw(&mut app, f)).unwrap();
+
+        let reserved = app.msg_ranges.first().map(|r| r.1).unwrap_or(0);
+        assert!(reserved > 1, "the layout reserved rows: {reserved}");
+        let seen = painted(&terminal, app.chat_rect);
+        assert!(
+            !seen.is_empty(),
+            "an opened card must paint its picture (reserved {reserved} rows, chat {:?})",
+            app.chat_rect
+        );
+    }
+
+    /// The human's own attachment becomes a card too, named by its path.
+    #[tokio::test]
+    async fn an_attached_image_becomes_a_collapsed_card() {
+        let dir = image_dir("attachcard");
+        let png = dir.join("shot.png");
+        std::fs::write(&png, crate::images::test_png(20, 10)).unwrap();
+        let mut app = test_app();
+        app.root = dir.clone();
+
+        let part = comrade_tool::load_image_file(&png).unwrap();
+        let input = comrade_tool::UserInput {
+            text: "why is this wrong?".into(),
+            images: vec![part],
+        };
+        app.show_user_input(&input);
+
+        let last = app.chat.last().expect("a card");
+        assert_eq!(last.kind, MsgKind::Image);
+        let card = last.image.as_ref().unwrap();
+        assert!(!card.open, "attachments start collapsed");
+        assert_eq!(card.path, Some(png.clone()));
+        assert_eq!(card.dims, Some((20, 10)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chart the model names is shown once, not again in every later message.
+    #[tokio::test]
+    async fn a_named_image_is_shown_once_per_session() {
+        let dir = image_dir("namedcard");
+        std::fs::write(dir.join("chart.png"), crate::images::test_png(10, 10)).unwrap();
+        let mut app = test_app();
+        app.root = dir.clone();
+
+        app.push_named_images("I plotted it: chart.png");
+        assert_eq!(app.chat.len(), 1);
+        assert_eq!(app.chat[0].kind, MsgKind::Image);
+
+        app.push_named_images("here it is again, chart.png");
+        assert_eq!(app.chat.len(), 1, "the same chart is not rendered twice");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

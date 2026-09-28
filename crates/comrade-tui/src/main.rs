@@ -3,6 +3,7 @@
 mod colors;
 mod editor;
 mod headless;
+mod images;
 mod proactive;
 mod session_store;
 mod tui;

@@ -455,6 +455,16 @@ Replaced the earlier `push_user_merged` delivery, which folded the nudge `\n\n` 
 - `crates/comrade-core/src/agent.rs`
 - `.comrade/memory/0037-tool-dispatch-prepost-hooks-per-tool-timeout-per-run-budget.md`
 
+## ImageCard
+> One image in the chat transcript: a display `name`, the `path` its pixels are read from (persisted) or the `pixels` held in memory (a clipboard paste, not persisted), its pixel `dims` read from the header, its encoded size, and whether it is `open`. Collapsed by default into one line ("🖼 name (size) — tab opens"); Tab on the selected block opens the picture in place.
+
+**References:**
+- `crates/comrade-tui/src/images.rs`
+- `crates/comrade-tui/src/tui.rs`
+
+**Notes:**
+Lives in `crates/comrade-tui/src/images.rs` and rides the chat as a `MsgKind::Image` message (`Msg::image(card)`). Construct with `ImageCard::file(..)` / `ImageCard::pixels(..)` then `.probed()`. An opened card's rows are reserved by `layout_chat_rows` (`RenderRow.image`) and painted after the paragraph by `ImageRenderer::draw`. The terminal's graphics support is queried lazily on the first open; see ADR 0098.
+
 ## ImagePart
 > One image attached to a user message: a display `name`, its real `ImageMime` (decided by magic bytes) and the base64 payload. Turns into `{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}` in a model request. The name is a UI label only — it is not part of the wire form.
 

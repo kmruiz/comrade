@@ -76,6 +76,11 @@ pub struct ImagePart {
     pub name: String,
     pub mime: ImageMime,
     pub base64: String,
+    /// The file the pixels came from, when there was one. `None` for an image
+    /// that exists only as bytes (a clipboard paste). Callers that want to
+    /// re-read or show the image (the TUI's preview) use this instead of keeping
+    /// a second copy of the payload; it is a UI concern, never sent to a model.
+    pub path: Option<std::path::PathBuf>,
 }
 
 impl ImagePart {
@@ -95,7 +100,16 @@ impl ImagePart {
             name,
             mime,
             base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            path: None,
         })
+    }
+
+    /// The exact bytes this part was built from — the payload decoded. `None`
+    /// when the payload is not valid base64.
+    pub fn decode(&self) -> Option<Vec<u8>> {
+        base64::engine::general_purpose::STANDARD
+            .decode(&self.base64)
+            .ok()
     }
 
     /// The `data:` URI a model request carries.
@@ -120,6 +134,7 @@ impl ImagePart {
             name: format!("image.{}", mime.ext()),
             mime,
             base64: payload.to_string(),
+            path: None,
         })
     }
 
@@ -167,7 +182,9 @@ pub fn load_image_file(path: &Path) -> Result<ImagePart, AttachError> {
         path: path.display().to_string(),
         err: e.to_string(),
     })?;
-    ImagePart::from_bytes(name, &bytes)
+    let mut part = ImagePart::from_bytes(name, &bytes)?;
+    part.path = Some(path.to_path_buf());
+    Ok(part)
 }
 
 /// Collect the images `text` refers to, in order, at most [`MAX_IMAGES`] of
@@ -580,6 +597,19 @@ mod tests {
         let mut input = UserInput::text("plain");
         assert!(!input.downgrade_images("no vision"));
         assert_eq!(input.text, "plain");
+    }
+
+    #[test]
+    fn decode_returns_the_bytes_the_part_was_built_from() {
+        let part = ImagePart::from_bytes("shot.png", PNG).unwrap();
+        assert_eq!(part.decode().unwrap(), PNG);
+        let broken = ImagePart {
+            name: "x.png".into(),
+            mime: ImageMime::Png,
+            base64: "not base64!!".into(),
+            path: None,
+        };
+        assert!(broken.decode().is_none());
     }
 
     #[test]
